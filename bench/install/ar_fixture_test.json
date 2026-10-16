@@ -1,0 +1,41 @@
+{
+  "rails": "8.1.3.1",
+  "hash_digest_class": "OpenSSL::Digest::SHA256",
+  "rows": [
+    {
+      "kind": "webhook",
+      "settings": {
+        "url": "https://hooks.example.com/rw?x=1",
+        "secret": "s3cr3t-✓"
+      },
+      "ciphertext": "{\"p\":\"1qGh+Ot2SYqWYNyxCb55Z5prAxoP53VYqQg7j/mBRbJXb+sEmWeCuXu77YmvYQWTUmO1o+zEKvS96yjBXmndKg==\",\"h\":{\"iv\":\"xePZReVG0K7PGOSY\",\"at\":\"mT7Ca1/K56DPtbZHgFa+cA==\"}}",
+      "compressed": false
+    },
+    {
+      "kind": "slack",
+      "settings": {
+        "webhook_url": "https://hooks.slack.com/services/T000/B000/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      "ciphertext": "{\"p\":\"IWKNvDaOGLihClgyEF2oYJL5gfkn06g9yHBKcIaIRi7vtAB3sPq4zT6xF6DcSyARONPnZULmPyhYw+wZMQwzpzAztw==\",\"h\":{\"iv\":\"Gfs5R5zY2XzrvIrv\",\"at\":\"k5xBiVeascMB8uK54rLgwQ==\",\"c\":true}}",
+      "compressed": true
+    },
+    {
+      "kind": "linear",
+      "settings": {
+        "access_token": "lin_oauth_abc",
+        "refresh_token": "lin_ref_def"
+      },
+      "ciphertext": "{\"p\":\"/HhD0Re0F+Th5URrCLw5PerMNq9upwd1tRpNfZXpLMzy3ueFdFZif/jSld2HU6KHretsTjhJdfKw7MZKqyo=\",\"h\":{\"iv\":\"SIweQTrvl1fUuqXD\",\"at\":\"nIbPObkyDReGlUoqx0ohOg==\"}}",
+      "compressed": false
+    },
+    {
+      "kind": "webhook",
+      "settings": {
+        "url": "https://old.example.com",
+        "secret": "old"
+      },
+      "ciphertext": "{\"p\":\"qCMwZ1eaxJageUX38cjZD+LRQFHSJs7Ktv5uRRxSGne2IssZ4Vqf0ckz69jLh/B/\",\"h\":{\"iv\":\"cZCiv2ewdaQfcQWx\",\"at\":\"6INwc1tlTkCCIfjyOHjj3w==\"}}",
+      "compressed": false
+    }
+  ]
+}

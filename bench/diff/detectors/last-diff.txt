@@ -1,0 +1,17 @@
+threshold        11/11 identical
+anomaly          10/10 identical
+missed           7/7 identical
+silent_host      6/6 identical
+release_health   6/6 identical
+quota            4/4 identical
+issue_events     5/5 identical
+auto_resolve     2/2 identical
+delivery         3/3 identical
+TOTAL 54/54 scenarios identical; Rails side: 48 issues (24 with detection), 83 alerts, 85 deliveries; presenter: 24 available, 25 representative records
+
+Note (2026-10-16, branch rails-bug-fixes, not re-run): two Rails bugs were
+fixed in both servers, so against the old rw-baseline image these scenarios
+now differ and compare.py lists them as EXPECTED (not counted):
+  missed_task_still_missed_seen  Rust keeps sample["detection"] on :seen
+  quota_80_then_100              the environment_ids [999] quota rule never fires
+On a baseline rebuilt from the fixed railwatch-cloud both must be identical.

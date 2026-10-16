@@ -1,0 +1,112 @@
+# Release: on a v* tag, build the static binaries for x86_64 and aarch64
+# Linux, the installer, and SHA256SUMS with bin/release (the same script a
+# laptop runs), sign SHA256SUMS with cosign keyless (Sigstore, this
+# workflow's GitHub OIDC identity; no key to keep), and publish them as the
+# tag's GitHub release. docs/SELF-HOST.md, "Releases", says how to verify.
+#
+# Hardening: every action is pinned to a full commit SHA (the comment is the
+# release it was taken from); event fields reach shell only through env and
+# the version is checked against a semver pattern before use; checkout keeps
+# no credentials; each job has only the permissions it needs; only a tag
+# push publishes (a manual dispatch builds and uploads an artifact, never a
+# release), and an existing release asset is never overwritten.
+#
+# Locally: act push -e .github/act-tag-event.json -j build --bind \
+#   -P ubuntu-24.04=catthehacker/ubuntu:act-24.04 --env GITHUB_REPOSITORY=Rebulk/railwatch-rs
+# runs the build job (publish needs the real GitHub: OIDC, release API).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "version to build (vX.Y.Z); dispatch builds, it does not publish"
+        required: true
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - id: v
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          HEAD_COMMIT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
+        run: |
+          version=${INPUT_VERSION:-$REF_NAME}
+          # vMAJOR.MINOR.PATCH with an optional -prerelease (semver 2.0).
+          if ! printf '%s' "$version" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+            echo "::error::not a release version: $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # The commit time is the build's timestamp (reproducible builds);
+          # from git when there is a repository, else the event's (act).
+          if epoch=$(git log -1 --format=%ct 2>/dev/null); then :; else epoch=$(date -d "$HEAD_COMMIT_TIMESTAMP" +%s); fi
+          echo "SOURCE_DATE_EPOCH=$epoch" >> "$GITHUB_ENV"
+      # The frontend: the gem's pinned .gem (bin/build fetches it with `gem`),
+      # Node and pnpm at the versions bin/build pins under mise.
+      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1.329.0
+        with:
+          ruby-version: "3.4"
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 10.30.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.23.2
+      - name: brotli (bin/build precompresses assets)
+        run: command -v brotli || (sudo apt-get update -qq && sudo apt-get install -y -qq brotli)
+      - name: frontend
+        run: SKIP_CARGO=1 bin/build
+      - name: binaries, installer, SHA256SUMS
+        # bin/release builds in a digest-pinned container; its caches live in
+        # the workspace so the paths it mounts exist on the docker host (here,
+        # and under act --bind).
+        env:
+          RELEASE_CACHE: ${{ github.workspace }}/.cache/release
+          RAILWATCH_REPO: ${{ github.repository }}
+          SKIP_FRONTEND: "1"
+          VERSION: ${{ steps.v.outputs.version }}
+        run: bin/release "$VERSION"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: dist/${{ steps.v.outputs.version }}/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # create the release
+      id-token: write   # cosign keyless: the OIDC token Fulcio certifies
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: sign SHA256SUMS (cosign keyless)
+        working-directory: release
+        run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.build.outputs.version, '-') }}

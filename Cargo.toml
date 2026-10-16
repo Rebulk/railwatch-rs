@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/server", "crates/load"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "AGPL-3.0-only"
+
+[workspace.dependencies]
+# The Inertia.js protocol (Phase 3): the inertia-omega fork, pinned by rev.
+omega = { package = "inertia-omega", git = "https://github.com/cole-robertson/inertia-omega", rev = "06754a74f1887a7df1cb4dc0c702597cb61a98ed", default-features = false, features = ["axum", "tower-sessions"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

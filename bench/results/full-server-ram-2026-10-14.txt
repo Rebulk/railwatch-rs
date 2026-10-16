@@ -1,0 +1,18 @@
+##### closed envs=10 conc=32 (rollups+watchdog on)
+  batches/s (200): 103.2   events/s accepted: 51611
+     200     4645     233.2     630.5    1038.5    1330.4
+== full-e10: anon idle 12 MiB peak 892 MiB; CPU s 170; tenant bytes 1739728248; dir /dev/shm/rwrs/rust-full-e10.XMRZ
+rollups|207
+##### closed envs=50 conc=64 (rollups+watchdog on)
+  batches/s (200): 136.2   events/s accepted: 68111
+     200     6130     471.9     700.1     855.0    1023.7
+== full-e50: anon idle 12 MiB peak 1546 MiB; CPU s 178; tenant bytes 2302471696; dir /dev/shm/rwrs/rust-full-e50.ILQF
+rollups|207
+##### open envs=10 rate=25
+  batches/s (200): 25.0   events/s accepted: 12489
+     200     1124      18.3      21.3      26.6      42.6
+== fullopen-e10: anon idle 12 MiB peak 523 MiB; CPU s 21; tenant bytes 411532296; dir /dev/shm/rwrs/rust-fullopen-e10.iuLV
+##### open envs=50 rate=30
+  batches/s (200): 30.0   events/s accepted: 14989
+     200     1349      11.0      14.0      17.5      61.8
+== fullopen-e50: anon idle 12 MiB peak 878 MiB; CPU s 18; tenant bytes 749931688; dir /dev/shm/rwrs/rust-fullopen-e50.yE2X

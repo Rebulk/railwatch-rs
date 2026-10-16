@@ -1,0 +1,315 @@
+//! One writer per tenant file. Requests map and validate on their own tasks
+//! (in parallel), then hand the prepared batch to the tenant's writer over a
+//! channel. The writer owns the only write connection to the file. It
+//! coalesces whatever is queued (up to MAX_COALESCE_BATCHES batches or
+//! MAX_COALESCE_ROWS rows) into one `BEGIN IMMEDIATE` transaction, with a
+//! SAVEPOINT per batch so a batch that fails rolls back alone, commits, and
+//! only then answers each request.
+//!
+//! The writer is a dedicated OS thread (rusqlite is blocking); it is opened
+//! lazily on the first batch and closes itself after `idle` without work.
+//! Reads that the ingest path needs (a receipt lookup) also go through it, so
+//! they see exactly what has committed.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use rusqlite::{Connection, OptionalExtension};
+use tokio::sync::oneshot;
+
+use crate::followups::{Followup, FollowupSender};
+use crate::ingest::batch::Prepared;
+use crate::ingest::writer::{WriteError, Written};
+use crate::schema;
+use crate::storage::Layout;
+use crate::storage::store::Store;
+
+pub const MAX_COALESCE_BATCHES: usize = 64;
+pub const MAX_COALESCE_ROWS: usize = 20_000;
+
+/// A stored receipt, as Telemetry::IngestReceipt.lookup returns it.
+#[derive(Debug, Clone)]
+pub struct StoredReceipt {
+    pub body_sha256: String,
+    pub metadata_sha256: String,
+    pub ack: String,
+    pub committed_at: String,
+}
+
+pub enum Job {
+    Write {
+        batch: Box<Prepared>,
+        /// Environment#ingest_followup_gc_before, re-read by the caller
+        /// just before sending (Batch#write_receipt! reads it in the txn).
+        gc_floor_micros: i64,
+        reply: oneshot::Sender<Result<Written, WriteError>>,
+    },
+    LookupReceipt {
+        producer_id: String,
+        delivery_id: String,
+        reply: oneshot::Sender<Result<Option<StoredReceipt>, String>>,
+    },
+}
+
+#[derive(Clone)]
+pub struct Tenants {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    dir: PathBuf,
+    idle: Duration,
+    /// slug -> (generation, sender); the generation tells a writer that
+    /// exits on idle whether the map still points at it.
+    writers: Mutex<HashMap<String, (u64, Sender<Job>)>>,
+    generation: std::sync::atomic::AtomicU64,
+    followups: Mutex<Option<FollowupSender>>,
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl Tenants {
+    pub fn new(dir: PathBuf, idle: Duration, followups: FollowupSender) -> Tenants {
+        std::fs::create_dir_all(&dir).expect("create telemetry dir");
+        Tenants {
+            inner: Arc::new(Inner { dir, idle, writers: Mutex::new(HashMap::new()), generation: Default::default(), followups: Mutex::new(Some(followups)), threads: Mutex::new(Vec::new()) }),
+        }
+    }
+
+    pub fn dir(&self) -> PathBuf {
+        self.inner.dir.clone()
+    }
+
+    /// The environment's single file (the Rails layout).
+    pub fn path(&self, slug: &str) -> PathBuf {
+        self.inner.dir.join(format!("{slug}.sqlite3"))
+    }
+
+    /// Where the environment's telemetry is, if it has any yet.
+    pub fn layout(&self, slug: &str) -> Option<Layout> {
+        Layout::detect(&self.inner.dir, slug)
+    }
+
+    /// Creates the environment's storage if it does not exist yet
+    /// (Environment's after_create_commit): a per-day directory.
+    pub fn ensure(&self, slug: &str) -> rusqlite::Result<()> {
+        match self.layout(slug) {
+            Some(_) => Ok(()),
+            None => crate::storage::layout::ensure(&self.inner.dir.join(slug)),
+        }
+    }
+
+    /// Hands a job to the tenant's writer, starting one if none is running.
+    pub fn send(&self, env_id: i64, slug: &str, mut job: Job) {
+        loop {
+            let (generation, tx) = {
+                let mut writers = self.inner.writers.lock().unwrap();
+                writers.entry(slug.to_string()).or_insert_with(|| self.spawn(env_id, slug)).clone()
+            };
+            match tx.send(job) {
+                Ok(()) => return,
+                // The writer exited on idle between our lookup and the send;
+                // forget it and start another.
+                Err(mpsc::SendError(j)) => {
+                    job = j;
+                    let mut writers = self.inner.writers.lock().unwrap();
+                    if writers.get(slug).is_some_and(|(g, _)| *g == generation) {
+                        writers.remove(slug);
+                    }
+                }
+            }
+        }
+    }
+
+    fn spawn(&self, env_id: i64, slug: &str) -> (u64, Sender<Job>) {
+        let (tx, rx) = mpsc::channel();
+        let dir = self.inner.dir.clone();
+        let inner = self.inner.clone();
+        let slug = slug.to_string();
+        let generation = self.inner.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let followups = self.inner.followups.lock().unwrap().clone().expect("tenants already shut down");
+        let handle = std::thread::Builder::new()
+            .name(format!("writer-{slug}"))
+            .spawn(move || {
+                run_writer(env_id, &slug, &dir, rx, inner.idle, &followups);
+                drop(followups);
+                // Unregister, unless a newer writer already took our place.
+                let mut writers = inner.writers.lock().unwrap();
+                if writers.get(&slug).is_some_and(|(g, _)| *g == generation) {
+                    writers.remove(&slug);
+                }
+            })
+            .expect("spawn writer thread");
+        let mut threads = self.inner.threads.lock().unwrap();
+        threads.retain(|h| !h.is_finished());
+        threads.push(handle);
+        (generation, tx)
+    }
+
+    /// Graceful shutdown: close every channel, then wait for the writers to
+    /// drain what was already queued.
+    pub fn shutdown(&self) {
+        self.inner.writers.lock().unwrap().clear();
+        self.inner.followups.lock().unwrap().take();
+        let handles: Vec<_> = std::mem::take(&mut *self.inner.threads.lock().unwrap());
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+}
+
+pub fn open_tenant(path: &Path) -> rusqlite::Result<Connection> {
+    let fresh = !path.exists();
+    let mut conn = Connection::open(path)?;
+    schema::configure(&conn)?;
+    // The per-batch SAVEPOINT makes every statement keep a statement journal;
+    // with the default temp_store those are files in /var/tmp (etilqs_*), and
+    // writing them was ~35% of the server's CPU under load (perf, 2026-10-13).
+    // A journal only lives for one batch's savepoint, so memory is cheap.
+    conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
+    // A batch dirties more pages than cache_size holds (one leaf per random
+    // index key); with spilling on, SQLite wrote them to the WAL mid-
+    // transaction and re-read them at COMMIT to rewrite checksums, ~30% of
+    // the writer once the file outgrew the cache (docs/PERF.md #3). Only the
+    // committing frames count either way, so durability is unchanged; the
+    // cost is a transaction's dirty pages held in memory until commit.
+    conn.execute_batch("PRAGMA cache_spill = OFF;")?;
+    let has_schema: bool = conn
+        .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'", [], |_| Ok(true))
+        .optional()?
+        .unwrap_or(false);
+    if fresh || !has_schema {
+        let now = crate::time::quoted_date_micros(crate::time::now_micros());
+        schema::create_tenant(&mut conn, &now)?;
+    }
+    conn.set_prepared_statement_cache_capacity(256);
+    Ok(conn)
+}
+
+fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Duration, followups: &FollowupSender) {
+    let mut store = match Store::open(dir, slug) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(tenant = slug, error = %e, "cannot open tenant file");
+            // Answer everything that arrives until the senders go away.
+            for job in rx.iter() {
+                fail(job, format!("cannot open tenant: {e}"));
+            }
+            return;
+        }
+    };
+    tracing::debug!(tenant = slug, "writer opened");
+    loop {
+        let first = match rx.recv_timeout(idle) {
+            Ok(job) => job,
+            Err(RecvTimeoutError::Timeout) => {
+                tracing::debug!(tenant = slug, "writer idle, closing");
+                return;
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        let mut jobs = vec![first];
+        let mut rows = row_count(&jobs[0]);
+        while jobs.len() < MAX_COALESCE_BATCHES && rows < MAX_COALESCE_ROWS {
+            match rx.try_recv() {
+                Ok(job) => {
+                    rows += row_count(&job);
+                    jobs.push(job);
+                }
+                Err(_) => break,
+            }
+        }
+        process(env_id, slug, &mut store, jobs, followups);
+    }
+}
+
+fn row_count(job: &Job) -> usize {
+    match job {
+        Job::Write { batch, .. } => batch.row_count().max(1),
+        Job::LookupReceipt { .. } => 0,
+    }
+}
+
+fn fail(job: Job, message: String) {
+    match job {
+        Job::Write { reply, .. } => {
+            let _ = reply.send(Err(WriteError::Internal(message)));
+        }
+        Job::LookupReceipt { reply, .. } => {
+            let _ = reply.send(Err(message));
+        }
+    }
+}
+
+type Pending = (oneshot::Sender<Result<Written, WriteError>>, Result<Written, WriteError>, Option<Followup>);
+
+fn process(env_id: i64, slug: &str, store: &mut Store, jobs: Vec<Job>, followups: &FollowupSender) {
+    // Lookups first: they read committed state, which is all there is
+    // between transactions.
+    let mut writes = Vec::new();
+    for job in jobs {
+        match job {
+            Job::LookupReceipt { producer_id, delivery_id, reply } => {
+                let _ = reply.send(lookup_receipt(store.meta(), &producer_id, &delivery_id).map_err(|e| e.to_string()));
+            }
+            w @ Job::Write { .. } => writes.push(w),
+        }
+    }
+    if writes.is_empty() {
+        return;
+    }
+    let started = Instant::now();
+    let begin = store.begin();
+    let lock_ms = started.elapsed().as_millis() as u64;
+    if let Err(e) = begin {
+        let busy = matches!(&e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::DatabaseBusy);
+        for job in writes {
+            match job {
+                Job::Write { reply, .. } => {
+                    let _ = reply.send(Err(if busy { WriteError::Busy } else { WriteError::Internal(e.to_string()) }));
+                }
+                Job::LookupReceipt { .. } => unreachable!(),
+            }
+        }
+        return;
+    }
+    let mut pending: Vec<Pending> = Vec::new();
+    for job in writes {
+        let Job::Write { mut batch, gc_floor_micros, reply } = job else { unreachable!() };
+        let result = store.write(&mut batch, gc_floor_micros);
+        let followup = result.as_ref().ok().map(|w| Followup::from_batch(env_id, slug, &batch, w));
+        tracing::debug!(tenant = slug, records = batch.record_count, ok = result.is_ok(), "batch written");
+        pending.push((reply, result, followup));
+    }
+    let n = pending.len();
+    match store.commit() {
+        Ok(()) => {
+            for (reply, result, followup) in pending {
+                if let Some(f) = followup {
+                    followups.send(f);
+                }
+                let _ = reply.send(result);
+            }
+        }
+        Err(e) => {
+            store.rollback();
+            tracing::error!(tenant = slug, error = %e, "commit failed");
+            for (reply, _, _) in pending {
+                let _ = reply.send(Err(WriteError::Internal(format!("commit failed: {e}"))));
+            }
+        }
+    }
+    tracing::debug!(tenant = slug, batches = n, lock_ms, ms = started.elapsed().as_millis() as u64, "transaction committed");
+}
+
+fn lookup_receipt(conn: &Connection, producer_id: &str, delivery_id: &str) -> rusqlite::Result<Option<StoredReceipt>> {
+    conn.prepare_cached(
+        "SELECT body_sha256, metadata_sha256, ack, committed_at FROM ingest_receipts WHERE producer_id = ? AND delivery_id = ? LIMIT 1",
+    )?
+    .query_row([producer_id, delivery_id], |r| {
+        Ok(StoredReceipt { body_sha256: r.get(0)?, metadata_sha256: r.get(1)?, ack: r.get(2)?, committed_at: r.get(3)? })
+    })
+    .optional()
+}

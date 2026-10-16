@@ -1,0 +1,22 @@
+##### RAM envs=1 conc=8
+  batches/s (200): 23.3   events/s accepted: 11656
+     200     1049     373.2     419.1     449.2     569.6
+== rust-e1: anon idle 8 MiB peak 92 MiB; CPU s 50; tenant bytes 360328632; dir /dev/shm/rwrs/rust-rust-e1.3vYP
+  batches/s (200): 35.7   events/s accepted: 17867
+     200      600     168.3     299.0     708.3    1049.3
+     429     2600       5.8      11.8      20.2     105.7
+== rails-e1: peak anon web 815 MiB + jobs 409 MiB; CPU s web 33 jobs 2; dir bench/scratch/rails-rails-e1.wgNy
+##### RAM envs=10 conc=32
+  batches/s (200): 77.2   events/s accepted: 38600
+     200     3474     224.9     913.7    3278.2    4893.9
+== rust-e10: anon idle 8 MiB peak 422 MiB; CPU s 154; tenant bytes 1282794104; dir /dev/shm/rwrs/rust-rust-e10.ZR31
+  batches/s (200): 49.4   events/s accepted: 24678
+     200     2221     669.7     748.1     827.4     956.3
+== rails-e10: peak anon web 843 MiB + jobs 719 MiB; CPU s web 90 jobs 10; dir bench/scratch/rails-rails-e10.5xR9
+##### RAM envs=50 conc=64
+  batches/s (200): 90.3   events/s accepted: 45133
+     200     4062     701.7    1161.4    1574.1    2236.8
+== rust-e50: anon idle 8 MiB peak 885 MiB; CPU s 143; tenant bytes 1604485160; dir /dev/shm/rwrs/rust-rust-e50.Lo2Q
+  batches/s (200): 58.1   events/s accepted: 29067
+     200     2616    1122.2    1247.3    1409.3    1528.9
+== rails-e50: peak anon web 1425 MiB + jobs 830 MiB; CPU s web 91 jobs 31; dir bench/scratch/rails-rails-e50.NMTD

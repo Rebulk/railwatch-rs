@@ -1,0 +1,15 @@
+# Documented placeholders gitleaks flags; none is a credential.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "test fixture and documentation placeholders"
+regexes = [
+  '''hooks\.slack\.com/services/T000/B000/x+''',  # bench/install/ar_fixture_test.json
+  '''rwp_your_token_here''',                       # mcp_docs/ai-and-mcp.md
+]
+
+[[allowlists]]
+description = "deploy/install.sh initialises its option variables to empty strings"
+paths = ['''(^|/)deploy/install\.sh$''']
+regexes = ['''ALLOW_PRIVATE=0''']

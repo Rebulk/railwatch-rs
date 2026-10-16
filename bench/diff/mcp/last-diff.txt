@@ -1,0 +1,14 @@
+DIFFERENT  get_issue.performance.437
+    $.body.result.content[0].text.detection keys: only rails=['schema_version', 'telemetry_type', 'telemetry_group_hash', 'target', 'metric', 'unit', 'window', 'measurement', 'rule', 'representative_records', 'event_count', 'trend', 'deploy_comparison', 'representative_references'] only rust=['message'] order_same=False
+DIFFERENT  get_issue.performance.438
+    $.body.result.content[0].text.detection keys: only rails=['schema_version', 'telemetry_type', 'telemetry_group_hash', 'target', 'metric', 'unit', 'window', 'measurement', 'rule', 'representative_records', 'event_count', 'trend', 'deploy_comparison', 'representative_references'] only rust=['message'] order_same=False
+152/154 cases identical
+
+Note (2026-10-16, branch rails-bug-fixes, not re-run): MCP body/params
+handling fixed in both servers (docs/DIFFERENCES.md MCP item 3). Against
+the old rw-baseline image compare.py prints these as EXPECTED (not
+counted) when they differ: parse.form_ctype, parse.string_body,
+parse.array_body, parse.null_body, parse.number_body,
+prompts/get.params_array, tools/call.params_array, and the new
+initialize.params_string and tools/list.params_number. On a baseline
+rebuilt from the fixed railwatch-cloud all must be identical.

@@ -1,0 +1,14 @@
+[
+  {"name": "new user", "kind": "flow", "next": {"email": "New.Person@Example.com", "sub": "g-new"}},
+  {"name": "existing verified user is linked", "kind": "flow", "setup": [{"email": "linked@example.com", "verified": true, "account": true}], "next": {"email": "linked@example.com", "sub": "g-linked"}},
+  {"name": "existing unverified user is refused", "kind": "flow", "setup": [{"email": "unverified@example.com", "verified": false}], "next": {"email": "unverified@example.com", "sub": "g-u"}},
+  {"name": "Google-unverified email is refused", "kind": "flow", "setup": [{"email": "victim@example.com", "verified": true}], "next": {"email": "victim@example.com", "sub": "attacker", "email_verified": false}},
+  {"name": "wrong aud", "kind": "flow", "next": {"email": "x@example.com", "sub": "g-x", "claims": {"aud": "someone-else.apps.googleusercontent.com", "azp": null}}},
+  {"name": "wrong iss", "kind": "flow", "next": {"email": "x@example.com", "sub": "g-x", "claims": {"iss": "https://evil.example.com"}}},
+  {"name": "expired", "kind": "flow", "next": {"email": "x@example.com", "sub": "g-x", "claims": {"exp": 1000000000, "iat": 999996400}}},
+  {"name": "bad signature", "kind": "flow", "next": {"email": "x@example.com", "sub": "g-x", "sign_with": "attacker"}},
+  {"name": "state mismatch", "kind": "state_mismatch", "next": {"email": "x@example.com", "sub": "g-x"}},
+  {"name": "replayed code", "kind": "replay", "next": {"email": "replay@example.com", "sub": "g-replay"}},
+  {"name": "access denied at Google", "kind": "access_denied", "next": {"email": "x@example.com", "sub": "g-x"}},
+  {"name": "forged form token", "kind": "bad_csrf"}
+]

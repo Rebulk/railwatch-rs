@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Builds the release artifacts: one static (musl) binary per Linux arch, the
+# installer, and SHA256SUMS. The same script runs locally and in
+# .github/workflows/release.yml, so CI does nothing a laptop can't repeat.
+#
+#   bin/release v0.2.0            -> dist/v0.2.0/
+#
+#   railwatch-v0.2.0-x86_64-linux-musl.tar.gz    railwatch (static), LICENSE (AGPL-3.0-only),
+#                                                 THIRD-PARTY-LICENSES, SELF-HOST.md
+#   railwatch-v0.2.0-aarch64-linux-musl.tar.gz
+#   install.sh                                    the one-command installer
+#   SHA256SUMS                                    sha256 of each file above
+#
+# Reproducible: the toolchain is a digest-pinned image (cargo-zigbuild:
+# Rust + zig as the musl cross linker, so both arches build on one x86_64
+# host without qemu), Cargo.lock is --locked, paths are remapped out of the
+# binary, C's __DATE__/__TIME__ (mimalloc embeds them; zig cc ignores
+# SOURCE_DATE_EPOCH) are pinned, and the tarballs are normalized (sorted,
+# fixed owner and mtime = SOURCE_DATE_EPOCH, gzip -n). Two runs of the same
+# commit with empty caches give the same SHA256SUMS (docs/SELF-HOST.md).
+#
+# Needs: docker; frontend/dist built (bin/build with SKIP_CARGO=1) unless
+# SKIP_FRONTEND=1 and dist/ is already there.
+set -euo pipefail
+
+VERSION=${1:?usage: bin/release vX.Y.Z}
+printf '%s' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' \
+  || { echo "bin/release: version must look like v1.2.3 (semver, optional -prerelease)" >&2; exit 2; }
+IMAGE=ghcr.io/rust-cross/cargo-zigbuild@sha256:d8313491ec5798de0633fdc1c5753761bff79967bea69076020dc78121b2cca8
+TARGETS="x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
+REPO=${RAILWATCH_REPO:-Rebulk/railwatch-rs}
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+out="$root/dist/$VERSION"
+cache=${RELEASE_CACHE:-$HOME/.cache/railwatch-release}
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$root" log -1 --format=%ct)}
+export SOURCE_DATE_EPOCH
+
+if [ "${SKIP_FRONTEND:-}" != 1 ]; then
+  SKIP_CARGO=1 "$root/bin/build"
+fi
+[ -f "$root/frontend/dist/.vite/manifest.json" ] || { echo "bin/release: frontend/dist is missing (bin/build)" >&2; exit 1; }
+for f in LICENSE THIRD-PARTY-LICENSES; do
+  [ -s "$root/$f" ] || { echo "bin/release: $f is missing (THIRD-PARTY-LICENSES: bin/third-party-licenses)" >&2; exit 1; }
+done
+
+mkdir -p "$cache"/{registry,git,target,home} "$out"
+# __DATE__ "Mmm dd yyyy" / __TIME__ "hh:mm:ss" of the commit (UTC) for C
+# code, through a forced include (cc-rs splits CFLAGS on spaces, so the
+# values cannot be -D arguments). The epoch is in the file name: cc-rs
+# rebuilds when CFLAGS change but does not track an included file, so a
+# fixed name would let a warm cache keep the previous build's time.
+cat > "$cache/home/source-date-$SOURCE_DATE_EPOCH.h" <<EOF
+#undef __DATE__
+#undef __TIME__
+#define __DATE__ "$(LC_ALL=C date -u -d "@$SOURCE_DATE_EPOCH" '+%b %e %Y')"
+#define __TIME__ "$(date -u -d "@$SOURCE_DATE_EPOCH" +%T)"
+EOF
+CDATE="-Wno-builtin-macro-redefined -include /home/b/source-date-$SOURCE_DATE_EPOCH.h"
+rm -f "$out"/*
+for target in $TARGETS; do
+  echo "==> $target"
+  # /src is read-only: the build cannot change the checkout. The registry and
+  # target caches are only caches; a clean cache gives the same bytes.
+  docker run --rm -u "$(id -u):$(id -g)" \
+    -e HOME=/home/b -e CARGO_HOME=/cargo -e RUSTUP_HOME=/usr/local/rustup -e CARGO_TARGET_DIR=/target \
+    -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" -e SOURCE_DATE_EPOCH \
+    -e RAILWATCH_VERSION="$VERSION" -e RAILWATCH_REPO="$REPO" \
+    -e RUSTFLAGS="--remap-path-prefix=/src=. --remap-path-prefix=/cargo=cargo -C strip=symbols" \
+    -e "CFLAGS_${target//-/_}=$CDATE" \
+    -v "$cache/home:/home/b" -v "$cache/registry:/cargo/registry" -v "$cache/git:/cargo/git" -v "$cache/target:/target" \
+    -v "$root:/src:ro" -w /src "$IMAGE" \
+    sh -c "PATH=/usr/local/cargo/bin:\$PATH cargo zigbuild --release --locked -p railwatch-server --bin railwatch --target $target"
+  arch=${target%%-*}
+  name="railwatch-$VERSION-$arch-linux-musl"
+  stage=$(mktemp -d)
+  mkdir "$stage/$name"
+  cp "$cache/target/$target/release/railwatch" "$stage/$name/railwatch"
+  cp "$root/docs/SELF-HOST.md" "$root/LICENSE" "$root/THIRD-PARTY-LICENSES" "$stage/$name/"
+  chmod 0755 "$stage/$name/railwatch"; chmod 0644 "$stage/$name/SELF-HOST.md" "$stage/$name/LICENSE" "$stage/$name/THIRD-PARTY-LICENSES"
+  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$SOURCE_DATE_EPOCH" \
+    --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+    -C "$stage" -cf - "$name" | gzip -9 -n > "$out/$name.tar.gz"
+  rm -rf "$stage"
+done
+
+# The installer, with this release's version, repository and each tarball's
+# sha256 baked in, so `curl .../download/vX/install.sh | sh` installs exactly
+# vX and refuses any other binary, whatever SHA256SUMS the server sends.
+sum() { sha256sum "$out/railwatch-$VERSION-$1-linux-musl.tar.gz" | cut -d' ' -f1; }
+sed -e "s|^RAILWATCH_VERSION_DEFAULT=.*|RAILWATCH_VERSION_DEFAULT=$VERSION|" \
+    -e "s|^RAILWATCH_REPO_DEFAULT=.*|RAILWATCH_REPO_DEFAULT=$REPO|" \
+    -e "s|^RAILWATCH_SHA256_X86_64=.*|RAILWATCH_SHA256_X86_64=$(sum x86_64)|" \
+    -e "s|^RAILWATCH_SHA256_AARCH64=.*|RAILWATCH_SHA256_AARCH64=$(sum aarch64)|" \
+    "$root/deploy/install.sh" > "$out/install.sh"
+grep -q "^RAILWATCH_SHA256_X86_64=[0-9a-f]\{64\}$" "$out/install.sh" && grep -q "^RAILWATCH_SHA256_AARCH64=[0-9a-f]\{64\}$" "$out/install.sh" \
+  || { echo "bin/release: failed to pin the tarball checksums into install.sh" >&2; exit 1; }
+chmod 0755 "$out/install.sh"
+
+(cd "$out" && sha256sum -- *.tar.gz install.sh > SHA256SUMS)
+echo "==> $out"
+cat "$out/SHA256SUMS"

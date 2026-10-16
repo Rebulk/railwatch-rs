@@ -1,0 +1,13 @@
+  logs_fts unindex                 4.54 s      415215 rows
+  executions                      10.31 s      212849 rows
+  queries                         93.10 s     1686706 rows
+  exceptions                       0.09 s       10266 rows
+  cache_events                     7.15 s      417761 rows
+  outgoing_requests                0.36 s       41586 rows
+  view_renders                     3.19 s      208236 rows
+  logs                             6.98 s      415215 rows
+  visits                           0.00 s        1228 rows
+  spans                            0.00 s        1246 rows
+  ingest_batches                   0.00 s        3000 rows
+  health_samples                   0.00 s        1179 rows
+PRUNE total 125.75 s; cutoff 2026-10-13 22:21:09.645131; file 5258055680 B; freelist 1455374336 B (27.7% of file)

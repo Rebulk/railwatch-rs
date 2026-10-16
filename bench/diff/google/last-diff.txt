@@ -1,0 +1,43 @@
+DIFF  new user                               failure key: rails='' rust=''
+      rails: {"first": "/dashboard", "final": "/accounts/new", "flash": {"notice": "Signed in with Google"}} [['new.person@example.com', 'google_oauth2', 'g-new', True]]
+      rust:  {"first": "/dashboard", "final": "/accounts/new", "flash": {}} [['new.person@example.com', 'google_oauth2', 'g-new', True]]
+SAME  existing verified user is linked       failure key: rails='' rust=''
+SAME  existing unverified user is refused    failure key: rails='' rust=''
+SAME  Google-unverified email is refused     failure key: rails='' rust=''
+SAME  wrong aud                              failure key: rails='Invalid+audience.+Expected+%5B%22railwatch-test.' rust='invalid_credentials'
+SAME  wrong iss                              failure key: rails='Invalid+issuer.+Expected+%5B%22accounts.google.c' rust='invalid_credentials'
+SAME  expired                                failure key: rails='Signature+has+expired' rust='invalid_credentials'
+DIFF  bad signature                          failure key: rails='' rust='invalid_credentials'
+      rails: {"first": "/dashboard", "final": "/accounts/new", "flash": {"notice": "Signed in with Google"}} [['x@example.com', 'google_oauth2', 'g-x', True]]
+      rust:  {"first": "/auth/failure?message=<key>", "final": "/sign_in", "flash": {"alert": "Sign in with Google failed. Please try again."}} []
+SAME  state mismatch                         failure key: rails='csrf_detected' rust='csrf_detected'
+DIFF  replayed code                          failure key: rails='invalid_credentials' rust='invalid_credentials'
+      rails: {"genuine": {"first": "/dashboard", "final": "/accounts/new", "flash": {"notice": "Signed in with Google"}}, "replay": {"first": "/auth/failure?message=<key>", "final": "/sign_in", "flash": {"alert": "Sign in with Google failed. Please try  [['replay@example.com', 'google_oauth2', 'g-replay', True]]
+      rust:  {"genuine": {"first": "/dashboard", "final": "/accounts/new", "flash": {}}, "replay": {"first": "/auth/failure?message=<key>", "final": "/sign_in", "flash": {"alert": "Sign in with Google failed. Please try again."}}} [['replay@example.com', 'google_oauth2', 'g-replay', True]]
+SAME  access denied at Google                failure key: rails='access_denied' rust='access_denied'
+SAME  forged form token                      failure key: rails='ActionController%3A%3AInvalidAuthenticityToken' rust='ActionController%3A%3AInvalidAuthenticityToken'
+9/12 identical
+
+The 3 DIFFs are deliberate (docs/DIFFERENCES.md, "Google sign-in"):
+- new user / replayed code (genuine half): same landing, users and session;
+  Rails shows "Signed in with Google" on /accounts/new because its flash
+  survives the /dashboard -> /accounts/new hop, Rust's does not (an existing
+  self-hosted redirect chain; password sign-up loses its flash the same way).
+- bad signature: Rails reads the identity from userinfo and never checks the
+  ID token's signature on the code path, so a forged ID token signs in; Rust
+  verifies it against the JWKS and refuses.
+
+rails_reauth.rb (the "Confirm with Google" button's real POST) in Rails:
+{"first":"/","first_flash":{"notice":"You are already signed in"},...,"recently_authenticated":false}
+
+Note (2026-10-16, branch rails-bug-fixes, not re-run): reauthentication
+is fixed in both servers. The button posts
+/auth/google_oauth2?reauthenticate=<user|account> (no hidden field), and
+any /auth/failure hit by a signed-in user is a failed reauthentication
+(alert "Google could not confirm your identity. Please try again.",
+/settings/members for "account", else /settings/profile). rails_reauth.rb
+now runs the old form-field shape and the fixed query-string shape; the
+latter is expected to confirm ("Identity confirmed. You can now
+continue.", recently_authenticated: true). The 12 flows above don't touch
+reauthentication, so 9/12 should be unchanged. "bad signature" remains a
+deliberate difference, but not a Rails bug (DIFFERENCES Google item 1).

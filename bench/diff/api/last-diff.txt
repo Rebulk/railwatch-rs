@@ -1,0 +1,16 @@
+198/198 cases identical
+activities: 11/11 identical
+comments: 2/2 identical
+issues: 10/10 identical
+deploys: 9/9 identical
+
+Note (2026-10-16, branch rails-bug-fixes, not re-run): Rails bugs fixed in
+both servers (docs/DIFFERENCES.md, JSON API "Rails bugs fixed on both
+sides"). Against the old rw-baseline image compare.py now prints these as
+EXPECTED (not counted) when they differ: issues.q_percent,
+issues.q_underscore, issues.page_array, issues.per_page_array (new),
+logs.limit_array (new), logs.level, logs.text, logs.cursor_page2,
+exceptions.cursor_wrong_resource, write.deploy.repost,
+after_writes.deploys, after_writes.releases; writes.py: activities (user
+now set) and deploys (deployed_at kept). On a baseline rebuilt from the
+fixed railwatch-cloud all must be identical.

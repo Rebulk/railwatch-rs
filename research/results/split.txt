@@ -1,0 +1,6 @@
+day1: 2995093 rows, 1829031936 B, built in 120.1s
+day2: 1498087 rows, 918253568 B, built in 64.7s
+day3: 1498145 rows, 918679552 B, built in 96.9s
+day4: 1494815 rows, 916160512 B, built in 54.6s
+day5: 1501177 rows, 920227840 B, built in 84.9s
+day6: 1498 rows, 1540096 B, built in 9.3s

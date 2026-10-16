@@ -1,0 +1,7 @@
+/* The dashboard's styles are the railwatch gem's (tmp/railwatch-frontend,
+   linked by `bin/rails railwatch:link_frontend`). This entrypoint exists
+   because Vite finds entrypoints in this app's own tree. Tailwind scans the
+   gem's pages and components as well as this app's hosting pages. */
+@import "../../../tmp/railwatch-frontend/entrypoints/application.css";
+
+@source "../../../tmp/railwatch-frontend";

@@ -1,0 +1,14 @@
+##### open loop envs=10 rate=25 batches/s
+  batches/s (200): 25.0   events/s accepted: 12489
+     200     1124      16.1      20.1      21.4      23.1
+== open-e10: anon idle 8 MiB peak 207 MiB; CPU s 17; tenant bytes 410429696; dir /dev/shm/rwrs/rust-open-e10.p6Ai
+  batches/s (200): 25.0   events/s accepted: 12489
+     200     1124      34.9      41.0     175.9     383.7
+== open-e10: peak anon web 445 MiB + jobs 539 MiB; CPU s web 40 jobs 4; dir bench/scratch/rails-open-e10.9h8X
+##### open loop envs=50 rate=30 batches/s
+  batches/s (200): 30.0   events/s accepted: 14989
+     200     1349      10.0      12.2      13.5      16.9
+== open-e50: anon idle 8 MiB peak 610 MiB; CPU s 13; tenant bytes 752815080; dir /dev/shm/rwrs/rust-open-e50.FSoB
+  batches/s (200): 30.0   events/s accepted: 14989
+     200     1349      30.7      38.2      49.6      85.8
+== open-e50: peak anon web 1136 MiB + jobs 608 MiB; CPU s web 42 jobs 11; dir bench/scratch/rails-open-e50.vKxA

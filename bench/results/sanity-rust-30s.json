@@ -1,0 +1,207 @@
+{
+  "url": "http://127.0.0.1:8797/ingest",
+  "tokens": 4,
+  "concurrency": 16,
+  "rate": 0.0,
+  "duration_s": 30.0,
+  "receipted": false,
+  "records_per_batch": 500,
+  "posts": 1130,
+  "batches_ok": 1130,
+  "batches_per_s": 37.666666666666664,
+  "events_per_s": 18833.333333333332,
+  "status_counts": {
+    "200": 1130
+  },
+  "latency": {
+    "200": {
+      "count": 1130,
+      "p50_ms": 332.43260499999997,
+      "p90_ms": 893.9356280000001,
+      "p99_ms": 1444.891366,
+      "max_ms": 2061.981347
+    }
+  },
+  "timeline": [
+    {
+      "s": 0,
+      "posts": 95,
+      "ok": 95,
+      "events": 47500
+    },
+    {
+      "s": 1,
+      "posts": 76,
+      "ok": 76,
+      "events": 38000
+    },
+    {
+      "s": 2,
+      "posts": 81,
+      "ok": 81,
+      "events": 40500
+    },
+    {
+      "s": 3,
+      "posts": 50,
+      "ok": 50,
+      "events": 25000
+    },
+    {
+      "s": 4,
+      "posts": 62,
+      "ok": 62,
+      "events": 31000
+    },
+    {
+      "s": 5,
+      "posts": 41,
+      "ok": 41,
+      "events": 20500
+    },
+    {
+      "s": 6,
+      "posts": 59,
+      "ok": 59,
+      "events": 29500
+    },
+    {
+      "s": 7,
+      "posts": 34,
+      "ok": 34,
+      "events": 17000
+    },
+    {
+      "s": 8,
+      "posts": 53,
+      "ok": 53,
+      "events": 26500
+    },
+    {
+      "s": 9,
+      "posts": 47,
+      "ok": 47,
+      "events": 23500
+    },
+    {
+      "s": 10,
+      "posts": 43,
+      "ok": 43,
+      "events": 21500
+    },
+    {
+      "s": 11,
+      "posts": 37,
+      "ok": 37,
+      "events": 18500
+    },
+    {
+      "s": 12,
+      "posts": 37,
+      "ok": 37,
+      "events": 18500
+    },
+    {
+      "s": 13,
+      "posts": 28,
+      "ok": 28,
+      "events": 14000
+    },
+    {
+      "s": 14,
+      "posts": 15,
+      "ok": 15,
+      "events": 7500
+    },
+    {
+      "s": 15,
+      "posts": 23,
+      "ok": 23,
+      "events": 11500
+    },
+    {
+      "s": 16,
+      "posts": 28,
+      "ok": 28,
+      "events": 14000
+    },
+    {
+      "s": 17,
+      "posts": 21,
+      "ok": 21,
+      "events": 10500
+    },
+    {
+      "s": 18,
+      "posts": 24,
+      "ok": 24,
+      "events": 12000
+    },
+    {
+      "s": 19,
+      "posts": 26,
+      "ok": 26,
+      "events": 13000
+    },
+    {
+      "s": 20,
+      "posts": 25,
+      "ok": 25,
+      "events": 12500
+    },
+    {
+      "s": 21,
+      "posts": 24,
+      "ok": 24,
+      "events": 12000
+    },
+    {
+      "s": 22,
+      "posts": 16,
+      "ok": 16,
+      "events": 8000
+    },
+    {
+      "s": 23,
+      "posts": 28,
+      "ok": 28,
+      "events": 14000
+    },
+    {
+      "s": 24,
+      "posts": 25,
+      "ok": 25,
+      "events": 12500
+    },
+    {
+      "s": 25,
+      "posts": 23,
+      "ok": 23,
+      "events": 11500
+    },
+    {
+      "s": 26,
+      "posts": 24,
+      "ok": 24,
+      "events": 12000
+    },
+    {
+      "s": 27,
+      "posts": 24,
+      "ok": 24,
+      "events": 12000
+    },
+    {
+      "s": 28,
+      "posts": 18,
+      "ok": 18,
+      "events": 9000
+    },
+    {
+      "s": 29,
+      "posts": 43,
+      "ok": 43,
+      "events": 21500
+    }
+  ]
+}

@@ -1,0 +1,752 @@
+{
+  "tools": [
+    {
+      "name": "list_applications",
+      "description": "List every application this token can see, with its account and its environments. Start here: other tools take the application_slug and environment name this returns. Also returns account_slug and application_id, which those tools accept to name one application when two accounts share an application_slug.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "list_issues",
+      "description": "List issues (grouped exceptions and performance regressions), newest occurrence first. Returns key, title, kind, status, priority, occurrence and affected-user counts, culprit, and first/last seen timestamps.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "resolved",
+              "ignored"
+            ],
+            "description": "Issue status. Defaults to open."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum issues to return, 1-100. Defaults to 20."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "get_issue",
+      "description": "Get one issue by key or issue_id; provide at least one. Exception issues include sample_occurrence and last_occurrence with stored stack frames, cause, locals, parsed context, browser breadcrumbs, and execution identifiers; occurrences are null after retention removes them. Performance and anomaly issues include typed metric, window, limit/baseline, underlying telemetry group, representative records, trend, deploy comparison, and drill-down identifiers.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Issue key, e.g. APP-171 (application issue prefix, dash, number). The canonical_key form \"account_slug/application_id/APP-171\" is also accepted, and is required when a bare key matches issues in more than one application."
+          },
+          "issue_id": {
+            "type": "integer",
+            "description": "Stable issue_id from list_issues. Optional; the most precise way to name an issue."
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "key"
+            ]
+          },
+          {
+            "required": [
+              "issue_id"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "list_slow_routes",
+      "description": "The 20 slowest routes in an environment, ranked by p95 request duration in milliseconds. Each row has the route name, request count, error count, and p95_ms.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          }
+        },
+        "required": [
+          "application_slug",
+          "environment"
+        ]
+      }
+    },
+    {
+      "name": "get_route",
+      "description": "Everything known about one route in a window: request count, error count, p50/p95/p99/max in milliseconds, the slowest individual requests, the slowest queries those requests ran, and any N+1 patterns with a concrete Active Record fix. Identify the route by name (e.g. \"GET /widgets\") or by the group_hash list_slow_routes returned.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          },
+          "route": {
+            "type": "string",
+            "description": "Route name as shown by list_slow_routes, e.g. \"GET /widgets/:id\". Ignored when group_hash is given."
+          },
+          "group_hash": {
+            "type": "string",
+            "description": "Route group hash from list_slow_routes. Preferred over route when you have it."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          }
+        },
+        "required": [
+          "application_slug",
+          "environment"
+        ]
+      }
+    },
+    {
+      "name": "get_profile",
+      "description": "The hottest frames of a sampled stack profile: self samples (time in that frame itself) and total samples (time in it or anything it called), each with a percentage of the profile. Pass profile_id for a specific profile, execution_id for the profile of one request or job, or neither for the most recent profile in the environment. Profiles only exist when the app enables Railwatch's profiler.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          },
+          "profile_id": {
+            "type": "integer",
+            "description": "Profile row id, as returned in a previous get_profile or get_execution timeline."
+          },
+          "execution_id": {
+            "type": "string",
+            "description": "Execution id whose profile to read."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "How many frames to return, 1-100. Defaults to 25."
+          }
+        },
+        "required": [
+          "application_slug",
+          "environment"
+        ]
+      }
+    },
+    {
+      "name": "search_requests",
+      "description": "Search individual requests with the same key:value filter syntax as the dashboard. Supported keys: method:GET, route:/widgets (substring), status:500 or status:5xx, deploy:<version>, tenant:<slug>, user:<user_ref>, min_ms:250 (minimum duration in milliseconds). Bare words match the route name. Returns one row per request with duration (milliseconds), status, query count, and execution_id for get_execution.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          },
+          "q": {
+            "type": "string",
+            "description": "Filter query, e.g. \"status:5xx route:/checkout min_ms:500\". Empty returns the most recent requests."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum requests to return, 1-200. Defaults to 50."
+          }
+        },
+        "required": [
+          "application_slug",
+          "environment"
+        ]
+      }
+    },
+    {
+      "name": "explain_query",
+      "description": "The stored database query plan for a query group, plus the SQL and how long that sample took in milliseconds. Plans are only captured for slow queries, and only when the app sets RAILWATCH_CAPTURE_QUERY_EXPLAIN; returns explain: null when there is none in the window.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          },
+          "group_hash": {
+            "type": "string",
+            "description": "Query group hash, as returned by get_route's slow_queries or the dashboard's query pages."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          }
+        },
+        "required": [
+          "application_slug",
+          "environment",
+          "group_hash"
+        ]
+      }
+    },
+    {
+      "name": "list_tenants",
+      "description": "The monitored app's own tenants (whatever it passes to Railwatch.context(tenant:)) that were active in the window, with per-tenant request, error, job, exception, and user counts.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          },
+          "q": {
+            "type": "string",
+            "description": "Substring match on the tenant identifier."
+          }
+        },
+        "required": [
+          "application_slug",
+          "environment"
+        ]
+      }
+    },
+    {
+      "name": "get_execution",
+      "description": "One execution (request, job attempt, scheduled task run, command, or Action Cable channel action) with its full child timeline: every query, cache read, log line, outgoing request, view render, and exception, each with an offset in milliseconds from the start of the execution.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          },
+          "execution_id": {
+            "type": "string",
+            "description": "Execution id (a UUID), from search_requests, list_issues samples, or a dashboard link."
+          }
+        },
+        "required": [
+          "application_slug",
+          "environment",
+          "execution_id"
+        ]
+      }
+    },
+    {
+      "name": "search_logs",
+      "description": "Search recent log lines with the shared log filter grammar, newest first. Each row carries its level, message, timestamp, and execution_id for expansion with get_execution.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          },
+          "q": {
+            "type": "string",
+            "description": "Log filter query; bare text searches messages and key:value tokens filter fields."
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "debug",
+              "info",
+              "warn",
+              "error",
+              "fatal",
+              "event",
+              "unknown"
+            ],
+            "description": "Restrict to one log level."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum lines to return, 1-200. Defaults to 50."
+          }
+        },
+        "required": [
+          "application_slug",
+          "environment",
+          "q"
+        ]
+      }
+    },
+    {
+      "name": "search_telemetry",
+      "description": "Search raw jobs, exceptions, logs, or SQL queries with Railwatch's shared filter grammar and stable cursor pagination. Job rows include enqueue-origin user_ref and tenant and support user:/tenant: filters. Returns data plus meta.next_cursor and meta.has_more.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          },
+          "resource": {
+            "type": "string",
+            "enum": [
+              "jobs",
+              "exceptions",
+              "logs",
+              "queries"
+            ],
+            "description": "Telemetry resource to search."
+          },
+          "q": {
+            "type": "string",
+            "description": "Shared key:value filter grammar. Common keys: after, before, user, tenant, deploy, kind. Child telemetry adds source (app file prefix). Jobs add class, job_id, outcome/status, queue; exceptions add class, handled/status, severity; logs add level/status; queries add adapter, connection, role. Bare text searches the resource message/name/SQL."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque next_cursor returned by the previous page."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Rows per page, 1-200. Defaults to 50."
+          }
+        },
+        "required": [
+          "application_slug",
+          "environment",
+          "resource"
+        ]
+      }
+    },
+    {
+      "name": "release_health",
+      "description": "Crash-free session rate, crash-free user rate, and adoption per release (a release is a deploy) in the window. Rates are percentages, avg_duration_ms is milliseconds, and rates are null when there were no sessions to divide by.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          }
+        },
+        "required": [
+          "application_slug",
+          "environment"
+        ]
+      }
+    },
+    {
+      "name": "recent_deploys",
+      "description": "The 20 most recent deploys of an environment, newest first, with the deploy identifier, git ref, name, timestamp, and link.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          }
+        },
+        "required": [
+          "application_slug",
+          "environment"
+        ]
+      }
+    },
+    {
+      "name": "list_alerts",
+      "description": "Fired alerts across this token's accounts, newest first: which rule fired, on which issue, through which integration, and whether delivery succeeded.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Restrict to one application's alert rules."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "event": {
+            "type": "string",
+            "enum": [
+              "new_issue",
+              "regressed_issue",
+              "resolved_issue",
+              "ignored_issue",
+              "assigned_issue",
+              "threshold",
+              "anomaly",
+              "silent_host",
+              "quota",
+              "crash_free_drop"
+            ],
+            "description": "Restrict to one alert event."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "sent",
+              "failed"
+            ],
+            "description": "Restrict to one delivery status."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum alerts to return, 1-100. Defaults to 20."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "update_issue",
+      "description": "Change an issue's status, priority, or assignee. Writes an activity entry attributed to this token's user and the agent name you pass, so the change is auditable in the UI.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Issue key, e.g. APP-171 (application issue prefix, dash, number). The canonical_key form \"account_slug/application_id/APP-171\" is also accepted, and is required when a bare key matches issues in more than one application."
+          },
+          "issue_id": {
+            "type": "integer",
+            "description": "Stable issue_id from list_issues. Optional; the most precise way to name an issue."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "resolved",
+              "ignored"
+            ],
+            "description": "New status."
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "low",
+              "normal",
+              "high",
+              "urgent"
+            ],
+            "description": "New priority."
+          },
+          "assignee_email": {
+            "type": "string",
+            "description": "Email of an account member to assign, or empty string to unassign."
+          },
+          "agent": {
+            "type": "string",
+            "description": "Your agent name, recorded on the activity entry. Defaults to mcp."
+          }
+        },
+        "required": [
+          "key"
+        ]
+      }
+    },
+    {
+      "name": "add_comment",
+      "description": "Add a comment to an issue, attributed to this token's user and the agent name you pass.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Issue key, e.g. APP-171 (application issue prefix, dash, number). The canonical_key form \"account_slug/application_id/APP-171\" is also accepted, and is required when a bare key matches issues in more than one application."
+          },
+          "issue_id": {
+            "type": "integer",
+            "description": "Stable issue_id from list_issues. Optional; the most precise way to name an issue."
+          },
+          "body": {
+            "type": "string",
+            "description": "Comment body, plain text or Markdown."
+          },
+          "agent": {
+            "type": "string",
+            "description": "Your agent name, recorded on the activity entry. Defaults to mcp."
+          }
+        },
+        "required": [
+          "key",
+          "body"
+        ]
+      }
+    }
+  ],
+  "prompts": [
+    {
+      "name": "triage_issue",
+      "description": "Investigate one Railwatch issue end to end and propose a fix.",
+      "arguments": [
+        {
+          "name": "key",
+          "description": "Issue key, e.g. APP-171.",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "slow_route",
+      "description": "Find out why one route is slow and what to change.",
+      "arguments": [
+        {
+          "name": "application_slug",
+          "description": "Application slug from list_applications.",
+          "required": true
+        },
+        {
+          "name": "environment",
+          "description": "Environment name, e.g. production.",
+          "required": true
+        },
+        {
+          "name": "route",
+          "description": "Route name, e.g. \"GET /widgets/:id\".",
+          "required": true
+        },
+        {
+          "name": "window",
+          "description": "Time window: 1h, 6h, 24h, 7d, or 30d. Defaults to 24h.",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "daily_summary",
+      "description": "Summarise what changed in an environment over a window.",
+      "arguments": [
+        {
+          "name": "application_slug",
+          "description": "Application slug from list_applications.",
+          "required": true
+        },
+        {
+          "name": "environment",
+          "description": "Environment name, e.g. production.",
+          "required": true
+        },
+        {
+          "name": "window",
+          "description": "Time window: 1h, 6h, 24h, 7d, or 30d. Defaults to 24h.",
+          "required": false
+        }
+      ]
+    }
+  ],
+  "write_tools": [
+    "update_issue",
+    "add_comment"
+  ],
+  "prompt_texts": {
+    "triage_issue": "Triage Railwatch issue \u0001key\u0001.\n\n1. Call get_issue with key \"\u0001key\u0001\" to read the title, culprit, status,\n   occurrence count, affected-user count, sample_occurrence and last_occurrence.\n   Read their frames, cause, context and browser_breadcrumbs. A null occurrence\n   means its stored telemetry is unavailable; do not invent a stack trace.\n2. If an occurrence has an execution_id, call get_execution with it to read\n   the full timeline leading up to the error:\n   the queries, cache reads, outgoing HTTP calls, and log lines that ran in\n   the same request or job, each with an offset in milliseconds. Browser\n   exceptions may have no execution_id; use their recorded browser trail\n   and correlate nearby server requests without claiming an exact link.\n3. Call search_logs for distinctive strings from the message to see whether\n   the same failure shows up outside this issue.\n4. Call recent_deploys and compare first_seen_at against the deploy times: an\n   issue that starts within minutes of a deploy usually came from it.\n5. Read the stack frames in sample_occurrence or last_occurrence, focusing\n   on application frames. Open those files if you have the repository.\n\nThen report: what breaks, for whom, how often, which change most likely\ncaused it, and the smallest fix. If you are confident, call add_comment with\nyour findings and update_issue to set a priority. Do not resolve the issue.\n",
+    "slow_route": "Find out why \u0001route\u0001 is slow in \u0001application_slug\u0001/\u0001environment\u0001.\n\n1. Call get_route with application_slug \"\u0001application_slug\u0001\", environment\n   \"\u0001environment\u0001\", route \"\u0001route\u0001\"\u0001window_clause\u0001. It returns the\n   request count, p50/p95/p99/max in milliseconds, the slowest individual\n   requests, the slowest queries those requests ran, and any N+1 patterns\n   with a suggested Active Record fix.\n2. For each slow query group, call explain_query with its group_hash to read\n   the stored query plan. A sequential scan on a filtered column is an index.\n3. Call get_profile with the execution_id of the slowest request. If a profile\n   exists, the hottest frames say whether the time is in the database, in\n   view rendering, or in application code.\n4. Call get_execution on the slowest request to see where the time sits across\n   the timeline rather than in any single child.\n\nThen report, in order of expected saving: the specific indexes to add, the\nspecific .includes / preload calls to add and where, and anything that should\nmove to a background job. Quote the measured milliseconds behind each\nrecommendation rather than estimating.\n",
+    "daily_summary": "Summarise what changed in \u0001application_slug\u0001/\u0001environment\u0001\u0001window_clause\u0001.\n\n1. Call list_issues with status \"open\" for this application and environment.\n   Anything whose first_seen_at falls inside the window is new; anything with\n   a much higher occurrence count than its age suggests is spiking.\n2. Call recent_deploys and line the deploys up against those first_seen_at\n   timestamps to attribute new issues to a release.\n3. Call release_health for crash-free session and user rates per release. A\n   release whose crash-free rate is below the one before it is a regression,\n   even if no new issue opened.\n4. Call list_slow_routes and flag any route whose p95_ms is high enough to\n   matter; use get_route on the worst one for the reason.\n5. Call list_alerts to see what already fired, so you do not re-report it.\n\nThen write a short summary: new issues (with keys), regressions, deploys that\nshipped, release health movement, and the slowest routes. Lead with the one\nthing worth acting on today. Milliseconds everywhere; no percentages you did\nnot compute from returned numbers.\n"
+  }
+}

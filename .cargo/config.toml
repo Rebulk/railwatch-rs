@@ -1,0 +1,11 @@
+[env]
+# Bundled SQLite build options (docs/PERF.md, "SQLite global mutexes").
+# libsqlite3-sys compiles with SQLITE_ENABLE_MEMORY_MANAGEMENT, which puts
+# every connection's page cache in one process-wide group behind a single
+# mutex, and SQLite's default MEMSTATUS=1 takes another global mutex on
+# every sqlite3_malloc/free. With a writer thread per tenant those two locks
+# were ~16% of server CPU (futex). Nothing here uses sqlite3_release_memory,
+# soft_heap_limit or sqlite3_status, so both go.
+# SQLITE_MAX_ATTACHED=125 (default 10): a per-day tenant's reader attaches
+# every day file in its retention window (docs/STORAGE.md).
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_MAX_ATTACHED=125"

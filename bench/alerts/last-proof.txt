@@ -1,0 +1,9 @@
+app stopped beating at 04:53:27
+app is back at 04:54:03
+silent_environment     + 34.6 s  signature_ok=True  alert_id=f02a8f8b-8d73-4e04-9eba-cfad73e3baf0  url=None
+                       payload.message: web-1 in production has sent nothing for 39 s (last data 04:53:22 UTC)
+environment_recovered  +  9.5 s  signature_ok=True  alert_id=37817684-4a5a-46c7-b54a-93902a2492c5  url=None
+                       payload.message: web-1 in production is reporting again after about 39 s of silence
+PASS: both alerts delivered over verified TLS with valid HMAC signatures
+1|silent_environment|sent|1|2026-10-14 04:54:02.563604
+2|environment_recovered|sent|1|2026-10-14 04:54:12.563985

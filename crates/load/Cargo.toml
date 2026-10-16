@@ -1,0 +1,27 @@
+[package]
+name = "railwatch-load"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rw-load"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+flate2 = "1"
+sha2 = "0.10"
+md-5 = "0.10"
+uuid = { version = "1", features = ["v4", "v7"] }
+rand = { version = "0.9", features = ["small_rng"] }
+# https:// targets (built-in TLS); --cacert trusts a test CA (Pebble).
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"

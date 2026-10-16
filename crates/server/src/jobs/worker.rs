@@ -1,0 +1,218 @@
+//! One background thread that owns, per tenant, a read-only connection, a
+//! write connection for rollups, and the incremental accumulator. It folds
+//! committed batches in, groups direct-path exceptions, flushes rollups every
+//! ROLLUP_FLUSH, and runs the per-tenant jobs the scheduler hands it
+//! (catch-up recompute, receipt drain, prune), so no two of them ever race
+//! on the same tenant's rollups.
+//!
+//! Reads (the hour, the group, the receipts) go through the read-only
+//! connection: under WAL they never wait for, or block, the ingest writer.
+//! Rollup writes take the tenant's write lock only for each type's DELETE +
+//! INSERTs, as RollupJob does.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
+use rusqlite::{Connection, OpenFlags};
+
+use super::TenantWork;
+use crate::control::Control;
+use crate::followups::{Followup, ROLLUP_FLUSH};
+use crate::grouping;
+use crate::rollup::incremental::{self, Accumulator, MAX_ROWS};
+use crate::rollup::{release_health_rollup_job, rollup_job};
+
+struct Tenant {
+    read: Connection,
+    /// The file rollups, release_health and receipts are written to: the
+    /// single file, or a per-day tenant's meta.
+    write: Connection,
+    /// Per-day tenants: the directory and the files `read` has attached.
+    days: Option<(PathBuf, crate::storage::reader::Attached)>,
+    acc: Accumulator,
+    /// Hours whose sessions changed since the last flush.
+    session_buckets: HashSet<i64>,
+    /// The accumulator overflowed: these hours need a full recompute.
+    overflow_buckets: HashSet<i64>,
+    users: grouping::AffectedUsers,
+}
+
+pub struct Worker {
+    pub control: Arc<Control>,
+    pub dir: PathBuf,
+    pub tiers: crate::storage::retention::Tiers,
+    tenants: HashMap<i64, (String, Tenant)>,
+}
+
+pub fn open_read(path: &std::path::Path) -> rusqlite::Result<Connection> {
+    let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI)?;
+    c.busy_timeout(Duration::from_secs(5))?;
+    c.execute_batch("PRAGMA cache_size = 2000; PRAGMA temp_store = MEMORY;")?;
+    Ok(c)
+}
+
+impl Worker {
+    pub fn new(control: Arc<Control>, dir: PathBuf) -> Worker {
+        Worker { control, dir, tiers: Default::default(), tenants: HashMap::new() }
+    }
+
+    fn tenant(&mut self, env: i64, slug: &str) -> rusqlite::Result<&mut Tenant> {
+        if !self.tenants.contains_key(&env) {
+            let (read, write, days) = match crate::storage::Layout::detect(&self.dir, slug) {
+                Some(crate::storage::Layout::Days(dir)) => {
+                    let write = crate::tenants::open_tenant(&crate::storage::layout::meta_path(&dir))?;
+                    let (read, attached) = crate::storage::reader::open(&dir)?;
+                    (read, write, Some((dir, attached)))
+                }
+                _ => {
+                    let path = self.dir.join(format!("{slug}.sqlite3"));
+                    let write = crate::tenants::open_tenant(&path)?;
+                    (open_read(&path)?, write, None)
+                }
+            };
+            self.tenants.insert(
+                env,
+                (
+                    slug.to_string(),
+                    Tenant { read, write, days, acc: Accumulator::default(), session_buckets: HashSet::new(), overflow_buckets: HashSet::new(), users: Default::default() },
+                ),
+            );
+        }
+        let t = &mut self.tenants.get_mut(&env).unwrap().1;
+        if let Some((dir, attached)) = t.days.as_mut() {
+            crate::storage::reader::refresh(&t.read, dir, attached)?;
+        }
+        Ok(t)
+    }
+
+    /// Drops a tenant's connections (its files are about to be deleted or
+    /// replaced).
+    pub fn forget(&mut self, env: i64) {
+        self.tenants.remove(&env);
+    }
+
+    pub fn run(mut self, rx: Receiver<TenantWork>) {
+        let mut last_flush = Instant::now();
+        loop {
+            match rx.recv_timeout(ROLLUP_FLUSH.saturating_sub(last_flush.elapsed()).max(Duration::from_millis(50))) {
+                Ok(w) => self.handle(w),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.flush_all();
+                    return;
+                }
+            }
+            if last_flush.elapsed() >= ROLLUP_FLUSH {
+                self.flush_all();
+                last_flush = Instant::now();
+            }
+        }
+    }
+
+    fn handle(&mut self, w: TenantWork) {
+        let started = Instant::now();
+        let what = w.name();
+        if let Err(e) = self.handle_inner(w) {
+            tracing::error!(work = what, error = %e, "background work failed");
+        }
+        tracing::debug!(work = what, ms = started.elapsed().as_millis() as u64, "background work");
+    }
+
+    fn handle_inner(&mut self, w: TenantWork) -> Result<(), String> {
+        let e = |e: rusqlite::Error| e.to_string();
+        match w {
+            TenantWork::Committed(f) => self.committed(f),
+            TenantWork::Recompute { env, slug, buckets } => {
+                let t = self.tenant(env, &slug).map_err(e)?;
+                for b in buckets {
+                    rollup_job::perform(&t.read, &t.write, b, &mut rollup_job::Rng::PerGroup).map_err(e)?;
+                }
+                Ok(())
+            }
+            TenantWork::RecomputeSessions { env, slug, buckets, retention_floor } => {
+                let t = self.tenant(env, &slug).map_err(e)?;
+                for b in buckets {
+                    release_health_rollup_job::perform(&t.read, &t.write, b, retention_floor).map_err(e)?;
+                }
+                Ok(())
+            }
+            TenantWork::Drain { env, slug } => {
+                let control = self.control.clone();
+                let t = self.tenant(env, &slug).map_err(e)?;
+                super::drain::drain(&control, (&t.read, &t.write), env, &mut t.users).map(|_| ())
+            }
+            TenantWork::Prune { env, slug } => {
+                let control = self.control.clone();
+                let tiers = self.tiers;
+                let t = self.tenant(env, &slug).map_err(e)?;
+                t.acc.clear();
+                t.users.clear();
+                match t.days.as_ref().map(|(d, _)| d.clone()) {
+                    Some(dir) => super::prune::prune_days(&control, &dir, &t.write, env, tiers).map(|_| ()),
+                    None => super::prune::prune(&control, &t.write, env).map(|_| ()),
+                }
+            }
+            TenantWork::With { env, slug, f } => {
+                let t = self.tenant(env, &slug).map_err(e)?;
+                f(&t.read, &t.write);
+                Ok(())
+            }
+        }
+    }
+
+    fn committed(&mut self, f: Followup) -> Result<(), String> {
+        let e = |e: rusqlite::Error| e.to_string();
+        let control = self.control.clone();
+        let t = self.tenant(f.env_id, &f.slug).map_err(e)?;
+        // Direct path: GroupExceptionsJob. Receipted: the drain, under claims.
+        if !f.exception_ids.is_empty() && !f.receipted {
+            let rows = grouping::load_exceptions(&t.read, &f.exception_ids).map_err(e)?;
+            let conn = control.conn();
+            grouping::group_with(&conn, &t.read, f.env_id, rows, None, &mut t.users)?;
+        }
+        if t.acc.row_count() > MAX_ROWS {
+            tracing::warn!(tenant = f.slug, rows = t.acc.row_count(), "rollup accumulator full; falling back to full recompute");
+            t.overflow_buckets.extend(t.acc.touched_buckets());
+            t.overflow_buckets.extend(f.rollup_buckets.iter().copied());
+            t.acc.clear();
+        } else if t.overflow_buckets.is_empty() {
+            for (table, ids) in &f.rolled_ids {
+                if *table != "sessions" {
+                    t.acc.ingest(&t.read, table, ids).map_err(e)?;
+                }
+            }
+        } else {
+            t.overflow_buckets.extend(f.rollup_buckets.iter().copied());
+        }
+        t.session_buckets.extend(f.session_buckets.iter().copied());
+        Ok(())
+    }
+
+    fn flush_all(&mut self) {
+        let started = Instant::now();
+        let now = crate::time::now_micros() / 1_000_000;
+        for (env, (slug, t)) in self.tenants.iter_mut() {
+            let r = (|| -> rusqlite::Result<()> {
+                incremental::flush(&mut t.acc, &t.write)?;
+                for b in std::mem::take(&mut t.overflow_buckets) {
+                    rollup_job::perform(&t.read, &t.write, b, &mut rollup_job::Rng::PerGroup)?;
+                }
+                for b in std::mem::take(&mut t.session_buckets) {
+                    release_health_rollup_job::perform(&t.read, &t.write, b, i64::MIN)?;
+                }
+                // Hours older than the catch-up window leave memory.
+                t.acc.evict_before(now - now.rem_euclid(3600) - 3600);
+                Ok(())
+            })();
+            if let Err(e) = r {
+                tracing::error!(environment = env, tenant = slug, error = %e, "rollup flush failed");
+            }
+        }
+        if !self.tenants.is_empty() {
+            tracing::debug!(ms = started.elapsed().as_millis() as u64, "rollup flush");
+        }
+    }
+}

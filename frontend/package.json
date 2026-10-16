@@ -1,0 +1,55 @@
+{
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "^24.13.6",
+    "@types/rails__actioncable": "^8.0.3",
+    "babel-plugin-react-compiler": "^1.0.0",
+    "tw-animate-css": "^1.4.0",
+    "vite": "^7.0.5"
+  },
+  "dependencies": {
+    "@headlessui/react": "^2.2.0",
+    "@inertiajs/core": "2.3.27",
+    "@inertiajs/react": "^2.1.2",
+    "@radix-ui/react-avatar": "^1.1.10",
+    "@radix-ui/react-checkbox": "^1.3.3",
+    "@radix-ui/react-collapsible": "^1.1.12",
+    "@radix-ui/react-dialog": "^1.1.15",
+    "@radix-ui/react-dropdown-menu": "^2.1.16",
+    "@radix-ui/react-label": "^2.1.7",
+    "@radix-ui/react-select": "^2.2.6",
+    "@radix-ui/react-separator": "^1.1.7",
+    "@radix-ui/react-slot": "^1.2.3",
+    "@radix-ui/react-tooltip": "^1.2.8",
+    "@rails/actioncable": "^7.2.302",
+    "@tailwindcss/forms": "^0.5.10",
+    "@tailwindcss/typography": "^0.5.16",
+    "@tailwindcss/vite": "^4.0.6",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.0.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "lucide-react": "<1.0",
+    "next-themes": "^0.4.6",
+    "radix-ui": "^1.6.7",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "recharts": "3.8.0",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.2.0",
+    "tailwindcss": "^4.0.6",
+    "typescript": "^5.7.3"
+  },
+  "scripts": {
+    "build": "vite build",
+    "check": "tsc -p tsconfig.app.json && tsc -p tsconfig.node.json"
+  },
+  "name": "railwatch-rs-frontend",
+  "packageManager": "pnpm@10.30.3",
+  "engines": {
+    "node": ">=22"
+  }
+}

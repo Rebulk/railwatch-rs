@@ -1,0 +1,10 @@
+target/
+*.sqlite3*
+bench/results/raw/
+bench/scratch/
+frontend/node_modules/
+frontend/tmp/
+frontend/dist/
+dist/
+.cache/
+.pnpm-store/

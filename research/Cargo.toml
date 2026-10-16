@@ -1,0 +1,30 @@
+[package]
+name = "railwatch-research"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Research prototypes only. Not a workspace member: builds against crates/server
+# as a library and never changes it.
+[workspace]
+
+[[bin]]
+name = "rw-fdserve"
+path = "src/bin/fdserve.rs"
+
+[[bin]]
+name = "rw-spool-bench"
+path = "src/bin/spool_bench.rs"
+
+[dependencies]
+railwatch-server = { path = "../crates/server" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "fs", "io-util"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+tracing = "0.1"
+libc = "0.2"
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
