@@ -12,6 +12,7 @@
 //!   railwatch backup                   one backup pass now (RAILWATCH_BACKUP_S3_*)
 //!   railwatch restore                  download the backup into an empty data dir
 //!   railwatch integrations [--show-secrets]   one JSON line per alert destination
+//!   railwatch integrations test <id>   Send test: one synthetic alert to that destination
 //!   railwatch doctor
 //!   railwatch upgrade [--version vX.Y.Z]   fetch the release's install.sh and re-run it
 //!   railwatch version
@@ -46,6 +47,7 @@ const USAGE: &str = "usage:
   railwatch backup
   railwatch restore
   railwatch integrations [--show-secrets]
+  railwatch integrations test <id>
   railwatch doctor
   railwatch upgrade [--version vX.Y.Z]   as root: install.sh from the release, re-run (zero-drop restart)
   railwatch version
@@ -146,6 +148,7 @@ fn main() -> ExitCode {
         ["doctor"] => doctor(),
         ["integrations"] => integrations(false),
         ["integrations", "--show-secrets"] => integrations(true),
+        ["integrations", "test", id] => integration_test(id),
         ["import-rails", rest @ ..] => offline(|| import_rails(rest)),
         ["split", "--all"] => offline(split_all),
         ["split", slug] => offline(|| split(slug)),
@@ -541,6 +544,33 @@ fn import_rails(rest: &[&str]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => fail(e),
+    }
+}
+
+/// Settings > Integrations > Send test, from the shell: one synthetic alert
+/// through the real delivery path (alerts::deliver_test), recorded like the
+/// button's. Safe beside a running server (the alert row is created already
+/// claimed, so the server's delivery loop never sends it too).
+fn integration_test(id: &str) -> ExitCode {
+    let Ok(id) = id.parse::<i64>() else { return usage() };
+    let cfg = config();
+    let control = open_control(&cfg);
+    match cfg.secret() {
+        Ok(secret) => control.configure_alerting(railwatch_server::alerts::integration::Alerting {
+            cipher: railwatch_server::alerts::integration::SettingsCipher::new(&secret),
+            smtp: cfg.smtp.clone(),
+            url: cfg.url.clone(),
+            deliver: cfg.alert_delivery,
+        }),
+        Err(e) => return fail(format!("secret_key_base: {e}")),
+    }
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+    match rt.block_on(railwatch_server::alerts::deliver_test(&control, id)) {
+        Ok(outcome) => {
+            println!("integration {id}: test alert {outcome}");
+            if outcome == "sent" { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        Err(e) => fail(format!("integration {id}: test alert failed: {e}")),
     }
 }
 
