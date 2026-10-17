@@ -311,7 +311,9 @@ mod tests {
         let rails = SettingsCipher::decrypt_plain(r#"{"p":"x","h":{"iv":"y"}}"#).unwrap_err();
         assert!(rails.contains("Rails"), "{rails}");
         assert!(SettingsCipher::decrypt_plain("not json").is_err());
-        let ours = SettingsCipher([7; 32]).encrypt(&Map::new());
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("random");
+        let ours = SettingsCipher(key).encrypt(&Map::new());
         assert!(ours.starts_with(PREFIX));
     }
 
