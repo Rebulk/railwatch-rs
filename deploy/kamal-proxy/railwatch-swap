@@ -33,7 +33,9 @@
 #
 # Pause budget: kamal-proxy answers 504 to a request it has held for
 # MAX_PAUSE. A request held from the start of the pause waits for the drain
-# (DRAIN), the old colour's exit (STOP_TIMEOUT), BETWEEN (BETWEEN_TIMEOUT)
+# (DRAIN), the old colour's expected exit (STOP_TIMEOUT, not STOP_WAIT: a
+# slower drain should 504 held requests for the gems to retry rather than
+# hold them for up to STOP_WAIT; see the README), BETWEEN (BETWEEN_TIMEOUT)
 # and the new colour's health check (DEPLOY_TIMEOUT, which includes taking
 # the lock and opening). MAX_PAUSE defaults to their sum plus 10 s of slack
 # and a smaller one is refused before anything is paused. A rollback adds

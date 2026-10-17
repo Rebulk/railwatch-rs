@@ -74,9 +74,15 @@ All in seconds, settable in `swap.conf`:
 
 `MAX_PAUSE` defaults to `DRAIN + STOP_TIMEOUT + DEPLOY_TIMEOUT
 (+ BETWEEN_TIMEOUT) + 10`, 130 s, and a smaller value is refused before
-anything is paused: a slow but successful swap never answers a held request
-504. A rollback can add up to another `DEPLOY_TIMEOUT`; requests held past
-`MAX_PAUSE` get 504, which the gems retry.
+anything is paused: a swap whose old colour exits within `STOP_TIMEOUT`
+never answers a held request 504. It is deliberately not based on
+`STOP_WAIT` (900 s): if the old colour is slow to drain, it is better that
+held requests get a 504 after 130 s, which the gems retry (nothing is
+lost: docs/STORAGE.md, "Exactly-once"), than that every request hangs for up
+to 16 minutes. So past `STOP_TIMEOUT`, and during a rollback (up to another
+`DEPLOY_TIMEOUT`), requests held past `MAX_PAUSE` get 504 and are retried.
+To hold requests for the whole wait instead, set `MAX_PAUSE` to at least
+`DRAIN + STOP_WAIT + DEPLOY_TIMEOUT + 10`.
 
 **The old colour is never SIGKILLed.** On SIGTERM the server answers its
 in-flight requests (a 200 is sent only after the batch commits), then
