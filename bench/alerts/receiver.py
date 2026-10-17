@@ -27,6 +27,7 @@ class H(http.server.BaseHTTPRequestHandler):
 
 srv = http.server.HTTPServer(("127.0.0.1", port), H)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 ctx.load_cert_chain(cert, key)
 srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
 print(f"listening https://127.0.0.1:{port}", flush=True)

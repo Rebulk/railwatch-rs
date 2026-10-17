@@ -122,7 +122,7 @@ async fn retry(cx: Ctx, Path(id): Path<i64>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{Control, create_account, create_environment, insert_application, insert_user};
+    use crate::control::{Control, create_account, create_environment, insert_application, insert_user, test_password};
 
     #[test]
     fn env_page_lists_its_issue_alerts_and_its_issueless_watchdog_alerts_only() {
@@ -130,7 +130,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let c = Control::open(&dir.join("control.sqlite3")).unwrap();
-        let user = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", "correct horse battery", true)).unwrap();
+        let user = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
         let account = c.tx(|tx| create_account(tx, "Acme", user)).unwrap();
         let other = c.tx(|tx| create_account(tx, "Other", user)).unwrap();
         let app = c.tx(|tx| insert_application(tx, account, "Shop", "shop", "SHOP", None, "main")).unwrap();
