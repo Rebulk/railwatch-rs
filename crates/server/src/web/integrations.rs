@@ -66,8 +66,12 @@ fn blank(v: &Value) -> bool {
 
 /// IntegrationsController#integration_props: never the secrets themselves.
 fn integration_props(i: &Integration) -> Value {
-    let mut settings: Map<String, Value> =
-        i.settings.iter().filter(|(k, _)| !["secret", "webhook_url", "api_key", "access_token", "refresh_token"].contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut settings: Map<String, Value> = i
+        .settings
+        .iter()
+        .filter(|(k, _)| !["secret", "webhook_url", "api_key", "access_token", "refresh_token"].contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     if i.kind == "slack" {
         settings.insert("webhook_url".into(), json!("configured"));
     }
@@ -201,7 +205,8 @@ async fn destroy(cx: Ctx, Path(id): Path<i64>) -> Response {
         .state
         .db(move |c| {
             c.tx(|tx| {
-                let exists: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM integrations WHERE id = ? AND account_id = ?)", params![id, account], |r| r.get(0))?;
+                let exists: bool =
+                    tx.query_row("SELECT EXISTS (SELECT 1 FROM integrations WHERE id = ? AND account_id = ?)", params![id, account], |r| r.get(0))?;
                 if exists {
                     integration::destroy(tx, id)?;
                 }
@@ -226,7 +231,9 @@ async fn send_test(cx: Ctx, Path(id): Path<i64>) -> Response {
     }
     let name = match cx
         .state
-        .db(move |c| c.with(|x| x.query_row("SELECT name FROM integrations WHERE id = ? AND account_id = ?", params![id, account], |r| r.get::<_, String>(0)).optional()))
+        .db(move |c| {
+            c.with(|x| x.query_row("SELECT name FROM integrations WHERE id = ? AND account_id = ?", params![id, account], |r| r.get::<_, String>(0)).optional())
+        })
         .await
     {
         Ok(Some(n)) => n,
@@ -329,8 +336,10 @@ async fn rule_create(cx: Ctx, p: Params) -> Response {
         .state
         .db(move |c| {
             c.with(|x| {
-                let ok_app: bool = x.query_row("SELECT EXISTS (SELECT 1 FROM applications WHERE id = ? AND account_id = ?)", params![app, account], |r| r.get(0))?;
-                let ok_int: bool = x.query_row("SELECT EXISTS (SELECT 1 FROM integrations WHERE id = ? AND account_id = ?)", params![integ, account], |r| r.get(0))?;
+                let ok_app: bool =
+                    x.query_row("SELECT EXISTS (SELECT 1 FROM applications WHERE id = ? AND account_id = ?)", params![app, account], |r| r.get(0))?;
+                let ok_int: bool =
+                    x.query_row("SELECT EXISTS (SELECT 1 FROM integrations WHERE id = ? AND account_id = ?)", params![integ, account], |r| r.get(0))?;
                 if !(ok_app && ok_int) {
                     return Ok(Out::NotFound);
                 }
@@ -407,14 +416,23 @@ mod tests {
     #[test]
     fn integration_props_never_carry_secrets() {
         let i = Integration {
-            id: 1, account_id: 1, kind: "webhook".into(), name: "Hook".into(), enabled: true,
+            id: 1,
+            account_id: 1,
+            kind: "webhook".into(),
+            name: "Hook".into(),
+            enabled: true,
             settings: json!({"url": "https://example.com/h", "secret": "s3cret"}).as_object().unwrap().clone(),
-            settings_error: None, last_delivered_at: None, last_received_at: None, last_synced_at: None, last_error: None,
+            settings_error: None,
+            last_delivered_at: None,
+            last_received_at: None,
+            last_synced_at: None,
+            last_error: None,
         };
         let p = integration_props(&i);
         assert!(!p.to_string().contains("s3cret"));
         assert_eq!(p["destination"], "https://example.com/h", "the destination is shown, as Rails does");
-        let s = Integration { kind: "slack".into(), settings: json!({"webhook_url": "https://hooks.slack.com/services/T/B1/x"}).as_object().unwrap().clone(), ..i };
+        let s =
+            Integration { kind: "slack".into(), settings: json!({"webhook_url": "https://hooks.slack.com/services/T/B1/x"}).as_object().unwrap().clone(), ..i };
         assert_eq!(integration_props(&s)["settings"], json!({"webhook_url": "configured"}));
     }
 }

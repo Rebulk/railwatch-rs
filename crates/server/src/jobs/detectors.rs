@@ -97,7 +97,13 @@ fn float_s(f: f64) -> String {
 fn format_value(metric: &str, v: f64, is_float: bool) -> String {
     let num = if is_float { float_s(v) } else { format!("{}", v as i64) };
     match metric {
-        "spend" => if is_float { format!("${v:.2}") } else { format!("${num}") },
+        "spend" => {
+            if is_float {
+                format!("${v:.2}")
+            } else {
+                format!("${num}")
+            }
+        }
         "tokens" => num,
         "truncation_rate" | "error_rate" | "failure_rate" => format!("{num}%"),
         _ => format!("{num}ms"),
@@ -167,12 +173,23 @@ pub fn detect_performance(c: &Connection, t: &Connection, env: i64, now: i64) ->
             let (iss, outcome) = record(c, env, &issue_hash, "performance", &title, Some(&name), now, sample)?;
             let newly_open = matches!(outcome, Outcome::New | Outcome::Regressed);
             snapshot::carry(c, &iss, newly_open, previous.as_ref(), || {
-                snapshot::capture(t, &snapshot::Capture {
-                    kind: "performance", telemetry_type: rt, telemetry_group_hash: &group_hash, target: &name, metric: &metric,
-                    from: from * 1_000_000, to: now * 1_000_000, value: rounded.clone(), limit: Value::Float(limit), baseline: Value::Nil,
-                    rule: crate::rhash! { "type" => "threshold", "id" => id, "target_kind" => kind.clone(), "target" => target.clone() },
-                    representative_from: None,
-                })
+                snapshot::capture(
+                    t,
+                    &snapshot::Capture {
+                        kind: "performance",
+                        telemetry_type: rt,
+                        telemetry_group_hash: &group_hash,
+                        target: &name,
+                        metric: &metric,
+                        from: from * 1_000_000,
+                        to: now * 1_000_000,
+                        value: rounded.clone(),
+                        limit: Value::Float(limit),
+                        baseline: Value::Nil,
+                        rule: crate::rhash! { "type" => "threshold", "id" => id, "target_kind" => kind.clone(), "target" => target.clone() },
+                        representative_from: None,
+                    },
+                )
             })
             .map_err(e)?;
             if newly_open {
@@ -185,7 +202,16 @@ pub fn detect_performance(c: &Connection, t: &Connection, env: i64, now: i64) ->
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record(c: &Connection, env: i64, group_hash: &str, kind: &str, title: &str, culprit: Option<&str>, now: i64, sample: Value) -> Result<(issue::Issue, Outcome), String> {
+fn record(
+    c: &Connection,
+    env: i64,
+    group_hash: &str,
+    kind: &str,
+    title: &str,
+    culprit: Option<&str>,
+    now: i64,
+    sample: Value,
+) -> Result<(issue::Issue, Outcome), String> {
     c.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
     let r = issue::record_occurrence(
         c,
@@ -269,7 +295,8 @@ pub fn detect_anomalies(c: &Connection, t: &Connection, env: i64, now: i64) -> R
             binds.push("".to_string().into());
         }
         binds.extend(buckets.iter().map(|b| rusqlite::types::Value::Text(b.clone())));
-        let base: Vec<StoredRollup> = t.prepare(&sql).and_then(|mut s| s.query_map(rusqlite::params_from_iter(binds), summary::stored_from_row)?.collect()).map_err(e)?;
+        let base: Vec<StoredRollup> =
+            t.prepare(&sql).and_then(|mut s| s.query_map(rusqlite::params_from_iter(binds), summary::stored_from_row)?.collect()).map_err(e)?;
         if base.len() > 50_000 {
             tracing::error!(rule_id = id, "anomaly detector skipped: more than 50000 baseline rollups");
             continue;
@@ -309,7 +336,12 @@ pub fn detect_anomalies(c: &Connection, t: &Connection, env: i64, now: i64) -> R
             }
             let sigmas = if sd > 0.0 { (current - mean) / sd } else { deviation };
             let (cur, m, sdr, sg) = (round2(current), round2(mean), round2(sd), round2(sigmas));
-            let title = format!("{metric} of {name} is {}σ above its {days}-day baseline ({} vs {})", float_s(crate::dashboard::rb::round(sg, 1)), float_s(cur), float_s(m));
+            let title = format!(
+                "{metric} of {name} is {}σ above its {days}-day baseline ({} vs {})",
+                float_s(crate::dashboard::rb::round(sg, 1)),
+                float_s(cur),
+                float_s(m)
+            );
             let sample = crate::rhash! {
                 "rule_id" => id, "metric" => metric.clone(), "current" => cur, "mean" => m, "stddev" => sdr, "sigmas" => sg, "window_minutes" => window,
             };
@@ -317,17 +349,28 @@ pub fn detect_anomalies(c: &Connection, t: &Connection, env: i64, now: i64) -> R
             let (iss, outcome) = record(c, env, &issue_hash, "anomaly", &title, Some(&name), now, sample)?;
             let newly_open = matches!(outcome, Outcome::New | Outcome::Regressed);
             snapshot::carry(c, &iss, newly_open, previous.as_ref(), || {
-                snapshot::capture(t, &snapshot::Capture {
-                    kind: "anomaly", telemetry_type: rt, telemetry_group_hash: &group_hash, target: &name, metric: &metric,
-                    from: (now - window * 60) * 1_000_000, to: now * 1_000_000, value: Value::Float(cur), limit: Value::Nil,
-                    baseline: crate::rhash! { "mean" => m, "stddev" => sdr, "sigmas" => sg, "days" => days, "deviation" => deviation },
-                    rule: crate::rhash! { "type" => "anomaly", "id" => id, "target_kind" => kind.clone(), "target" => target.clone() },
-                    representative_from: None,
-                })
+                snapshot::capture(
+                    t,
+                    &snapshot::Capture {
+                        kind: "anomaly",
+                        telemetry_type: rt,
+                        telemetry_group_hash: &group_hash,
+                        target: &name,
+                        metric: &metric,
+                        from: (now - window * 60) * 1_000_000,
+                        to: now * 1_000_000,
+                        value: Value::Float(cur),
+                        limit: Value::Nil,
+                        baseline: crate::rhash! { "mean" => m, "stddev" => sdr, "sigmas" => sg, "days" => days, "deviation" => deviation },
+                        rule: crate::rhash! { "type" => "anomaly", "id" => id, "target_kind" => kind.clone(), "target" => target.clone() },
+                        representative_from: None,
+                    },
+                )
             })
             .map_err(e)?;
             if newly_open {
-                let extra = crate::alerts::as_hash(crate::rhash! { "rule_id" => id, "metric" => metric.clone(), "current" => cur, "mean" => m, "sigmas" => sg });
+                let extra =
+                    crate::alerts::as_hash(crate::rhash! { "rule_id" => id, "metric" => metric.clone(), "current" => cur, "mean" => m, "sigmas" => sg });
                 rules::fire_for_issue(c, &iss, "anomaly", extra).map_err(e)?;
                 opened += 1;
             }
@@ -395,7 +438,9 @@ pub fn release_health_check(c: &Connection, t: &Connection, env: i64, now: i64) 
         return Ok(0);
     }
     let Some((deploy, rf)) = c
-        .query_row("SELECT deploy, ref FROM deploys WHERE environment_id = ? ORDER BY deployed_at DESC LIMIT 1", [env], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+        .query_row("SELECT deploy, ref FROM deploys WHERE environment_id = ? ORDER BY deployed_at DESC LIMIT 1", [env], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
         .optional()
         .map_err(e)?
     else {
@@ -634,15 +679,26 @@ pub fn check_scheduled_tasks(c: &Connection, t: &Connection, env: i64, now: i64)
                 [&key],
                 |r| r.get(0),
             )?;
-            snapshot::capture(t, &snapshot::Capture {
-                kind: "performance", telemetry_type: "scheduled_task", telemetry_group_hash: &latest, target: &key, metric: "missed",
-                from: expected * 1_000_000, to: now * 1_000_000, value: Value::Nil, limit: Value::Nil, baseline: Value::Nil,
-                rule: crate::rhash! {
-                    "type" => "schedule", "task_key" => key.clone(), "schedule" => schedule.clone(),
-                    "last_run" => time::iso8601(last_run), "expected" => time::iso8601(expected),
+            snapshot::capture(
+                t,
+                &snapshot::Capture {
+                    kind: "performance",
+                    telemetry_type: "scheduled_task",
+                    telemetry_group_hash: &latest,
+                    target: &key,
+                    metric: "missed",
+                    from: expected * 1_000_000,
+                    to: now * 1_000_000,
+                    value: Value::Nil,
+                    limit: Value::Nil,
+                    baseline: Value::Nil,
+                    rule: crate::rhash! {
+                        "type" => "schedule", "task_key" => key.clone(), "schedule" => schedule.clone(),
+                        "last_run" => time::iso8601(last_run), "expected" => time::iso8601(expected),
+                    },
+                    representative_from: Some(last_run_us),
                 },
-                representative_from: Some(last_run_us),
-            })
+            )
         })
         .map_err(e)?;
         if newly_open {

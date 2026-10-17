@@ -33,9 +33,7 @@ impl std::fmt::Display for GzipError {
 
 pub fn verify(compressed: &[u8], max_bytes: u64, expected: i64, utf8: bool) -> Result<u64, GzipError> {
     if !(0..=max_bytes as i64).contains(&expected) {
-        return Err(GzipError::SizeMismatch(format!(
-            "declared size {expected} exceeds the {max_bytes} byte ceiling"
-        )));
+        return Err(GzipError::SizeMismatch(format!("declared size {expected} exceeds the {max_bytes} byte ceiling")));
     }
     let mut out = Vec::new();
     let total = inflate_bounded(compressed, max_bytes, &mut out)?;
@@ -45,9 +43,7 @@ pub fn verify(compressed: &[u8], max_bytes: u64, expected: i64, utf8: bool) -> R
     if total == expected as u64 {
         Ok(total)
     } else {
-        Err(GzipError::SizeMismatch(format!(
-            "declared size {expected} does not match decompressed size {total}"
-        )))
+        Err(GzipError::SizeMismatch(format!("declared size {expected} does not match decompressed size {total}")))
     }
 }
 

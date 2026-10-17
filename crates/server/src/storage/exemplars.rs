@@ -143,7 +143,10 @@ mod tests {
                     .unwrap();
             }
             detail
-                .execute("INSERT INTO logs (id, level, message, execution_id, occurred_at) VALUES (?, 'info', 'hello', ?, ?)", rusqlite::params![i, format!("e{i}"), format!("{day} 10:{i:02}:00")])
+                .execute(
+                    "INSERT INTO logs (id, level, message, execution_id, occurred_at) VALUES (?, 'info', 'hello', ?, ?)",
+                    rusqlite::params![i, format!("e{i}"), format!("{day} 10:{i:02}:00")],
+                )
                 .unwrap();
         }
         detail.execute("INSERT INTO logs_fts(rowid, message) SELECT id, message FROM logs", []).unwrap();
@@ -153,7 +156,8 @@ mod tests {
         assert_eq!(c, Copied { executions: 4, rows: 4 * 3 });
         assert_eq!(copy(&dir, day, 3).unwrap(), Copied::default(), "idempotent");
         let core = Connection::open(day_path(&dir, Tier::Core, day)).unwrap();
-        let kept: Vec<String> = core.prepare("SELECT DISTINCT execution_id FROM queries ORDER BY 1").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        let kept: Vec<String> =
+            core.prepare("SELECT DISTINCT execution_id FROM queries ORDER BY 1").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
         assert_eq!(kept, vec!["e10", "e3", "e8", "e9"]);
         let fts: i64 = core.query_row("SELECT COUNT(*) FROM logs_fts WHERE logs_fts MATCH 'hello'", [], |r| r.get(0)).unwrap();
         assert_eq!(fts, 4);

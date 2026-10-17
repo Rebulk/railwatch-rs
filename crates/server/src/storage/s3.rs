@@ -84,10 +84,8 @@ impl S3 {
         let k = hmac(&k, "s3");
         let k = hmac(&k, "aws4_request");
         let signature = hex(&hmac(&k, &to_sign));
-        let auth = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}",
-            self.access_key
-        );
+        let auth =
+            format!("AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}", self.access_key);
         let url = if canonical_query.is_empty() { format!("{host_url}{path}") } else { format!("{host_url}{path}?{canonical_query}") };
         let m = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
         let resp = Self::client()
@@ -167,9 +165,7 @@ fn tags(xml: &str, tag: &str) -> Vec<String> {
     while let Some(i) = rest.find(&open) {
         let after = &rest[i + open.len()..];
         let Some(j) = after.find(&close) else { break };
-        out.push(
-            after[..j].replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&"),
-        );
+        out.push(after[..j].replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&"));
         rest = &after[j + close.len()..];
     }
     out
@@ -194,7 +190,8 @@ mod tests {
         let k = hmac(&k, "us-east-1");
         let k = hmac(&k, "s3");
         let k = hmac(&k, "aws4_request");
-        let to_sign = "AWS4-HMAC-SHA256\n20130524T000000Z\n20130524/us-east-1/s3/aws4_request\n7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972";
+        let to_sign =
+            "AWS4-HMAC-SHA256\n20130524T000000Z\n20130524/us-east-1/s3/aws4_request\n7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972";
         assert_eq!(hex(&hmac(&k, to_sign)), "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41");
     }
 }

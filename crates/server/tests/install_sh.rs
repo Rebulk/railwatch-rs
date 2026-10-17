@@ -18,8 +18,20 @@ fn semver_lt(a: &str, b: &str) -> bool {
 fn install_sh_orders_versions_by_semver() {
     // semver.org section 11's examples, ascending, plus the forms the
     // installer sees (`railwatch vX.Y.Z` from `railwatch version`).
-    let ascending =
-        ["1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta", "1.0.0-beta.2", "1.0.0-beta.11", "1.0.0-rc.1", "1.0.0", "1.0.1", "1.1.0", "1.10.0", "2.0.0"];
+    let ascending = [
+        "1.0.0-alpha",
+        "1.0.0-alpha.1",
+        "1.0.0-alpha.beta",
+        "1.0.0-beta",
+        "1.0.0-beta.2",
+        "1.0.0-beta.11",
+        "1.0.0-rc.1",
+        "1.0.0",
+        "1.0.1",
+        "1.1.0",
+        "1.10.0",
+        "2.0.0",
+    ];
     for (i, a) in ascending.iter().enumerate() {
         for (j, b) in ascending.iter().enumerate() {
             assert_eq!(semver_lt(a, b), i < j, "semver_lt {a} {b}");

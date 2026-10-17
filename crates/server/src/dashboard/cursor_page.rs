@@ -142,11 +142,7 @@ pub fn call(
     } else {
         cond.from.clone().unwrap_or_else(|| format!("\"{table}\""))
     };
-    let sql = format!(
-        "SELECT {select} FROM {from} WHERE {} ORDER BY \"{table}\".\"{col}\" DESC, \"{table}\".\"id\" DESC LIMIT {}",
-        cond.sql(),
-        limit + 1
-    );
+    let sql = format!("SELECT {select} FROM {from} WHERE {} ORDER BY \"{table}\".\"{col}\" DESC, \"{table}\".\"id\" DESC LIMIT {}", cond.sql(), limit + 1);
     let rows = match db::query(conn, &sql, rusqlite::params_from_iter(cond.binds.iter())) {
         Ok(r) => r,
         Err(e) => return Ok(Err(e)),
@@ -195,10 +191,7 @@ mod tests {
 
     #[test]
     fn hmac_rfc4231_case2() {
-        assert_eq!(
-            hex(&hmac(b"Jefe", b"what do ya want for nothing?")),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
+        assert_eq!(hex(&hmac(b"Jefe", b"what do ya want for nothing?")), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
     }
 
     #[test]

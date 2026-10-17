@@ -20,9 +20,7 @@ use rusqlite::{Connection, OpenFlags};
 
 pub fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI)?;
-    conn.execute_batch(
-        "PRAGMA query_only = ON; PRAGMA mmap_size = 17179869184; PRAGMA cache_size = -16000; PRAGMA temp_store = MEMORY;",
-    )?;
+    conn.execute_batch("PRAGMA query_only = ON; PRAGMA mmap_size = 17179869184; PRAGMA cache_size = -16000; PRAGMA temp_store = MEMORY;")?;
     conn.set_prepared_statement_cache_capacity(256);
     Ok(conn)
 }

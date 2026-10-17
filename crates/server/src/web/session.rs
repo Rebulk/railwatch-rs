@@ -184,12 +184,10 @@ fn csrf_ok(headers: &HeaderMap, expected: &str) -> bool {
 async fn middleware(State(state): State<Arc<WebState>>, mut req: Request, next: Next) -> Response {
     let jar = cookies::parse(req.headers());
     let session = SessionHandle(Arc::new(Mutex::new(SessionData::load(&state.keys, &jar))));
-    let session_id: Option<i64> = cookies::get(&jar, cookies::SESSION_TOKEN)
-        .and_then(|c| state.keys.verify(cookies::SESSION_TOKEN, c))
-        .and_then(|v| v.parse().ok());
-    let account_pref: Option<i64> = cookies::get(&jar, cookies::ACCOUNT_ID)
-        .and_then(|c| state.keys.verify(cookies::ACCOUNT_ID, c))
-        .and_then(|v| v.parse().ok());
+    let session_id: Option<i64> =
+        cookies::get(&jar, cookies::SESSION_TOKEN).and_then(|c| state.keys.verify(cookies::SESSION_TOKEN, c)).and_then(|v| v.parse().ok());
+    let account_pref: Option<i64> =
+        cookies::get(&jar, cookies::ACCOUNT_ID).and_then(|c| state.keys.verify(cookies::ACCOUNT_ID, c)).and_then(|v| v.parse().ok());
     let ip = state.client_ip(&req).to_string();
     let user_agent = req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(str::to_string);
 

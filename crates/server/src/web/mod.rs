@@ -121,10 +121,7 @@ impl WebState {
     }
 
     /// Runs a blocking control-DB closure off the async runtime.
-    pub async fn db<T: Send + 'static>(
-        self: &Arc<Self>,
-        f: impl FnOnce(&Control) -> T + Send + 'static,
-    ) -> T {
+    pub async fn db<T: Send + 'static>(self: &Arc<Self>, f: impl FnOnce(&Control) -> T + Send + 'static) -> T {
         let control = self.control.clone();
         tokio::task::spawn_blocking(move || f(&control)).await.expect("control DB task panicked")
     }
@@ -133,7 +130,12 @@ impl WebState {
 /// Everything browser-facing. The ingest router (http.rs) handles /ingest,
 /// /up and is the fallback for anything this one does not route.
 pub fn router(state: Arc<WebState>) -> Router {
-    let pages = controllers::routes().merge(env_pages::routes()).merge(issues::routes()).merge(alerts::routes()).merge(integrations::routes()).merge(sessions_oauth::routes());
+    let pages = controllers::routes()
+        .merge(env_pages::routes())
+        .merge(issues::routes())
+        .merge(alerts::routes())
+        .merge(integrations::routes())
+        .merge(sessions_oauth::routes());
     let pages = inertia::layer(pages);
     let pages = session::layer(pages, state.clone());
     Router::new()

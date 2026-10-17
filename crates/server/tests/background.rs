@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use railwatch_server::alerts::{outbox, rules};
 use railwatch_server::control::Control;
-use railwatch_server::grouping::{self, issue, Receipt};
+use railwatch_server::grouping::{self, Receipt, issue};
 use railwatch_server::jobs::{detectors, watchdog};
 use rusqlite::{Connection, params};
 
@@ -178,7 +178,8 @@ fn watchdog_alerts_once_on_silence_and_once_on_recovery() {
 fn receipted_grouping_is_claimed_exactly_once() {
     let (control, env, t, _d) = setup("claims");
     let c = control.conn();
-    let ids = vec![exception(&t, &format!("{:032x}", 1), "E", None, "2026-10-13 10:00:00"), exception(&t, &format!("{:032x}", 2), "E", None, "2026-10-13 10:00:01")];
+    let ids =
+        vec![exception(&t, &format!("{:032x}", 1), "E", None, "2026-10-13 10:00:00"), exception(&t, &format!("{:032x}", 2), "E", None, "2026-10-13 10:00:01")];
     let receipt = Receipt { producer_id: "p".into(), delivery_id: "d".into(), delivery_created_at: railwatch_server::time::now_micros() };
     for _ in 0..3 {
         let rows = grouping::load_exceptions(&t, &ids).unwrap();
@@ -231,7 +232,11 @@ fn an_alert_in_its_retry_schedule_is_delivered_past_the_reconcile_window_and_ret
     rule(&c, app, integ, "quota", "{}");
     let payload = railwatch_server::alerts::as_hash(railwatch_server::rhash! { "message" => "m", "environment_id" => env });
     let id = rules::fire_issueless(&c, app, "quota", &payload).unwrap()[0];
-    c.execute("UPDATE alerts SET created_at = datetime('now', '-90 minutes'), delivery_attempts = 4, next_delivery_at = datetime('now', '-1 second') WHERE id = ?", [id]).unwrap();
+    c.execute(
+        "UPDATE alerts SET created_at = datetime('now', '-90 minutes'), delivery_attempts = 4, next_delivery_at = datetime('now', '-1 second') WHERE id = ?",
+        [id],
+    )
+    .unwrap();
     assert_eq!(outbox::claim_due(&c, 10).unwrap().len(), 1, "attempt 5 is still claimed");
     // A never-attempted alert that old is not (it predates the outbox).
     let stale = rules::fire_issueless(&c, app, "quota", &payload).unwrap()[0];

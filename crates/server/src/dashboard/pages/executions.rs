@@ -286,7 +286,9 @@ pub fn traces_show(conn: &Connection, ctx: &PageContext, _control: &dyn ControlD
         let ph = vec!["?"; chunk.len()].join(", ");
         for o in db::query(
             conn,
-            &format!("SELECT \"outgoing_requests\".* FROM \"outgoing_requests\" WHERE \"outgoing_requests\".\"execution_id\" IN ({ph}) ORDER BY \"outgoing_requests\".\"occurred_at\" ASC"),
+            &format!(
+                "SELECT \"outgoing_requests\".* FROM \"outgoing_requests\" WHERE \"outgoing_requests\".\"execution_id\" IN ({ph}) ORDER BY \"outgoing_requests\".\"occurred_at\" ASC"
+            ),
             rusqlite::params_from_iter(chunk),
         )? {
             outgoing_count += 1;
@@ -312,13 +314,7 @@ pub fn traces_show(conn: &Connection, ctx: &PageContext, _control: &dyn ControlD
             None => roots.push(i),
         }
     }
-    fn node(
-        i: usize,
-        ex: &[db::Rec],
-        children: &HashMap<usize, Vec<usize>>,
-        outgoing: &HashMap<String, Vec<db::Rec>>,
-        offset: &dyn Fn(i64) -> f64,
-    ) -> Value {
+    fn node(i: usize, ex: &[db::Rec], children: &HashMap<usize, Vec<usize>>, outgoing: &HashMap<String, Vec<db::Rec>>, offset: &dyn Fn(i64) -> f64) -> Value {
         let e = &ex[i];
         let outs: Vec<Value> = outgoing
             .get(e.s("execution_id").unwrap_or(""))
@@ -347,14 +343,12 @@ pub fn traces_show(conn: &Connection, ctx: &PageContext, _control: &dyn ControlD
     let mut services: Vec<String> = vec![];
     for e in &executions {
         if let Some(sv) = e.s("server")
-            && !services.iter().any(|x| x == sv) {
-                services.push(sv.to_string());
-            }
+            && !services.iter().any(|x| x == sv)
+        {
+            services.push(sv.to_string());
+        }
     }
-    let duration = executions
-        .iter()
-        .map(|e| offset(e.t("occurred_at").unwrap_or(0)) + models::dur_ms(e).unwrap_or(0.0))
-        .fold(f64::NEG_INFINITY, f64::max);
+    let duration = executions.iter().map(|e| offset(e.t("occurred_at").unwrap_or(0)) + models::dur_ms(e).unwrap_or(0.0)).fold(f64::NEG_INFINITY, f64::max);
     Ok(crate::obj! {
         "trace_id" => trace_id, "roots" => roots, "span_count" => executions.len() + outgoing_count,
         "services" => services, "duration" => jf(rb::round(duration, 2)),
@@ -372,10 +366,8 @@ pub fn people_index(conn: &Connection, ctx: &PageContext, _control: &dyn Control
          GROUP BY \"executions\".\"user_ref\"",
         rusqlite::params!["request", qt(from), qt(to)],
     )?;
-    let active: Vec<(String, i64, Value, Value)> = rows
-        .iter()
-        .map(|r| (r.s("user_ref").unwrap_or("").to_string(), r.i("COUNT(*)").unwrap_or(0), db::raw_json(r.at(2)), db::raw_json(r.at(3))))
-        .collect();
+    let active: Vec<(String, i64, Value, Value)> =
+        rows.iter().map(|r| (r.s("user_ref").unwrap_or("").to_string(), r.i("COUNT(*)").unwrap_or(0), db::raw_json(r.at(2)), db::raw_json(r.at(3)))).collect();
     let active = rb::sort_by_num(active, |a| rb::Num::I(-a.1));
     let active: Vec<_> = active.into_iter().take(200).collect();
     let refs: Vec<String> = active.iter().map(|a| a.0.clone()).collect();
@@ -407,8 +399,7 @@ pub fn people_show(conn: &Connection, ctx: &PageContext, control: &dyn ControlDa
          WHERE \"exceptions\".\"user_ref\" = ?1 AND \"exceptions\".\"occurred_at\" BETWEEN ?2 AND ?3 GROUP BY \"exceptions\".\"group_hash\"",
         rusqlite::params![ref_, qt(from), qt(to)],
     )?;
-    let counts: HashMap<String, i64> =
-        groups.iter().filter_map(|r| Some((r.s("exceptions_group_hash")?.to_string(), r.i("count_all").unwrap_or(0)))).collect();
+    let counts: HashMap<String, i64> = groups.iter().filter_map(|r| Some((r.s("exceptions_group_hash")?.to_string(), r.i("count_all").unwrap_or(0)))).collect();
     let groups: Vec<&str> = counts.keys().map(String::as_str).collect();
     let issues = control::issues_in_groups(control, &groups);
     Ok(crate::obj! {
@@ -516,12 +507,7 @@ pub mod cron {
 /// each on its own read connection from `pools` (WAL readers do not block
 /// each other or the writer). Same props as `overview_show`, in the same key
 /// order; the props-diff harness runs both.
-pub fn overview_show_parallel(
-    pools: &crate::dashboard::pool::ReadPools,
-    slug: &str,
-    ctx: &PageContext,
-    control: &(dyn ControlData + Sync),
-) -> R {
+pub fn overview_show_parallel(pools: &crate::dashboard::pool::ReadPools, slug: &str, ctx: &PageContext, control: &(dyn ControlData + Sync)) -> R {
     let (from, to) = ctx.range();
     type Job<'a> = Box<dyn FnOnce(&Connection) -> rusqlite::Result<Value> + Send + 'a>;
     let jobs: Vec<(&str, Job)> = vec![
@@ -538,10 +524,13 @@ pub fn overview_show_parallel(
         let handles: Vec<_> = jobs
             .into_iter()
             .map(|(name, job)| {
-                (name, s.spawn(move || -> Result<Value, PageError> {
-                    let conn = pools.get(slug)?;
-                    Ok(job(&conn)?)
-                }))
+                (
+                    name,
+                    s.spawn(move || -> Result<Value, PageError> {
+                        let conn = pools.get(slug)?;
+                        Ok(job(&conn)?)
+                    }),
+                )
             })
             .collect();
         handles.into_iter().map(|(n, h)| (n, h.join().expect("overview section panicked"))).collect()

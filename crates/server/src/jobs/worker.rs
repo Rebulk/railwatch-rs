@@ -77,7 +77,15 @@ impl Worker {
                 env,
                 (
                     slug.to_string(),
-                    Tenant { read, write, days, acc: Accumulator::default(), session_buckets: HashSet::new(), overflow_buckets: HashSet::new(), users: Default::default() },
+                    Tenant {
+                        read,
+                        write,
+                        days,
+                        acc: Accumulator::default(),
+                        session_buckets: HashSet::new(),
+                        overflow_buckets: HashSet::new(),
+                        users: Default::default(),
+                    },
                 ),
             );
         }

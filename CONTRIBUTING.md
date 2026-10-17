@@ -22,6 +22,7 @@ What CI runs (`.github/workflows/ci.yml`); a PR needs all of it green:
 
 ```sh
 SKIP_CARGO=1 bin/build
+cargo fmt --check          # rustfmt.toml: 160 columns
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo audit --deny warnings

@@ -3,8 +3,8 @@
 //! `filter_routes`.
 
 use indexmap::IndexMap;
-use rusqlite::types::Value as Sql;
 use rusqlite::Connection;
+use rusqlite::types::Value as Sql;
 use serde_json::Value;
 
 use super::db::{self, qt};
@@ -37,10 +37,13 @@ pub fn parse(query: Option<&str>) -> Parsed {
             continue;
         }
         if let Some((k, v)) = word.split_once(':')
-            && !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') && !v.is_empty() {
-                p.fields.insert(k.to_string(), v.to_string());
-                continue;
-            }
+            && !k.is_empty()
+            && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+            && !v.is_empty()
+        {
+            p.fields.insert(k.to_string(), v.to_string());
+            continue;
+        }
         if rb::present(Some(word)) {
             text.push(word);
         }
@@ -91,13 +94,9 @@ pub fn filter_routes(routes: Vec<Value>, query: Option<&str>) -> Vec<Value> {
 /// SHA256 of `[environment_id, resource, query.to_s, [from, to]].to_json`.
 pub fn cursor_context(environment_id: i64, resource: &str, query: Option<&str>, from: i64, to: i64) -> String {
     use sha2::Digest;
-    let json = serde_json::to_string(&serde_json::json!([
-        environment_id,
-        resource,
-        query.unwrap_or(""),
-        [crate::time::iso8601_6(from), crate::time::iso8601_6(to)]
-    ]))
-    .unwrap();
+    let json =
+        serde_json::to_string(&serde_json::json!([environment_id, resource, query.unwrap_or(""), [crate::time::iso8601_6(from), crate::time::iso8601_6(to)]]))
+            .unwrap();
     let json = crate::rjson::escape_html(&json);
     sha2::Sha256::digest(json.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -215,9 +214,11 @@ pub fn apply(conn: &Connection, resource: Resource, query: Option<&str>, from: i
         }
     }
     if let Some(k) = parsed.fields.get("kind")
-        && EXECUTION_KINDS.contains(&k.as_str()) && has_column(table, "execution_source") {
-            c.eq(table, "execution_source", s(k));
-        }
+        && EXECUTION_KINDS.contains(&k.as_str())
+        && has_column(table, "execution_source")
+    {
+        c.eq(table, "execution_source", s(k));
+    }
     let text = parsed.text.clone();
     match resource {
         Resource::Jobs => {
@@ -238,9 +239,10 @@ pub fn apply(conn: &Connection, resource: Resource, query: Option<&str>, from: i
                     let mut groups: Vec<String> = vec![md5_hex(name)];
                     for r in db::query(conn, &format!("SELECT DISTINCT \"rollups\".\"group_hash\" FROM \"rollups\" WHERE {rollup_cond}"), binds)? {
                         if let Some(g) = r.s("group_hash")
-                            && !groups.iter().any(|x| x == g) {
-                                groups.push(g.to_string());
-                            }
+                            && !groups.iter().any(|x| x == g)
+                        {
+                            groups.push(g.to_string());
+                        }
                     }
                     in_groups_or_fresh(&mut c, "job_attempt", &groups, range);
                     c.eq(table, "name", s(name));
@@ -311,11 +313,7 @@ pub fn md5_hex(s: &str) -> String {
 }
 
 fn range_sql(col: &str, (lo, hi, empty): (i64, i64, bool)) -> (String, Vec<Sql>) {
-    if empty {
-        (format!("{col} >= ? AND {col} < ?"), vec![s(&qt(lo)), s(&qt(hi))])
-    } else {
-        (format!("{col} BETWEEN ? AND ?"), vec![s(&qt(lo)), s(&qt(hi))])
-    }
+    if empty { (format!("{col} >= ? AND {col} < ?"), vec![s(&qt(lo)), s(&qt(hi))]) } else { (format!("{col} BETWEEN ? AND ?"), vec![s(&qt(lo)), s(&qt(hi))]) }
 }
 
 /// `Execution.in_groups_or_fresh(kind, groups, range)`, as a condition.
@@ -367,7 +365,8 @@ pub fn named_like(conn: &Connection, c: &mut Cond, kind: &str, text: &str, range
     binds.extend(rbinds.clone());
     binds.push(s(kind));
     branches.push(
-        "\"executions\".id IN (SELECT e3.id FROM \"executions\" e3 WHERE e3.kind = ? AND e3.occurred_at BETWEEN ? AND ? AND (e3.name LIKE ? ESCAPE '\\'))".into(),
+        "\"executions\".id IN (SELECT e3.id FROM \"executions\" e3 WHERE e3.kind = ? AND e3.occurred_at BETWEEN ? AND ? AND (e3.name LIKE ? ESCAPE '\\'))"
+            .into(),
     );
     binds.extend([s(kind), s(&qt(lo.max(hi - FRESH_NAMES))), s(&qt(hi)), s(&pat)]);
     if previews {
@@ -424,12 +423,13 @@ fn scan_terms(text: &str) -> Vec<String> {
         let start = i;
         let q = if cs[i] == '-' && cs.get(i + 1) == Some(&'"') { i + 1 } else { i };
         if cs[q] == '"'
-            && let Some(end) = cs[q + 1..].iter().position(|&c| c == '"') {
-                let stop = q + 1 + end + 1;
-                out.push(cs[start..stop].iter().collect());
-                i = stop;
-                continue;
-            }
+            && let Some(end) = cs[q + 1..].iter().position(|&c| c == '"')
+        {
+            let stop = q + 1 + end + 1;
+            out.push(cs[start..stop].iter().collect());
+            i = stop;
+            continue;
+        }
         while i < cs.len() && !cs[i].is_whitespace() {
             i += 1;
         }

@@ -15,7 +15,7 @@ use railwatch_server::config::Config;
 use railwatch_server::control::{self, Control};
 use railwatch_server::followups;
 use railwatch_server::tenants::Tenants;
-use railwatch_server::web::{self, cookies, WebState};
+use railwatch_server::web::{self, WebState, cookies};
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -70,9 +70,8 @@ async fn security_pocs() {
             .unwrap();
         let sa = control.with(|c| control::create_session(c, ua, Some("ua"), Some("127.0.0.1"))).unwrap();
         // An API+read+write token for user A, scoped to all of A's accounts.
-        let (_id, raw) = control
-            .tx(|tx| control::issue_api_token(tx, ua, "t", &["api".into(), "read".into(), "write".into(), "mcp".into()], None, None, None))
-            .unwrap();
+        let (_id, raw) =
+            control.tx(|tx| control::issue_api_token(tx, ua, "t", &["api".into(), "read".into(), "write".into(), "mcp".into()], None, None, None)).unwrap();
         (ua, aa, ia, sa, raw)
     };
 

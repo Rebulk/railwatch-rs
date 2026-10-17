@@ -7,7 +7,10 @@
 
 use std::time::Instant;
 
-use railwatch_server::rollup::{incremental::{self, Accumulator}, rollup_job};
+use railwatch_server::rollup::{
+    incremental::{self, Accumulator},
+    rollup_job,
+};
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();

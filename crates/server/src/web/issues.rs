@@ -404,10 +404,7 @@ async fn split_rows(state: &Arc<WebState>, slug: &str, group_hash: &str) -> rusq
             return Ok(vec![]);
         }
         let reader = state.readers.get(&slug)?;
-        let sql = format!(
-            "SELECT {} FROM exceptions WHERE group_hash = ? ORDER BY occurred_at DESC LIMIT {SPLIT_SAMPLE}",
-            crate::grouping::EXCEPTION_COLUMNS
-        );
+        let sql = format!("SELECT {} FROM exceptions WHERE group_hash = ? ORDER BY occurred_at DESC LIMIT {SPLIT_SAMPLE}", crate::grouping::EXCEPTION_COLUMNS);
         let mut s = reader.prepare(&sql)?;
         s.query_map([group_hash], crate::grouping::exception_row)?.collect()
     })
@@ -420,10 +417,11 @@ async fn split_rows(state: &Arc<WebState>, slug: &str, group_hash: &str) -> rusq
 
 /// `Issue.joins(:application).where(applications: {account_id:}).find(id)`.
 fn find_in_account(c: &Connection, account: i64, id: i64) -> rusqlite::Result<Option<issue::Issue>> {
-    let ok: bool = c
-        .query_row("SELECT EXISTS (SELECT 1 FROM issues i JOIN applications ap ON ap.id = i.application_id WHERE ap.account_id = ? AND i.id = ?)", params![account, id], |r| {
-            r.get(0)
-        })?;
+    let ok: bool = c.query_row(
+        "SELECT EXISTS (SELECT 1 FROM issues i JOIN applications ap ON ap.id = i.application_id WHERE ap.account_id = ? AND i.id = ?)",
+        params![account, id],
+        |r| r.get(0),
+    )?;
     if ok { issue::find(c, id) } else { Ok(None) }
 }
 
@@ -433,7 +431,9 @@ fn scope_ids(c: &Connection, account: i64, ids: &[i64], order: &str) -> rusqlite
         return Ok(vec![]);
     }
     let ph = vec!["?"; ids.len()].join(",");
-    let sql = format!("SELECT i.id FROM issues i JOIN applications ap ON ap.id = i.application_id WHERE ap.account_id = {account} AND i.id IN ({ph}) ORDER BY {order}");
+    let sql = format!(
+        "SELECT i.id FROM issues i JOIN applications ap ON ap.id = i.application_id WHERE ap.account_id = {account} AND i.id IN ({ph}) ORDER BY {order}"
+    );
     let mut s = c.prepare(&sql)?;
     s.query_map(params_from_iter(ids), |r| r.get(0))?.collect()
 }
@@ -577,8 +577,9 @@ pub fn index_props(c: &Connection, account: i64, user_id: i64, p: &Params) -> ru
         c.prepare_cached(sql)?.query_map([account], |r| Ok((r.get::<_, String>(0)?, Value::from(r.get::<_, i64>(1)?))))?.collect()
     };
     let counts = grouped("SELECT i.status, COUNT(*) FROM issues i JOIN applications ap ON ap.id = i.application_id WHERE ap.account_id = ? GROUP BY i.status")?;
-    let kind_counts =
-        grouped("SELECT i.kind, COUNT(*) FROM issues i JOIN applications ap ON ap.id = i.application_id WHERE ap.account_id = ? AND i.status = 'open' GROUP BY i.kind")?;
+    let kind_counts = grouped(
+        "SELECT i.kind, COUNT(*) FROM issues i JOIN applications ap ON ap.id = i.application_id WHERE ap.account_id = ? AND i.status = 'open' GROUP BY i.kind",
+    )?;
     Ok(json!({
         "issues": issues,
         "filters": filters,
@@ -763,7 +764,11 @@ pub fn show_props(c: &Connection, account: i64, s: &Shown, telemetry: Option<Val
     let merged_into = match s.merged_into_id {
         None => Value::Null,
         Some(t) => c
-            .query_row("SELECT i.id, ap.issue_prefix || '-' || i.number, i.title FROM issues i JOIN applications ap ON ap.id = i.application_id WHERE i.id = ?", [t], brief)
+            .query_row(
+                "SELECT i.id, ap.issue_prefix || '-' || i.number, i.title FROM issues i JOIN applications ap ON ap.id = i.application_id WHERE i.id = ?",
+                [t],
+                brief,
+            )
             .optional()?
             .unwrap_or(Value::Null),
     };
@@ -971,9 +976,28 @@ mod tests {
         assert_eq!(
             order,
             [
-                "issue", "detection", "latest", "breadcrumbs", "browser_breadcrumbs", "fingerprint", "fingerprint_source", "distinct_messages", "top_messages",
-                "occurrences", "daily", "by_deploy", "by_tenant", "attachments", "comments", "activities", "members", "deploys", "related_issues",
-                "merged_into", "merged_issues", "alerts"
+                "issue",
+                "detection",
+                "latest",
+                "breadcrumbs",
+                "browser_breadcrumbs",
+                "fingerprint",
+                "fingerprint_source",
+                "distinct_messages",
+                "top_messages",
+                "occurrences",
+                "daily",
+                "by_deploy",
+                "by_tenant",
+                "attachments",
+                "comments",
+                "activities",
+                "members",
+                "deploys",
+                "related_issues",
+                "merged_into",
+                "merged_issues",
+                "alerts"
             ],
             "render_detection_issue's key order"
         );
@@ -994,7 +1018,8 @@ mod tests {
         let x = f.c.conn();
         let occ = |id: i64| -> i64 { x.query_row("SELECT occurrences FROM issues WHERE id = ?", [id], |r| r.get(0)).unwrap() };
         assert_eq!(occ(b), 8, "target absorbs the source's occurrences");
-        let (st, into): (String, Option<i64>) = x.query_row("SELECT status, merged_into_id FROM issues WHERE id = ?", [a], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let (st, into): (String, Option<i64>) =
+            x.query_row("SELECT status, merged_into_id FROM issues WHERE id = ?", [a], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!((st.as_str(), into), ("merged", Some(b)));
         let moved: i64 = x.query_row("SELECT COUNT(*) FROM comments WHERE issue_id = ?", [b], |r| r.get(0)).unwrap();
         assert_eq!(moved, 1, "comments move to the target");
@@ -1009,7 +1034,10 @@ mod tests {
         };
         assert_eq!(msg(update(&f, c3, json!({"action_name": "merge", "target_id": c3}))), "cannot merge an issue into itself");
         assert_eq!(msg(update(&f, a, json!({"action_name": "merge", "target_id": c3}))), "cannot merge an issue that is already merged");
-        assert!(matches!(update(&f, c3, json!({"action_name": "merge", "target_id": a})), Err(Fail::NotFound)), "a merged target is not among the open issues: 404");
+        assert!(
+            matches!(update(&f, c3, json!({"action_name": "merge", "target_id": a})), Err(Fail::NotFound)),
+            "a merged target is not among the open issues: 404"
+        );
         assert_eq!(msg(update(&f, c3, json!({"action_name": "unmerge"}))), "cannot unmerge an issue that is not merged");
 
         // Chain: b -> c3, then a's unmerge must wait for b's.
@@ -1052,7 +1080,8 @@ mod tests {
         drop(x);
         update(&f, id, json!({"action_name": "resolve"})).unwrap();
         let x = f.c.conn();
-        let (status, deploy): (String, Option<String>) = x.query_row("SELECT status, resolved_in_deploy FROM issues WHERE id = ?", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let (status, deploy): (String, Option<String>) =
+            x.query_row("SELECT status, resolved_in_deploy FROM issues WHERE id = ?", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!((status.as_str(), deploy.as_deref()), ("resolved", Some("v42")), "no deploy param: the environment's most recent deploy");
         let (data, user): (String, Option<i64>) =
             x.query_row("SELECT data, user_id FROM issue_activities WHERE issue_id = ? AND kind = 'status'", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
@@ -1117,7 +1146,10 @@ mod tests {
         assert_eq!((source.as_str(), user), ("railwatch", f.ada));
         let (data, auser): (String, i64) =
             x.query_row("SELECT data, user_id FROM issue_activities WHERE issue_id = ? AND kind = 'comment'", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&data).unwrap(), json!({"comment_id": cid, "body": "Looking into it", "source": "railwatch", "author_name": null}));
+        assert_eq!(
+            serde_json::from_str::<Value>(&data).unwrap(),
+            json!({"comment_id": cid, "body": "Looking into it", "source": "railwatch", "author_name": null})
+        );
         assert_eq!(auser, f.ada);
         let shown = find_shown(&x, f.account, id).unwrap().unwrap();
         let props = show_props(&x, f.account, &shown, Some(json!({})), Value::Null).unwrap();
@@ -1155,7 +1187,8 @@ mod tests {
         update(&f, c3, json!({"action_name": "merge", "target_id": a})).unwrap();
         write(&f.c, |tx| apply_bulk(tx, f.account, ada(&f), &p(json!({"ids": [a, b, c3], "action_name": "merge"})))).unwrap();
         let x = f.c.conn();
-        let row = |id: i64| -> (String, i64) { x.query_row("SELECT status, occurrences FROM issues WHERE id = ?", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap() };
+        let row =
+            |id: i64| -> (String, i64) { x.query_row("SELECT status, occurrences FROM issues WHERE id = ?", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap() };
         assert_eq!(row(b), ("open".into(), 9), "b was first seen earliest, so it is the target: 3 + a's 2 + c's 4 already in a");
         assert_eq!(row(a).0, "merged");
         assert_eq!(x.query_row("SELECT merged_into_id FROM issues WHERE id = ?", [c3], |r| r.get::<_, i64>(0)).unwrap(), a, "the stale merged one is skipped");

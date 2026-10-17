@@ -152,7 +152,11 @@ mod tests {
         })
         .unwrap();
         let ids = |v: Vec<Value>| v.iter().map(|a| a["id"].as_i64().unwrap()).collect::<Vec<_>>();
-        assert_eq!(ids(c.with(|x| rows(x, account, Some(prod), "")).unwrap()), [3, 1], "prod's issue alert + its silence; not staging's, not the test, not another account's");
+        assert_eq!(
+            ids(c.with(|x| rows(x, account, Some(prod), "")).unwrap()),
+            [3, 1],
+            "prod's issue alert + its silence; not staging's, not the test, not another account's"
+        );
         assert_eq!(ids(c.with(|x| rows(x, account, None, "")).unwrap()), [5, 4, 3, 2, 1], "account-wide: every alert of this account's integrations");
         assert_eq!(ids(c.with(|x| rows(x, account, None, "status:failed")).unwrap()), [3]);
         assert_eq!(ids(c.with(|x| rows(x, account, None, "event:silent_environment status:bogus")).unwrap()), [4, 3], "unknown status is ignored, as Rails");

@@ -208,8 +208,13 @@ mod tests {
         let c = crate::tenants::open_tenant(&single).unwrap();
         for (i, at) in ["2026-10-12 23:59:59.5", "2026-10-13 00:00:00", "2026-10-14 08:00:00"].iter().enumerate() {
             let id = i as i64 + 1;
-            c.execute("INSERT INTO executions (execution_id, kind, name, occurred_at, duration) VALUES (?, 'request', 'GET /', ?, 1.5)", rusqlite::params![format!("e{id}"), at]).unwrap();
-            c.execute("INSERT INTO queries (execution_id, sql, occurred_at, duration) VALUES (?, 'SELECT 1', ?, 0.5)", rusqlite::params![format!("e{id}"), at]).unwrap();
+            c.execute(
+                "INSERT INTO executions (execution_id, kind, name, occurred_at, duration) VALUES (?, 'request', 'GET /', ?, 1.5)",
+                rusqlite::params![format!("e{id}"), at],
+            )
+            .unwrap();
+            c.execute("INSERT INTO queries (execution_id, sql, occurred_at, duration) VALUES (?, 'SELECT 1', ?, 0.5)", rusqlite::params![format!("e{id}"), at])
+                .unwrap();
             c.execute("INSERT INTO logs (level, message, occurred_at) VALUES ('info', ?, ?)", rusqlite::params![format!("line {id}"), at]).unwrap();
         }
         c.execute("INSERT INTO logs_fts(rowid, message) SELECT id, message FROM logs", []).unwrap();

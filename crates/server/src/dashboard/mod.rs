@@ -59,12 +59,7 @@ pub struct PageContext {
 impl PageContext {
     /// Builds the context from the request's params, at `now`.
     pub fn new(environment_id: i64, now: i64, params: Params, cursor_key: CursorKey) -> PageContext {
-        let window = Window::parse(
-            params.get("window").map(String::as_str),
-            params.get("from").map(String::as_str),
-            params.get("to").map(String::as_str),
-            now,
-        );
+        let window = Window::parse(params.get("window").map(String::as_str), params.get("from").map(String::as_str), params.get("to").map(String::as_str), now);
         let step = window::step_key(window.from, window.to, params.get("step").map(String::as_str));
         PageContext { environment_id, now, window, step, params, cursor_key }
     }

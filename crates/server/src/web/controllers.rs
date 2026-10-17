@@ -356,9 +356,7 @@ async fn user_destroy(cx: Ctx, p: Params) -> Response {
     };
     if !blocking.is_empty() {
         let names = to_sentence(&blocking.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>());
-        return cx.redirect(
-            Redirect::to("/settings/profile").error("account_ownership", &format!("Transfer or delete {names} before deleting your user.")),
-        );
+        return cx.redirect(Redirect::to("/settings/profile").error("account_ownership", &format!("Transfer or delete {names} before deleting your user.")));
     }
     // UsersController#deletion_confirmation_valid?
     let confirmed = if user.provider.as_deref().is_some_and(|p| !p.is_empty()) {
@@ -467,11 +465,8 @@ async fn password_reset_new(cx: Ctx) -> Response {
 }
 
 async fn reset_user(cx: &Ctx, sid: &str) -> Option<control::User> {
-    let users: Vec<(i64, String)> = cx
-        .state
-        .db(|c| c.with(|x| x.prepare("SELECT id, password_digest FROM users")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()))
-        .await
-        .ok()?;
+    let users: Vec<(i64, String)> =
+        cx.state.db(|c| c.with(|x| x.prepare("SELECT id, password_digest FROM users")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())).await.ok()?;
     let id = verify_token(cx, "password_reset", sid, |id| users.iter().find(|(u, _)| *u == id).map(|(_, d)| reset_bind(d)))?;
     cx.state.db(move |c| c.with(|x| control::find_user(x, id))).await.ok().flatten()
 }
@@ -544,11 +539,10 @@ async fn invitation_show(cx: Ctx, Path(token): Path<String>) -> Response {
         .db(move |c| {
             c.with(|x| {
                 let Some(inv) = control::find_invitation_by_token(x, &t)? else { return Ok(None) };
-                let (account, inviter): (String, String) = x.query_row(
-                    "SELECT a.name, u.name FROM accounts a, users u WHERE a.id = ? AND u.id = ?",
-                    params![inv.account_id, inv.inviter_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
+                let (account, inviter): (String, String) =
+                    x.query_row("SELECT a.name, u.name FROM accounts a, users u WHERE a.id = ? AND u.id = ?", params![inv.account_id, inv.inviter_id], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?;
                 Ok(Some((inv, account, inviter)))
             })
         })
@@ -574,10 +568,7 @@ async fn invitation_show(cx: Ctx, Path(token): Path<String>) -> Response {
                 Err(e) => internal(e),
             }
         }
-        None => {
-            cx.render("users/new", json!({"invitation": {"token": token, "email": inv.email, "account": account, "inviter": inviter}}), None)
-                .await
-        }
+        None => cx.render("users/new", json!({"invitation": {"token": token, "email": inv.email, "account": account, "inviter": inviter}}), None).await,
     }
 }
 
@@ -691,7 +682,9 @@ fn request_sparkline(tenants: &std::path::Path, slug: &str) -> (Vec<i64>, f64) {
         }
         Ok(())
     };
-    if path.exists() && let Err(e) = read() {
+    if path.exists()
+        && let Err(e) = read()
+    {
         tracing::warn!(path = %path.display(), error = %e, "sparkline read failed");
     }
     (buckets, if count == 0 { 0.0 } else { errors as f64 / count as f64 })
@@ -772,7 +765,8 @@ async fn account_destroy(cx: Ctx, Path(id): Path<i64>, p: Params) -> Response {
                     .prepare("SELECT e.slug FROM environments e JOIN applications a ON a.id = e.application_id WHERE a.account_id = ?")?
                     .query_map([id], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
-                let apps: Vec<i64> = tx.prepare("SELECT id FROM applications WHERE account_id = ?")?.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                let apps: Vec<i64> =
+                    tx.prepare("SELECT id FROM applications WHERE account_id = ?")?.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
                 for app in apps {
                     delete_application_rows(tx, app)?;
                 }
@@ -805,7 +799,8 @@ fn delete_environment_rows(tx: &rusqlite::Connection, env: i64) -> rusqlite::Res
 }
 
 fn delete_application_rows(tx: &rusqlite::Connection, app: i64) -> rusqlite::Result<()> {
-    let envs: Vec<i64> = tx.prepare("SELECT id FROM environments WHERE application_id = ?")?.query_map([app], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let envs: Vec<i64> =
+        tx.prepare("SELECT id FROM environments WHERE application_id = ?")?.query_map([app], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     for e in envs {
         delete_environment_rows(tx, e)?;
     }
@@ -866,9 +861,7 @@ async fn application_create(cx: Ctx, p: Params) -> Response {
             if let Ok(slug) = slug {
                 ensure_tenant(&cx.state, &slug);
             }
-            cx.redirect(
-                Redirect::to(format!("/apps/{app}")).notice("Application created").with("new_token", json!({"environment_id": env, "token": token})),
-            )
+            cx.redirect(Redirect::to(format!("/apps/{app}")).notice("Application created").with("new_token", json!({"environment_id": env, "token": token})))
         }
         Err(e) => match model_errors(e) {
             Ok(v) => cx.redirect(Redirect::to("/apps/new").errors(v)),
@@ -962,12 +955,7 @@ async fn application_show(cx: Ctx, Path(id): Path<i64>) -> Response {
         let env = t.get("environment_id")?.as_i64()?;
         envs.iter().any(|e| e["id"].as_i64() == Some(env)).then(|| t.get("token").cloned()).flatten()
     });
-    cx.render(
-        "applications/show",
-        json!({"application": app.props(), "environments": envs, "new_token": new_token, "issues_open": 0}),
-        None,
-    )
-    .await
+    cx.render("applications/show", json!({"application": app.props(), "environments": envs, "new_token": new_token, "issues_open": 0}), None).await
 }
 
 async fn application_edit(cx: Ctx, Path(id): Path<i64>) -> Response {
@@ -1124,8 +1112,7 @@ async fn environment_edit(cx: Ctx, Path((app, id)): Path<(i64, i64)>) -> Respons
     };
     let expected: Vec<String> = env["expected_servers"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
     let silent = silent_servers(&cx.state, &slug, &expected);
-    cx.render("environments/edit", json!({"application": {"id": a.id, "name": a.name}, "environment": env, "silent_servers": silent}), None)
-        .await
+    cx.render("environments/edit", json!({"application": {"id": a.id, "name": a.name}, "environment": env, "silent_servers": silent}), None).await
 }
 
 /// Environment#silent_servers: expected servers with no health sample or
@@ -1310,8 +1297,10 @@ async fn profile_show(cx: Ctx) -> Response {
                     .collect::<rusqlite::Result<_>>()?;
                 for (id, name) in &accounts {
                     targets.push(json!({"value": format!("account:{id}"), "label": format!("Account: {name}")}));
-                    let apps: Vec<(i64, String)> =
-                        x.prepare("SELECT id, name FROM applications WHERE account_id = ? ORDER BY name")?.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+                    let apps: Vec<(i64, String)> = x
+                        .prepare("SELECT id, name FROM applications WHERE account_id = ? ORDER BY name")?
+                        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<rusqlite::Result<_>>()?;
                     for (aid, aname) in apps {
                         targets.push(json!({"value": format!("application:{aid}"), "label": format!("Application: {name} / {aname}")}));
                     }
@@ -1377,10 +1366,8 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
     if expiry.as_deref().is_some_and(|d| !EXPIRY_CHOICES.contains(&d)) {
         return cx.redirect(Redirect::to("/settings/profile").error("expires_in_days", "is not supported"));
     }
-    let expires_at = expiry
-        .and_then(|d| d.parse::<i64>().ok())
-        .filter(|d| *d > 0)
-        .map(|d| crate::time::quoted_date_micros(crate::time::now_micros() + d * 86_400_000_000));
+    let expires_at =
+        expiry.and_then(|d| d.parse::<i64>().ok()).filter(|d| *d > 0).map(|d| crate::time::quoted_date_micros(crate::time::now_micros() + d * 86_400_000_000));
     let name = p.presence("name").unwrap_or_else(|| "API & MCP token".into());
     let scopes = if p.has("scopes_present") { p.strings("scopes") } else { ["api", "mcp", "read", "write"].map(String::from).to_vec() };
     let replace = p.i64("replace_token_id");
@@ -1420,7 +1407,8 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
                     _ => return Ok(Out::Bad),
                 };
                 if let Some(rid) = replace {
-                    let mine: bool = tx.query_row("SELECT 1 FROM api_tokens WHERE id = ? AND user_id = ?", params![rid, uid], |_| Ok(true)).optional()?.unwrap_or(false);
+                    let mine: bool =
+                        tx.query_row("SELECT 1 FROM api_tokens WHERE id = ? AND user_id = ?", params![rid, uid], |_| Ok(true)).optional()?.unwrap_or(false);
                     if !mine {
                         return Ok(Out::Bad);
                     }
@@ -1457,7 +1445,11 @@ async fn profile_revoke_token(cx: Ctx, p: Params) -> Response {
     guard!(authenticate(&cx));
     let uid = cx.user_id();
     let Some(id) = p.i64("token_id") else { return not_found() };
-    match cx.state.db(move |c| c.with(|x| x.execute("UPDATE api_tokens SET revoked_at = ?1, updated_at = ?1 WHERE id = ?2 AND user_id = ?3", params![now_db(), id, uid]))).await {
+    match cx
+        .state
+        .db(move |c| c.with(|x| x.execute("UPDATE api_tokens SET revoked_at = ?1, updated_at = ?1 WHERE id = ?2 AND user_id = ?3", params![now_db(), id, uid])))
+        .await
+    {
         Ok(0) => not_found(),
         Ok(_) => cx.redirect(Redirect::to("/settings/profile").notice("API token revoked.")),
         Err(e) => internal(e),
@@ -1641,7 +1633,8 @@ async fn members_update(cx: Ctx, Path(id): Path<i64>, p: Params) -> Response {
         .state
         .db(move |c| {
             c.tx(|tx| {
-                let current: Option<String> = tx.query_row("SELECT role FROM memberships WHERE id = ? AND account_id = ?", params![id, account], |r| r.get(0)).optional()?;
+                let current: Option<String> =
+                    tx.query_row("SELECT role FROM memberships WHERE id = ? AND account_id = ?", params![id, account], |r| r.get(0)).optional()?;
                 match current.as_deref() {
                     None => Ok(None),
                     Some("owner") => Ok(Some(true)),
@@ -1669,7 +1662,8 @@ async fn members_destroy(cx: Ctx, Path(id): Path<i64>) -> Response {
         .state
         .db(move |c| {
             c.tx(|tx| {
-                let role: Option<String> = tx.query_row("SELECT role FROM memberships WHERE id = ? AND account_id = ?", params![id, account], |r| r.get(0)).optional()?;
+                let role: Option<String> =
+                    tx.query_row("SELECT role FROM memberships WHERE id = ? AND account_id = ?", params![id, account], |r| r.get(0)).optional()?;
                 match role.as_deref() {
                     None => Ok(None),
                     Some("owner") => Ok(Some(true)),
@@ -1699,9 +1693,11 @@ async fn members_transfer(cx: Ctx, Path(id): Path<i64>) -> Response {
         .db(move |c| {
             c.tx(|tx| {
                 let target: Option<(i64, String)> = tx
-                    .query_row("SELECT m.user_id, u.name FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.id = ? AND m.account_id = ?", params![id, account], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })
+                    .query_row(
+                        "SELECT m.user_id, u.name FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.id = ? AND m.account_id = ?",
+                        params![id, account],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
                     .optional()?;
                 let Some((target_user, name)) = target else { return Ok(Err(None)) };
                 if control::membership_role(tx, account, uid)?.as_deref() != Some("owner") {
@@ -1744,11 +1740,18 @@ async fn invitation_resend(cx: Ctx, Path(id): Path<i64>) -> Response {
         .db(move |c| {
             c.with(|x| {
                 let email: Option<String> = x
-                    .query_row("SELECT email FROM invitations WHERE id = ? AND account_id = ? AND accepted_at IS NULL AND expires_at > ?", params![id, account, now_db()], |r| r.get(0))
+                    .query_row(
+                        "SELECT email FROM invitations WHERE id = ? AND account_id = ? AND accepted_at IS NULL AND expires_at > ?",
+                        params![id, account, now_db()],
+                        |r| r.get(0),
+                    )
                     .optional()?;
                 if email.is_some() {
                     let expires = crate::time::quoted_date_micros(crate::time::now_micros() + 7 * 86_400_000_000);
-                    x.execute("UPDATE invitations SET token_digest = ?, expires_at = ?, updated_at = ? WHERE id = ?", params![control::digest(&t), expires, now_db(), id])?;
+                    x.execute(
+                        "UPDATE invitations SET token_digest = ?, expires_at = ?, updated_at = ? WHERE id = ?",
+                        params![control::digest(&t), expires, now_db(), id],
+                    )?;
                 }
                 Ok(email)
             })

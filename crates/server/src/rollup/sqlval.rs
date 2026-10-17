@@ -75,9 +75,7 @@ impl Sql {
             Sql::Null => false,
             Sql::Int(i) => *i != 0,
             Sql::Real(_) => true,
-            Sql::Text(t) | Sql::Blob(t) => {
-                !matches!(t.as_slice(), b"" | b"0" | b"f" | b"F" | b"false" | b"FALSE" | b"off" | b"OFF")
-            }
+            Sql::Text(t) | Sql::Blob(t) => !matches!(t.as_slice(), b"" | b"0" | b"f" | b"F" | b"false" | b"FALSE" | b"off" | b"OFF"),
         }
     }
 }

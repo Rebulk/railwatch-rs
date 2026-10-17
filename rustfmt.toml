@@ -1,0 +1,4 @@
+# The code base is written at 160 columns; rustfmt's defaults (100, with
+# the small-heuristics) would rewrap most of it. CI runs `cargo fmt --check`.
+max_width = 160
+use_small_heuristics = "Max"

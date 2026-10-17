@@ -145,12 +145,11 @@ fn has_column(c: &Connection, table: &str, column: &str) -> rusqlite::Result<boo
 /// The environment's application id (see the module note).
 pub fn application_of(c: &Connection, environment_id: i64) -> rusqlite::Result<i64> {
     if has_column(c, "environments", "application_id")?
-        && let Some(Some(id)) = c
-            .query_row("SELECT application_id FROM environments WHERE id = ?", [environment_id], |r| r.get::<_, Option<i64>>(0))
-            .optional()?
-        {
-            return Ok(id);
-        }
+        && let Some(Some(id)) =
+            c.query_row("SELECT application_id FROM environments WHERE id = ?", [environment_id], |r| r.get::<_, Option<i64>>(0)).optional()?
+    {
+        return Ok(id);
+    }
     Ok(environment_id)
 }
 
@@ -158,11 +157,7 @@ pub fn application_of(c: &Connection, environment_id: i64) -> rusqlite::Result<i
 fn next_issue_number(c: &Connection, application_id: i64) -> rusqlite::Result<i64> {
     if has_column(c, "applications", "issues_count")? {
         let n: Option<i64> = c
-            .query_row(
-                "UPDATE applications SET issues_count = issues_count + 1 WHERE id = ? RETURNING issues_count",
-                [application_id],
-                |r| r.get(0),
-            )
+            .query_row("UPDATE applications SET issues_count = issues_count + 1 WHERE id = ? RETURNING issues_count", [application_id], |r| r.get(0))
             .optional()?;
         if let Some(n) = n {
             return Ok(n);
@@ -214,8 +209,13 @@ pub fn add_activity(c: &Connection, issue_id: i64, kind: &str, data: Value) -> r
 
 /// `activities.create!(kind:, user: Current.user, data:)`.
 pub fn add_activity_by(c: &Connection, issue_id: i64, kind: &str, user_id: Option<i64>, data: Value) -> rusqlite::Result<()> {
-    c.prepare_cached("INSERT INTO issue_activities (issue_id, kind, data, user_id, created_at) VALUES (?, ?, ?, ?, ?)")?
-        .execute(params![issue_id, kind, rjson::generate(&data).unwrap_or_else(|_| "{}".into()), user_id, now_db()])?;
+    c.prepare_cached("INSERT INTO issue_activities (issue_id, kind, data, user_id, created_at) VALUES (?, ?, ?, ?, ?)")?.execute(params![
+        issue_id,
+        kind,
+        rjson::generate(&data).unwrap_or_else(|_| "{}".into()),
+        user_id,
+        now_db()
+    ])?;
     Ok(())
 }
 
@@ -398,14 +398,16 @@ pub fn merge_into(c: &Connection, source_id: i64, target_id: i64, actor: Option<
     }
     let now = now_db();
     c.prepare_cached("UPDATE comments SET issue_id = ? WHERE issue_id = ?")?.execute(params![target.id, source.id])?;
-    c.prepare_cached("UPDATE issues SET occurrences = ?, affected_users = ?, first_seen_at = ?, last_seen_at = ?, updated_at = ? WHERE id = ?")?.execute(params![
-        target.occurrences + source.occurrences,
-        target.affected_users.max(source.affected_users),
-        time::quoted_date_micros(target.first_seen_at.min(source.first_seen_at)),
-        time::quoted_date_micros(target.last_seen_at.max(source.last_seen_at)),
-        now,
-        target.id
-    ])?;
+    c.prepare_cached("UPDATE issues SET occurrences = ?, affected_users = ?, first_seen_at = ?, last_seen_at = ?, updated_at = ? WHERE id = ?")?.execute(
+        params![
+            target.occurrences + source.occurrences,
+            target.affected_users.max(source.affected_users),
+            time::quoted_date_micros(target.first_seen_at.min(source.first_seen_at)),
+            time::quoted_date_micros(target.last_seen_at.max(source.last_seen_at)),
+            now,
+            target.id
+        ],
+    )?;
     c.prepare_cached("UPDATE issues SET status = 'merged', merged_into_id = ?, updated_at = ? WHERE id = ?")?.execute(params![target.id, now, source.id])?;
     let uid = actor.map(|a| a.user_id);
     add_activity_by(c, source.id, "merge", uid, crate::rhash! { "target_id" => target.id, "target_key" => key(c, &target) })?;
@@ -432,8 +434,11 @@ pub fn unmerge(c: &Connection, issue_id: i64, actor: Option<Actor<'_>>) -> Resul
         return invalid(format!("cannot unmerge this issue yet; unmerge {} first (top-down order)", key(c, &target)));
     }
     let now = now_db();
-    c.prepare_cached("UPDATE issues SET occurrences = ?, updated_at = ? WHERE id = ?")?
-        .execute(params![(target.occurrences - source.occurrences).max(0), now, target.id])?;
+    c.prepare_cached("UPDATE issues SET occurrences = ?, updated_at = ? WHERE id = ?")?.execute(params![
+        (target.occurrences - source.occurrences).max(0),
+        now,
+        target.id
+    ])?;
     c.prepare_cached("UPDATE issues SET status = 'open', merged_into_id = NULL, updated_at = ? WHERE id = ?")?.execute(params![now, source.id])?;
     add_activity_by(c, source.id, "unmerge", actor.map(|a| a.user_id), crate::rhash! { "target_id" => target.id, "target_key" => key(c, &target) })?;
     Ok(())

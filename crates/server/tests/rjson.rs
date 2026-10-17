@@ -19,15 +19,9 @@ fn floats_generate_exactly_like_ruby_json_and_to_s() {
 #[test]
 fn generate_matches_ruby_for_strings_and_structure() {
     let v = rjson::parse(br#"{"a":"</x>&\u2028\u2029/\t\u0001\u007f\u00e9","n":null,"l":[1,2.5,true]}"#).unwrap();
-    assert_eq!(
-        rjson::generate(&v).unwrap(),
-        "{\"a\":\"</x>&\u{2028}\u{2029}/\\t\\u0001\u{7f}é\",\"n\":null,\"l\":[1,2.5,true]}"
-    );
+    assert_eq!(rjson::generate(&v).unwrap(), "{\"a\":\"</x>&\u{2028}\u{2029}/\\t\\u0001\u{7f}é\",\"n\":null,\"l\":[1,2.5,true]}");
     // Rails' render json: escapes html entities and the JS separators.
-    assert_eq!(
-        rjson::generate_escaped(&v).unwrap(),
-        "{\"a\":\"\\u003c/x\\u003e\\u0026\\u2028\\u2029/\\t\\u0001\u{7f}é\",\"n\":null,\"l\":[1,2.5,true]}"
-    );
+    assert_eq!(rjson::generate_escaped(&v).unwrap(), "{\"a\":\"\\u003c/x\\u003e\\u0026\\u2028\\u2029/\\t\\u0001\u{7f}é\",\"n\":null,\"l\":[1,2.5,true]}");
     assert_eq!(rjson::generate(&Value::Str(vec![0xff])).unwrap_err().0, "source sequence is illegal/malformed utf-8");
     assert_eq!(rjson::generate(&Value::Float(f64::INFINITY)).unwrap_err().0, "Infinity not allowed in JSON");
 }
@@ -79,14 +73,32 @@ fn parse_errors_carry_ruby_messages() {
 
 #[test]
 fn ruby_conversions() {
-    assert_eq!(ruby::inspect(&rjson::parse(br#"{"a":1.0e-05,"b":[18446744073709551616,-0.0,null]}"#).unwrap()),
-               br#"{"a" => 1.0e-05, "b" => [18446744073709551616, -0.0, nil]}"#.to_vec());
-    assert_eq!(ruby::inspect(&Value::Str(b"a\"b\\\n\x1b\x00\x7f\xc3\xa9\xe2\x80\x8b#{x}".to_vec())),
-               b"\"a\\\"b\\\\\\n\\e\\u0000\\u007F\xc3\xa9\xe2\x80\x8b\\#{x}\"".to_vec());
+    assert_eq!(
+        ruby::inspect(&rjson::parse(br#"{"a":1.0e-05,"b":[18446744073709551616,-0.0,null]}"#).unwrap()),
+        br#"{"a" => 1.0e-05, "b" => [18446744073709551616, -0.0, nil]}"#.to_vec()
+    );
+    assert_eq!(
+        ruby::inspect(&Value::Str(b"a\"b\\\n\x1b\x00\x7f\xc3\xa9\xe2\x80\x8b#{x}".to_vec())),
+        b"\"a\\\"b\\\\\\n\\e\\u0000\\u007F\xc3\xa9\xe2\x80\x8b\\#{x}\"".to_vec()
+    );
     assert_eq!(ruby::inspect(&Value::Str(b"a\xffb".to_vec())), b"\"a\\xFFb\"".to_vec());
-    for (s, ok) in [("1.5", Some(1.5)), (" 2.5 ", Some(2.5)), ("1_000.5", Some(1000.5)), ("0x10", Some(16.0)),
-                    (".5", Some(0.5)), ("1.", Some(1.0)), ("1e5", Some(1e5)), ("+3", Some(3.0)), ("", None),
-                    ("abc", None), ("1__0", None), ("_1", None), ("1e", None), ("Infinity", None), ("1 2", None)] {
+    for (s, ok) in [
+        ("1.5", Some(1.5)),
+        (" 2.5 ", Some(2.5)),
+        ("1_000.5", Some(1000.5)),
+        ("0x10", Some(16.0)),
+        (".5", Some(0.5)),
+        ("1.", Some(1.0)),
+        ("1e5", Some(1e5)),
+        ("+3", Some(3.0)),
+        ("", None),
+        ("abc", None),
+        ("1__0", None),
+        ("_1", None),
+        ("1e", None),
+        ("Infinity", None),
+        ("1 2", None),
+    ] {
         assert_eq!(ruby::float(&Value::Str(s.as_bytes().to_vec())).ok(), ok, "Float({s:?})");
     }
     assert_eq!(ruby::float(&Value::Str(b"abc".to_vec())).unwrap_err().1, "invalid value for Float(): \"abc\"");

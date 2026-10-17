@@ -238,7 +238,8 @@ impl Config {
         let d = crate::storage::retention::Tiers::default();
         let tiers = crate::storage::retention::Tiers {
             detail_days: num(get("detail_retention_days", &["RAILWATCH_DETAIL_RETENTION_DAYS"]), "detail_retention_days", d.detail_days as u64)? as i64,
-            core_days_max: num(get("core_retention_days_max", &["RAILWATCH_CORE_RETENTION_DAYS_MAX"]), "core_retention_days_max", d.core_days_max as u64)? as i64,
+            core_days_max: num(get("core_retention_days_max", &["RAILWATCH_CORE_RETENTION_DAYS_MAX"]), "core_retention_days_max", d.core_days_max as u64)?
+                as i64,
             exemplars_per_hour: num(get("exemplars_per_hour", &["RAILWATCH_EXEMPLARS_PER_HOUR"]), "exemplars_per_hour", d.exemplars_per_hour as u64)? as usize,
         };
         if tiers.detail_days < 1 || tiers.core_days_max < 1 {
@@ -303,8 +304,10 @@ impl Config {
         };
         let dl = crate::grouping::Limits::default();
         let new_issues = crate::grouping::Limits {
-            new_issues_per_hour: num(get("new_issues_per_hour", &["RAILWATCH_NEW_ISSUES_PER_HOUR"]), "new_issues_per_hour", dl.new_issues_per_hour as u64)? as usize,
-            new_issues_per_batch: num(get("new_issues_per_batch", &["RAILWATCH_NEW_ISSUES_PER_BATCH"]), "new_issues_per_batch", dl.new_issues_per_batch as u64)? as usize,
+            new_issues_per_hour: num(get("new_issues_per_hour", &["RAILWATCH_NEW_ISSUES_PER_HOUR"]), "new_issues_per_hour", dl.new_issues_per_hour as u64)?
+                as usize,
+            new_issues_per_batch: num(get("new_issues_per_batch", &["RAILWATCH_NEW_ISSUES_PER_BATCH"]), "new_issues_per_batch", dl.new_issues_per_batch as u64)?
+                as usize,
             new_issues_per_account_per_hour: num(
                 get("new_issues_per_account_per_hour", &["RAILWATCH_NEW_ISSUES_PER_ACCOUNT_PER_HOUR"]),
                 "new_issues_per_account_per_hour",
@@ -320,7 +323,11 @@ impl Config {
             Ok(std::time::Duration::from_secs(n))
         };
         let http = crate::serve::Limits {
-            header_timeout: secs(get("http_header_timeout_seconds", &["RAILWATCH_HTTP_HEADER_TIMEOUT_SECONDS"]), "http_header_timeout_seconds", dh.header_timeout)?,
+            header_timeout: secs(
+                get("http_header_timeout_seconds", &["RAILWATCH_HTTP_HEADER_TIMEOUT_SECONDS"]),
+                "http_header_timeout_seconds",
+                dh.header_timeout,
+            )?,
             body_timeout: secs(get("http_body_timeout_seconds", &["RAILWATCH_HTTP_BODY_TIMEOUT_SECONDS"]), "http_body_timeout_seconds", dh.body_timeout)?,
             idle_timeout: secs(get("http_idle_timeout_seconds", &["RAILWATCH_HTTP_IDLE_TIMEOUT_SECONDS"]), "http_idle_timeout_seconds", dh.idle_timeout)?,
             max_connections: num(get("max_connections", &["RAILWATCH_MAX_CONNECTIONS"]), "max_connections", dh.max_connections as u64)?.max(1) as usize,
@@ -459,11 +466,7 @@ impl Config {
             ),
             ("new_issues_per_hour".into(), self.new_issues.new_issues_per_hour.to_string(), src("new_issues_per_hour")),
             ("new_issues_per_batch".into(), self.new_issues.new_issues_per_batch.to_string(), src("new_issues_per_batch")),
-            (
-                "new_issues_per_account_per_hour".into(),
-                self.new_issues.new_issues_per_account_per_hour.to_string(),
-                src("new_issues_per_account_per_hour"),
-            ),
+            ("new_issues_per_account_per_hour".into(), self.new_issues.new_issues_per_account_per_hour.to_string(), src("new_issues_per_account_per_hour")),
             ("detail_retention_days".into(), self.tiers.detail_days.to_string(), src("detail_retention_days")),
             ("core_retention_days_max".into(), self.tiers.core_days_max.to_string(), src("core_retention_days_max")),
             ("exemplars_per_hour".into(), self.tiers.exemplars_per_hour.to_string(), src("exemplars_per_hour")),
@@ -488,11 +491,7 @@ impl Config {
             ),
             ("tls_redirect_bind".into(), self.tls_redirect_bind.clone().unwrap_or_else(|| "(off)".into()), src("tls_redirect_bind")),
             ("alert_delivery".into(), if self.alert_delivery { "on" } else { "off (alerts recorded as skipped, never sent)" }.into(), src("alert_delivery")),
-            (
-                "secret_key_base".into(),
-                if self.secret_key_base.is_some() { "(set)".into() } else { "(generated file)".into() },
-                src("secret_key_base"),
-            ),
+            ("secret_key_base".into(), if self.secret_key_base.is_some() { "(set)".into() } else { "(generated file)".into() }, src("secret_key_base")),
         ];
         match &self.google {
             None => rows.push(("google".into(), "(not configured: no \"Continue with Google\" button)".into(), "default".into())),
@@ -521,12 +520,8 @@ impl Config {
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    let mut f =
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     f.write_all(bytes).map_err(|e| e.to_string())
 }
 

@@ -30,22 +30,14 @@ pub const SELF_HOSTED_QUOTA: i64 = 1_000_000_000_000;
 
 type Step = fn(&Transaction) -> rusqlite::Result<()>;
 
-pub const MIGRATIONS: &[(&str, Step)] = &[
-    ("20261013000001_phase1", phase1),
-    ("20261013000002_rails_primary", rails_primary),
-    ("20261013000003_issues_alerts", issues_alerts),
-];
+pub const MIGRATIONS: &[(&str, Step)] =
+    &[("20261013000001_phase1", phase1), ("20261013000002_rails_primary", rails_primary), ("20261013000003_issues_alerts", issues_alerts)];
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<&'static str>> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS railwatch_migrations (version TEXT PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL)",
-    )?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS railwatch_migrations (version TEXT PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL)")?;
     let mut applied = Vec::new();
     for (version, step) in MIGRATIONS {
-        let done: bool = conn
-            .query_row("SELECT 1 FROM railwatch_migrations WHERE version = ?", [version], |_| Ok(true))
-            .optional()?
-            .unwrap_or(false);
+        let done: bool = conn.query_row("SELECT 1 FROM railwatch_migrations WHERE version = ?", [version], |_| Ok(true)).optional()?.unwrap_or(false);
         if done {
             continue;
         }

@@ -39,8 +39,7 @@ pub struct ExceptionRow {
 }
 
 /// The columns `exception_row` reads, in its order.
-pub const EXCEPTION_COLUMNS: &str =
-    "id, group_hash, class_name, message, file, line, occurred_at, deploy, user_ref, source, handled, execution_id, execution_preview, fingerprint, fingerprint_source";
+pub const EXCEPTION_COLUMNS: &str = "id, group_hash, class_name, message, file, line, occurred_at, deploy, user_ref, source, handled, execution_id, execution_preview, fingerprint, fingerprint_source";
 
 /// One exceptions row selected with EXCEPTION_COLUMNS.
 pub fn exception_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ExceptionRow> {
@@ -107,14 +106,7 @@ pub fn claim(c: &Connection, environment_id: i64, r: &Receipt, effect_key: &str)
             "INSERT INTO ingest_followup_receipts (environment_id, producer_id, delivery_id, delivery_created_at, effect_key, created_at)
              VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (environment_id, producer_id, delivery_id, effect_key) DO NOTHING",
         )?
-        .execute(params![
-            environment_id,
-            r.producer_id,
-            r.delivery_id,
-            time::quoted_date_micros(r.delivery_created_at),
-            effect_key,
-            issue::now_db()
-        ])?;
+        .execute(params![environment_id, r.producer_id, r.delivery_id, time::quoted_date_micros(r.delivery_created_at), effect_key, issue::now_db()])?;
     Ok(n == 1)
 }
 
@@ -218,7 +210,11 @@ impl AffectedUsers {
                 ValueRef::Text(t) => users.insert(t.to_vec()),
                 _ => {
                     self.groups.remove(group_hash);
-                    return tenant.query_row("SELECT COUNT(DISTINCT user_ref) FROM exceptions WHERE group_hash = ? AND user_ref IS NOT NULL", [group_hash], |r| r.get(0));
+                    return tenant.query_row(
+                        "SELECT COUNT(DISTINCT user_ref) FROM exceptions WHERE group_hash = ? AND user_ref IS NOT NULL",
+                        [group_hash],
+                        |r| r.get(0),
+                    );
                 }
             };
         }
@@ -291,9 +287,10 @@ pub fn group_with_limits(
         control.execute_batch("BEGIN IMMEDIATE").map_err(e)?;
         let result = (|| -> Result<Option<(Outcome, bool)>, String> {
             if let Some(r) = receipt
-                && !claim(control, environment_id, r, &format!("group:{group_hash}")).map_err(e)? {
-                    return Ok(None);
-                }
+                && !claim(control, environment_id, r, &format!("group:{group_hash}")).map_err(e)?
+            {
+                return Ok(None);
+            }
             let capped = (created_this_batch >= limits.new_issues_per_batch
                 || created_this_hour >= limits.new_issues_per_hour
                 || account_created_this_hour >= limits.new_issues_per_account_per_hour)
@@ -344,7 +341,14 @@ pub fn group_with_limits(
     Ok(out)
 }
 
-fn record(control: &Connection, tenant: &Connection, environment_id: i64, group_hash: &str, group: &[ExceptionRow], users: &mut AffectedUsers) -> Result<Outcome, String> {
+fn record(
+    control: &Connection,
+    tenant: &Connection,
+    environment_id: i64,
+    group_hash: &str,
+    group: &[ExceptionRow],
+    users: &mut AffectedUsers,
+) -> Result<Outcome, String> {
     let e = |e: rusqlite::Error| e.to_string();
     // max_by(&:occurred_at): the first of equal maxima.
     let latest = group.iter().fold(&group[0], |a, b| if b.occurred_at > a.occurred_at { b } else { a });

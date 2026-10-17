@@ -31,7 +31,13 @@ fn main() {
     let control = Control::open(std::path::Path::new(control_path)).unwrap();
     let env = control.create("grouping-diff", &"0".repeat(64), 30).unwrap();
     if let Some(at) = deploy_at {
-        control.conn().execute("INSERT INTO deploys (environment_id, deploy, deployed_at, created_at, updated_at) VALUES (?, 'd', ?, ?, ?)", rusqlite::params![env.id, at, at, at]).unwrap();
+        control
+            .conn()
+            .execute(
+                "INSERT INTO deploys (environment_id, deploy, deployed_at, created_at, updated_at) VALUES (?, 'd', ?, ?, ?)",
+                rusqlite::params![env.id, at, at, at],
+            )
+            .unwrap();
     }
     let t = railwatch_server::jobs::worker::open_read(std::path::Path::new(tenant)).unwrap();
     let ids: Vec<i64> = t.prepare("SELECT id FROM exceptions ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
@@ -42,7 +48,8 @@ fn main() {
         grouping::group_with(&control.conn(), &t, env.id, rows, None, &mut users).unwrap();
     }
     if repeat {
-        let ids_: Vec<i64> = control.conn().prepare("SELECT id FROM issues ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        let ids_: Vec<i64> =
+            control.conn().prepare("SELECT id FROM issues ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
         for (n, id) in ids_.iter().enumerate() {
             let c = control.conn();
             let issue = grouping::issue::find(&c, *id).unwrap().unwrap();

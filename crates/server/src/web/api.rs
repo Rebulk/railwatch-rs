@@ -56,8 +56,7 @@ pub fn routes() -> Router<Arc<WebState>> {
 async fn handle(State(state): State<Arc<WebState>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let Ok(bytes) = axum::body::to_bytes(body, 4 << 20).await else {
-        return (StatusCode::PAYLOAD_TOO_LARGE, [(header::CONTENT_TYPE, "application/json; charset=utf-8")], r#"{"error":"body too large"}"#)
-            .into_response();
+        return (StatusCode::PAYLOAD_TOO_LARGE, [(header::CONTENT_TYPE, "application/json; charset=utf-8")], r#"{"error":"body too large"}"#).into_response();
     };
     let s = state.clone();
     let req = ApiRequest {
@@ -165,7 +164,21 @@ impl Action {
         use Action::*;
         matches!(
             self,
-            Summary | Requests | RequestGroup | Execution | Jobs | Queries | Exceptions | Logs | Deploys | CreateDeploy | Releases | Users | Tenants | Spans | Series
+            Summary
+                | Requests
+                | RequestGroup
+                | Execution
+                | Jobs
+                | Queries
+                | Exceptions
+                | Logs
+                | Deploys
+                | CreateDeploy
+                | Releases
+                | Users
+                | Tenants
+                | Spans
+                | Series
         )
     }
 }
@@ -424,8 +437,7 @@ fn route_format(path: &str) -> &str {
 
 fn run(env: &Env, limit: &FixedWindow<(&'static str, i64)>, now: i64, action: Action, authorization: Option<&str>, params: Result<Params, ()>) -> R<Rendered> {
     // ApiTokenAuthenticated#authenticate_user!
-    let token = Token::from_authorization(env.control, authorization, now)?
-        .ok_or(Halt::Json(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"})))?;
+    let token = Token::from_authorization(env.control, authorization, now)?.ok_or(Halt::Json(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"})))?;
     if !(token.allows("api") && token.allows("read")) {
         return Err(Halt::Json(StatusCode::FORBIDDEN, json!({"error": "insufficient_scope"})));
     }
@@ -623,11 +635,9 @@ impl Api<'_> {
         let ids = cast_id(id);
         let Some(&id) = ids.first().filter(|_| !id.is_array()) else { return Err(not_found()) };
         let found = self.control(|c| {
-            c.query_row(
-                "SELECT id, slug, last_seen_at FROM environments WHERE application_id = ? AND id = ? LIMIT 1",
-                params![application_id, id],
-                |r| Ok(Scoped { id: r.get(0)?, slug: r.get(1)?, application_id, last_seen_at: r.get(2)? }),
-            )
+            c.query_row("SELECT id, slug, last_seen_at FROM environments WHERE application_id = ? AND id = ? LIMIT 1", params![application_id, id], |r| {
+                Ok(Scoped { id: r.get(0)?, slug: r.get(1)?, application_id, last_seen_at: r.get(2)? })
+            })
             .optional()
         })?;
         found.ok_or_else(not_found)
@@ -707,9 +717,11 @@ impl Api<'_> {
         let (acc, mut binds) = self.token.accounts_sql(self.env.control);
         binds.insert(0, self.token.user_id.into());
         let memberships: Vec<Value> = self.control(|c| {
-            c.prepare(&format!("SELECT memberships.account_id, memberships.role FROM memberships WHERE memberships.user_id = ? AND memberships.account_id IN ({acc})"))?
-                .query_map(params_from_iter(binds), |r| Ok(crate::obj! { "account_id" => r.get::<_, i64>(0)?, "role" => r.get::<_, String>(1)? }))?
-                .collect()
+            c.prepare(&format!(
+                "SELECT memberships.account_id, memberships.role FROM memberships WHERE memberships.user_id = ? AND memberships.account_id IN ({acc})"
+            ))?
+            .query_map(params_from_iter(binds), |r| Ok(crate::obj! { "account_id" => r.get::<_, i64>(0)?, "role" => r.get::<_, String>(1)? }))?
+            .collect()
         })?;
         let t = &self.token;
         ok(crate::obj! {
@@ -817,7 +829,9 @@ impl Api<'_> {
             let offset = (page - 1).saturating_mul(per_page);
             let rows = db::query(
                 conn,
-                &format!("SELECT \"executions\".* FROM \"executions\" WHERE {cond} ORDER BY \"executions\".\"occurred_at\" DESC LIMIT {per_page} OFFSET {offset}"),
+                &format!(
+                    "SELECT \"executions\".* FROM \"executions\" WHERE {cond} ORDER BY \"executions\".\"occurred_at\" DESC LIMIT {per_page} OFFSET {offset}"
+                ),
                 b,
             )?;
             let summary = aggregations::summary_with_delta(conn, "request", (from, to), w.previous().range(), Some(&group_hash))?;
@@ -866,7 +880,18 @@ impl Api<'_> {
         order: Order,
     ) -> R<cursor_page::Page> {
         let (cursor, limit) = (self.params.opt("cursor"), self.cursor_limit()?);
-        match cursor_page::call(conn, self.env.cursor_key, table, model, select, cond, cursor.as_deref(), limit.as_deref(), order, &self.cursor_context(e, resource)) {
+        match cursor_page::call(
+            conn,
+            self.env.cursor_key,
+            table,
+            model,
+            select,
+            cond,
+            cursor.as_deref(),
+            limit.as_deref(),
+            order,
+            &self.cursor_context(e, resource),
+        ) {
             Ok(p) => Ok(p?),
             Err(err) => Err(Halt::Json(StatusCode::UNPROCESSABLE_ENTITY, json!({"error": err.to_string()}))),
         }
@@ -1117,9 +1142,12 @@ impl Api<'_> {
                 .iter()
                 .map(|r| {
                     let c = r.i("COUNT(*)").unwrap_or(0);
-                    (c, crate::obj! {
-                        "ref" => db::raw_json(r.at(0)), "requests" => c, "errors" => db::raw_json(r.at(2)), "last_seen_at" => db::raw_json(r.at(3)),
-                    })
+                    (
+                        c,
+                        crate::obj! {
+                            "ref" => db::raw_json(r.at(0)), "requests" => c, "errors" => db::raw_json(r.at(2)), "last_seen_at" => db::raw_json(r.at(3)),
+                        },
+                    )
                 })
                 .collect();
             Ok(rb::sort_by_num(active, |a| rb::Num::I(-a.0)).into_iter().map(|a| a.1).collect::<Vec<_>>())
@@ -1632,22 +1660,7 @@ mod tests {
         let (followups, _rx) = crate::followups::channel();
         let tenants = Tenants::new(dir.join("telemetry"), std::time::Duration::from_secs(60), followups);
         let readers = ReadPools::new(dir.join("telemetry"), 1);
-        Fixture {
-            dir,
-            c,
-            tenants,
-            readers,
-            key: CursorKey(b"k".to_vec()),
-            limit: rate_limit(),
-            ada,
-            app,
-            env,
-            other_app,
-            other_env,
-            issue,
-            theirs,
-            tokens,
-        }
+        Fixture { dir, c, tenants, readers, key: CursorKey(b"k".to_vec()), limit: rate_limit(), ada, app, env, other_app, other_env, issue, theirs, tokens }
     }
 
     fn req(f: &Fixture, method: Method, path: &str, token: Option<&str>, body: Option<Value>) -> ApiResponse {
@@ -1787,7 +1800,9 @@ mod tests {
         assert_eq!(one.status, StatusCode::CREATED);
         let one: Value = serde_json::from_slice(&one.body).unwrap();
         assert_eq!(one["deployed_at"], rb::t_json(NOW));
-        let two: Value = serde_json::from_slice(&req_at(&f, NOW + 3_600_000_000, Method::POST, &path, Some("full"), Some(json!({"deploy": "v1", "ref": "def"}))).body).unwrap();
+        let two: Value =
+            serde_json::from_slice(&req_at(&f, NOW + 3_600_000_000, Method::POST, &path, Some("full"), Some(json!({"deploy": "v1", "ref": "def"}))).body)
+                .unwrap();
         assert_eq!((two["id"].clone(), two["ref"].clone(), two["url"].clone()), (one["id"].clone(), json!("def"), Value::Null), "same row, fields reassigned");
         assert_eq!(two["deployed_at"], rb::t_json(NOW), "a re-post keeps deployed_at");
         let (_, list) = get(&f, &path, "full");
@@ -1826,7 +1841,11 @@ mod tests {
         headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", f.tokens["full"])).unwrap());
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
         let env = Env { control: &f.c, tenants: &f.tenants, readers: &f.readers, cursor_key: &f.key };
-        let bad = |path: &str, h: HeaderMap| call(&env, &f.limit, NOW, &ApiRequest { method: Method::GET, path: path.into(), query: None, headers: h, body: Bytes::from("{bad") }).status.as_u16();
+        let bad = |path: &str, h: HeaderMap| {
+            call(&env, &f.limit, NOW, &ApiRequest { method: Method::GET, path: path.into(), query: None, headers: h, body: Bytes::from("{bad") })
+                .status
+                .as_u16()
+        };
         assert_eq!(bad("/api/v1/accounts", headers.clone()), 400);
         assert_eq!(bad("/api/v1/me", headers.clone()), 200, "MeController never reads params");
         let mut anon = headers.clone();
@@ -1840,14 +1859,19 @@ mod tests {
         let f = fixture("series");
         let base = format!("/api/v1/applications/{}/environments/{}/series", f.app, f.env);
         assert_eq!(get(&f, &base, "full"), (422, json!({"error": "type must be one of request, job_attempt, query"})));
-        assert_eq!(get(&f, &format!("{base}?type=request&step=1d"), "full"), (422, json!({"error": "step must be one of 5m, 15m, 1h, 6h for this window"})), "24h: 1m is 1,440 points, 1d one");
+        assert_eq!(
+            get(&f, &format!("{base}?type=request&step=1d"), "full"),
+            (422, json!({"error": "step must be one of 5m, 15m, 1h, 6h for this window"})),
+            "24h: 1m is 1,440 points, 1d one"
+        );
         let (s, v) = get(&f, &format!("{base}?type=request&window=1h&step=5m"), "full");
         assert_eq!((s, v["data"].as_array().unwrap().len()), (200, 13), "an empty tenant still fills every bucket");
         let small = FixedWindow::new(2);
         let env = Env { control: &f.c, tenants: &f.tenants, readers: &f.readers, cursor_key: &f.key };
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", f.tokens["full"])).unwrap());
-        let hit = |p: &str| call(&env, &small, NOW, &ApiRequest { method: Method::GET, path: p.into(), query: None, headers: headers.clone(), body: Bytes::new() });
+        let hit =
+            |p: &str| call(&env, &small, NOW, &ApiRequest { method: Method::GET, path: p.into(), query: None, headers: headers.clone(), body: Bytes::new() });
         assert_eq!(hit("/api/v1/me").status, 200);
         assert_eq!(hit("/api/v1/me").status, 200);
         let third = hit("/api/v1/me");
@@ -1869,7 +1893,8 @@ mod tests {
         assert_eq!(titles("_"), ["digest_daily missed"], "_ is a literal underscore");
         assert_eq!(titles("digest_daily"), ["digest_daily missed"], "not digestXdaily");
         f.c.with(|x| x.execute("UPDATE issues SET title = 'NoMethodError: 100% broken' WHERE id = ?", [f.issue])).unwrap();
-        f.c.with(|x| x.execute("UPDATE issues SET title = 'NoMethodError: 1000 broken' WHERE id != ? AND application_id = ?", params![f.issue, f.app])).unwrap();
+        f.c.with(|x| x.execute("UPDATE issues SET title = 'NoMethodError: 1000 broken' WHERE id != ? AND application_id = ?", params![f.issue, f.app]))
+            .unwrap();
         assert_eq!(titles("100%25"), ["NoMethodError: 100% broken"], "% is a literal percent");
     }
 
@@ -1930,9 +1955,10 @@ mod tests {
         .unwrap();
         let path = format!("/api/v1/issues/{}", f.issue);
         assert_eq!(req(&f, Method::PATCH, &path, Some("full"), Some(json!({"status": "resolved", "assignee_id": f.ada}))).status, 200);
-        let actors: Vec<(String, Option<String>)> = f
-            .c
-            .with(|x| x.prepare("SELECT event, json_extract(payload, '$.actor') FROM alerts ORDER BY id")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+        let actors: Vec<(String, Option<String>)> =
+            f.c.with(|x| {
+                x.prepare("SELECT event, json_extract(payload, '$.actor') FROM alerts ORDER BY id")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+            })
             .unwrap();
         assert_eq!(actors, [("resolved_issue".into(), Some("Ada".into())), ("assigned_issue".into(), Some("Ada".into()))]);
     }
@@ -1940,9 +1966,10 @@ mod tests {
     #[test]
     fn reopening_a_merged_issue_with_a_broken_chain_is_a_422() {
         let f = fixture("unmerge");
-        let others: Vec<i64> = f
-            .c
-            .with(|x| x.prepare("SELECT id FROM issues WHERE application_id = ? AND id != ? ORDER BY id")?.query_map(params![f.app, f.issue], |r| r.get(0))?.collect())
+        let others: Vec<i64> =
+            f.c.with(|x| {
+                x.prepare("SELECT id FROM issues WHERE application_id = ? AND id != ? ORDER BY id")?.query_map(params![f.app, f.issue], |r| r.get(0))?.collect()
+            })
             .unwrap();
         let target = others[0];
         // Merged into an issue that is itself merged: unmerge top-down first.
@@ -1961,7 +1988,10 @@ mod tests {
             .unwrap();
         let r = req(&f, Method::PATCH, &format!("/api/v1/issues/{}", f.issue), Some("full"), Some(json!({"status": "open"})));
         assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(serde_json::from_slice::<Value>(&r.body).unwrap(), json!({"errors": {"status": ["cannot unmerge this issue yet; unmerge SHOP-2 first (top-down order)"]}}));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&r.body).unwrap(),
+            json!({"errors": {"status": ["cannot unmerge this issue yet; unmerge SHOP-2 first (top-down order)"]}})
+        );
         // The chain changed under the client (the target was itself unmerged
         // and our row's status no longer says merged): "issue merge changed".
         f.c.with(|x| x.execute("UPDATE issues SET status = 'merged', merged_into_id = NULL WHERE id = ?", [target])).unwrap();

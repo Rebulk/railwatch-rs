@@ -46,7 +46,13 @@ fn tally_sorted(items: impl Iterator<Item = String>, first: Option<usize>) -> Ve
         }
         *c += 1;
     }
-    let pairs: Vec<(String, i64)> = order.into_iter().map(|k| { let c = counts[&k]; (k, c) }).collect();
+    let pairs: Vec<(String, i64)> = order
+        .into_iter()
+        .map(|k| {
+            let c = counts[&k];
+            (k, c)
+        })
+        .collect();
     let sorted = rb::sort_by_num(pairs, |(_, c)| Num::I(-c));
     sorted.into_iter().take(first.unwrap_or(usize::MAX)).map(|(k, c)| Value::Array(vec![Value::String(k), Value::from(c)])).collect()
 }
@@ -90,8 +96,14 @@ pub fn n_plus_ones(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<Va
         rows.iter()
             .take(50)
             .map(|r| {
-                let sql = match r.at(2) { Sql::Text(t) => Some(t.as_str()), _ => None };
-                let src = match r.at(3) { Sql::Text(t) => Some(t.as_str()), _ => None };
+                let sql = match r.at(2) {
+                    Sql::Text(t) => Some(t.as_str()),
+                    _ => None,
+                };
+                let src = match r.at(3) {
+                    Sql::Text(t) => Some(t.as_str()),
+                    _ => None,
+                };
                 crate::obj! {
                     "group_hash" => db::raw_json(r.at(0)), "occurrences" => db::raw_json(r.at(1)), "sql" => js(sql), "source" => js(src),
                     "max_count" => db::raw_json(r.at(4)), "suggestion" => n_plus_one::suggestion(sql.unwrap_or(""), src),
@@ -332,13 +344,16 @@ pub mod n_plus_one {
         let st = r.i;
         let ok = (r.kw("1") && r.ws1() && r.kw("AS") && r.ws1() && r.kw("one")) || {
             r.i = st;
-            r.kw("EXISTS") && {
-                r.ws0();
-                r.kw("(")
-            } && {
-                r.ws0();
-                r.kw("SELECT")
-            } && r.ws1()
+            r.kw("EXISTS")
+                && {
+                    r.ws0();
+                    r.kw("(")
+                }
+                && {
+                    r.ws0();
+                    r.kw("SELECT")
+                }
+                && r.ws1()
                 && r.kw("1")
         };
         if !ok {
@@ -375,10 +390,12 @@ pub mod n_plus_one {
     }
 
     fn camelize(s: &str) -> String {
-        s.split('_').map(|w| {
-            let mut c = w.chars();
-            c.next().map_or(String::new(), |f| f.to_uppercase().collect::<String>() + c.as_str())
-        }).collect()
+        s.split('_')
+            .map(|w| {
+                let mut c = w.chars();
+                c.next().map_or(String::new(), |f| f.to_uppercase().collect::<String>() + c.as_str())
+            })
+            .collect()
     }
 
     pub fn singularize(s: &str) -> String {
@@ -698,8 +715,14 @@ pub fn spans_show(conn: &Connection, ctx: &PageContext, _control: &dyn ControlDa
             }
         }
     }
-    let facets: Vec<(String, usize, Vec<Value>)> =
-        keys.into_iter().map(|k| { let vs = pairs.remove(&k).unwrap(); let n = vs.len(); (k, n, tally_sorted(vs.into_iter(), Some(5))) }).collect();
+    let facets: Vec<(String, usize, Vec<Value>)> = keys
+        .into_iter()
+        .map(|k| {
+            let vs = pairs.remove(&k).unwrap();
+            let n = vs.len();
+            (k, n, tally_sorted(vs.into_iter(), Some(5)))
+        })
+        .collect();
     let facets = rb::sort_by_num(facets, |(_, n, _)| Num::I(-(*n as i64)));
     let facets: Vec<Value> = facets.into_iter().take(10).map(|(k, n, v)| crate::obj! { "key" => k, "count" => n, "values" => v }).collect();
     Ok(crate::obj! {
@@ -743,7 +766,13 @@ pub fn profiles_index(conn: &Connection, ctx: &PageContext, _control: &dyn Contr
         }
         groups.entry(g).or_default().push(r);
     }
-    let gs: Vec<(Option<String>, Vec<&db::Rec>)> = order.into_iter().map(|g| { let v = groups.remove(&g).unwrap(); (g, v) }).collect();
+    let gs: Vec<(Option<String>, Vec<&db::Rec>)> = order
+        .into_iter()
+        .map(|g| {
+            let v = groups.remove(&g).unwrap();
+            (g, v)
+        })
+        .collect();
     let gs = rb::sort_by_num(gs, |(_, v)| Num::I(-(v.len() as i64)));
     let groups: Vec<Value> = gs
         .iter()
@@ -769,9 +798,17 @@ fn executions_in(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<i64>
     let first = if fh == from { from } else { fh + 3_600_000_000 };
     let last = rb::beginning_of_hour(to);
     if first >= last {
-        return db::count(conn, "SELECT COUNT(*) FROM \"executions\" WHERE \"executions\".\"occurred_at\" BETWEEN ?1 AND ?2", rusqlite::params![qt(from), qt(to)]);
+        return db::count(
+            conn,
+            "SELECT COUNT(*) FROM \"executions\" WHERE \"executions\".\"occurred_at\" BETWEEN ?1 AND ?2",
+            rusqlite::params![qt(from), qt(to)],
+        );
     }
-    let a = db::count(conn, "SELECT COUNT(*) FROM \"executions\" WHERE \"executions\".\"occurred_at\" >= ?1 AND \"executions\".\"occurred_at\" < ?2", rusqlite::params![qt(from), qt(first)])?;
+    let a = db::count(
+        conn,
+        "SELECT COUNT(*) FROM \"executions\" WHERE \"executions\".\"occurred_at\" >= ?1 AND \"executions\".\"occurred_at\" < ?2",
+        rusqlite::params![qt(from), qt(first)],
+    )?;
     let b = db::count(
         conn,
         "SELECT SUM(\"rollups\".\"count\") FROM \"rollups\" WHERE \"rollups\".\"record_type\" IN ('request', 'job_attempt', 'scheduled_task', 'command', 'channel_action') \
@@ -785,8 +822,8 @@ fn executions_in(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<i64>
 pub fn profiles_show(conn: &Connection, ctx: &PageContext, _control: &dyn ControlData) -> R {
     let id: i64 = ctx.param_s("id").parse().map_err(|_| PageError::NotFound)?;
     let p = db::query_one(conn, "SELECT \"profiles\".* FROM \"profiles\" WHERE \"profiles\".\"id\" = ?1 LIMIT 1", [id])?.ok_or(PageError::NotFound)?;
-    let (collapsed, truncated) = collapsed_capped(p.blob("stacks").unwrap_or(&[]), crate::dashboard::execution_presenter::MAX_COLLAPSED_BYTES)
-        .map_err(PageError::Unprocessable)?;
+    let (collapsed, truncated) =
+        collapsed_capped(p.blob("stacks").unwrap_or(&[]), crate::dashboard::execution_presenter::MAX_COLLAPSED_BYTES).map_err(PageError::Unprocessable)?;
     Ok(crate::obj! {
         "profile" => crate::obj! {
             "id" => ji(p.i("id")), "profiler" => js(p.s("profiler")), "mode" => js(p.s("mode")), "interval" => ji(p.i("interval")),
@@ -1111,9 +1148,7 @@ pub fn llm_calls_index(conn: &Connection, ctx: &PageContext, _control: &dyn Cont
         .collect();
     // sort_by { [-(cost || 0), -count] }: Array keys -> ruby_qsort (stable).
     let mut models_ = models_;
-    rb::sort_by_stable(&mut models_, |a, b| {
-        (-a.1).partial_cmp(&-b.1).unwrap_or(std::cmp::Ordering::Equal).then((-a.2).cmp(&-b.2))
-    });
+    rb::sort_by_stable(&mut models_, |a, b| (-a.1).partial_cmp(&-b.1).unwrap_or(std::cmp::Ordering::Equal).then((-a.2).cmp(&-b.2)));
     let models_: Vec<Value> = models_.into_iter().take(200).map(|m| m.0).collect();
 
     let tool_rollups = rollup::between(conn, "llm_tool", from, to)?;
@@ -1280,12 +1315,7 @@ pub fn visits_index(conn: &Connection, ctx: &PageContext, _control: &dyn Control
 /// `queries_index` with its independent sections (grouped table, summary
 /// with delta, series, n+1s, the cursor page) on separate read connections.
 /// Same props, same key order.
-pub fn queries_index_parallel(
-    pools: &crate::dashboard::pool::ReadPools,
-    slug: &str,
-    ctx: &PageContext,
-    _control: &(dyn ControlData + Sync),
-) -> R {
+pub fn queries_index_parallel(pools: &crate::dashboard::pool::ReadPools, slug: &str, ctx: &PageContext, _control: &(dyn ControlData + Sync)) -> R {
     let (from, to) = ctx.range();
     let run = |f: &(dyn Fn(&Connection) -> R + Sync)| -> R {
         let conn = pools.get(slug)?;

@@ -72,7 +72,8 @@ async fn request_phase(cx: Ctx, headers: HeaderMap, p: Params) -> Response {
     if !same_origin(&headers) || !given.is_some_and(|g| bool::from(g.as_bytes().ct_eq(expected.as_bytes()))) {
         return fail(&cx, "ActionController::InvalidAuthenticityToken", None);
     }
-    let auth = match strategy::authorize(&google, &cx.state.config.google_redirect_uri(), p.presence("prompt").as_deref(), p.presence("login_hint").as_deref()) {
+    let auth = match strategy::authorize(&google, &cx.state.config.google_redirect_uri(), p.presence("prompt").as_deref(), p.presence("login_hint").as_deref())
+    {
         Ok(a) => a,
         Err(e) => return internal(e),
     };
@@ -211,8 +212,7 @@ pub fn from_omniauth(tx: &rusqlite::Connection, auth: &Identity, signup_open: bo
     let Some(email) = auth.email.as_deref().map(control::normalize_email).filter(|e| auth.email_verified && !e.is_empty()) else {
         return Ok(Err(Refused::Invalid));
     };
-    let by_uid: Option<i64> =
-        tx.query_row("SELECT id FROM users WHERE provider = ?1 AND uid = ?2", params![PROVIDER, auth.uid], |r| r.get(0)).optional()?;
+    let by_uid: Option<i64> = tx.query_row("SELECT id FROM users WHERE provider = ?1 AND uid = ?2", params![PROVIDER, auth.uid], |r| r.get(0)).optional()?;
     if let Some(id) = by_uid {
         return Ok(Ok(id));
     }

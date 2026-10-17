@@ -98,9 +98,26 @@ const SIGNMASK: u64 = 0x8000_0000_0000_0000;
 const EXPBIAS: i32 = 1023 + 52;
 
 const TENS: [u64; 20] = [
-    10000000000000000000, 1000000000000000000, 100000000000000000, 10000000000000000,
-    1000000000000000, 100000000000000, 10000000000000, 1000000000000, 100000000000,
-    10000000000, 1000000000, 100000000, 10000000, 1000000, 100000, 10000, 1000, 100, 10, 1,
+    10000000000000000000,
+    1000000000000000000,
+    100000000000000000,
+    10000000000000000,
+    1000000000000000,
+    100000000000000,
+    10000000000000,
+    1000000000000,
+    100000000000,
+    10000000000,
+    1000000000,
+    100000000,
+    10000000,
+    1000000,
+    100000,
+    10000,
+    1000,
+    100,
+    10,
+    1,
 ];
 
 fn build_fp(d: f64) -> Fp {
@@ -155,10 +172,7 @@ fn multiply(a: &Fp, b: &Fp) -> Fp {
 }
 
 fn round_digit(digits: &mut [u8], ndigits: usize, delta: u64, mut rem: u64, kappa: u64, frac: u64) {
-    while rem < frac
-        && delta - rem >= kappa
-        && (rem.wrapping_add(kappa) < frac || frac - rem > rem.wrapping_add(kappa).wrapping_sub(frac))
-    {
+    while rem < frac && delta - rem >= kappa && (rem.wrapping_add(kappa) < frac || frac - rem > rem.wrapping_add(kappa).wrapping_sub(frac)) {
         digits[ndigits - 1] -= 1;
         rem += kappa;
     }

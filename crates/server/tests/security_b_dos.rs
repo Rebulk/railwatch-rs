@@ -176,7 +176,8 @@ fn exception_grouping_caps_new_issues_per_account() {
         new += g.new;
         overflowed += g.overflowed;
     }
-    let issues: i64 = control.with(|c| c.query_row("SELECT COUNT(*) FROM issues WHERE group_hash != ?", [grouping::OVERFLOW_GROUP_HASH], |r| r.get(0))).unwrap();
+    let issues: i64 =
+        control.with(|c| c.query_row("SELECT COUNT(*) FROM issues WHERE group_hash != ?", [grouping::OVERFLOW_GROUP_HASH], |r| r.get(0))).unwrap();
     let diverted: i64 = control
         .with(|c| c.query_row("SELECT COALESCE(SUM(occurrences), 0) FROM issues WHERE group_hash = ?", [grouping::OVERFLOW_GROUP_HASH], |r| r.get(0)))
         .unwrap();
@@ -189,7 +190,8 @@ fn exception_grouping_caps_new_issues_per_account() {
     assert_eq!(issues, 250);
     assert_eq!(overflowed, 750, "every exception past the cap is accounted for");
     assert_eq!(diverted, 750, "the overflow issues count every diverted exception");
-    let overflow_issues: i64 = control.with(|c| c.query_row("SELECT COUNT(*) FROM issues WHERE group_hash = ?", [grouping::OVERFLOW_GROUP_HASH], |r| r.get(0))).unwrap();
+    let overflow_issues: i64 =
+        control.with(|c| c.query_row("SELECT COUNT(*) FROM issues WHERE group_hash = ?", [grouping::OVERFLOW_GROUP_HASH], |r| r.get(0))).unwrap();
     assert_eq!(overflow_issues, 8, "one overflow issue per capped environment");
     // Another account is not affected by this one's cap.
     let g = control.with(|c| Ok(grouping::group_with_limits(c, &tenant, other.id, batch(99, 50), None, &mut users, limits).unwrap())).unwrap();

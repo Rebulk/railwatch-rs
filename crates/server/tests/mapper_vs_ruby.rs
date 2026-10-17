@@ -19,8 +19,7 @@ fn first_chars(s: &str, n: usize) -> String {
 fn row_for_matches_ruby_on_every_corpus_line() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
     let corpus = std::fs::read(format!("{dir}mapper_corpus.ndjson")).unwrap();
-    let expected: Vec<serde_json::Value> =
-        serde_json::from_str(&std::fs::read_to_string(format!("{dir}mapper_corpus.ruby.json")).unwrap()).unwrap();
+    let expected: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(format!("{dir}mapper_corpus.ruby.json")).unwrap()).unwrap();
     let records = payload::parse_bytes(&corpus, false).unwrap();
     assert_eq!(records.len(), expected.len());
     let mut failures = Vec::new();

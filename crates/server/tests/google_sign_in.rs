@@ -129,7 +129,10 @@ fn serve_one(mut conn: TcpStream, state: &Mutex<Provider>, base: &str) {
                 (true, Some(next)) => {
                     let code = format!("code-{}", p.grants.len() + 1);
                     let redirect = q["redirect_uri"].clone();
-                    p.grants.insert(code.clone(), Grant { challenge: q["code_challenge"].clone(), redirect_uri: redirect.clone(), nonce: q["nonce"].clone(), next });
+                    p.grants.insert(
+                        code.clone(),
+                        Grant { challenge: q["code_challenge"].clone(), redirect_uri: redirect.clone(), nonce: q["nonce"].clone(), next },
+                    );
                     let to = format!("{redirect}?code={code}&state={}&scope=email%20profile%20openid", enc(&q["state"]));
                     (302, "text/plain", String::new(), Some(to))
                 }
@@ -140,7 +143,8 @@ fn serve_one(mut conn: TcpStream, state: &Mutex<Provider>, base: &str) {
             let f: HashMap<String, String> = form_urlencoded::parse(&body).into_owned().collect();
             let mut p = state.lock().unwrap();
             // Basic auth (oauth2's default) or client_secret_post.
-            let basic = headers.get("authorization").and_then(|v| v.strip_prefix("Basic ")).and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok());
+            let basic =
+                headers.get("authorization").and_then(|v| v.strip_prefix("Basic ")).and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok());
             let creds = basic.and_then(|b| String::from_utf8(b).ok());
             let client_ok = creds.as_deref() == Some(&format!("{}:{}", enc(CLIENT_ID), enc(CLIENT_SECRET)))
                 || (f.get("client_id").map(String::as_str) == Some(CLIENT_ID) && f.get("client_secret").map(String::as_str) == Some(CLIENT_SECRET));
@@ -148,15 +152,30 @@ fn serve_one(mut conn: TcpStream, state: &Mutex<Provider>, base: &str) {
             let grant = f.get("code").and_then(|c| p.grants.remove(c));
             let verifier_ok = |g: &Grant| f.get("code_verifier").is_some_and(|v| B64.encode(Sha256::digest(v.as_bytes())) == g.challenge);
             match grant {
-                Some(g) if client_ok && f.get("grant_type").map(String::as_str) == Some("authorization_code") && f.get("redirect_uri") == Some(&g.redirect_uri) && verifier_ok(&g) => {
+                Some(g)
+                    if client_ok
+                        && f.get("grant_type").map(String::as_str) == Some("authorization_code")
+                        && f.get("redirect_uri") == Some(&g.redirect_uri)
+                        && verifier_ok(&g) =>
+                {
                     p.log.push("token ok".into());
                     let mut claims = json!({"iss": base, "aud": CLIENT_ID, "azp": CLIENT_ID, "sub": g.next.sub, "email": g.next.email,
                         "email_verified": g.next.email_verified, "name": "Ada Lovelace", "nonce": g.nonce, "iat": now(), "exp": now() + 3600});
                     for (k, v) in g.next.claims.as_object().unwrap() {
-                        if v.is_null() { claims.as_object_mut().unwrap().remove(k); } else { claims[k] = v.clone(); }
+                        if v.is_null() {
+                            claims.as_object_mut().unwrap().remove(k);
+                        } else {
+                            claims[k] = v.clone();
+                        }
                     }
                     let id_token = sign(&g.next.sign_with.0, &key(&g.next.sign_with.1), &claims);
-                    (200, "application/json", json!({"access_token": "ya29.test", "token_type": "Bearer", "expires_in": 3599, "scope": "openid email profile", "id_token": id_token}).to_string(), None)
+                    (
+                        200,
+                        "application/json",
+                        json!({"access_token": "ya29.test", "token_type": "Bearer", "expires_in": 3599, "scope": "openid email profile", "id_token": id_token})
+                            .to_string(),
+                        None,
+                    )
                 }
                 g => {
                     p.log.push(format!("token refused (grant {})", if g.is_some() { "bad" } else { "unknown/used" }));
@@ -203,7 +222,8 @@ fn read_request(conn: &mut TcpStream) -> Option<Request> {
     let mut lines = head.split("\r\n");
     let mut first = lines.next()?.split(' ');
     let (method, target) = (first.next()?.to_string(), first.next()?.to_string());
-    let headers: HashMap<String, String> = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
+    let headers: HashMap<String, String> =
+        lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
     let len: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut body = buf[split + 4..].to_vec();
     while body.len() < len {
@@ -308,7 +328,11 @@ impl Browser {
         s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let cookies: Vec<String> = self.jar.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let body = form.unwrap_or("");
-        let mut head = format!("{method} {} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\nContent-Length: {}\r\n", if path.is_empty() { "/" } else { path }, body.len());
+        let mut head = format!(
+            "{method} {} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\nContent-Length: {}\r\n",
+            if path.is_empty() { "/" } else { path },
+            body.len()
+        );
         if !cookies.is_empty() {
             head.push_str(&format!("Cookie: {}\r\n", cookies.join("; ")));
         }
@@ -541,7 +565,6 @@ fn google_sign_in_end_to_end() {
     let r = b.request(&format!("{base}/auth/google_oauth2"), "POST", Some("authenticity_token=forged"));
     assert_eq!(r.location.as_deref(), Some("/auth/failure?message=ActionController%3A%3AInvalidAuthenticityToken&strategy=google_oauth2"));
     assert_eq!(b.get(&format!("{base}/auth/google_oauth2")).status, 404, "GET is not a request phase (allowed_request_methods = [:post])");
-
 }
 
 #[test]
@@ -588,7 +611,15 @@ fn reauthentication_for_google_users() {
     let account = server.control().tx(|tx| control::create_account(tx, "Owner Co", owner)).unwrap();
     // A co-owner, so the user is not the account's only owner.
     let co = server.control().tx(|tx| control::insert_user(tx, "Co", "co@example.com", "correct horse battery", true)).unwrap();
-    server.control().with(|x| x.execute("INSERT INTO memberships (account_id, user_id, role, created_at, updated_at) VALUES (?1, ?2, 'owner', '2026-01-01', '2026-01-01')", [account, co])).unwrap();
+    server
+        .control()
+        .with(|x| {
+            x.execute(
+                "INSERT INTO memberships (account_id, user_id, role, created_at, updated_at) VALUES (?1, ?2, 'owner', '2026-01-01', '2026-01-01')",
+                [account, co],
+            )
+        })
+        .unwrap();
     // Make the sign-in old.
     server.control().with(|x| x.execute("UPDATE sessions SET authenticated_at = '2020-01-01 00:00:00'", [])).unwrap();
     // A different Google account cannot confirm this user.

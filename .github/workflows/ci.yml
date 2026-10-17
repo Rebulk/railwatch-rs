@@ -1,4 +1,4 @@
-# CI for pull requests and main: tests, clippy (warnings are errors),
+# CI for pull requests and main: tests, rustfmt, clippy (warnings are errors),
 # cargo audit (RustSec advisories) and cargo deny (licenses, bans, sources,
 # advisories; deny.toml). Read-only token, no credentials kept, every
 # action pinned to a full commit SHA (the comment is its release).
@@ -43,6 +43,8 @@ jobs:
         run: command -v brotli || (sudo apt-get update -qq && sudo apt-get install -y -qq brotli)
       - name: frontend (include_dir! embeds frontend/dist)
         run: SKIP_CARGO=1 bin/build
+      - name: fmt
+        run: cargo fmt --check
       - name: clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: test

@@ -352,7 +352,8 @@ fn prompt(label: &str, default: Option<&str>) -> String {
 }
 
 fn setup(rest: &[&str]) -> ExitCode {
-    let known = ["--email", "--name", "--account", "--app", "--env", "--password-stdin", "--alert-webhook", "--alert-webhook-secret", "--alert-slack", "--alert-email"];
+    let known =
+        ["--email", "--name", "--account", "--app", "--env", "--password-stdin", "--alert-webhook", "--alert-webhook-secret", "--alert-slack", "--alert-email"];
     if rest.iter().any(|a| a.starts_with("--") && !known.contains(a)) {
         return usage();
     }
@@ -396,9 +397,13 @@ fn setup(rest: &[&str]) -> ExitCode {
     };
     let default_name = email.split('@').next().unwrap_or("Admin").to_string();
     let name = flag(rest, "--name").map(str::to_string).unwrap_or_else(|| if interactive { prompt("Your name", Some(&default_name)) } else { default_name });
-    let account = flag(rest, "--account").map(str::to_string).unwrap_or_else(|| if interactive { prompt("Account name", Some("My company")) } else { "My company".into() });
-    let app = flag(rest, "--app").map(str::to_string).unwrap_or_else(|| if interactive { prompt("First application", Some("My app")) } else { "My app".into() });
-    let env = flag(rest, "--env").map(str::to_string).unwrap_or_else(|| if interactive { prompt("Environment", Some("production")) } else { "production".into() });
+    let account = flag(rest, "--account")
+        .map(str::to_string)
+        .unwrap_or_else(|| if interactive { prompt("Account name", Some("My company")) } else { "My company".into() });
+    let app =
+        flag(rest, "--app").map(str::to_string).unwrap_or_else(|| if interactive { prompt("First application", Some("My app")) } else { "My app".into() });
+    let env =
+        flag(rest, "--env").map(str::to_string).unwrap_or_else(|| if interactive { prompt("Environment", Some("production")) } else { "production".into() });
 
     let errors = control::validate_new_user(&name, &control::normalize_email(&email), &password, None);
     if !errors.is_empty() {
@@ -440,7 +445,10 @@ fn setup(rest: &[&str]) -> ExitCode {
         for (kind, name, _) in &alerts.integrations {
             println!("Alerts: {name} ({kind}) gets {}.", SETUP_ALERT_EVENTS.join(", "));
         }
-        println!("Silence is noticed after {} s without data (RAILWATCH_SILENCE_SECONDS). Try it: Settings > Integrations > Send test.", railwatch_server::jobs::watchdog::silence_secs());
+        println!(
+            "Silence is noticed after {} s without data (RAILWATCH_SILENCE_SECONDS). Try it: Settings > Integrations > Send test.",
+            railwatch_server::jobs::watchdog::silence_secs()
+        );
     }
     let host = cfg.url.trim_start_matches("http://").split(['/', ':']).next().unwrap_or("");
     if cfg.url.starts_with("http://") && !["localhost", "127.0.0.1", "[::1]"].contains(&host) {
@@ -595,7 +603,8 @@ fn integrations(show_secrets: bool) -> ExitCode {
     for id in ids {
         let Ok(Some(i)) = control.with(|c| integration::find(c, Some(&cipher), id)) else { continue };
         unreadable += usize::from(i.settings_error.is_some());
-        let mut line = serde_json::json!({"id": i.id, "account_id": i.account_id, "kind": i.kind, "name": i.name, "enabled": i.enabled, "error": i.settings_error});
+        let mut line =
+            serde_json::json!({"id": i.id, "account_id": i.account_id, "kind": i.kind, "name": i.name, "enabled": i.enabled, "error": i.settings_error});
         if show_secrets {
             line["settings"] = serde_json::Value::Object(i.settings);
         }
@@ -718,12 +727,13 @@ fn upgrade(rest: &[&str]) -> ExitCode {
             }
             println!("SHA256SUMS: signature verified (release workflow of {}, tag {tag})", railwatch_server::REPO);
         }
-        Err(_) if insecure => eprintln!("railwatch: WARNING: no signature at {dir} (RAILWATCH_ALLOW_HTTP_RELEASE test mode): install.sh is checked against SHA256SUMS only"),
+        Err(_) if insecure => {
+            eprintln!("railwatch: WARNING: no signature at {dir} (RAILWATCH_ALLOW_HTTP_RELEASE test mode): install.sh is checked against SHA256SUMS only")
+        }
         Err(e) => return fail(format!("{e}: the release has no signature, refusing to run its installer")),
     }
-    let want = String::from_utf8_lossy(&sums)
-        .lines()
-        .find_map(|l| l.strip_suffix("  install.sh").or_else(|| l.strip_suffix(" *install.sh")).map(str::to_string));
+    let want =
+        String::from_utf8_lossy(&sums).lines().find_map(|l| l.strip_suffix("  install.sh").or_else(|| l.strip_suffix(" *install.sh")).map(str::to_string));
     let got = railwatch_server::ingest::receipt_headers::hex(&<sha2::Sha256 as sha2::Digest>::digest(&script));
     if want.as_deref() != Some(got.as_str()) {
         return fail(format!("install.sh sha256 {got} does not match SHA256SUMS ({}); not running it", want.as_deref().unwrap_or("absent")));
@@ -897,7 +907,8 @@ fn cosign_verify(sums: &[u8], bundle: &[u8], tag: &str) -> Result<(), CosignErro
             f.write_all(bytes).map_err(|e| e.to_string())?;
             Ok(p)
         };
-        let (sums_path, bundle_path) = (write("SHA256SUMS", sums).map_err(CosignError::Failed)?, write("SHA256SUMS.sigstore.json", bundle).map_err(CosignError::Failed)?);
+        let (sums_path, bundle_path) =
+            (write("SHA256SUMS", sums).map_err(CosignError::Failed)?, write("SHA256SUMS.sigstore.json", bundle).map_err(CosignError::Failed)?);
         let repo = railwatch_server::REPO;
         let out = std::process::Command::new("cosign")
             .arg("verify-blob")
@@ -911,7 +922,10 @@ fn cosign_verify(sums: &[u8], bundle: &[u8], tag: &str) -> Result<(), CosignErro
             .output();
         match out {
             Ok(o) if o.status.success() => Ok(()),
-            Ok(o) => Err(CosignError::Failed(format!("cosign: SHA256SUMS signature does not verify for {repo} {tag}: {}", String::from_utf8_lossy(&o.stderr).trim()))),
+            Ok(o) => Err(CosignError::Failed(format!(
+                "cosign: SHA256SUMS signature does not verify for {repo} {tag}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(CosignError::NotInstalled),
             Err(e) => Err(CosignError::Failed(format!("cosign: {e}"))),
         }
@@ -979,14 +993,14 @@ fn doctor() -> ExitCode {
     match Control::open(&cfg.control_path()) {
         Ok(c) => {
             let counts = c.with(|x| {
-                x.query_row(
-                    "SELECT (SELECT count(*) FROM users), (SELECT count(*) FROM accounts), (SELECT count(*) FROM environments)",
-                    [],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
-                )
+                x.query_row("SELECT (SELECT count(*) FROM users), (SELECT count(*) FROM accounts), (SELECT count(*) FROM environments)", [], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                })
             });
             match counts {
-                Ok((u, a, e)) => println!("ok    control DB: {u} users, {a} accounts, {e} environments{}", if u == 0 { " (run `railwatch setup`)" } else { "" }),
+                Ok((u, a, e)) => {
+                    println!("ok    control DB: {u} users, {a} accounts, {e} environments{}", if u == 0 { " (run `railwatch setup`)" } else { "" })
+                }
                 Err(e) => {
                     ok = false;
                     println!("FAIL  control DB: {e}");
@@ -1090,7 +1104,13 @@ fn doctor_network(cfg: &Config) -> bool {
     for p in ports {
         let reached = addrs.iter().any(|a| TcpStream::connect_timeout(&std::net::SocketAddr::new(a.ip(), p), Duration::from_secs(3)).is_ok());
         let what = if p == 80 && cfg.tls.is_some() { " (ACME TLS-ALPN-01 needs 443; 80 is the redirect)" } else { "" };
-        ok &= check(reached, format!("port {p} on {host} {}{what}", if reached { "accepts connections" } else { "does not accept connections (is the server running? firewall?)" }));
+        ok &= check(
+            reached,
+            format!(
+                "port {p} on {host} {}{what}",
+                if reached { "accepts connections" } else { "does not accept connections (is the server running? firewall?)" }
+            ),
+        );
     }
     ok
 }
@@ -1124,7 +1144,11 @@ fn doctor_tls(cfg: &Config) -> bool {
                 line.push_str(" (does not name tls_domain)");
             }
             if !healthy {
-                line.push_str(if matches!(tls, railwatch_server::tls::Tls::Acme { .. }) { " (past its renewal point: renewal is failing, see journalctl -u railwatch)" } else { " (replace it)" });
+                line.push_str(if matches!(tls, railwatch_server::tls::Tls::Acme { .. }) {
+                    " (past its renewal point: renewal is failing, see journalctl -u railwatch)"
+                } else {
+                    " (replace it)"
+                });
             }
             check(named && healthy, line)
         }
@@ -1140,7 +1164,15 @@ fn doctor_backups(cfg: &Config) -> bool {
         return true;
     };
     let reach = b.s3.list("control/");
-    let mut ok = check(reach.is_ok(), format!("backup bucket {}/{}: {}", b.s3.endpoint, b.s3.bucket, reach.as_ref().map_or_else(|e| e.clone(), |k| format!("reachable, {} control snapshot(s)", k.len()))));
+    let mut ok = check(
+        reach.is_ok(),
+        format!(
+            "backup bucket {}/{}: {}",
+            b.s3.endpoint,
+            b.s3.bucket,
+            reach.as_ref().map_or_else(|e| e.clone(), |k| format!("reachable, {} control snapshot(s)", k.len()))
+        ),
+    );
     let last = std::fs::read_to_string(railwatch_server::storage::backup::last_ok_path(&cfg.data_dir)).ok().and_then(|s| s.trim().parse::<i64>().ok());
     let now = railwatch_server::time::now_micros() / 1_000_000;
     let limit = (3 * b.interval_secs as i64).max(900);
@@ -1155,9 +1187,7 @@ fn doctor_backups(cfg: &Config) -> bool {
 // serve
 
 fn serve() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("RAILWATCH_LOG").unwrap_or_else(|_| "info".into()))
-        .init();
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("RAILWATCH_LOG").unwrap_or_else(|_| "info".into())).init();
     let cfg = config();
     // Held until the process exits, after the writers have drained.
     let _lock = match lock_data_dir(&cfg, true) {
@@ -1200,8 +1230,7 @@ fn serve() -> ExitCode {
         let (stop_jobs, jobs_stopped) = tokio::sync::watch::channel(false);
         let scheduler = tokio::spawn(railwatch_server::jobs::scheduler(control.clone(), jobs.background.clone(), jobs_stopped));
         let hub = web::cable::Hub::new();
-        let followups_task =
-            tokio::spawn(followups::run_with(control.clone(), followups_rx, Some(hub.clone()), Some(jobs.background.clone())));
+        let followups_task = tokio::spawn(followups::run_with(control.clone(), followups_rx, Some(hub.clone()), Some(jobs.background.clone())));
         let web_state = match WebState::new(control, cfg.clone(), tenants.clone(), hub) {
             Ok(s) => Arc::new(s),
             Err(e) => {

@@ -79,9 +79,9 @@ impl SettingsCipher {
                 return Err("integration secrets are corrupt (too short)".into());
             }
             let cipher = XChaCha20Poly1305::new((&self.0).into());
-            let plain = cipher.decrypt(XNonce::from_slice(&raw[..24]), &raw[24..]).map_err(|_| {
-                "integration secrets cannot be decrypted with this secret_key_base; re-enter them in Settings > Integrations".to_string()
-            })?;
+            let plain = cipher
+                .decrypt(XNonce::from_slice(&raw[..24]), &raw[24..])
+                .map_err(|_| "integration secrets cannot be decrypted with this secret_key_base; re-enter them in Settings > Integrations".to_string())?;
             return match serde_json::from_slice(&plain) {
                 Ok(Value::Object(m)) => Ok(m),
                 _ => Err("integration secrets are corrupt (not an object)".into()),
@@ -89,7 +89,8 @@ impl SettingsCipher {
         }
         match serde_json::from_str::<Value>(stored) {
             Ok(Value::Object(m)) if m.contains_key("p") && m.contains_key("h") => {
-                Err("integration secrets were encrypted by Rails (Active Record encryption) and cannot be read here; re-enter them in Settings > Integrations".into())
+                Err("integration secrets were encrypted by Rails (Active Record encryption) and cannot be read here; re-enter them in Settings > Integrations"
+                    .into())
             }
             Ok(Value::Object(m)) => Ok(m),
             _ => Err("integration secrets are unreadable".into()),
@@ -126,9 +127,9 @@ fn row(r: &rusqlite::Row<'_>, cipher: Option<&SettingsCipher>) -> rusqlite::Resu
         let decrypted = match cipher {
             Some(c) => c.decrypt(&stored),
             // Without a key only the legacy plain-JSON form is readable.
-            None => SettingsCipher([0; 32]).decrypt(&stored).and_then(|m| {
-                if stored.starts_with(PREFIX) { Err("integration secrets key is not configured".into()) } else { Ok(m) }
-            }),
+            None => SettingsCipher([0; 32])
+                .decrypt(&stored)
+                .and_then(|m| if stored.starts_with(PREFIX) { Err("integration secrets key is not configured".into()) } else { Ok(m) }),
         };
         match decrypted {
             Ok(m) => settings.extend(m),
@@ -267,12 +268,19 @@ impl Integration {
             "webhook" => s("url"),
             // settings["webhook_url"].to_s[%r{/(B[A-Z0-9]+)(?:/|\z)}, 1]
             "slack" => s("webhook_url").and_then(|u| {
-                u.split('/').find(|seg| seg.len() > 1 && seg.starts_with('B') && seg.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())).map(str::to_string)
+                u.split('/')
+                    .find(|seg| seg.len() > 1 && seg.starts_with('B') && seg.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
+                    .map(str::to_string)
             }),
             "linear" => {
                 let team_id = s("team_id");
                 let team = self.settings.get("team_options").and_then(Value::as_array).and_then(|teams| {
-                    teams.iter().find(|t| t.get("id").and_then(Value::as_str) == team_id.as_deref()).and_then(|t| t.get("name")).and_then(Value::as_str).map(str::to_string)
+                    teams
+                        .iter()
+                        .find(|t| t.get("id").and_then(Value::as_str) == team_id.as_deref())
+                        .and_then(|t| t.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
                 });
                 let parts: Vec<String> = [s("organization_name"), team.or(team_id)].into_iter().flatten().collect();
                 Some(parts.join(" / ")).filter(|p| !p.is_empty())
@@ -323,8 +331,17 @@ mod tests {
     #[test]
     fn destination_names_what_the_integration_points_at() {
         let i = |kind: &str, s: Value| Integration {
-            id: 1, account_id: 1, kind: kind.into(), name: "n".into(), enabled: true, settings: obj(s), settings_error: None,
-            last_delivered_at: None, last_received_at: None, last_synced_at: None, last_error: None,
+            id: 1,
+            account_id: 1,
+            kind: kind.into(),
+            name: "n".into(),
+            enabled: true,
+            settings: obj(s),
+            settings_error: None,
+            last_delivered_at: None,
+            last_received_at: None,
+            last_synced_at: None,
+            last_error: None,
         };
         assert_eq!(i("slack", json!({"webhook_url": "https://hooks.slack.com/services/T0/B07ABC/xyz"})).destination().as_deref(), Some("B07ABC"));
         assert_eq!(i("email", json!({"to": "a@b.c"})).destination().as_deref(), Some("a@b.c"));

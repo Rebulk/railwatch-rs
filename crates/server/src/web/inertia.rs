@@ -32,10 +32,7 @@ use super::session::{Current, Outgoing, SessionHandle, csrf_token};
 const FLASH: &str = "flash";
 
 pub fn config() -> omega::Config {
-    omega::Config::new()
-        .version_with(|| assets::manifest().version.clone())
-        .root_view(document::render)
-        .with_all_errors(true)
+    omega::Config::new().version_with(|| assets::manifest().version.clone()).root_view(document::render).with_all_errors(true)
 }
 
 fn is_prefetch(parts: &Parts) -> bool {
@@ -232,10 +229,7 @@ impl Ctx {
             json!({"id": u.id, "email": u.email, "name": u.name, "created_at": t_json(&u.created_at), "updated_at": t_json(&u.updated_at),
                    "verified": u.verified, "provider": u.provider, "editor": u.editor, "editor_root": u.editor_root})
         });
-        let session = cur
-            .session
-            .as_ref()
-            .map(|s| json!({"id": s.id, "recently_authenticated": crate::control::recently_authenticated(s)}));
+        let session = cur.session.as_ref().map(|s| json!({"id": s.id, "recently_authenticated": crate::control::recently_authenticated(s)}));
         // Rails' flash: the previous redirect's, consumed by this render
         // (not by a prefetch, whose page may never be shown).
         let flash = if self.prefetch { self.session.get(FLASH) } else { self.session.take(FLASH) };
@@ -251,7 +245,9 @@ impl Ctx {
                     let accounts: Vec<Value> = match user_id {
                         None => vec![],
                         Some(uid) => conn
-                            .prepare_cached("SELECT a.id, a.name FROM accounts a JOIN memberships m ON m.account_id = a.id WHERE m.user_id = ? ORDER BY a.name")?
+                            .prepare_cached(
+                                "SELECT a.id, a.name FROM accounts a JOIN memberships m ON m.account_id = a.id WHERE m.user_id = ? ORDER BY a.name",
+                            )?
                             .query_map([uid], |r| Ok(json!({"id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?})))?
                             .collect::<rusqlite::Result<_>>()?,
                     };
@@ -273,10 +269,7 @@ impl Ctx {
             ("accounts".into(), omega::IntoProp::into_prop(Value::Array(accounts))),
             ("flash".into(), omega::IntoProp::into_prop(json!({"alert": pick("alert"), "warning": pick("warning"), "notice": pick("notice")}))),
             ("google_oauth".into(), omega::IntoProp::into_prop(Value::Bool(self.state.config.google.is_some()))),
-            (
-                "applications".into(),
-                omega::lazy(move || async move { Value::Array(applications) }).once_as(nav_key).until(std::time::Duration::from_secs(30)),
-            ),
+            ("applications".into(), omega::lazy(move || async move { Value::Array(applications) }).once_as(nav_key).until(std::time::Duration::from_secs(30))),
         ])
     }
 }
@@ -343,7 +336,15 @@ mod tests {
         assert_eq!(local_path("https://rw.example/issues?status=open"), Some("/issues?status=open"));
         assert_eq!(local_path("https://rw.example"), Some("/"));
         assert_eq!(local_path("/alerts"), Some("/alerts"));
-        for bad in ["https://rw.example//evil.example/x", "https://rw.example/\\evil.example", "//evil.example", "/\\evil.example", "/\t/evil.example", "evil.example", "https://rw.example/a\nb"] {
+        for bad in [
+            "https://rw.example//evil.example/x",
+            "https://rw.example/\\evil.example",
+            "//evil.example",
+            "/\\evil.example",
+            "/\t/evil.example",
+            "evil.example",
+            "https://rw.example/a\nb",
+        ] {
             assert_eq!(local_path(bad), None, "{bad:?}");
         }
     }

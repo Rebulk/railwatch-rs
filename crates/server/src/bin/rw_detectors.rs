@@ -152,7 +152,11 @@ fn main() {
                 }
                 "env" => update_columns(&c, "environments", env, step.as_object().unwrap()),
                 "account" => {
-                    let account: i64 = c.query_row("SELECT ap.account_id FROM environments e JOIN applications ap ON ap.id = e.application_id WHERE e.id = ?", [env], |r| r.get(0)).unwrap();
+                    let account: i64 = c
+                        .query_row("SELECT ap.account_id FROM environments e JOIN applications ap ON ap.id = e.application_id WHERE e.id = ?", [env], |r| {
+                            r.get(0)
+                        })
+                        .unwrap();
                     update_columns(&c, "accounts", account, step.as_object().unwrap());
                 }
                 "scan" => {

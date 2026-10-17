@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use oauth2::basic::{BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse, BasicTokenType};
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet, ExtraTokenFields, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, RequestTokenError, Scope, StandardRevocableToken, StandardTokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet, ExtraTokenFields, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, RequestTokenError, Scope, StandardRevocableToken, StandardTokenResponse, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -77,13 +77,8 @@ pub fn endpoints(g: &Google) -> Endpoints {
 /// One shared client: no redirects (a token endpoint never redirects; the
 /// oauth2 crate's advice against SSRF), bounded time, rustls.
 fn http() -> &'static reqwest::Client {
-    static C: LazyLock<reqwest::Client> = LazyLock::new(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("http client")
-    });
+    static C: LazyLock<reqwest::Client> =
+        LazyLock::new(|| reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(10)).build().expect("http client"));
     &C
 }
 
@@ -195,14 +190,7 @@ pub struct Pending {
 }
 
 /// `callback_phase`.
-pub async fn callback(
-    g: &Google,
-    redirect_uri: &str,
-    code: &str,
-    state: &str,
-    error: Option<&str>,
-    pending: Pending,
-) -> Result<Identity, Failure> {
+pub async fn callback(g: &Google, redirect_uri: &str, code: &str, state: &str, error: Option<&str>, pending: Pending) -> Result<Identity, Failure> {
     let expected = pending.state.unwrap_or_default();
     if state.is_empty() || expected.is_empty() || !bool::from(state.as_bytes().ct_eq(expected.as_bytes())) {
         return Err(Failure::CsrfDetected);
@@ -215,17 +203,15 @@ pub async fn callback(
     };
     let ep = endpoints(g);
     let client = client(g, &ep, redirect_uri).map_err(Failure::InvalidCredentials)?;
-    let token = client
-        .exchange_code(AuthorizationCode::new(code.to_string()))
-        .set_pkce_verifier(PkceCodeVerifier::new(verifier))
-        .request_async(http())
-        .await
-        .map_err(|e| match e {
-            RequestTokenError::Request(oauth2::HttpClientError::Reqwest(r)) if r.is_timeout() => Failure::Timeout,
-            RequestTokenError::Request(_) => Failure::FailedToConnect,
-            RequestTokenError::ServerResponse(r) => Failure::InvalidCredentials(r.to_string()),
-            other => Failure::InvalidCredentials(other.to_string()),
-        })?;
+    let token =
+        client.exchange_code(AuthorizationCode::new(code.to_string())).set_pkce_verifier(PkceCodeVerifier::new(verifier)).request_async(http()).await.map_err(
+            |e| match e {
+                RequestTokenError::Request(oauth2::HttpClientError::Reqwest(r)) if r.is_timeout() => Failure::Timeout,
+                RequestTokenError::Request(_) => Failure::FailedToConnect,
+                RequestTokenError::ServerResponse(r) => Failure::InvalidCredentials(r.to_string()),
+                other => Failure::InvalidCredentials(other.to_string()),
+            },
+        )?;
     let id_token = token.extra_fields().id_token.clone().ok_or_else(|| Failure::InvalidCredentials("no id_token in the token response".into()))?;
     verify_id_token(&id_token, g, &ep, &nonce).await.map_err(Failure::InvalidCredentials)
 }
@@ -381,9 +367,7 @@ mod ring_provider {
     impl Verifier<Vec<u8>> for Rs256 {
         fn verify(&self, msg: &[u8], signature: &Vec<u8>) -> std::result::Result<(), Error> {
             let DecodingKeyKind::RsaModulusExponent { n, e } = self.0.kind() else { return Err(Error::new()) };
-            ring::signature::RsaPublicKeyComponents { n, e }
-                .verify(&ring::signature::RSA_PKCS1_2048_8192_SHA256, msg, signature)
-                .map_err(|_| Error::new())
+            ring::signature::RsaPublicKeyComponents { n, e }.verify(&ring::signature::RSA_PKCS1_2048_8192_SHA256, msg, signature).map_err(|_| Error::new())
         }
     }
 

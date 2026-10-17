@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use railwatch_server::rollup::{incremental::Accumulator, incremental, rollup_job};
+use railwatch_server::rollup::{incremental, incremental::Accumulator, rollup_job};
 use rusqlite::Connection;
 
 fn tmp(name: &str) -> PathBuf {
@@ -42,19 +42,22 @@ fn seed(conn: &Connection) {
                 tx.execute(
                     "INSERT INTO queries (occurred_at, duration, group_hash, sql) VALUES (?, ?, ?, ?)",
                     rusqlite::params![at, dur % 5000, format!("q{}", next(120)), format!("SELECT {}", next(120))],
-                ).unwrap();
+                )
+                .unwrap();
             }
             4 => {
                 tx.execute(
                     "INSERT INTO cache_events (occurred_at, duration, group_hash, store, key, type) VALUES (?, ?, ?, 'redis', 'k', ?)",
                     rusqlite::params![at, dur % 900, format!("c{}", next(10)), ["hit", "miss", "generate", "write"][next(4) as usize]],
-                ).unwrap();
+                )
+                .unwrap();
             }
             _ => {
                 tx.execute(
                     "INSERT INTO view_renders (occurred_at, duration, group_hash, identifier, kind) VALUES (?, ?, ?, 'x.erb', ?)",
                     rusqlite::params![at, dur % 9000, format!("v{}", next(10)), ["template", "partial", "collection"][next(3) as usize]],
-                ).unwrap();
+                )
+                .unwrap();
             }
         }
     }
@@ -85,7 +88,8 @@ fn incremental_equals_full_recompute() {
     // part-way through (the first slices are "already committed").
     let mut acc = Accumulator::default();
     for table in ["executions", "queries", "cache_events", "view_renders"] {
-        let ids: Vec<i64> = incr.prepare(&format!("SELECT id FROM {table} ORDER BY id")).unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        let ids: Vec<i64> =
+            incr.prepare(&format!("SELECT id FROM {table} ORDER BY id")).unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
         for chunk in ids.chunks(733) {
             acc.ingest(&incr, table, chunk).unwrap();
             incremental::flush(&mut acc, &incr).unwrap();

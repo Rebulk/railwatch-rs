@@ -168,17 +168,12 @@ pub fn parameterize(s: &str) -> String {
 /// URI::MailTo::EMAIL_REGEXP
 pub fn valid_email(s: &str) -> bool {
     let Some((local, domain)) = s.split_once('@') else { return false };
-    let local_ok = !local.is_empty()
-        && local.bytes().all(|b| b.is_ascii_alphanumeric() || b".!#$%&'*+/=?^_`{|}~-".contains(&b));
+    let local_ok = !local.is_empty() && local.bytes().all(|b| b.is_ascii_alphanumeric() || b".!#$%&'*+/=?^_`{|}~-".contains(&b));
     let labels: Vec<&str> = domain.split('.').collect();
     let domain_ok = !domain.is_empty()
-        && labels.iter().all(|l| {
-            !l.is_empty()
-                && l.len() <= 63
-                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                && !l.starts_with('-')
-                && !l.ends_with('-')
-        });
+        && labels
+            .iter()
+            .all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') && !l.starts_with('-') && !l.ends_with('-'));
     local_ok && domain_ok
 }
 
@@ -276,10 +271,7 @@ impl Control {
                     Some(id) => id,
                     None => insert_account(tx, &name, &name, retention_days)?,
                 };
-                let app = match tx
-                    .query_row("SELECT id FROM applications WHERE account_id = ? AND slug = 'default'", [account], |r| r.get(0))
-                    .optional()?
-                {
+                let app = match tx.query_row("SELECT id FROM applications WHERE account_id = ? AND slug = 'default'", [account], |r| r.get(0)).optional()? {
                     Some(id) => id,
                     None => insert_application(tx, account, "default", "default", "APP", None, "main")?,
                 };
@@ -434,7 +426,9 @@ pub fn validate_application(name: &str, slug: &str, issue_prefix: &str, reposito
         }
     }
     if let Some(u) = repository_url.filter(|u| !u.trim().is_empty()) {
-        let ok = (u.starts_with("http://") || u.starts_with("https://")) && !u.chars().any(char::is_whitespace) && u.split_once("://").is_some_and(|(_, r)| !r.is_empty());
+        let ok = (u.starts_with("http://") || u.starts_with("https://"))
+            && !u.chars().any(char::is_whitespace)
+            && u.split_once("://").is_some_and(|(_, r)| !r.is_empty());
         if !ok {
             e.push(("repository_url".into(), "must be a single http:// or https:// URL".into()));
         }
@@ -479,10 +473,7 @@ pub fn touch_account(tx: &Connection, account_id: i64) -> rusqlite::Result<()> {
 pub fn touch_application(tx: &Connection, application_id: i64) -> rusqlite::Result<()> {
     let now = now_db();
     tx.execute("UPDATE applications SET updated_at = ? WHERE id = ?", params![now, application_id])?;
-    tx.execute(
-        "UPDATE accounts SET updated_at = ? WHERE id = (SELECT account_id FROM applications WHERE id = ?)",
-        params![now, application_id],
-    )?;
+    tx.execute("UPDATE accounts SET updated_at = ? WHERE id = (SELECT account_id FROM applications WHERE id = ?)", params![now, application_id])?;
     Ok(())
 }
 
@@ -526,11 +517,10 @@ pub fn insert_environment(tx: &Connection, application_id: i64, name: &str, slug
 /// Environment#assign_slug + #assign_token for a new environment of an
 /// application: returns (id, plaintext token).
 pub fn create_environment(tx: &Connection, application_id: i64, name: &str) -> ModelResult<(i64, String)> {
-    let (account_slug, app_slug): (String, String) = tx.query_row(
-        "SELECT a.slug, ap.slug FROM applications ap JOIN accounts a ON a.id = ap.account_id WHERE ap.id = ?",
-        [application_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let (account_slug, app_slug): (String, String) =
+        tx.query_row("SELECT a.slug, ap.slug FROM applications ap JOIN accounts a ON a.id = ap.account_id WHERE ap.id = ?", [application_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
     let slug = format!("{account_slug}-{app_slug}-{name}");
     let token = new_token();
     let id = insert_environment(tx, application_id, name, &slug, &digest(&token), &token[..12])?;
@@ -549,10 +539,7 @@ pub fn rotate_token(tx: &Connection, environment_id: i64) -> rusqlite::Result<St
 
 /// Slugs name tenant files and directories, so they must be path-safe.
 pub fn validate_slug(slug: &str) -> Result<(), String> {
-    if !slug.is_empty()
-        && slug.len() <= 128
-        && slug.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
-    {
+    if !slug.is_empty() && slug.len() <= 128 && slug.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') {
         Ok(())
     } else {
         Err(format!("invalid slug {slug:?}: use a-z, 0-9, - and _"))
@@ -666,9 +653,7 @@ pub fn find_user(c: &Connection, id: i64) -> rusqlite::Result<Option<User>> {
 }
 
 pub fn find_user_by_email(c: &Connection, email: &str) -> rusqlite::Result<Option<User>> {
-    c.prepare_cached(&format!("SELECT {USER_COLUMNS} FROM users WHERE email = ?"))?
-        .query_row([normalize_email(email)], user_row)
-        .optional()
+    c.prepare_cached(&format!("SELECT {USER_COLUMNS} FROM users WHERE email = ?"))?.query_row([normalize_email(email)], user_row).optional()
 }
 
 /// User.authenticate_by(email:, password:)
@@ -740,9 +725,7 @@ pub fn recently_authenticated(s: &Session) -> bool {
 pub const ROLES: [&str; 3] = ["owner", "admin", "member"];
 
 pub fn membership_role(c: &Connection, account_id: i64, user_id: i64) -> rusqlite::Result<Option<String>> {
-    c.prepare_cached("SELECT role FROM memberships WHERE account_id = ? AND user_id = ?")?
-        .query_row(params![account_id, user_id], |r| r.get(0))
-        .optional()
+    c.prepare_cached("SELECT role FROM memberships WHERE account_id = ? AND user_id = ?")?.query_row(params![account_id, user_id], |r| r.get(0)).optional()
 }
 
 pub struct NewInvitation {
@@ -889,9 +872,8 @@ mod tests {
         assert_eq!(c.find(env.id).unwrap().unwrap().events_this_month, 12);
         // A charge for an older month goes to the ledger only.
         c.count_events(env.id, "2000-01", 1, "2000-01-01 00:00:00").unwrap();
-        let cached: (i64, String) = c
-            .with(|x| x.query_row("SELECT events_this_month, usage_month FROM environments WHERE id = ?", [env.id], |r| Ok((r.get(0)?, r.get(1)?))))
-            .unwrap();
+        let cached: (i64, String) =
+            c.with(|x| x.query_row("SELECT events_this_month, usage_month FROM environments WHERE id = ?", [env.id], |r| Ok((r.get(0)?, r.get(1)?)))).unwrap();
         assert_eq!(cached, (12, format!("{month}-01")));
         assert!(c.create("../etc", "d", 30).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -927,9 +909,8 @@ mod tests {
         let user = c.tx(|tx| insert_user(tx, "Ada", " Ada@Example.com ", "correct horse battery", false)).unwrap();
         let account = c.tx(|tx| create_account(tx, "Acme", user)).unwrap();
         let account2 = c.tx(|tx| create_account(tx, "Acme", user)).unwrap();
-        let slugs: Vec<String> = c
-            .with(|x| x.prepare("SELECT slug FROM accounts WHERE id IN (?, ?) ORDER BY id")?.query_map([account, account2], |r| r.get(0))?.collect())
-            .unwrap();
+        let slugs: Vec<String> =
+            c.with(|x| x.prepare("SELECT slug FROM accounts WHERE id IN (?, ?) ORDER BY id")?.query_map([account, account2], |r| r.get(0))?.collect()).unwrap();
         assert_eq!(slugs, ["acme", "acme-2"]);
         let app = c.tx(|tx| insert_application(tx, account, "Web", "web", "WEB", None, "main")).unwrap();
         let (env, token) = c.tx(|tx| create_environment(tx, app, "production")).unwrap();

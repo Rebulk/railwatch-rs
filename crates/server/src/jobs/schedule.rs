@@ -82,7 +82,13 @@ fn parse_at(a: &str) -> Option<(u32, u32)> {
         "midnight" => return Some((0, 0)),
         _ => {}
     }
-    let (body, pm, am) = if let Some(b) = a.strip_suffix("pm") { (b, true, false) } else if let Some(b) = a.strip_suffix("am") { (b, false, true) } else { (a, false, false) };
+    let (body, pm, am) = if let Some(b) = a.strip_suffix("pm") {
+        (b, true, false)
+    } else if let Some(b) = a.strip_suffix("am") {
+        (b, false, true)
+    } else {
+        (a, false, false)
+    };
     let (h, m) = match body.trim().split_once(':') {
         Some((h, m)) => (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?),
         None => (body.trim().parse::<u32>().ok()?, 0),

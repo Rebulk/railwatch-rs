@@ -187,9 +187,7 @@ pub fn run_pass(s3: &S3, data_dir: &Path, tenants_dir: &Path, now_micros: i64) -
 }
 
 fn has_exemplars(file: &Path) -> bool {
-    Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .and_then(|c| super::exemplars::done(&c))
-        .unwrap_or(false)
+    Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_ONLY).and_then(|c| super::exemplars::done(&c)).unwrap_or(false)
 }
 
 #[derive(Debug, Default)]
@@ -278,13 +276,13 @@ pub fn spawn(settings: Settings, data_dir: PathBuf, tenants_dir: PathBuf) -> std
                     Ok(p) => {
                         record_ok(&data_dir);
                         tracing::info!(
-                        snapshots = p.snapshots,
-                        day_files = p.day_files,
-                        skipped = p.skipped,
-                        raw = p.bytes_raw,
-                        compressed = p.bytes_compressed,
-                        ms = started.elapsed().as_millis() as u64,
-                        "backup pass"
+                            snapshots = p.snapshots,
+                            day_files = p.day_files,
+                            skipped = p.skipped,
+                            raw = p.bytes_raw,
+                            compressed = p.bytes_compressed,
+                            ms = started.elapsed().as_millis() as u64,
+                            "backup pass"
                         )
                     }
                     Err(e) => tracing::error!(error = %e, "backup pass failed"),

@@ -27,8 +27,7 @@ pub struct Rollup {
 /// conditions follow it in the order Active Record appends them. Row order
 /// is whatever SQLite's plan yields, as in Ruby (no ORDER BY): pages group
 /// these rows by first appearance, so the statement must be the same one.
-pub const BETWEEN: &str =
-    r#"SELECT "rollups".* FROM "rollups" WHERE "rollups"."record_type" = ?1 AND "rollups"."bucket" BETWEEN ?2 AND ?3"#;
+pub const BETWEEN: &str = r#"SELECT "rollups".* FROM "rollups" WHERE "rollups"."record_type" = ?1 AND "rollups"."bucket" BETWEEN ?2 AND ?3"#;
 
 pub fn between(conn: &Connection, record_type: &str, from: i64, to: i64) -> rusqlite::Result<Vec<Rollup>> {
     load(conn, BETWEEN, rusqlite::params![record_type, qt(rb::beginning_of_hour(from)), qt(to)])

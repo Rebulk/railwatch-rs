@@ -152,8 +152,11 @@ mod tests {
             )
             .unwrap();
             let d = open_or_create(&day_path(&dir, Tier::Detail, day)).unwrap();
-            d.execute("INSERT INTO queries (execution_id, sql, occurred_at, duration) VALUES (?, 'x', ?, 1.0)", rusqlite::params![format!("e{day}"), format!("{day} 10:00:00")])
-                .unwrap();
+            d.execute(
+                "INSERT INTO queries (execution_id, sql, occurred_at, duration) VALUES (?, 'x', ?, 1.0)",
+                rusqlite::params![format!("e{day}"), format!("{day} 10:00:00")],
+            )
+            .unwrap();
         }
         meta.execute("INSERT INTO rollups (record_type, group_hash, bucket, name, count) VALUES ('request', 'g', '2025-08-01 00:00:00', 'x', 1), ('request', 'g', '2026-10-01 00:00:00', 'x', 1)", [])
             .unwrap();
@@ -168,7 +171,8 @@ mod tests {
         // Each expired detail day's one execution is its group's slowest.
         assert_eq!(p.exemplar_executions, 3);
         assert_eq!(p.rollups, 1);
-        let kept: i64 = Connection::open(day_path(&dir, Tier::Core, "2026-10-06")).unwrap().query_row("SELECT COUNT(*) FROM queries", [], |r| r.get(0)).unwrap();
+        let kept: i64 =
+            Connection::open(day_path(&dir, Tier::Core, "2026-10-06")).unwrap().query_row("SELECT COUNT(*) FROM queries", [], |r| r.get(0)).unwrap();
         assert_eq!(kept, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

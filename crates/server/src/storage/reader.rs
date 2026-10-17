@@ -25,10 +25,7 @@ use super::layout::{self, Tier};
 pub type Attached = Vec<PathBuf>;
 
 pub fn open(dir: &Path) -> rusqlite::Result<(Connection, Attached)> {
-    let conn = Connection::open_with_flags(
-        "file::memory:",
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
-    )?;
+    let conn = Connection::open_with_flags("file::memory:", OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
     let attached = attach_all(&conn, dir)?;
@@ -250,8 +247,11 @@ mod tests {
             )
             .unwrap();
             let d = open_or_create(&day_path(&dir, Tier::Detail, day)).unwrap();
-            d.execute("INSERT INTO logs (id, level, message, occurred_at) VALUES (?, 'info', ?, ?)", rusqlite::params![id, format!("hello {day}"), format!("{day} 12:00:00")])
-                .unwrap();
+            d.execute(
+                "INSERT INTO logs (id, level, message, occurred_at) VALUES (?, 'info', ?, ?)",
+                rusqlite::params![id, format!("hello {day}"), format!("{day} 12:00:00")],
+            )
+            .unwrap();
             d.execute("INSERT INTO logs_fts (rowid, message) SELECT id, message FROM logs", []).unwrap();
         }
         let (conn, mut attached) = open(&dir).unwrap();

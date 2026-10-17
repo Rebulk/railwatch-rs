@@ -268,9 +268,7 @@ struct Sample {
 #[tokio::main]
 async fn main() {
     let o = parse_args();
-    let count = o.batches.unwrap_or_else(|| {
-        if o.rate > 0.0 { (o.rate * o.duration).ceil() as usize } else { (o.concurrency * 400).max(2000) }
-    });
+    let count = o.batches.unwrap_or_else(|| if o.rate > 0.0 { (o.rate * o.duration).ceil() as usize } else { (o.concurrency * 400).max(2000) });
     eprintln!("building {count} batches of {RECORDS_PER_BATCH} records...");
     let started_build = Instant::now();
     let producer = uuid::Uuid::new_v4().to_string();
@@ -354,8 +352,7 @@ async fn main() {
 
     let mut tasks = Vec::new();
     for _ in 0..opts.concurrency {
-        let (client, batches, next, opts, tx, permits) =
-            (client.clone(), batches.clone(), next.clone(), opts.clone(), tx.clone(), permits.clone());
+        let (client, batches, next, opts, tx, permits) = (client.clone(), batches.clone(), next.clone(), opts.clone(), tx.clone(), permits.clone());
         tasks.push(tokio::spawn(async move {
             loop {
                 if Instant::now() >= deadline {
@@ -384,20 +381,13 @@ async fn main() {
                     Ok(resp) => {
                         let status = resp.status().as_u16();
                         let body = resp.into_body().collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-                        let accepted = serde_json::from_slice::<Value>(&body)
-                            .ok()
-                            .and_then(|v| v.get("accepted").and_then(Value::as_u64))
-                            .unwrap_or(0) as usize;
+                        let accepted =
+                            serde_json::from_slice::<Value>(&body).ok().and_then(|v| v.get("accepted").and_then(Value::as_u64)).unwrap_or(0) as usize;
                         (status, accepted)
                     }
                     Err(_) => (0, 0),
                 };
-                let _ = tx.send(Sample {
-                    at: sent.duration_since(t0).as_secs_f64(),
-                    status,
-                    latency_ms: sent.elapsed().as_secs_f64() * 1000.0,
-                    events,
-                });
+                let _ = tx.send(Sample { at: sent.duration_since(t0).as_secs_f64(), status, latency_ms: sent.elapsed().as_secs_f64() * 1000.0, events });
             }
         }));
     }
@@ -450,9 +440,15 @@ fn report(o: &Opts, samples: &[Sample], elapsed: f64, built: usize) {
         by_status.entry(s.status).or_default().push(s.latency_ms);
     }
     let mut latency = serde_json::Map::new();
-    println!("rw-load: {} posts in {:.1}s against {} ({} env tokens, concurrency {}, rate {})",
-        samples.len(), elapsed, o.url, o.tokens.len(), o.concurrency,
-        if o.rate > 0.0 { format!("{}/s open loop", o.rate) } else { "closed loop".into() });
+    println!(
+        "rw-load: {} posts in {:.1}s against {} ({} env tokens, concurrency {}, rate {})",
+        samples.len(),
+        elapsed,
+        o.url,
+        o.tokens.len(),
+        o.concurrency,
+        if o.rate > 0.0 { format!("{}/s open loop", o.rate) } else { "closed loop".into() }
+    );
     if samples.len() == built {
         println!("  WARNING: every prebuilt batch was sent; the run may have been limited by --batches, not the server");
     }
@@ -463,7 +459,12 @@ fn report(o: &Opts, samples: &[Sample], elapsed: f64, built: usize) {
         let label = if *status == 0 { "error".to_string() } else { status.to_string() };
         println!(
             "  {:>6} {:>8} {:>9.1} {:>9.1} {:>9.1} {:>9.1}",
-            label, lat.len(), percentile(lat, 50.0), percentile(lat, 90.0), percentile(lat, 99.0), lat.last().copied().unwrap_or(0.0)
+            label,
+            lat.len(),
+            percentile(lat, 50.0),
+            percentile(lat, 90.0),
+            percentile(lat, 99.0),
+            lat.last().copied().unwrap_or(0.0)
         );
         latency.insert(
             label,

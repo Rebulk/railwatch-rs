@@ -107,9 +107,7 @@ fn gem_docs() -> &'static Vec<(String, &'static str)> {
 // HTTP
 
 pub fn routes() -> Router<Arc<WebState>> {
-    Router::new()
-        .route("/mcp", get(show).post(create))
-        .route("/.well-known/mcp.json", get(show))
+    Router::new().route("/mcp", get(show).post(create)).route("/.well-known/mcp.json", get(show))
 }
 
 fn json_body(status: StatusCode, v: &Value) -> Response {
@@ -164,8 +162,11 @@ async fn create(State(state): State<Arc<WebState>>, req: Request) -> Response {
     // rate_limit to: 300, within: 1.minute, before the token lookup.
     let ip = state.client_ip(&req);
     if state.mcp_preauth_limit.exceeded(&ip) {
-        return json_body(StatusCode::TOO_MANY_REQUESTS, &json!({"jsonrpc": "2.0", "id": null,
-            "error": {"code": -32029, "message": "Rate limit exceeded", "data": {"retry_after": PREAUTH_IP_WINDOW_SECS}}}));
+        return json_body(
+            StatusCode::TOO_MANY_REQUESTS,
+            &json!({"jsonrpc": "2.0", "id": null,
+            "error": {"code": -32029, "message": "Rate limit exceeded", "data": {"retry_after": PREAUTH_IP_WINDOW_SECS}}}),
+        );
     }
     let (parts, body) = req.into_parts();
     let auth = parts.headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -242,10 +243,7 @@ impl Token {
     /// accessible_accounts without its select list: "FROM ... WHERE ...".
     pub fn accounts_from(&self, control: &Control) -> (String, Vec<rusqlite::types::Value>) {
         let restricted: Option<i64> = match self.application_id {
-            Some(app) => control
-                .with(|c| c.query_row("SELECT account_id FROM applications WHERE id = ?", [app], |r| r.get(0)).optional())
-                .ok()
-                .flatten(),
+            Some(app) => control.with(|c| c.query_row("SELECT account_id FROM applications WHERE id = ?", [app], |r| r.get(0)).optional()).ok().flatten(),
             None => None,
         }
         .or(self.account_id);
@@ -386,9 +384,12 @@ impl Mcp<'_> {
         };
         let method = index(payload, "method").ok()?;
         let r = match method.as_str() {
-            Some("initialize") => Ok(success(&id, json!({"protocolVersion": PROTOCOL_VERSION,
+            Some("initialize") => Ok(success(
+                &id,
+                json!({"protocolVersion": PROTOCOL_VERSION,
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                "capabilities": {"tools": {}, "prompts": {}, "resources": {}}}))),
+                "capabilities": {"tools": {}, "prompts": {}, "resources": {}}}),
+            )),
             Some("tools/list") => Ok(success(&id, json!({"tools": self.visible_tools()}))),
             Some("tools/call") => Ok(self.call_tool(&id, &params)),
             Some("prompts/list") => Ok(success(&id, json!({"prompts": definitions().prompts}))),
@@ -414,11 +415,7 @@ impl Mcp<'_> {
 
     fn visible_tools(&self) -> Vec<Value> {
         let all = &definitions().tools;
-        if self.token.allows("write") {
-            all.clone()
-        } else {
-            all.iter().filter(|t| !Self::write_tool(t["name"].as_str().unwrap_or(""))).cloned().collect()
-        }
+        if self.token.allows("write") { all.clone() } else { all.iter().filter(|t| !Self::write_tool(t["name"].as_str().unwrap_or(""))).cloned().collect() }
     }
 
     fn call_tool(&self, id: &Value, params: &Value) -> Value {
@@ -660,18 +657,14 @@ impl Mcp<'_> {
         );
         Ok(self.env.control.with(|c| {
             c.prepare(&sql)?
-                .query_map(params_from_iter(binds), |r| {
-                    Ok(App { id: r.get(0)?, slug: r.get(1)?, name: r.get(2)?, account_slug: r.get(3)? })
-                })?
+                .query_map(params_from_iter(binds), |r| Ok(App { id: r.get(0)?, slug: r.get(1)?, name: r.get(2)?, account_slug: r.get(3)? }))?
                 .collect()
         })?)
     }
 
     fn environments_of(&self, app: i64) -> R<Vec<(String, String)>> {
         Ok(self.env.control.with(|c| {
-            c.prepare("SELECT name, slug FROM environments WHERE application_id = ? ORDER BY id")?
-                .query_map([app], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect()
+            c.prepare("SELECT name, slug FROM environments WHERE application_id = ? ORDER BY id")?.query_map([app], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
         })?)
     }
 
@@ -692,9 +685,7 @@ impl Mcp<'_> {
             return Ok(None);
         }
         let (ids, mut binds) = self.applications_sql();
-        let mut sql = format!(
-            "SELECT ap.id, ap.slug, ap.name, ac.slug FROM applications ap JOIN accounts ac ON ac.id = ap.account_id WHERE ap.id IN ({ids})"
-        );
+        let mut sql = format!("SELECT ap.id, ap.slug, ap.name, ac.slug FROM applications ap JOIN accounts ac ON ac.id = ap.account_id WHERE ap.id IN ({ids})");
         if !slug_blank {
             sql.push_str(" AND ap.slug = ?");
             binds.push(slug.clone().into());
@@ -712,9 +703,7 @@ impl Mcp<'_> {
         sql.push_str(" LIMIT 2");
         let mut matches: Vec<App> = self.env.control.with(|c| {
             c.prepare(&sql)?
-                .query_map(params_from_iter(binds), |r| {
-                    Ok(App { id: r.get(0)?, slug: r.get(1)?, name: r.get(2)?, account_slug: r.get(3)? })
-                })?
+                .query_map(params_from_iter(binds), |r| Ok(App { id: r.get(0)?, slug: r.get(1)?, name: r.get(2)?, account_slug: r.get(3)? }))?
                 .collect()
         })?;
         if matches.len() > 1 {
@@ -1097,10 +1086,13 @@ impl Mcp<'_> {
                     _ => 0.0,
                 };
                 let p95_ms = rb::round(p95 / 1000.0, 2);
-                (p95_ms, crate::obj! {
-                    "route" => db::raw_json(r.at(1)), "group_hash" => db::raw_json(r.at(0)), "count" => db::raw_json(r.at(2)),
-                    "errors" => db::raw_json(r.at(3)), "p95_ms" => jf(p95_ms),
-                })
+                (
+                    p95_ms,
+                    crate::obj! {
+                        "route" => db::raw_json(r.at(1)), "group_hash" => db::raw_json(r.at(0)), "count" => db::raw_json(r.at(2)),
+                        "errors" => db::raw_json(r.at(3)), "p95_ms" => jf(p95_ms),
+                    },
+                )
             })
             .collect();
         // sort_by { -p95_ms } (Float keys: MRI's introsort), first(20)
@@ -1312,11 +1304,7 @@ impl Mcp<'_> {
         let Some(env) = self.resolve_environment(a)? else { return not_found("environment") };
         let eid = a.s("execution_id");
         self.with_telemetry(&env, |conn| {
-            let Some(exe) = db::query_one(
-                conn,
-                "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"execution_id\" = ?1 LIMIT 1",
-                [&eid],
-            )?
+            let Some(exe) = db::query_one(conn, "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"execution_id\" = ?1 LIMIT 1", [&eid])?
             else {
                 return not_found("execution");
             };
@@ -1382,8 +1370,7 @@ impl Mcp<'_> {
                 _ => (Resource::Queries, "queries", "Railwatch::Telemetry::Query", models::QUERY_WITH_SQL, Order::Slowest),
             };
             let cond = filter_query::apply(conn, res, q_s.as_deref(), from, to, &[])?;
-            let page = match cursor_page::call(conn, self.env.cursor_key, table, model, select, cond, cursor.as_deref(), limit_s.as_deref(), order, &context)
-            {
+            let page = match cursor_page::call(conn, self.env.cursor_key, table, model, select, cond, cursor.as_deref(), limit_s.as_deref(), order, &context) {
                 Ok(p) => p?,
                 Err(e) => return Err(Fail::Invalid(e.to_string())),
             };
@@ -1560,7 +1547,8 @@ impl Mcp<'_> {
                 issue::set_assignee(c, &i, to.as_ref().map(|(id, n)| (*id, n.as_str())), Some(actor))?;
             }
             // data: {agent:, changes: args.except("key", "issue_id", "agent")}
-            let changes: Map<String, Value> = a.0.iter().filter(|(k, _)| !matches!(k.as_str(), "key" | "issue_id" | "agent")).map(|(k, v)| (k.clone(), v.clone())).collect();
+            let changes: Map<String, Value> =
+                a.0.iter().filter(|(k, _)| !matches!(k.as_str(), "key" | "issue_id" | "agent")).map(|(k, v)| (k.clone(), v.clone())).collect();
             let data = json!({"agent": a.presence("agent").map_or_else(|| Value::from("mcp"), |_| a.get("agent").clone()), "changes": changes});
             add_activity_json(c, id, "agent", self.token.user_id, &data)?;
             Ok(())
@@ -1606,8 +1594,13 @@ impl Mcp<'_> {
 /// `activities.create!(kind:, user:, data:)` with a JSON value as Rails
 /// serializes it (to_json of the Hash).
 fn add_activity_json(c: &Connection, issue_id: i64, kind: &str, user_id: i64, data: &Value) -> rusqlite::Result<()> {
-    c.prepare_cached("INSERT INTO issue_activities (issue_id, kind, data, user_id, created_at) VALUES (?, ?, ?, ?, ?)")?
-        .execute(params![issue_id, kind, crate::rjson::escape_html(&data.to_string()), user_id, crate::control::now_db()])?;
+    c.prepare_cached("INSERT INTO issue_activities (issue_id, kind, data, user_id, created_at) VALUES (?, ?, ?, ?, ?)")?.execute(params![
+        issue_id,
+        kind,
+        crate::rjson::escape_html(&data.to_string()),
+        user_id,
+        crate::control::now_db()
+    ])?;
     Ok(())
 }
 
@@ -1803,10 +1796,13 @@ fn slow_queries_for(conn: &Connection, ids: &[String]) -> rusqlite::Result<Value
             let first = rs[0];
             let total: i64 = rs.iter().map(|q| q.i("duration").unwrap_or(0)).sum();
             let total_ms = rb::round(total as f64 / 1000.0, 3);
-            (total_ms, crate::obj! {
-                "group_hash" => g, "sql" => rb::first_chars(first.s("resolved_sql").unwrap_or(""), 400), "source" => first.s("source"),
-                "count" => rs.len(), "max_ms" => jf(rb::round(first.i("duration").unwrap_or(0) as f64 / 1000.0, 3)), "total_ms" => jf(total_ms),
-            })
+            (
+                total_ms,
+                crate::obj! {
+                    "group_hash" => g, "sql" => rb::first_chars(first.s("resolved_sql").unwrap_or(""), 400), "source" => first.s("source"),
+                    "count" => rs.len(), "max_ms" => jf(rb::round(first.i("duration").unwrap_or(0) as f64 / 1000.0, 3)), "total_ms" => jf(total_ms),
+                },
+            )
         })
         .collect();
     let sorted = rb::sort_by_num(out, |(t, _)| rb::Num::F(-t));
@@ -1830,11 +1826,14 @@ fn n_plus_ones_for(conn: &Connection, ids: &[String]) -> rusqlite::Result<Value>
         .map(|(g, rs)| {
             let first = rs[0];
             let max_repeats = rs.iter().filter_map(|r| r.i("count")).max();
-            (rs.len() as i64, crate::obj! {
-                "group_hash" => g, "sql" => rb::first_chars(first.s("sql").unwrap_or(""), 400), "source" => first.s("source"),
-                "occurrences" => rs.len(), "max_repeats" => max_repeats,
-                "suggestion" => crate::dashboard::pages::n_plus_one::suggestion(first.s("sql").unwrap_or(""), first.s("source")),
-            })
+            (
+                rs.len() as i64,
+                crate::obj! {
+                    "group_hash" => g, "sql" => rb::first_chars(first.s("sql").unwrap_or(""), 400), "source" => first.s("source"),
+                    "occurrences" => rs.len(), "max_repeats" => max_repeats,
+                    "suggestion" => crate::dashboard::pages::n_plus_one::suggestion(first.s("sql").unwrap_or(""), first.s("source")),
+                },
+            )
         })
         .collect();
     let sorted = rb::sort_by_num(out, |(n, _)| rb::Num::I(-n));
@@ -1973,10 +1972,13 @@ fn execution_timeline(conn: &Connection, eid: &str, start: i64) -> rusqlite::Res
             let offset = rb::round(rb::time_sub(r.t("occurred_at").unwrap_or(0), start) * 1000.0, 3);
             let duration = if has_duration { r.i("duration").map_or(Value::Null, |d| jf(d as f64 / 1000.0)) } else { Value::Null };
             let source = if has_source { crate::dashboard::db::js(r.s("source")) } else { Value::Null };
-            entries.push((offset, crate::obj! {
-                "type" => singular, "id" => r.i("id"), "offset" => jf(offset), "duration" => duration,
-                "label" => label, "stage" => r.s("execution_stage"), "source" => source,
-            }));
+            entries.push((
+                offset,
+                crate::obj! {
+                    "type" => singular, "id" => r.i("id"), "offset" => jf(offset), "duration" => duration,
+                    "label" => label, "stage" => r.s("execution_stage"), "source" => source,
+                },
+            ));
         }
     }
     let sorted = rb::sort_by_num(entries, |(o, _)| rb::Num::F(*o));
@@ -2002,8 +2004,11 @@ impl Mcp<'_> {
             v => v,
         };
         let text = prompt_text(name.as_str().unwrap_or(""), &args).map_err(|_| Fail::Unrescued)?;
-        Ok(success(id, json!({"description": prompt["description"],
-            "messages": [{"role": "user", "content": {"type": "text", "text": text}}]})))
+        Ok(success(
+            id,
+            json!({"description": prompt["description"],
+            "messages": [{"role": "user", "content": {"type": "text", "text": text}}]}),
+        ))
     }
 
     fn resources(&self) -> R<Vec<Value>> {
@@ -2078,7 +2083,9 @@ impl Mcp<'_> {
         let (open, deploys): (i64, Vec<Value>) = self.env.control.with(|c| {
             let open = c.query_row("SELECT COUNT(*) FROM issues WHERE environment_id = ? AND status = 'open'", [env.id], |r| r.get(0))?;
             let deploys = c
-                .prepare("SELECT deploy, deployed_at FROM deploys WHERE environment_id = ?1 AND deployed_at BETWEEN ?2 AND ?3 ORDER BY deployed_at DESC LIMIT 10")?
+                .prepare(
+                    "SELECT deploy, deployed_at FROM deploys WHERE environment_id = ?1 AND deployed_at BETWEEN ?2 AND ?3 ORDER BY deployed_at DESC LIMIT 10",
+                )?
                 .query_map(params![env.id, qt(from), qt(to)], |r| Ok(json!({"deploy": r.get::<_, String>(0)?, "deployed_at": db_time_s(r.get(1)?)})))?
                 .collect::<rusqlite::Result<_>>()?;
             Ok((open, deploys))
@@ -2154,7 +2161,12 @@ mod tests {
     #[test]
     fn hot_frames_counts_self_and_total_once_per_line() {
         let v = hot_frames("main;a;b 3\nmain;a 1\nmain;b;b 2\nbad\n 4\n", 10);
-        let f: Vec<(&str, i64, i64)> = v.as_array().unwrap().iter().map(|r| (r["frame"].as_str().unwrap(), r["self_samples"].as_i64().unwrap(), r["total_samples"].as_i64().unwrap())).collect();
+        let f: Vec<(&str, i64, i64)> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["frame"].as_str().unwrap(), r["self_samples"].as_i64().unwrap(), r["total_samples"].as_i64().unwrap()))
+            .collect();
         assert_eq!(f, [("b", 5, 5), ("a", 1, 4)]);
         assert_eq!(v[0]["self_pct"].to_string(), "83.3");
     }
