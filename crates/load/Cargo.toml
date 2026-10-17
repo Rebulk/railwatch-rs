@@ -17,8 +17,8 @@ http-body-util = "0.1"
 bytes = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 flate2 = "1"
-sha2 = "0.10"
-md-5 = "0.10"
+sha2 = "0.11"
+md-5 = "0.11"
 uuid = { version = "1", features = ["v4", "v7"] }
 rand = { version = "0.9", features = ["small_rng"] }
 # https:// targets (built-in TLS); --cacert trusts a test CA (Pebble).
