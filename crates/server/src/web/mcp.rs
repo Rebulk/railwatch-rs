@@ -2182,12 +2182,12 @@ mod tests {
 
     #[test]
     fn the_body_is_json_whatever_its_type_and_must_be_an_object_with_object_params() {
-        use crate::control::{Control, insert_user, issue_api_token};
+        use crate::control::{Control, insert_user, issue_api_token, test_password};
         let dir = std::env::temp_dir().join(format!("rw-mcp-{}-body", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("telemetry")).unwrap();
         let c = Control::open(&dir.join("control.sqlite3")).unwrap();
-        let ada = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", "correct horse battery", true)).unwrap();
+        let ada = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
         let scopes: Vec<String> = ["mcp", "read"].iter().map(|s| s.to_string()).collect();
         let (_, raw) = c.tx(|tx| issue_api_token(tx, ada, "t", &scopes, None, None, None)).unwrap();
         let (followups, _rx) = crate::followups::channel();

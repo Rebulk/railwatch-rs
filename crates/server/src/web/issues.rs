@@ -860,7 +860,7 @@ mod tests {
     fn unavailable(s: &Shown) -> Value {
         crate::detection::presenter::unavailable_json(&crate::detection::presenter::Presented { kind: &s.kind, occurrences: s.occurrences, sample: &s.sample })
     }
-    use crate::control::{create_account, create_environment, insert_application, insert_user};
+    use crate::control::{create_account, create_environment, insert_application, insert_user, test_password};
 
     struct Fixture {
         dir: std::path::PathBuf,
@@ -884,8 +884,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let c = Control::open(&dir.join("control.sqlite3")).unwrap();
-        let ada = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", "correct horse battery", true)).unwrap();
-        let eve = c.tx(|tx| insert_user(tx, "Eve", "eve@example.com", "correct horse battery", true)).unwrap();
+        let ada = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
+        let eve = c.tx(|tx| insert_user(tx, "Eve", "eve@example.com", &test_password(), true)).unwrap();
         let account = c.tx(|tx| create_account(tx, "Acme", ada)).unwrap();
         let other = c.tx(|tx| create_account(tx, "Other", eve)).unwrap();
         let app = c.tx(|tx| insert_application(tx, account, "Shop", "shop", "SHOP", None, "main")).unwrap();

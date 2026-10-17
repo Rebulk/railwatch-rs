@@ -331,14 +331,7 @@ pub fn dry_run(control: &Control, tenants_dir: &Path, base_url: &str, now: i64, 
 mod tests {
     use super::*;
 
-    /// A throwaway password for fixture users (random, so no credential is
-    /// written into the source).
-    fn test_password() -> String {
-        let mut b = [0u8; 16];
-        getrandom::fill(&mut b).expect("random");
-        b.iter().map(|x| format!("{x:02x}")).collect()
-    }
-    use crate::control::{create_account, create_environment, insert_application, insert_membership, insert_user};
+    use crate::control::{create_account, create_environment, insert_application, insert_membership, insert_user, test_password};
     use crate::rollup::random::RubyRandom;
     use crate::rollup::tdigest::TDigest;
 

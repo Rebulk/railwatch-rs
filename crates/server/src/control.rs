@@ -574,7 +574,7 @@ pub fn verify_password(password: &str, digest: &str) -> bool {
 /// costs what a hit costs (authenticate_by's timing equalisation).
 pub fn dummy_digest() -> &'static str {
     static D: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    D.get_or_init(|| hash_password("railwatch-timing-equaliser"))
+    D.get_or_init(|| hash_password(&base58(16)))
 }
 
 /// User validations for sign-up / password change; email normalised.
@@ -840,6 +840,13 @@ pub fn issue_api_token(
     Ok((tx.last_insert_rowid(), raw))
 }
 
+/// A throwaway password for fixture users (random, so no credential is
+/// written into the source).
+#[cfg(test)]
+pub(crate) fn test_password() -> String {
+    base58(16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,7 +913,8 @@ mod tests {
         assert!(!valid_email("bad"));
         assert!(!valid_email("a@-x.com"));
         let (dir, c) = temp();
-        let user = c.tx(|tx| insert_user(tx, "Ada", " Ada@Example.com ", "correct horse battery", false)).unwrap();
+        let password = test_password();
+        let user = c.tx(|tx| insert_user(tx, "Ada", " Ada@Example.com ", &password, false)).unwrap();
         let account = c.tx(|tx| create_account(tx, "Acme", user)).unwrap();
         let account2 = c.tx(|tx| create_account(tx, "Acme", user)).unwrap();
         let slugs: Vec<String> =
@@ -919,10 +927,10 @@ mod tests {
         assert_eq!((slug.as_str(), prefix.as_str()), ("acme-web-production", &token[..12]));
         assert!(matches!(c.tx(|tx| create_environment(tx, app, "production")), Err(ModelError::Invalid(e)) if e[0].1 == "has already been taken"));
         assert!(matches!(c.tx(|tx| create_environment(tx, app, "Prod")), Err(ModelError::Invalid(_))));
-        let u = c.with(|x| authenticate_by(x, "ADA@example.com", "correct horse battery")).unwrap().unwrap();
+        let u = c.with(|x| authenticate_by(x, "ADA@example.com", &password)).unwrap().unwrap();
         assert_eq!(u.email, "ada@example.com");
         assert!(u.password_digest.starts_with("$2b$12$"));
-        assert!(c.with(|x| authenticate_by(x, "ada@example.com", "wrong")).unwrap().is_none());
+        assert!(c.with(|x| authenticate_by(x, "ada@example.com", &format!("{password}x"))).unwrap().is_none());
         // A digest Ruby's bcrypt wrote (has_secure_password, cost 12, rw-baseline).
         let rails = "$2a$12$1EzDBnePTwOGg6V1MTqICOaxRDkMD1vVk5RM0fB6JBBMam5iMRCly";
         assert!(verify_password("correct horse battery staple", rails));
@@ -933,15 +941,15 @@ mod tests {
     #[test]
     fn invitations_are_single_use_and_bound_to_their_recipient() {
         let (dir, c) = temp();
-        let owner = c.tx(|tx| insert_user(tx, "Owner", "o@example.com", "correct horse battery", true)).unwrap();
-        let other = c.tx(|tx| insert_user(tx, "Other", "x@example.com", "correct horse battery", true)).unwrap();
+        let owner = c.tx(|tx| insert_user(tx, "Owner", "o@example.com", &test_password(), true)).unwrap();
+        let other = c.tx(|tx| insert_user(tx, "Other", "x@example.com", &test_password(), true)).unwrap();
         let account = c.tx(|tx| create_account(tx, "Acme", owner)).unwrap();
         let inv = c.tx(|tx| create_invitation(tx, account, owner, "New@Example.com", "member")).unwrap();
         assert!(matches!(c.tx(|tx| create_invitation(tx, account, owner, "new@example.com", "member")), Err(ModelError::Invalid(_))));
         let found = c.with(|x| find_invitation_by_token(x, &inv.token)).unwrap().unwrap();
         let wrong = c.with(|x| find_user(x, other)).unwrap().unwrap();
         assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &wrong, &inv.token)).unwrap(), Err(AcceptError::RecipientMismatch));
-        let newbie = c.tx(|tx| insert_user(tx, "New", "new@example.com", "correct horse battery", true)).unwrap();
+        let newbie = c.tx(|tx| insert_user(tx, "New", "new@example.com", &test_password(), true)).unwrap();
         let newbie = c.with(|x| find_user(x, newbie)).unwrap().unwrap();
         assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &newbie, &inv.token)).unwrap(), Ok(()));
         assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &newbie, &inv.token)).unwrap(), Err(AcceptError::Unavailable));

@@ -52,9 +52,11 @@ async fn security_pocs() {
     let cfg = Config::load().expect("config");
     let control = Arc::new(Control::open(&cfg.control_path()).expect("control"));
 
-    // Account A (user A, owner) and a separate Account B (user B, owner).
+    // Account A (user A, owner) and a separate Account B (user B, owner),
+    // both with one random password (none is written into the source).
+    let password = control::base58(16);
     let (user_a, account_a, issue_a, session_a, token_a) = {
-        let ua = control.tx(|tx| control::insert_user(tx, "Ada", "ada@example.com", "correct horse battery", true)).unwrap();
+        let ua = control.tx(|tx| control::insert_user(tx, "Ada", "ada@example.com", &password, true)).unwrap();
         let aa = control.tx(|tx| control::create_account(tx, "Acme", ua)).unwrap();
         let app = control.tx(|tx| control::insert_application(tx, aa, "Shop", "shop", "SHOP", None, "main")).unwrap();
         let (env, _) = control.tx(|tx| control::create_environment(tx, app, "production")).unwrap();
@@ -77,7 +79,7 @@ async fn security_pocs() {
 
     // Account B, a DIFFERENT owner, with its own issue.
     let issue_b = {
-        let ub = control.tx(|tx| control::insert_user(tx, "Bo", "bo@example.com", "correct horse battery", true)).unwrap();
+        let ub = control.tx(|tx| control::insert_user(tx, "Bo", "bo@example.com", &password, true)).unwrap();
         let ab = control.tx(|tx| control::create_account(tx, "Beta", ub)).unwrap();
         let app = control.tx(|tx| control::insert_application(tx, ab, "Else", "else", "ELSE", None, "main")).unwrap();
         let (env, _) = control.tx(|tx| control::create_environment(tx, app, "production")).unwrap();
@@ -265,9 +267,9 @@ async fn security_pocs() {
     let (b, a) = (median(&mut before), median(&mut after));
     println!("[sign-in] wrong password: median {:.0} ms before the email bucket filled, {:.0} ms after", b * 1e3, a * 1e3);
     assert!(a > b * 0.5, "bcrypt still runs once the bucket is full, so timing does not tell ({a:.3} s vs {b:.3} s)");
-    let (to, _, _) = sign_in("ada@example.com", "correct horse battery").await;
+    let (to, _, _) = sign_in("ada@example.com", &password).await;
     assert_eq!(to, "/dashboard", "the owner's right password signs in although ada@'s failure bucket is full");
-    let (to, _, _) = sign_in("bo@example.com", "correct horse battery").await;
+    let (to, _, _) = sign_in("bo@example.com", &password).await;
     assert_eq!(to, "/dashboard", "another email from the same IP signs in");
     // Brute force from one IP: 15 attempts so far; the per-IP limit (30)
     // refuses from the 31st on, even with the right password.
@@ -278,7 +280,7 @@ async fn security_pocs() {
     let too_many = "Too many sign-in attempts. Try again in a few minutes.";
     let (to, alert, _) = sign_in("ada@example.com", "guess").await;
     assert_eq!((to.as_str(), alert.as_str()), ("/sign_in", too_many), "the 31st attempt from one IP is refused");
-    let (to, alert, _) = sign_in("ada@example.com", "correct horse battery").await;
+    let (to, alert, _) = sign_in("ada@example.com", &password).await;
     assert_eq!((to.as_str(), alert.as_str()), ("/sign_in", too_many), "the per-IP limit refuses even the right password");
 
     std::fs::remove_dir_all(&dir).ok();

@@ -1579,7 +1579,7 @@ fn summary_json(v: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{Control, create_account, create_environment, insert_application, insert_user, issue_api_token};
+    use crate::control::{Control, create_account, create_environment, insert_application, insert_user, issue_api_token, test_password};
     use crate::dashboard::CursorKey;
     use crate::dashboard::pool::ReadPools;
     use crate::tenants::Tenants;
@@ -1614,8 +1614,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("telemetry")).unwrap();
         let c = Control::open(&dir.join("control.sqlite3")).unwrap();
-        let ada = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", "correct horse battery", true)).unwrap();
-        let eve = c.tx(|tx| insert_user(tx, "Eve", "eve@example.com", "correct horse battery", true)).unwrap();
+        let ada = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
+        let eve = c.tx(|tx| insert_user(tx, "Eve", "eve@example.com", &test_password(), true)).unwrap();
         let account = c.tx(|tx| create_account(tx, "Acme", ada)).unwrap();
         let other = c.tx(|tx| create_account(tx, "Other", eve)).unwrap();
         let app = c.tx(|tx| insert_application(tx, account, "Shop", "shop", "SHOP", None, "main")).unwrap();

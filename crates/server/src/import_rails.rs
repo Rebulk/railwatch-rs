@@ -194,6 +194,13 @@ fn copy(c: &mut Connection, snapshot: &Path, telemetry_dir: &Path, target_tenant
     if !fk.is_empty() {
         return Err(format!("foreign keys broken after the copy (nothing was written): {}", fk.join(", ")));
     }
+    // Slugs name files and directories under telemetry/; the copy bypassed
+    // insert_environment's check, so it runs here.
+    let slugs: Vec<String> =
+        tx.prepare("SELECT slug FROM main.environments ORDER BY id").and_then(|mut s| s.query_map([], |r| r.get(0))?.collect()).map_err(|e| e.to_string())?;
+    if let Some(e) = slugs.iter().find_map(|s| crate::control::validate_slug(s).err()) {
+        return Err(format!("environments: {e} (nothing was written)"));
+    }
     tx.commit().map_err(|e| e.to_string())?;
     c.execute("DETACH DATABASE rails", []).map_err(|e| e.to_string())?;
 
@@ -333,6 +340,34 @@ mod tests {
         assert!(next.id > 42);
         drop(c);
         assert!(run(&control, &primary, &dir.join("rails-telemetry"), &dir.join("data/telemetry"), None).is_err(), "a used target is refused");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_an_environment_slug_that_would_leave_the_telemetry_dir() {
+        let dir = std::env::temp_dir().join(format!("rw-import-slug-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(dir.join("rails-telemetry")).unwrap();
+        let primary = dir.join("production.sqlite3");
+        let r = Connection::open(&primary).unwrap();
+        r.execute_batch(crate::control_schema::RAILS_PRIMARY).unwrap();
+        r.execute_batch(
+            "INSERT INTO accounts (id, name, slug, plan, monthly_event_quota, retention_days, created_at, updated_at)
+               VALUES (7, 'Acme', 'acme', 'team', 25000000, 30, 'x', 'x');
+             INSERT INTO applications (id, account_id, name, slug, issue_prefix, created_at, updated_at) VALUES (11, 7, 'Web', 'web', 'WEB', 'x', 'x');
+             INSERT INTO environments (id, application_id, name, slug, token_digest, token_prefix, created_at, updated_at)
+               VALUES (42, 11, 'production', '../escape', 'd1', 'rw_abc', 'x', 'x');",
+        )
+        .unwrap();
+        drop(r);
+        std::fs::write(dir.join("escape.sqlite3"), b"").unwrap();
+        let control = dir.join("data/control.sqlite3");
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let err = run(&control, &primary, &dir.join("rails-telemetry"), &dir.join("data/telemetry"), None).unwrap_err();
+        assert!(err.contains("invalid slug \"../escape\""), "{err}");
+        let c = Control::open(&control).unwrap();
+        let n: i64 = c.with(|x| x.query_row("SELECT COUNT(*) FROM environments", [], |r| r.get(0))).unwrap();
+        assert_eq!(n, 0, "nothing was written");
+        assert!(!dir.join("data/escape.sqlite3").exists(), "no link outside telemetry/");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

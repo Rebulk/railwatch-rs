@@ -1772,14 +1772,14 @@ async fn invitation_resend(cx: Ctx, Path(id): Path<i64>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{Control, create_account, create_environment, insert_application, insert_user};
+    use crate::control::{Control, create_account, create_environment, insert_application, insert_user, test_password};
 
     #[test]
     fn dashboard_counts_and_lists_only_open_issues_of_the_account() {
         let dir = std::env::temp_dir().join(format!("rw-dash-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let c = Control::open(&dir.join("control.sqlite3")).unwrap();
-        let user = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", "correct horse battery", true)).unwrap();
+        let user = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
         let account = c.tx(|tx| create_account(tx, "Acme", user)).unwrap();
         let other = c.tx(|tx| create_account(tx, "Other", user)).unwrap();
         let app = c.tx(|tx| insert_application(tx, account, "Shop", "shop", "SHOP", None, "main")).unwrap();

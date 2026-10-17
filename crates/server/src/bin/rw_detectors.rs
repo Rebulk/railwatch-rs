@@ -69,8 +69,8 @@ fn main() {
         control.configure_alerting(Alerting { cipher: cipher.clone(), smtp: None, url: "https://railwatch.rebulk.com".into(), deliver: true });
         let (env, slug) = {
             let c = control.conn();
-            let ada = control::insert_user(&c, "Ada", "ada@example.com", "correct horse battery", true).ok().unwrap();
-            let grace = control::insert_user(&c, "Grace", "grace@example.com", "correct horse battery", true).ok().unwrap();
+            let ada = control::insert_user(&c, "Ada", "ada@example.com", &control::base58(16), true).ok().unwrap();
+            let grace = control::insert_user(&c, "Grace", "grace@example.com", &control::base58(16), true).ok().unwrap();
             let account = control::insert_account(&c, &format!("dets{index}"), &format!("dets{index}"), 7).ok().unwrap();
             control::insert_membership(&c, account, ada, "owner").ok().unwrap();
             control::insert_membership(&c, account, grace, "member").ok().unwrap();

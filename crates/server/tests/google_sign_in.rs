@@ -465,7 +465,7 @@ fn google_sign_in_end_to_end() {
     assert!(b.jar.contains_key("_railwatch_session"));
 
     // 3. An existing user with a verified email: linked, not duplicated.
-    let linked = server.control().tx(|tx| control::insert_user(tx, "Linked", "linked@example.com", "correct horse battery", true)).unwrap();
+    let linked = server.control().tx(|tx| control::insert_user(tx, "Linked", "linked@example.com", &control::base58(16), true)).unwrap();
     // With an account and an application, /dashboard renders (and shows the flash).
     let acct = server.control().tx(|tx| control::create_account(tx, "Linked Co", linked)).unwrap();
     server.control().tx(|tx| control::insert_application(tx, acct, "Shop", "shop", "SHOP", None, "main")).unwrap();
@@ -478,7 +478,7 @@ fn google_sign_in_end_to_end() {
     assert_eq!(users[1], ("linked@example.com".into(), Some("google_oauth2".into()), Some("g-linked".into()), true));
 
     // 4. An existing user whose email is unverified here: refused.
-    server.control().tx(|tx| control::insert_user(tx, "U", "unverified@example.com", "correct horse battery", false)).unwrap();
+    server.control().tx(|tx| control::insert_user(tx, "U", "unverified@example.com", &control::base58(16), false)).unwrap();
     let invalid = "That Google account's email is unverified or already registered. Sign in with your password instead.";
     let mut b = Browser::default();
     mock.next(Next::user("unverified@example.com", "g-u"));
@@ -610,7 +610,7 @@ fn reauthentication_for_google_users() {
     let owner: i64 = server.control().with(|x| x.query_row("SELECT id FROM users", [], |r| r.get(0))).unwrap();
     let account = server.control().tx(|tx| control::create_account(tx, "Owner Co", owner)).unwrap();
     // A co-owner, so the user is not the account's only owner.
-    let co = server.control().tx(|tx| control::insert_user(tx, "Co", "co@example.com", "correct horse battery", true)).unwrap();
+    let co = server.control().tx(|tx| control::insert_user(tx, "Co", "co@example.com", &control::base58(16), true)).unwrap();
     server
         .control()
         .with(|x| {
@@ -670,7 +670,7 @@ fn invite_only_signs_in_known_users_and_invited_emails_only() {
     let mock = Mock::start();
     let server = Server::start(&mock.base, "invite");
     let base = format!("http://127.0.0.1:{}", server.port);
-    let admin = server.control().tx(|tx| control::insert_user(tx, "Admin", "admin@example.com", "correct horse battery", true)).unwrap();
+    let admin = server.control().tx(|tx| control::insert_user(tx, "Admin", "admin@example.com", &control::base58(16), true)).unwrap();
     let account = server.control().tx(|tx| control::create_account(tx, "Acme", admin)).unwrap();
     server.control().tx(|tx| control::create_invitation(tx, account, admin, "invited@example.com", "member").map(|_| ())).unwrap();
 

@@ -250,7 +250,7 @@ pub fn from_omniauth(tx: &rusqlite::Connection, auth: &Identity, signup_open: bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{Control, insert_user};
+    use crate::control::{Control, insert_user, test_password};
 
     fn identity(email: &str, uid: &str, verified: bool) -> Identity {
         Identity { uid: uid.into(), email: Some(email.into()), email_verified: verified, name: Some("Ada Lovelace".into()) }
@@ -280,11 +280,11 @@ mod tests {
         // Same uid again: the same user, even if Google's email changed.
         assert_eq!(c.tx(|tx| from_omniauth(tx, &identity("renamed@example.com", "g-1", true), true)).unwrap(), Ok(new));
         // An existing verified-email user is linked, not duplicated.
-        let linked = c.tx(|tx| insert_user(tx, "Linked", "linked@example.com", "correct horse battery", true)).unwrap();
+        let linked = c.tx(|tx| insert_user(tx, "Linked", "linked@example.com", &test_password(), true)).unwrap();
         assert_eq!(c.tx(|tx| from_omniauth(tx, &identity("linked@example.com", "g-2", true), true)).unwrap(), Ok(linked));
         assert_eq!(row(&c, linked).2.as_deref(), Some("g-2"));
         // An unverified-email user is neither linked nor duplicated.
-        let unverified = c.tx(|tx| insert_user(tx, "U", "unverified@example.com", "correct horse battery", false)).unwrap();
+        let unverified = c.tx(|tx| insert_user(tx, "U", "unverified@example.com", &test_password(), false)).unwrap();
         assert_eq!(c.tx(|tx| from_omniauth(tx, &identity("unverified@example.com", "g-3", true), true)).unwrap(), Err(Refused::Invalid));
         assert_eq!(row(&c, unverified).2, None);
         // Google has not verified the email: nothing linked or created.
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn invite_only_signs_existing_users_in_but_creates_only_the_invited() {
         let (c, dir) = control("invite");
-        let existing = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", "correct horse battery", true)).unwrap();
+        let existing = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
         assert_eq!(c.tx(|tx| from_omniauth(tx, &identity("ada@example.com", "g-ada", true), false)).unwrap(), Ok(existing));
         assert_eq!(c.tx(|tx| from_omniauth(tx, &identity("stranger@example.com", "g-x", true), false)).unwrap(), Err(Refused::InviteOnly));
         let account = c.tx(|tx| control::create_account(tx, "Acme", existing)).unwrap();
