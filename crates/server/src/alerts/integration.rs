@@ -87,6 +87,13 @@ impl SettingsCipher {
                 _ => Err("integration secrets are corrupt (not an object)".into()),
             };
         }
+        Self::decrypt_plain(stored)
+    }
+
+    /// A stored value that is not this server's ciphertext: plain JSON (a row
+    /// written by hand or by an earlier build), or Rails' Active Record
+    /// encryption, which cannot be read here. Needs no key.
+    pub fn decrypt_plain(stored: &str) -> Result<Map<String, Value>, String> {
         match serde_json::from_str::<Value>(stored) {
             Ok(Value::Object(m)) if m.contains_key("p") && m.contains_key("h") => {
                 Err("integration secrets were encrypted by Rails (Active Record encryption) and cannot be read here; re-enter them in Settings > Integrations"
@@ -127,9 +134,8 @@ fn row(r: &rusqlite::Row<'_>, cipher: Option<&SettingsCipher>) -> rusqlite::Resu
         let decrypted = match cipher {
             Some(c) => c.decrypt(&stored),
             // Without a key only the legacy plain-JSON form is readable.
-            None => SettingsCipher([0; 32])
-                .decrypt(&stored)
-                .and_then(|m| if stored.starts_with(PREFIX) { Err("integration secrets key is not configured".into()) } else { Ok(m) }),
+            None if stored.starts_with(PREFIX) => Err("integration secrets key is not configured".into()),
+            None => SettingsCipher::decrypt_plain(&stored),
         };
         match decrypted {
             Ok(m) => settings.extend(m),
@@ -294,6 +300,20 @@ impl Integration {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Without a key: plain JSON is read, this server's ciphertext is refused
+    /// as "not configured", and Rails' AR envelope is refused, all without
+    /// ever deriving a cipher from a fixed key.
+    #[test]
+    fn keyless_reads_only_plain_json() {
+        let plain = SettingsCipher::decrypt_plain(r#"{"url":"https://example.com/hook"}"#).unwrap();
+        assert_eq!(plain["url"], json!("https://example.com/hook"));
+        let rails = SettingsCipher::decrypt_plain(r#"{"p":"x","h":{"iv":"y"}}"#).unwrap_err();
+        assert!(rails.contains("Rails"), "{rails}");
+        assert!(SettingsCipher::decrypt_plain("not json").is_err());
+        let ours = SettingsCipher([7; 32]).encrypt(&Map::new());
+        assert!(ours.starts_with(PREFIX));
+    }
 
     fn obj(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
