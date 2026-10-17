@@ -21,6 +21,7 @@ pub mod google_oauth2;
 pub mod inertia;
 pub mod integrations;
 pub mod issues;
+pub mod digest_mailer;
 pub mod mailer;
 pub mod mcp;
 pub mod params;
