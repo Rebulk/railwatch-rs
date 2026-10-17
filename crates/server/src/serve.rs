@@ -11,8 +11,11 @@
 //!   from the handler's first read of it (600 s: the 32 MiB ingest ceiling
 //!   at ~450 kbit/s; the gem's batches are far smaller).
 //! - `idle_timeout`: no byte read or written for this long while hyper waits
-//!   on the socket (a stalled upload, a client that stops reading the
-//!   response, a dead websocket; cable pings every 3 s) closes it.
+//!   on the peer (a stalled upload, a client that stops reading the
+//!   response, a dead websocket; cable pings every 3 s) closes it. Time the
+//!   server spends on a request it has read in full is not the peer's: from
+//!   the end of the request body (or the head, without one) until the
+//!   response starts to be written, it does not count.
 //! - `max_connections`: past this many open connections the server stops
 //!   accepting; new ones wait in the kernel's backlog, as during a restart.
 //! - `max_connections_per_ip`: one client address (an IPv6 /64) may hold at
@@ -31,6 +34,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -196,12 +200,17 @@ where
         let mut stop = stop_rx.clone();
         let close = close_rx.clone();
         tokio::spawn(async move {
+            let working = Arc::new(AtomicBool::new(false));
+            let io = TokioIo::new(Idle::new(io, limits.idle_timeout, working.clone()));
             let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
-                let mut req = req.map(|b| Body::new(DeadlineBody::new(b, limits.body_timeout)));
+                if http_body::Body::is_end_stream(req.body()) {
+                    working.store(true, Ordering::Relaxed);
+                }
+                let working = working.clone();
+                let mut req = req.map(|b| Body::new(DeadlineBody::new(b, limits.body_timeout, working)));
                 req.extensions_mut().insert(ConnectInfo(addr));
                 router.clone().oneshot(req)
             });
-            let io = TokioIo::new(Idle::new(io, limits.idle_timeout));
             let mut builder = hyper::server::conn::http1::Builder::new();
             builder.timer(TokioTimer::new()).header_read_timeout(limits.header_timeout);
             let mut conn = std::pin::pin!(builder.serve_connection(io, svc).with_upgrades());
@@ -232,15 +241,17 @@ where
 }
 
 /// A request body that fails once `timeout` has passed since its first read.
+/// Sets `working` when it has been read to the end (see `Idle`).
 struct DeadlineBody {
     inner: Incoming,
     timeout: Duration,
     deadline: Option<Pin<Box<Sleep>>>,
+    working: Arc<AtomicBool>,
 }
 
 impl DeadlineBody {
-    fn new(inner: Incoming, timeout: Duration) -> Self {
-        DeadlineBody { inner, timeout, deadline: None }
+    fn new(inner: Incoming, timeout: Duration, working: Arc<AtomicBool>) -> Self {
+        DeadlineBody { inner, timeout, deadline: None, working }
     }
 }
 
@@ -262,6 +273,10 @@ impl http_body::Body for DeadlineBody {
     fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
         let this = &mut *self;
         if let Poll::Ready(r) = Pin::new(&mut this.inner).poll_frame(cx) {
+            // A chunked body only says so with the final None.
+            if r.is_none() || (matches!(r, Some(Ok(_))) && this.inner.is_end_stream()) {
+                this.working.store(true, Ordering::Relaxed);
+            }
             return Poll::Ready(r.map(|f| f.map_err(Into::into)));
         }
         let timeout = this.timeout;
@@ -286,23 +301,40 @@ impl http_body::Body for DeadlineBody {
 
 /// An IO that fails with TimedOut when a read or write it was asked for has
 /// waited `timeout` since the last byte moved either way.
+///
+/// Except while `working`: set once a request has been read in full, cleared
+/// when hyper starts to write the response. In between hyper keeps a read
+/// pending only to notice a hang-up; the peer is waiting on the server, so a
+/// handler slower than `timeout` must not get the connection closed under it.
 struct Idle<T> {
     inner: T,
     timeout: Duration,
     sleep: Pin<Box<Sleep>>,
+    working: Arc<AtomicBool>,
 }
 
 impl<T> Idle<T> {
-    fn new(inner: T, timeout: Duration) -> Self {
-        Idle { inner, timeout, sleep: Box::pin(tokio::time::sleep(timeout)) }
+    fn new(inner: T, timeout: Duration, working: Arc<AtomicBool>) -> Self {
+        Idle { inner, timeout, sleep: Box::pin(tokio::time::sleep(timeout)), working }
     }
 
     fn moved(&mut self) {
         self.sleep.as_mut().reset(Instant::now() + self.timeout);
     }
 
+    /// hyper is writing: the server's turn is over, and the peer's idle time
+    /// starts now, not when the request was read.
+    fn writing(&mut self) {
+        if self.working.swap(false, Ordering::Relaxed) {
+            self.moved();
+        }
+    }
+
     /// For a pending read/write: TimedOut if the idle deadline has passed.
     fn expired<R>(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<R>> {
+        if self.working.load(Ordering::Relaxed) {
+            return Poll::Pending;
+        }
         match self.sleep.as_mut().poll(cx) {
             Poll::Ready(()) => Poll::Ready(Err(std::io::ErrorKind::TimedOut.into())),
             Poll::Pending => Poll::Pending,
@@ -329,6 +361,7 @@ impl<T: AsyncRead + Unpin> AsyncRead for Idle<T> {
 impl<T: AsyncWrite + Unpin> AsyncWrite for Idle<T> {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        this.writing();
         match Pin::new(&mut this.inner).poll_write(cx, buf) {
             Poll::Ready(r) => {
                 if matches!(r, Ok(n) if n > 0) {
@@ -342,6 +375,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Idle<T> {
 
     fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[std::io::IoSlice<'_>]) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        this.writing();
         match Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
             Poll::Ready(r) => {
                 if matches!(r, Ok(n) if n > 0) {
@@ -358,6 +392,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Idle<T> {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // Not `writing`: hyper flushes on every turn, response or not.
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_flush(cx) {
             Poll::Pending => this.expired(cx),
@@ -436,6 +471,73 @@ mod tests {
             }
             let _ = stop.send(());
         }
+    }
+
+    /// Serves `router` on a loopback port under `limits`.
+    async fn serve_router(limits: Limits, router: axum::Router) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(run(listener, router, limits, async move {
+            let _ = rx.await;
+        }));
+        (addr, tx)
+    }
+
+    /// Sends `req` and reads until the server closes: what came back.
+    async fn exchange(addr: SocketAddr, req: &[u8]) -> String {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(req).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// A handler that takes longer than `idle_timeout` (a big ingest batch on
+    /// a slow runner, a heavy dashboard query) still gets its response out:
+    /// while the server works, hyper's pending read only watches for a hang-up,
+    /// and the client, waiting for the response, is not idle. The connection
+    /// used to be closed with no response at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handler_slower_than_the_idle_timeout_still_responds() {
+        let limits = Limits { idle_timeout: Duration::from_millis(300), ..Limits::default() };
+        let slow = Duration::from_millis(1200);
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || async move {
+                tokio::time::sleep(slow).await;
+                "slow get"
+            })
+            .post(move |body: Bytes| async move {
+                tokio::time::sleep(slow).await;
+                format!("slow post {}", body.len())
+            }),
+        );
+        let (addr, stop) = serve_router(limits, router).await;
+        let get = exchange(addr, b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").await;
+        assert!(get.starts_with("HTTP/1.1 200") && get.ends_with("slow get"), "GET: {get:?}");
+        let post = exchange(addr, b"POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello").await;
+        assert!(post.starts_with("HTTP/1.1 200") && post.ends_with("slow post 5"), "POST: {post:?}");
+        let _ = stop.send(());
+    }
+
+    /// The idle timeout still cuts off a client that stops reading the
+    /// response once the server has started sending it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_that_stops_reading_the_response_is_cut_off() {
+        const SIZE: usize = 64 << 20; // far more than both socket buffers hold
+        let limits = Limits { idle_timeout: Duration::from_millis(300), ..Limits::default() };
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { vec![b'x'; SIZE] }));
+        let (addr, stop) = serve_router(limits, router).await;
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").await.unwrap();
+        let mut head = [0u8; 12];
+        s.read_exact(&mut head).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let mut rest = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut rest)).await;
+        assert!(rest.len() < SIZE, "the server gave up on a client that stopped reading ({} bytes after the pause)", rest.len());
+        let _ = stop.send(());
     }
 
     #[test]

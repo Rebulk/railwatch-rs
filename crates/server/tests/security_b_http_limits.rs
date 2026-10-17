@@ -141,7 +141,10 @@ fn slow_clients_are_cut_off_and_connections_are_capped() {
 }
 
 /// The defaults must not cut off a legitimate slow upload: a 32 MiB-class
-/// body trickled in chunks with short pauses is accepted whole.
+/// body trickled in chunks with short pauses is accepted whole. Committing
+/// the 3,000 records once the body is in is the server's time, not the
+/// client's: however long it takes on a slow runner, the idle timeout must
+/// not close the connection under it (it did, with an empty response).
 #[test]
 fn slow_but_steady_upload_is_accepted() {
     let s = start(&[("RAILWATCH_HTTP_IDLE_TIMEOUT_SECONDS", "2")]);
@@ -158,7 +161,7 @@ fn slow_but_steady_upload_is_accepted() {
         c.write_all(chunk).unwrap();
         std::thread::sleep(Duration::from_millis(500)); // well under the 2 s idle limit
     }
-    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(120))).unwrap(); // the commit, however slow
     let mut out = Vec::new();
     let _ = c.read_to_end(&mut out);
     let status = String::from_utf8_lossy(&out[..out.len().min(12)]).into_owned();
