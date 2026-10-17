@@ -199,9 +199,13 @@ async fn sign_in_create(cx: Ctx, p: Params) -> Response {
     guard!(rate_limited(&cx, &cx.state.sign_in_limit, "/sign_in", "Too many sign-in attempts. Try again in a few minutes."));
     guard!(require_no_authentication(&cx));
     let (email, password) = (p.s("email"), p.s("password"));
-    if cx.state.sign_in_email_limit.exceeded(&email.trim().to_lowercase()) {
-        return cx.redirect(Redirect::to("/sign_in").alert("Too many sign-in attempts. Try again in a few minutes."));
-    }
+    // Failures are counted per email, but never refuse: a refusal would let
+    // anyone who knows an address keep its owner out, and a different answer
+    // would say the bucket is full. The password is always checked (bcrypt,
+    // same cost either way), so the right one signs in and a wrong one gets
+    // the usual "incorrect", full bucket or not. Only the per-IP limit above
+    // refuses outright.
+    let email_key = email.trim().to_lowercase();
     let ua = cx.current.user_agent.clone();
     let ip = cx.current.ip.clone();
     let result = cx
@@ -218,7 +222,12 @@ async fn sign_in_create(cx: Ctx, p: Params) -> Response {
             cx.outgoing.sign_in(session);
             cx.redirect(Redirect::to("/dashboard").notice("Signed in successfully"))
         }
-        Ok(None) => cx.redirect(Redirect::to("/sign_in").alert("That email or password is incorrect")),
+        Ok(None) => {
+            if cx.state.sign_in_email_limit.exceeded(&email_key) {
+                tracing::warn!(ip = %cx.current.ip, "repeated failed sign-ins for one email (password guessing or a forgotten password)");
+            }
+            cx.redirect(Redirect::to("/sign_in").alert("That email or password is incorrect"))
+        }
         Err(e) => internal(e),
     }
 }

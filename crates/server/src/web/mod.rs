@@ -54,10 +54,10 @@ pub struct WebState {
     pub mailer: Option<mailer::Mailer>,
     /// SessionsController: 30 sign-in attempts per 5 minutes per IP.
     pub sign_in_limit: FixedWindow<IpAddr>,
-    /// Rust-only: 10 sign-in attempts per 5 minutes per submitted email
-    /// (lower-cased), so guessing one account's password is throttled even
-    /// when the per-IP limit is spread across addresses or collapsed onto a
-    /// proxy's.
+    /// Rust-only: 10 failed sign-ins per 5 minutes per submitted email
+    /// (lower-cased). Only failures count, and the right password always
+    /// signs in, so knowing someone's email does not let you lock them out;
+    /// a full bucket logs a warning (sessions::sign_in_create).
     pub sign_in_email_limit: FixedWindow<String>,
     /// UsersController: 10 sign-ups an hour per IP.
     pub sign_up_limit: FixedWindow<IpAddr>,

@@ -1011,10 +1011,15 @@ security audits. Regression tests: `crates/server/tests/security_*.rs`.
    missing Referer (Rails' `url_from` would also refuse it). Control
    characters are refused as well. Every other redirect target is a fixed
    path.
-6. **Sign-in is also throttled per email** (10 attempts per 5 minutes per
-   lower-cased email, on top of Rails' 30 per 5 minutes per IP), so guessing
-   one account's password is limited even when the per-IP bucket is spread
-   over addresses or collapsed onto a proxy's. `serve` and `doctor` warn
+6. **Failed sign-ins are also counted per email** (10 per 5 minutes per
+   lower-cased email, on top of Rails' 30 attempts per 5 minutes per IP).
+   A full email bucket never refuses: the password is still checked (the
+   same bcrypt work), the right one signs in, and a wrong one gets the usual
+   "That email or password is incorrect", so the response says nothing
+   about the bucket and knowing someone's email does not let you lock them
+   out. It logs a warning instead. Only the per-IP limit refuses outright,
+   so guessing one account's password from many addresses is bounded by the
+   per-IP limit times the addresses, as in Rails. `serve` and `doctor` warn
    when the url is https, the bind is loopback/private, there is no built-in
    TLS and `trust_proxy` is off (every client looks like the proxy).
 7. **HSTS** (`Strict-Transport-Security: max-age=31536000`) on every
