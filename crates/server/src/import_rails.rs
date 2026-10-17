@@ -209,6 +209,14 @@ fn copy(c: &mut Connection, snapshot: &Path, telemetry_dir: &Path, target_tenant
     let same_dir = telemetry_dir.canonicalize().ok() == target_tenants.canonicalize().ok();
     for slug in slugs {
         let src = telemetry_dir.join(format!("{slug}.sqlite3"));
+        // Importing the control DB into an install that already has its own
+        // per-day telemetry for these environments (a server that ran beside
+        // Rails, fed the same ingest): that directory is the environment's
+        // data, adopted as is.
+        if same_dir && crate::storage::Layout::detect(target_tenants, &slug).is_some() {
+            report.tenants_found += 1;
+            continue;
+        }
         if !src.is_file() {
             report.tenants_missing.push(slug);
             continue;
@@ -328,6 +336,33 @@ mod tests {
         assert!(next.id > 42);
         drop(c);
         assert!(run(&control, &primary, &dir.join("rails-telemetry"), &dir.join("data/telemetry"), None).is_err(), "a used target is refused");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn adopts_per_day_directories_already_in_the_data_dir() {
+        let dir = std::env::temp_dir().join(format!("rw-import-days-{}", crate::control::base58(8)));
+        let tenants = dir.join("data/telemetry");
+        std::fs::create_dir_all(&tenants).unwrap();
+        let primary = dir.join("production.sqlite3");
+        let r = Connection::open(&primary).unwrap();
+        r.execute_batch(crate::control_schema::RAILS_PRIMARY).unwrap();
+        r.execute_batch(
+            "INSERT INTO accounts (id, name, slug, plan, monthly_event_quota, retention_days, created_at, updated_at)
+               VALUES (7, 'Acme', 'acme', 'team', 25000000, 30, 'x', 'x');
+             INSERT INTO applications (id, account_id, name, slug, issue_prefix, created_at, updated_at) VALUES (11, 7, 'Web', 'web', 'WEB', 'x', 'x');
+             INSERT INTO environments (id, application_id, name, slug, token_digest, token_prefix, created_at, updated_at)
+               VALUES (42, 11, 'production', 'acme-web-production', 'd1', 'rw_abc', 'x', 'x'),
+                      (43, 11, 'staging', 'acme-web-staging', 'd2', 'rw_def', 'x', 'x');",
+        )
+        .unwrap();
+        drop(r);
+        // This install already holds production's per-day data; staging has none.
+        crate::storage::layout::ensure(&tenants.join("acme-web-production")).unwrap();
+        let rep = run(&dir.join("data/control.sqlite3"), &primary, &tenants, &tenants, None).unwrap();
+        assert_eq!(rep.tenants_found, 1);
+        assert_eq!(rep.tenants_missing, vec!["acme-web-staging".to_string()]);
+        assert!(crate::storage::layout::meta_path(&tenants.join("acme-web-production")).is_file(), "left in place");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -12,6 +12,7 @@
 //!   railwatch backup                   one backup pass now (RAILWATCH_BACKUP_S3_*)
 //!   railwatch restore                  download the backup into an empty data dir
 //!   railwatch integrations [--show-secrets]   one JSON line per alert destination
+//!   railwatch integrations test <id>   Send test: one synthetic alert to that destination
 //!   railwatch doctor
 //!   railwatch upgrade [--version vX.Y.Z]   fetch the release's install.sh and re-run it
 //!   railwatch version
@@ -46,6 +47,7 @@ const USAGE: &str = "usage:
   railwatch backup
   railwatch restore
   railwatch integrations [--show-secrets]
+  railwatch integrations test <id>
   railwatch doctor
   railwatch upgrade [--version vX.Y.Z]   as root: install.sh from the release, re-run (zero-drop restart)
   railwatch version
@@ -83,6 +85,47 @@ fn open_control(cfg: &Config) -> Arc<Control> {
     }))
 }
 
+/// The data directory's instance lock: one `railwatch serve` at a time.
+/// The tenant writers cache their high-water marks (storage/writer.rs) and
+/// the scheduler, watchdog and alert loop assume they are alone, so a second
+/// server on the same data must not start writing until the first has
+/// drained and exited. `flock` on `<data_dir>/serve.lock`, held for the
+/// life of the process: the kernel releases it on exit, crash included, and
+/// it works across containers sharing one volume.
+///
+/// `wait`: block until the holder exits (serve; this is the hand-over of a
+/// restart that starts the next server before stopping the last). Otherwise
+/// fail at once (split, import-rails, restore: offline work).
+fn lock_data_dir(cfg: &Config, wait: bool) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(&cfg.data_dir).map_err(|e| format!("cannot create {}: {e}", cfg.data_dir.display()))?;
+    let path = cfg.data_dir.join("serve.lock");
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // SAFETY: flock on an fd we own.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(file);
+    }
+    if !wait {
+        return Err(format!("{} is held: a railwatch server is running on {} (stop it first)", path.display(), cfg.data_dir.display()));
+    }
+    eprintln!("railwatch: waiting for {}: another railwatch server on this data dir has not exited yet", path.display());
+    let started = std::time::Instant::now();
+    // SAFETY: as above; blocks until the holder's fd closes.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!("{}: {}", path.display(), std::io::Error::last_os_error()));
+    }
+    eprintln!("railwatch: {} acquired after {} ms", path.display(), started.elapsed().as_millis());
+    Ok(file)
+}
+
+/// Runs an offline command only while no server holds the data dir.
+fn offline(f: impl FnOnce() -> ExitCode) -> ExitCode {
+    match lock_data_dir(&config(), false) {
+        Ok(_lock) => f(),
+        Err(e) => fail(e),
+    }
+}
+
 fn tenants(cfg: &Config) -> Tenants {
     let (tx, _rx) = followups::channel();
     Tenants::new(cfg.tenants_dir(), Duration::from_secs(1), tx)
@@ -105,12 +148,13 @@ fn main() -> ExitCode {
         ["doctor"] => doctor(),
         ["integrations"] => integrations(false),
         ["integrations", "--show-secrets"] => integrations(true),
-        ["import-rails", rest @ ..] => import_rails(rest),
-        ["split", "--all"] => split_all(),
-        ["split", slug] => split(slug),
+        ["integrations", "test", id] => integration_test(id),
+        ["import-rails", rest @ ..] => offline(|| import_rails(rest)),
+        ["split", "--all"] => offline(split_all),
+        ["split", slug] => offline(|| split(slug)),
         ["export", slug, out] => export(slug, out),
         ["backup"] => backup_now(),
-        ["restore"] => restore(),
+        ["restore"] => offline(restore),
         ["env", "list"] => {
             let cfg = config();
             for e in open_control(&cfg).list().expect("list environments") {
@@ -500,6 +544,33 @@ fn import_rails(rest: &[&str]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => fail(e),
+    }
+}
+
+/// Settings > Integrations > Send test, from the shell: one synthetic alert
+/// through the real delivery path (alerts::deliver_test), recorded like the
+/// button's. Safe beside a running server (the alert row is created already
+/// claimed, so the server's delivery loop never sends it too).
+fn integration_test(id: &str) -> ExitCode {
+    let Ok(id) = id.parse::<i64>() else { return usage() };
+    let cfg = config();
+    let control = open_control(&cfg);
+    match cfg.secret() {
+        Ok(secret) => control.configure_alerting(railwatch_server::alerts::integration::Alerting {
+            cipher: railwatch_server::alerts::integration::SettingsCipher::new(&secret),
+            smtp: cfg.smtp.clone(),
+            url: cfg.url.clone(),
+            deliver: cfg.alert_delivery,
+        }),
+        Err(e) => return fail(format!("secret_key_base: {e}")),
+    }
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+    match rt.block_on(railwatch_server::alerts::deliver_test(&control, id)) {
+        Ok(outcome) => {
+            println!("integration {id}: test alert {outcome}");
+            if outcome == "sent" { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        Err(e) => fail(format!("integration {id}: test alert failed: {e}")),
     }
 }
 
@@ -969,6 +1040,11 @@ fn serve() -> ExitCode {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("RAILWATCH_LOG").unwrap_or_else(|_| "info".into()))
         .init();
     let cfg = config();
+    // Held until the process exits, after the writers have drained.
+    let _lock = match lock_data_dir(&cfg, true) {
+        Ok(l) => l,
+        Err(e) => return fail(e),
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     runtime.block_on(async {
         let control = open_control(&cfg);

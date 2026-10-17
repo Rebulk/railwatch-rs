@@ -240,6 +240,13 @@ commits queued writes before it exits (SIGTERM, up to 60 s). Measured
 HTTPS: **641 posts, 641 answered 200, 641 batches in the database, 0
 errors**.
 
+**One server per data directory.** `railwatch serve` holds an exclusive
+lock on `<data_dir>/serve.lock` for its whole life; a second `serve` on the
+same directory waits until the first has drained and exited, and `split`,
+`import-rails` and `restore` refuse to run while a server holds it. Behind
+kamal-proxy (a host shared with Kamal apps), `deploy/kamal-proxy/` uses
+that for zero-drop blue/green restarts; see its README.
+
 ## Uninstall
 
 ```sh
