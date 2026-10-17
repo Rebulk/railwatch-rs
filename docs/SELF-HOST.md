@@ -223,8 +223,14 @@ or integration secrets must be re-entered.
 
 ```sh
 sudo railwatch upgrade                   # the latest release
-sudo railwatch upgrade --version v0.3.0  # a specific one (or back to an older one)
+sudo railwatch upgrade --version v0.3.0  # a specific one
+sudo railwatch upgrade --version v0.2.0 --allow-downgrade  # back to an older one
 ```
+
+An older release than the running one (semver order, so `v1.0.0-rc.1` is
+older than `v1.0.0`) is refused without `--allow-downgrade`: it may have
+vulnerabilities fixed since. `install.sh` does the same when it would
+replace a newer installed binary.
 
 That downloads the release's `install.sh`, verifies it (the release's
 signed `SHA256SUMS`: needs `cosign` on PATH, see [Releases](#releases)),

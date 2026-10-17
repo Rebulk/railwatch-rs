@@ -14,7 +14,7 @@
 //!   railwatch integrations [--show-secrets]   one JSON line per alert destination
 //!   railwatch integrations test <id>   Send test: one synthetic alert to that destination
 //!   railwatch doctor
-//!   railwatch upgrade [--version vX.Y.Z]   fetch the release's install.sh and re-run it
+//!   railwatch upgrade [--version vX.Y.Z] [--allow-downgrade]   fetch the release's install.sh and re-run it
 //!   railwatch version
 
 #[global_allocator]
@@ -49,7 +49,9 @@ const USAGE: &str = "usage:
   railwatch integrations [--show-secrets]
   railwatch integrations test <id>
   railwatch doctor
-  railwatch upgrade [--version vX.Y.Z]   as root: install.sh from the release, re-run (zero-drop restart)
+  railwatch upgrade [--version vX.Y.Z] [--allow-downgrade]
+                                         as root: install.sh from the release, re-run (zero-drop restart);
+                                         an older release only with --allow-downgrade
   railwatch version
 
 Configuration: RAILWATCH_* env vars (RAILWATCH_ENV_FILE=PATH reads them from a KEY=VALUE file),
@@ -670,6 +672,15 @@ fn upgrade(rest: &[&str]) -> ExitCode {
         return fail(format!("{base}: releases are only fetched over https (RAILWATCH_ALLOW_HTTP_RELEASE=1 is for tests)"));
     }
     let version = flag(rest, "--version");
+    let allow_downgrade = rest.contains(&"--allow-downgrade");
+    // An explicit older version is refused before anything is fetched;
+    // `latest` is checked once SHA256SUMS names its tag, below.
+    if let Some(v) = version
+        && !allow_downgrade
+        && let Err(e) = not_a_downgrade(railwatch_server::VERSION, v)
+    {
+        return fail(e);
+    }
     let dir = match version {
         Some(v) => format!("{base}/download/{v}"),
         None => format!("{base}/latest/download"),
@@ -697,6 +708,9 @@ fn upgrade(rest: &[&str]) -> ExitCode {
             None => return fail("SHA256SUMS names no release tarball; cannot tell which release this is"),
         },
     };
+    if !allow_downgrade && let Err(e) = not_a_downgrade(railwatch_server::VERSION, &tag) {
+        return fail(e);
+    }
     match get("SHA256SUMS.sigstore.json") {
         Ok(bundle) => {
             if let Err(e) = cosign_verify(&sums, &bundle, &tag) {
@@ -719,6 +733,11 @@ fn upgrade(rest: &[&str]) -> ExitCode {
     // between the check and the run.
     let mut cmd = std::process::Command::new("sh");
     cmd.args(["-s", "--", "--upgrade", "--version", &tag]);
+    // An installer from before --allow-downgrade has no downgrade check and
+    // would refuse the unknown flag.
+    if allow_downgrade && script.windows(19).any(|w| w == b"--allow-downgrade) ") {
+        cmd.arg("--allow-downgrade");
+    }
     if std::env::var_os("RAILWATCH_RELEASE_BASE").is_some() {
         // The binary and SHA256SUMS come from the same place as the script.
         cmd.args(["--release-url", &dir]);
@@ -737,6 +756,91 @@ fn upgrade(rest: &[&str]) -> ExitCode {
         (Err(e), _) => fail(format!("sh: {e}")),
         (_, Ok(s)) => fail(format!("install.sh --upgrade exited with {s}")),
         (_, Err(e)) => fail(format!("sh: {e}")),
+    }
+}
+
+/// Err when `target` is an older release than `running` (Semantic
+/// Versioning 2.0 precedence, so v1.0.0-rc.1 < v1.0.0). A version that does
+/// not parse, on either side, is also refused: without an order, rolling
+/// back cannot be ruled out. `--allow-downgrade` skips this.
+fn not_a_downgrade(running: &str, target: &str) -> Result<(), String> {
+    let (Some(r), Some(t)) = (Semver::parse(running), Semver::parse(target)) else {
+        return Err(format!("cannot compare versions {running:?} and {target:?}; pass --allow-downgrade if {target} is the release you want"));
+    };
+    if t < r {
+        return Err(format!(
+            "{target} is older than the running {running}; an older release may have fixed vulnerabilities. Pass --allow-downgrade to install it anyway"
+        ));
+    }
+    Ok(())
+}
+
+/// `[v]MAJOR.MINOR.PATCH[-PRE][+BUILD]`, ordered by semver precedence (the
+/// build metadata is ignored).
+#[derive(Debug, PartialEq, Eq)]
+struct Semver {
+    core: [u64; 3],
+    pre: Vec<String>,
+}
+
+impl Semver {
+    fn parse(s: &str) -> Option<Semver> {
+        let s = s.strip_prefix('v').unwrap_or(s);
+        let s = s.split_once('+').map_or(s, |(v, _build)| v);
+        let (core, pre) = match s.split_once('-') {
+            Some((c, p)) => (c, Some(p)),
+            None => (s, None),
+        };
+        let mut parts = core.split('.');
+        let mut n = || -> Option<u64> {
+            let p = parts.next()?;
+            (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && (p == "0" || !p.starts_with('0'))).then(|| p.parse().ok())?
+        };
+        let core = [n()?, n()?, n()?];
+        if parts.next().is_some() {
+            return None;
+        }
+        let pre: Vec<String> = match pre {
+            None => Vec::new(),
+            Some(p) => p.split('.').map(str::to_string).collect(),
+        };
+        if pre.iter().any(|i| i.is_empty() || !i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+            return None;
+        }
+        Some(Semver { core, pre })
+    }
+}
+
+impl PartialOrd for Semver {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Semver {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        self.core.cmp(&other.core).then_with(|| match (self.pre.is_empty(), other.pre.is_empty()) {
+            (true, true) => Ordering::Equal,
+            // A pre-release comes before its release.
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => {
+                for (a, b) in self.pre.iter().zip(&other.pre) {
+                    let numeric = |s: &str| s.bytes().all(|b| b.is_ascii_digit()).then(|| s.parse::<u64>().ok()).flatten();
+                    let o = match (numeric(a), numeric(b)) {
+                        (Some(x), Some(y)) => x.cmp(&y),
+                        (Some(_), None) => Ordering::Less,
+                        (None, Some(_)) => Ordering::Greater,
+                        (None, None) => a.cmp(b),
+                    };
+                    if o != Ordering::Equal {
+                        return o;
+                    }
+                }
+                self.pre.len().cmp(&other.pre.len())
+            }
+        })
     }
 }
 
@@ -1268,6 +1372,28 @@ mod tests {
         assert_eq!(release_tag(sums).as_deref(), Some("v1.2.3"));
         assert_eq!(release_tag(b"aa  railwatch-v0.2.0-rc.1-x86_64-linux-musl.tar.gz\n").as_deref(), Some("v0.2.0-rc.1"));
         assert_eq!(release_tag(b"cc  install.sh\n"), None);
+    }
+
+    /// Issue #5: `upgrade --version` must not roll back to an older signed
+    /// release (one with since-fixed vulnerabilities) unless asked to.
+    #[test]
+    fn upgrade_refuses_to_go_backwards() {
+        assert!(not_a_downgrade("0.2.0", "v0.2.0").is_ok(), "re-installing the same release");
+        assert!(not_a_downgrade("0.2.0", "v0.2.1").is_ok());
+        assert!(not_a_downgrade("0.2.0", "v1.0.0").is_ok());
+        assert!(not_a_downgrade("v0.2.0-rc.1", "v0.2.0").is_ok(), "a release is newer than its pre-releases");
+        assert!(not_a_downgrade("0.2.0", "v0.1.9").unwrap_err().contains("--allow-downgrade"));
+        assert!(not_a_downgrade("0.10.0", "v0.9.0").is_err(), "numeric, not lexical");
+        assert!(not_a_downgrade("0.2.0", "v0.2.0-rc.1").is_err(), "a pre-release of the running version is older");
+        assert!(not_a_downgrade("0.0.0-test.10", "v0.0.0-test.9").is_err());
+        assert!(not_a_downgrade("0.0.0-test.2", "v0.0.0-test.10").is_ok(), "numeric pre-release identifiers compare as numbers");
+        assert!(not_a_downgrade("1.0.0-alpha.1", "v1.0.0-alpha").is_err(), "fewer identifiers sort first");
+        assert!(not_a_downgrade("1.0.0-alpha", "v1.0.0-beta").is_ok());
+        assert!(not_a_downgrade("1.0.0-rc.1", "v1.0.0-1").is_err(), "numeric identifiers sort before alphanumeric ones");
+        assert!(not_a_downgrade("1.0.0+build.5", "v1.0.0+build.1").is_ok(), "build metadata is ignored");
+        assert!(not_a_downgrade("0.2.0", "latest").is_err(), "an unparseable version is refused");
+        assert!(not_a_downgrade("0.2.0", "v01.2.3").is_err(), "leading zeros are not semver");
+        assert!(not_a_downgrade("0.2.0", "v1.2").is_err());
     }
 
     /// The upgrade's scratch directory is fresh, private and unpredictable.

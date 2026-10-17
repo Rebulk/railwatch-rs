@@ -51,6 +51,7 @@
 #   --memory-max SIZE      systemd MemoryMax for the service (default 2G)
 #   --allow-private-alert-targets   alert destinations on private/loopback addresses
 #   --upgrade              only swap the binary and restart (what `railwatch upgrade` runs)
+#   --allow-downgrade      replace an installed binary with an older release
 #   --yes                  never prompt
 set -eu
 
@@ -63,7 +64,7 @@ RAILWATCH_SHA256_X86_64=
 RAILWATCH_SHA256_AARCH64=
 
 DOMAIN="" EMAIL="" URL="" NO_TLS=0 APP="" ENVNAME="" PASSWORD_STDIN=0 PASSWORD_FILE="" ALLOW_PRIVATE=0 MEMORY_MAX=""
-VERSION=$RAILWATCH_VERSION_DEFAULT BINARY="" RELEASE_URL="" ACME_DIRECTORY="" ACME_CA_FILE="" UPGRADE_ONLY=0 YES=0 ALLOW_HTTP=0
+VERSION=$RAILWATCH_VERSION_DEFAULT BINARY="" RELEASE_URL="" ACME_DIRECTORY="" ACME_CA_FILE="" UPGRADE_ONLY=0 YES=0 ALLOW_HTTP=0 ALLOW_DOWNGRADE=0
 ALERT_ARGS="" S3_ENDPOINT="" S3_BUCKET="" S3_KEY="" S3_SECRET="" S3_REGION="" S3_PREFIX=""
 BIN=/usr/local/bin/railwatch ETC=/etc/railwatch ENVFILE=/etc/railwatch/railwatch.env DATA=/var/lib/railwatch
 UNITS=/etc/systemd/system
@@ -101,8 +102,9 @@ while [ $# -gt 0 ]; do
     --memory-max) need "$@"; MEMORY_MAX=$2; shift 2 ;;
     --allow-private-alert-targets) ALLOW_PRIVATE=1; shift ;;
     --upgrade) UPGRADE_ONLY=1; shift ;;
+    --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
     --yes|-y) YES=1; shift ;;
-    -h|--help) sed -n '2,58p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || echo "see docs/SELF-HOST.md"; exit 0 ;;
+    -h|--help) sed -n '2,59p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || echo "see docs/SELF-HOST.md"; exit 0 ;;
     *) die "unknown option $1 (--help)" ;;
   esac
 done
@@ -139,6 +141,36 @@ fetch() {
     if [ "$ALLOW_HTTP" = 1 ]; then wget -q -O "$2" "$1"
     else wget -q --https-only --secure-protocol=TLSv1_2 -O "$2" "$1"; fi
   else die "needs curl or wget"; fi
+}
+# semver_lt A B: true when version A sorts before B (Semantic Versioning
+# 2.0 precedence: numeric core, a pre-release before its release, numeric
+# identifiers as numbers and before alphanumeric ones; build metadata
+# ignored). A leading "railwatch " or "v" is dropped.
+semver_lt() {
+  awk -v a="$1" -v b="$2" '
+    function clean(v) { sub(/^railwatch /, "", v); sub(/^v/, "", v); sub(/\+.*/, "", v); return v }
+    function num(s) { return s ~ /^[0-9]+$/ }
+    # -1, 0, 1 for x < y, x = y, x > y.
+    function cmp(x, y,   xc, yc, xp, yp, i, n, m, xi, yi) {
+      xp = ""; yp = ""
+      if (index(x, "-")) { xp = substr(x, index(x, "-") + 1); x = substr(x, 1, index(x, "-") - 1) }
+      if (index(y, "-")) { yp = substr(y, index(y, "-") + 1); y = substr(y, 1, index(y, "-") - 1) }
+      split(x, xc, "."); split(y, yc, ".")
+      for (i = 1; i <= 3; i++) { if (xc[i] + 0 < yc[i] + 0) return -1; if (xc[i] + 0 > yc[i] + 0) return 1 }
+      if (xp == "" && yp == "") return 0
+      if (xp == "") return 1
+      if (yp == "") return -1
+      n = split(xp, xi, "."); m = split(yp, yi, ".")
+      for (i = 1; i <= n && i <= m; i++) {
+        if (xi[i] == yi[i]) continue
+        if (num(xi[i]) && num(yi[i])) return (xi[i] + 0 < yi[i] + 0) ? -1 : 1
+        if (num(xi[i])) return -1
+        if (num(yi[i])) return 1
+        return (xi[i] < yi[i]) ? -1 : 1
+      }
+      return (n < m) ? -1 : (n > m) ? 1 : 0
+    }
+    BEGIN { exit !(cmp(clean(a), clean(b)) < 0) }'
 }
 sha256() {
   if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1
@@ -195,6 +227,9 @@ fi
 chmod 0755 "$TMP/railwatch"
 "$TMP/railwatch" version > /dev/null 2>&1 || die "the downloaded binary does not run on this machine ($(uname -m))"
 NEW_VERSION=$("$TMP/railwatch" version)
+if [ -f "$BIN" ] && [ "$ALLOW_DOWNGRADE" = 0 ] && OLD_VERSION=$("$BIN" version 2> /dev/null) && semver_lt "$NEW_VERSION" "$OLD_VERSION"; then
+  die "$NEW_VERSION is older than the installed $OLD_VERSION (an older release may have fixed vulnerabilities); pass --allow-downgrade to install it anyway"
+fi
 UPGRADE=0
 if [ -f "$BIN" ] && cmp -s "$TMP/railwatch" "$BIN"; then
   echo "$NEW_VERSION already installed"

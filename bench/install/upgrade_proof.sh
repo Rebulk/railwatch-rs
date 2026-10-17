@@ -73,7 +73,7 @@ sleep 6
 for i in $(seq 1 "$SWAPS"); do
   if [ $((i % 2)) = 1 ]; then v=$NEW_V; else v=$OLD_V; fi
   t0=$(date +%s%N)
-  docker exec -e RAILWATCH_RELEASE_BASE=http://10.77.0.30:8000 -e RAILWATCH_ALLOW_HTTP_RELEASE=1 rwi-vps railwatch upgrade --version "$v" > "$W/upgrade-$i.log" 2>&1 \
+  docker exec -e RAILWATCH_RELEASE_BASE=http://10.77.0.30:8000 -e RAILWATCH_ALLOW_HTTP_RELEASE=1 rwi-vps railwatch upgrade --version "$v" --allow-downgrade > "$W/upgrade-$i.log" 2>&1 \
     || { cat "$W/upgrade-$i.log"; exit 1; }
   ms=$(( ($(date +%s%N) - t0) / 1000000 ))
   pid=$(docker exec rwi-vps systemctl show -p MainPID --value railwatch.service)
