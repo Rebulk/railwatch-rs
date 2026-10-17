@@ -142,6 +142,7 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `HTTP_BODY_TIMEOUT_SECONDS` | 600 | a request body must arrive within this (32 MiB at ~450 kbit/s) |
 | `HTTP_IDLE_TIMEOUT_SECONDS` | 300 | a connection with no bytes moving either way is closed |
 | `MAX_CONNECTIONS` | 4096 | open connections; more wait in the kernel's backlog |
+| `MAX_CONNECTIONS_PER_IP` | 256 | open connections from one address (an IPv6 /64); more are closed at once. Off with `TRUST_PROXY` (every connection comes from the proxy: limit per client there) |
 | `NEW_ISSUES_PER_HOUR`, `NEW_ISSUES_PER_BATCH` | 1000, 200 | past these, new exception groups count onto one "Too many new issues" issue |
 
 ## `railwatch doctor`

@@ -319,6 +319,12 @@ impl Config {
             body_timeout: secs(get("http_body_timeout_seconds", &["RAILWATCH_HTTP_BODY_TIMEOUT_SECONDS"]), "http_body_timeout_seconds", dh.body_timeout)?,
             idle_timeout: secs(get("http_idle_timeout_seconds", &["RAILWATCH_HTTP_IDLE_TIMEOUT_SECONDS"]), "http_idle_timeout_seconds", dh.idle_timeout)?,
             max_connections: num(get("max_connections", &["RAILWATCH_MAX_CONNECTIONS"]), "max_connections", dh.max_connections as u64)?.max(1) as usize,
+            // Behind a trusted proxy every connection's peer is the proxy.
+            max_connections_per_ip: if trust_proxy {
+                0
+            } else {
+                num(get("max_connections_per_ip", &["RAILWATCH_MAX_CONNECTIONS_PER_IP"]), "max_connections_per_ip", dh.max_connections_per_ip as u64)? as usize
+            },
         };
         // With automatic certificates the public URL is the domain's.
         let url = match (&tls, url_given) {
@@ -434,11 +440,15 @@ impl Config {
             (
                 "http".into(),
                 format!(
-                    "header {} s, body {} s, idle {} s, max {} connections",
+                    "header {} s, body {} s, idle {} s, max {} connections, {} per IP",
                     self.http.header_timeout.as_secs(),
                     self.http.body_timeout.as_secs(),
                     self.http.idle_timeout.as_secs(),
-                    self.http.max_connections
+                    self.http.max_connections,
+                    match self.http.max_connections_per_ip {
+                        0 => "no limit".to_string(),
+                        n => n.to_string(),
+                    }
                 ),
                 src("max_connections"),
             ),

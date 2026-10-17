@@ -15,13 +15,20 @@
 //!   response, a dead websocket; cable pings every 3 s) closes it.
 //! - `max_connections`: past this many open connections the server stops
 //!   accepting; new ones wait in the kernel's backlog, as during a restart.
+//! - `max_connections_per_ip`: one client address (an IPv6 /64) may hold at
+//!   most this many of them; a further connection from it is closed as soon
+//!   as it is accepted, so one source cannot take every slot and starve the
+//!   others. The address is the TCP peer: X-Forwarded-For cannot be read
+//!   before a request is, so with `trust_proxy` (every connection comes from
+//!   the proxy) this cap is off and the proxy's own limits apply.
 //!
 //! Shutdown keeps the zero-drop restart: the listener stops accepting the
 //! moment the signal fires and is dropped, so with socket activation every
 //! connection not yet accepted stays queued for the next process.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -43,6 +50,8 @@ pub struct Limits {
     pub body_timeout: Duration,
     pub idle_timeout: Duration,
     pub max_connections: usize,
+    /// 0: no per-address cap (`trust_proxy`: every peer is the proxy).
+    pub max_connections_per_ip: usize,
 }
 
 impl Default for Limits {
@@ -52,6 +61,55 @@ impl Default for Limits {
             body_timeout: Duration::from_secs(600),
             idle_timeout: Duration::from_secs(300),
             max_connections: 4096,
+            max_connections_per_ip: 256,
+        }
+    }
+}
+
+/// Open connections per client address, for `max_connections_per_ip`.
+#[derive(Clone, Default)]
+struct PerIp(Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>);
+
+/// One open connection's place in `PerIp`; dropping it gives the place back.
+struct IpSlot {
+    counts: PerIp,
+    key: IpAddr,
+}
+
+impl PerIp {
+    /// The key one client is counted under: an IPv4 address (IPv4-mapped
+    /// IPv6 included), or an IPv6 /64, which is what one host is given.
+    fn key(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V4(v4) => IpAddr::V4(v4),
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
+            },
+        }
+    }
+
+    /// A slot for a connection from `ip`, or None when it has `max` open.
+    fn take(&self, ip: IpAddr, max: usize) -> Option<IpSlot> {
+        let key = Self::key(ip);
+        let mut counts = self.0.lock().unwrap();
+        let n = counts.entry(key).or_insert(0);
+        if *n >= max {
+            return None;
+        }
+        *n += 1;
+        Some(IpSlot { counts: self.clone(), key })
+    }
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let mut counts = self.counts.0.lock().unwrap();
+        if let Some(n) = counts.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(&self.key);
+            }
         }
     }
 }
@@ -91,6 +149,8 @@ where
     L: axum::serve::Listener<Addr = SocketAddr>,
 {
     let permits = Arc::new(Semaphore::new(limits.max_connections.max(1)));
+    let per_ip = PerIp::default();
+    let mut per_ip_logged: Option<Instant> = None;
     // Dropped receivers tell connections to shut down; `close` counts them.
     let (stop_tx, stop_rx) = watch::channel(());
     let (close_tx, close_rx) = watch::channel(());
@@ -116,6 +176,21 @@ where
         let (io, addr) = tokio::select! {
             c = listener.accept() => c,
             _ = &mut shutdown => break,
+        };
+        let ip_slot = if limits.max_connections_per_ip == 0 {
+            None
+        } else {
+            match per_ip.take(addr.ip(), limits.max_connections_per_ip) {
+                Some(slot) => Some(slot),
+                None => {
+                    // Dropping the stream closes it; at most one warning a minute.
+                    if per_ip_logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                        tracing::warn!(ip = %addr.ip(), max_connections_per_ip = limits.max_connections_per_ip, "per-address connection limit reached: closing new connections from it");
+                        per_ip_logged = Some(Instant::now());
+                    }
+                    continue;
+                }
+            }
         };
         let router = router.clone();
         let mut stop = stop_rx.clone();
@@ -145,6 +220,7 @@ where
                     }
                 }
             }
+            drop(ip_slot);
             drop(permit);
             drop(close);
         });
@@ -291,5 +367,84 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Idle<T> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves `/` on a loopback port under `limits`; the shutdown sender stops it.
+    async fn server(limits: Limits) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(run(listener, router, limits, async move {
+            let _ = rx.await;
+        }));
+        (addr, tx)
+    }
+
+    async fn connect_from(from: [u8; 4], to: SocketAddr) -> tokio::net::TcpStream {
+        let s = tokio::net::TcpSocket::new_v4().unwrap();
+        s.bind(SocketAddr::from((from, 0))).unwrap();
+        s.connect(to).await.unwrap()
+    }
+
+    /// A GET / from `from`: true when "200 OK" comes back within 2 s.
+    async fn served(from: [u8; 4], to: SocketAddr) -> bool {
+        let attempt = async {
+            let mut s = connect_from(from, to).await;
+            s.write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").await.ok()?;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await.ok()?;
+            Some(buf.starts_with(b"HTTP/1.1 200"))
+        };
+        tokio::time::timeout(Duration::from_secs(2), attempt).await.ok().flatten().unwrap_or(false)
+    }
+
+    /// Issue #3: one source opening connections and sending nothing held
+    /// every slot of the global cap until the header timeout, and another
+    /// source waited in the backlog. Linux routes all of 127/8 to loopback,
+    /// so 127.0.0.1 and 127.0.0.2 are two sources.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_source_cannot_take_every_connection() {
+        let limits = Limits { max_connections: 8, max_connections_per_ip: 4, ..Limits::default() };
+        for (per_ip, victim_served) in [(0, false), (4, true)] {
+            let (addr, stop) = server(Limits { max_connections_per_ip: per_ip, ..limits }).await;
+            let mut held = Vec::new();
+            for _ in 0..20 {
+                held.push(connect_from([127, 0, 0, 1], addr).await);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(served([127, 0, 0, 2], addr).await, victim_served, "max_connections_per_ip {per_ip}");
+            if per_ip > 0 {
+                // The flooding source keeps its 4; its others were closed.
+                let mut closed = 0;
+                for s in &mut held {
+                    let mut b = [0u8; 1];
+                    if let Ok(Ok(0) | Err(_)) = tokio::time::timeout(Duration::from_millis(50), s.read(&mut b)).await {
+                        closed += 1;
+                    }
+                }
+                assert_eq!(closed, 16, "connections past the per-address cap are closed at once");
+                drop(held);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(served([127, 0, 0, 1], addr).await, "closing them gives the source its slots back");
+            }
+            let _ = stop.send(());
+        }
+    }
+
+    #[test]
+    fn per_ip_key_is_the_ipv4_address_or_the_ipv6_64() {
+        let key = |s: &str| PerIp::key(s.parse().unwrap()).to_string();
+        assert_eq!(key("203.0.113.7"), "203.0.113.7");
+        assert_eq!(key("::ffff:203.0.113.7"), "203.0.113.7");
+        assert_eq!(key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), "2001:db8:1:2::");
+        assert_eq!(key("2001:db8:1:2::1"), key("2001:db8:1:2:ffff::9"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
     }
 }

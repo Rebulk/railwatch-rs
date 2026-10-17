@@ -995,6 +995,16 @@ security audits. Regression tests: `crates/server/tests/security_*.rs`.
    at the limit (1.0 s with the test's 1 s setting). Socket-activated
    restarts are unchanged (bench/restart/run.sh restart and overlap: every
    generation inherited the socket, 2,399/2,399 posts accepted).
+   One address (an IPv6 /64) may hold at most `max_connections_per_ip`
+   (256) of them; a further connection from it is closed as soon as it is
+   accepted. Without it one source could take all 4,096 slots and keep other
+   clients, the gems included, in the backlog (`serve::tests::
+   one_source_cannot_take_every_connection`: with 8 slots and the flood
+   holding 20 connections, a second address was not served within 2 s; with
+   4 per address it is, and the flood's 16 extra connections are closed).
+   The cap uses the TCP peer, since X-Forwarded-For is not read until a
+   request is, so with `trust_proxy` it is off: every connection is the
+   proxy's, and per-client connection limits belong in the proxy.
 5. **Back-redirects refuse `//` and `/\` paths.** `redirect_back_or_to`
    (`Ctx::back_or`) reflected the Referer's path; a path starting `//` or
    `/\` is protocol-relative to a browser, so it now falls back like a
