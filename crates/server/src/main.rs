@@ -13,6 +13,7 @@
 //!   railwatch restore                  download the backup into an empty data dir
 //!   railwatch integrations [--show-secrets]   one JSON line per alert destination
 //!   railwatch integrations test <id>   Send test: one synthetic alert to that destination
+//!   railwatch digest send --dry-run [--account ID]   the weekly digests a run now would send
 //!   railwatch doctor
 //!   railwatch upgrade [--version vX.Y.Z] [--allow-downgrade]   fetch the release's install.sh and re-run it
 //!   railwatch version
@@ -48,6 +49,7 @@ const USAGE: &str = "usage:
   railwatch restore
   railwatch integrations [--show-secrets]
   railwatch integrations test <id>
+  railwatch digest send --dry-run [--account ID]   print the weekly digests a run now would send
   railwatch doctor
   railwatch upgrade [--version vX.Y.Z] [--allow-downgrade]
                                          as root: install.sh from the release, re-run (zero-drop restart);
@@ -151,6 +153,11 @@ fn main() -> ExitCode {
         ["integrations"] => integrations(false),
         ["integrations", "--show-secrets"] => integrations(true),
         ["integrations", "test", id] => integration_test(id),
+        ["digest", "send", "--dry-run"] => digest_dry_run(None),
+        ["digest", "send", "--dry-run", "--account", id] | ["digest", "send", "--account", id, "--dry-run"] => match id.parse() {
+            Ok(id) => digest_dry_run(Some(id)),
+            Err(_) => usage(),
+        },
         ["import-rails", rest @ ..] => offline(|| import_rails(rest)),
         ["split", "--all"] => offline(split_all),
         ["split", slug] => offline(|| split(slug)),
@@ -611,6 +618,27 @@ fn integrations(show_secrets: bool) -> ExitCode {
         println!("{line}");
     }
     if unreadable > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+/// `railwatch digest send --dry-run`: the server sends the weekly digest
+/// itself (Mondays 08:00 UTC); this prints what a run now would send.
+fn digest_dry_run(account: Option<i64>) -> ExitCode {
+    let cfg = config();
+    let control = open_control(&cfg);
+    let delivery = match (&cfg.smtp, cfg.alert_delivery) {
+        (_, false) => "off (alert_delivery = off: digests are logged, never sent)",
+        (None, true) => "off (SMTP is not configured: digests are logged, not sent)",
+        (Some(_), true) => "on (SMTP)",
+    };
+    let now = railwatch_server::time::now_micros();
+    match railwatch_server::jobs::weekly_digest::dry_run(&control, &cfg.tenants_dir(), &cfg.url, now, account, delivery) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => fail(format!("no account {}", account.unwrap_or_default())),
+        Err(e) => fail(e),
+    }
 }
 
 /// Rails' Active Record encryption keys, from `--ar-primary-key` (repeat
@@ -1228,7 +1256,7 @@ fn serve() -> ExitCode {
             railwatch_server::storage::backup::spawn(b, cfg.data_dir.clone(), cfg.tenants_dir());
         }
         let (stop_jobs, jobs_stopped) = tokio::sync::watch::channel(false);
-        let scheduler = tokio::spawn(railwatch_server::jobs::scheduler(control.clone(), jobs.background.clone(), jobs_stopped));
+        let scheduler = tokio::spawn(railwatch_server::jobs::scheduler(control.clone(), jobs.background.clone(), cfg.tenants_dir(), jobs_stopped));
         let hub = web::cable::Hub::new();
         let followups_task = tokio::spawn(followups::run_with(control.clone(), followups_rx, Some(hub.clone()), Some(jobs.background.clone())));
         let web_state = match WebState::new(control, cfg.clone(), tenants.clone(), hub) {
