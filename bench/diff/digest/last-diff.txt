@@ -1,0 +1,4 @@
+# bench/diff/digest/run.sh, 2026-10-16, rw-baseline (railwatch-cloud @ 464f0fd)
+NOW=1792396800 (Mon 2026-10-19 08:00 UTC): 3 mails, 181 environment sections: IDENTICAL
+NOW=1792396800, SPLIT=1:                    3 mails, 181 environment sections: IDENTICAL
+NOW=1792540800 (Wed 2026-10-21 00:00 UTC, window cuts the data): 2 mails, 48 environment sections: IDENTICAL
