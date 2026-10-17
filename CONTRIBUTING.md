@@ -6,7 +6,7 @@ Security problems go through [SECURITY.md](SECURITY.md), not public issues.
 
 ## Build
 
-You need Rust 1.95 (CI's pinned toolchain; `rust-version` is the floor),
+You need Rust 1.99.1 (CI's pinned toolchain; `rust-version` is the floor),
 Node 22 + pnpm 10 (versions pinned in `bin/build`; `mise` picks them up if
 installed), Ruby (bin/build unpacks the railwatch gem's frontend from its
 pinned, checksummed `.gem`) and `brotli`.

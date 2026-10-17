@@ -64,7 +64,7 @@ async fn show(cx: Ctx, Path(id): Path<i64>) -> Response {
     let (telemetry, detection) = if shown.kind == "exception" {
         match exception_telemetry(&cx, &shown).await {
             Ok(t) => (Some(t), Value::Null),
-            Err(r) => return r,
+            Err(r) => return *r,
         }
     } else {
         match detection_props(&cx, &shown).await {
@@ -103,7 +103,7 @@ async fn detection_props(cx: &Ctx, shown: &Shown) -> rusqlite::Result<Value> {
 /// The telemetry half of issues#show from the environment's tenant file.
 /// A missing file reads as an empty tenant (a schema-only in-memory file),
 /// so the props are exactly what Rails renders with no telemetry yet.
-async fn exception_telemetry(cx: &Ctx, shown: &Shown) -> Result<Value, Response> {
+async fn exception_telemetry(cx: &Ctx, shown: &Shown) -> Result<Value, Box<Response>> {
     use crate::dashboard::PageError;
     let ctx = crate::dashboard::PageContext::new(shown.environment_id, crate::time::now_micros(), Default::default(), cx.state.cursor_key.clone());
     let control_issue = shown.control_issue();
@@ -123,9 +123,9 @@ async fn exception_telemetry(cx: &Ctx, shown: &Shown) -> Result<Value, Response>
     .unwrap_or_else(|e| Err(PageError::Unprocessable(format!("page task failed: {e}"))));
     match result {
         Ok(v) => Ok(v),
-        Err(PageError::NotFound) => Err(not_found()),
-        Err(PageError::Unprocessable(m)) => Err((StatusCode::UNPROCESSABLE_ENTITY, m).into_response()),
-        Err(PageError::Sql(e)) => Err(internal(e)),
+        Err(PageError::NotFound) => Err(Box::new(not_found())),
+        Err(PageError::Unprocessable(m)) => Err(Box::new((StatusCode::UNPROCESSABLE_ENTITY, m).into_response())),
+        Err(PageError::Sql(e)) => Err(Box::new(internal(e))),
     }
 }
 
