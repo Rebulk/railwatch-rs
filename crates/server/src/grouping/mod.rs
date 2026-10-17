@@ -149,11 +149,14 @@ pub struct Limits {
     pub new_issues_per_hour: usize,
     /// New groups per grouping pass (one batch).
     pub new_issues_per_batch: usize,
+    /// New issues across all of an account's environments in the trailing
+    /// hour, so creating environments does not multiply the cap above.
+    pub new_issues_per_account_per_hour: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { new_issues_per_hour: 1_000, new_issues_per_batch: 200 }
+        Limits { new_issues_per_hour: 1_000, new_issues_per_batch: 200, new_issues_per_account_per_hour: 3_000 }
     }
 }
 
@@ -273,6 +276,16 @@ pub fn group_with_limits(
     let mut created_this_hour: usize = control
         .query_row("SELECT COUNT(*) FROM issues WHERE environment_id = ? AND created_at >= ?", params![environment_id, hour_ago], |r| r.get::<_, i64>(0))
         .map_err(e)? as usize;
+    // The same for the environment's whole account.
+    let mut account_created_this_hour: usize = control
+        .query_row(
+            "SELECT COUNT(*) FROM issues WHERE created_at >= ?2 AND environment_id IN (
+               SELECT environments.id FROM environments JOIN applications ON applications.id = environments.application_id
+               WHERE applications.account_id = (SELECT applications.account_id FROM environments JOIN applications ON applications.id = environments.application_id WHERE environments.id = ?1))",
+            params![environment_id, hour_ago],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(e)? as usize;
     let mut created_this_batch = 0usize;
     for (group_hash, group) in groups {
         control.execute_batch("BEGIN IMMEDIATE").map_err(e)?;
@@ -281,7 +294,9 @@ pub fn group_with_limits(
                 && !claim(control, environment_id, r, &format!("group:{group_hash}")).map_err(e)? {
                     return Ok(None);
                 }
-            let capped = (created_this_batch >= limits.new_issues_per_batch || created_this_hour >= limits.new_issues_per_hour)
+            let capped = (created_this_batch >= limits.new_issues_per_batch
+                || created_this_hour >= limits.new_issues_per_hour
+                || account_created_this_hour >= limits.new_issues_per_account_per_hour)
                 && issue::find_by_group(control, environment_id, &group_hash).map_err(e)?.is_none();
             let target = if capped { OVERFLOW_GROUP_HASH } else { group_hash.as_str() };
             record(control, tenant, environment_id, target, &group, users).map(|o| Some((o, capped)))
@@ -297,12 +312,14 @@ pub fn group_with_limits(
                         out.overflowed += group.len();
                         if o == Outcome::New {
                             created_this_hour += 1;
+                            account_created_this_hour += 1;
                         }
                     }
                     Some((Outcome::New, false)) => {
                         out.new += 1;
                         created_this_batch += 1;
                         created_this_hour += 1;
+                        account_created_this_hour += 1;
                     }
                     Some((Outcome::Regressed, false)) => out.regressed += 1,
                     Some((Outcome::Seen, false)) => out.seen += 1,
@@ -320,6 +337,7 @@ pub fn group_with_limits(
             overflowed = out.overflowed,
             per_hour = limits.new_issues_per_hour,
             per_batch = limits.new_issues_per_batch,
+            per_account_per_hour = limits.new_issues_per_account_per_hour,
             "too many new exception groups: counted onto the overflow issue instead of creating issues"
         );
     }

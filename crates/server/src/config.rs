@@ -76,7 +76,7 @@ pub struct Config {
     /// `0.0.0.0:80` when bind is a :443 address, else off; "off" turns it
     /// off). Ignored when a second socket is inherited (LISTEN_FDS=2).
     pub tls_redirect_bind: Option<String>,
-    /// Caps on new issues per environment (grouping::Limits).
+    /// Caps on new issues per environment and per account (grouping::Limits).
     pub new_issues: crate::grouping::Limits,
     /// HTTP timeouts and the connection cap (serve::Limits).
     pub http: crate::serve::Limits,
@@ -305,6 +305,11 @@ impl Config {
         let new_issues = crate::grouping::Limits {
             new_issues_per_hour: num(get("new_issues_per_hour", &["RAILWATCH_NEW_ISSUES_PER_HOUR"]), "new_issues_per_hour", dl.new_issues_per_hour as u64)? as usize,
             new_issues_per_batch: num(get("new_issues_per_batch", &["RAILWATCH_NEW_ISSUES_PER_BATCH"]), "new_issues_per_batch", dl.new_issues_per_batch as u64)? as usize,
+            new_issues_per_account_per_hour: num(
+                get("new_issues_per_account_per_hour", &["RAILWATCH_NEW_ISSUES_PER_ACCOUNT_PER_HOUR"]),
+                "new_issues_per_account_per_hour",
+                dl.new_issues_per_account_per_hour as u64,
+            )? as usize,
         };
         let dh = crate::serve::Limits::default();
         let secs = |v: Option<String>, key: &str, d: std::time::Duration| -> Result<std::time::Duration, String> {
@@ -454,6 +459,11 @@ impl Config {
             ),
             ("new_issues_per_hour".into(), self.new_issues.new_issues_per_hour.to_string(), src("new_issues_per_hour")),
             ("new_issues_per_batch".into(), self.new_issues.new_issues_per_batch.to_string(), src("new_issues_per_batch")),
+            (
+                "new_issues_per_account_per_hour".into(),
+                self.new_issues.new_issues_per_account_per_hour.to_string(),
+                src("new_issues_per_account_per_hour"),
+            ),
             ("detail_retention_days".into(), self.tiers.detail_days.to_string(), src("detail_retention_days")),
             ("core_retention_days_max".into(), self.tiers.core_days_max.to_string(), src("core_retention_days_max")),
             ("exemplars_per_hour".into(), self.tiers.exemplars_per_hour.to_string(), src("exemplars_per_hour")),

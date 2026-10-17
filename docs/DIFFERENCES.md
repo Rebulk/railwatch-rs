@@ -968,12 +968,14 @@ security audits. Regression tests: `crates/server/tests/security_*.rs`.
 2. **Deploy `timestamp` parsing is byte-safe and checked.** A multibyte
    timestamp used to panic the handler task (no response); a 19-digit year
    wrapped. Both now answer the usual 422 "Deployed at can't be blank".
-3. **New issues are capped per environment.** `_group` is client-chosen, so
+3. **New issues are capped per environment and per account.** `_group` is client-chosen, so
    one ingest token could mint an issue (and an alert) per exception in the
    shared control database: 5,000 distinct hashes made 5,000 issues (+2.9 MB).
-   Now at most `new_issues_per_batch` (200) new issues per grouping pass and
-   `new_issues_per_hour` (1,000, trailing hour, per environment) are created;
-   a busy real deployment creates a handful a day. Past a cap, a group that
+   Now at most `new_issues_per_batch` (200) new issues per grouping pass,
+   `new_issues_per_hour` (1,000, trailing hour, per environment) and
+   `new_issues_per_account_per_hour` (3,000, trailing hour, across all of an
+   account's environments, so making environments does not multiply the
+   cap) are created; a busy real deployment creates a handful a day. Past a cap, a group that
    has no issue yet is recorded onto one overflow issue per environment
    (group hash `railwatch:too-many-new-issues`, which `_group` validation
    can never produce; title "Too many new issues: ..."), its `occurrences`
