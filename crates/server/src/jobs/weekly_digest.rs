@@ -174,7 +174,8 @@ fn env_digest(c: &Connection, env: &EnvRow, requests: &rollup::Summary, jobs: &r
     .iter()
     .map(|i| {
         // Issue#key: the issue's own application's prefix.
-        let prefix: String = c.query_row(r#"SELECT "applications"."issue_prefix" FROM "applications" WHERE "applications"."id" = ?"#, [i.i("application_id")], |r| r.get(0))?;
+        let prefix: String =
+            c.query_row(r#"SELECT "applications"."issue_prefix" FROM "applications" WHERE "applications"."id" = ?"#, [i.i("application_id")], |r| r.get(0))?;
         Ok(TopIssue {
             id: i.i("id").unwrap_or_default(),
             key: format!("{prefix}-{}", i.i("number").unwrap_or_default()),
@@ -398,7 +399,11 @@ mod tests {
         let none = c.tx(|tx| create_account(tx, "Empty", cyd)).unwrap();
         c.tx(|tx| insert_application(tx, none, "E", "e", "E", None, "main")).unwrap();
 
-        tenant(&f, "acme-shop-production", &[("request", NOW - 2 * HOUR, 100, 7, 120), ("job_attempt", NOW - 3 * HOUR, 40, 2, 900), ("request", NOW - 8 * 24 * HOUR, 999, 999, 5)]);
+        tenant(
+            &f,
+            "acme-shop-production",
+            &[("request", NOW - 2 * HOUR, 100, 7, 120), ("job_attempt", NOW - 3 * HOUR, 40, 2, 900), ("request", NOW - 8 * 24 * HOUR, 999, 999, 5)],
+        );
         tenant(&f, "acme-shop-staging", &[]); // a tenant file, but nothing in the window
         // acme-shop-old: no tenant file at all.
         let at = |h: i64| qt(NOW - h * HOUR);
@@ -452,7 +457,14 @@ mod tests {
         c.tx(|tx| create_environment(tx, shop, "production")).unwrap();
         tenant(&f, "acme-shop-production", &[("request", NOW - HOUR, 10, 0, 50)]);
         // Nothing listens on port 9: an attempted send fails and is counted.
-        let smtp = crate::config::Smtp { address: "127.0.0.1".into(), port: 9, username: None, password: None, security: "none".into(), from: "Railwatch <rw@example.com>".into() };
+        let smtp = crate::config::Smtp {
+            address: "127.0.0.1".into(),
+            port: 9,
+            username: None,
+            password: None,
+            security: "none".into(),
+            from: "Railwatch <rw@example.com>".into(),
+        };
         let run = |deliver: bool| {
             let control = std::sync::Arc::new(Control::open(&f.dir.join("control.sqlite3")).unwrap());
             control.configure_alerting(crate::alerts::integration::Alerting {

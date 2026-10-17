@@ -52,11 +52,7 @@ pub fn weekly(base_url: &str, user_name: &str, user_email: &str, account_name: &
     // weekly.html.erb
     let h = html_escape;
     let s = |n: i64| if n == 1 { "" } else { "s" };
-    let mut body = format!(
-        "<p>Hey {},</p>\n\n<p>Here's what happened in <strong>{}</strong> over the last 7 days.</p>\n\n",
-        h(user_name),
-        h(account_name)
-    );
+    let mut body = format!("<p>Hey {},</p>\n\n<p>Here's what happened in <strong>{}</strong> over the last 7 days.</p>\n\n", h(user_name), h(account_name));
     for env in environments {
         body += &format!(
             "  <h3>{}</h3>\n  <ul>\n    <li>{} requests, p95 {}ms, {}% 5xx</li>\n    <li>{} job attempts, {} failed</li>\n    <li>{} new issue{}, {} resolved, {} deploy{}</li>\n  </ul>\n",
@@ -75,22 +71,12 @@ pub fn weekly(base_url: &str, user_name: &str, user_email: &str, account_name: &
         if !env.top_issues.is_empty() {
             body += "    <p>Most frequent open issues:</p>\n    <ul>\n";
             for i in &env.top_issues {
-                body += &format!(
-                    "        <li><a href=\"{}\">{}</a> {} ({})</li>\n",
-                    h(&issue_url(i.id)),
-                    h(&i.key),
-                    h(&i.title),
-                    delimit(i.occurrences)
-                );
+                body += &format!("        <li><a href=\"{}\">{}</a> {} ({})</li>\n", h(&issue_url(i.id)), h(&i.key), h(&i.title), delimit(i.occurrences));
             }
             body += "    </ul>\n";
         }
     }
-    body += &format!(
-        "\n<p><a href=\"{}\">Open Railwatch</a> · <a href=\"{}\">Turn off this digest</a></p>\n",
-        h(&dashboard_url),
-        h(&profile_url)
-    );
+    body += &format!("\n<p><a href=\"{}\">Open Railwatch</a> · <a href=\"{}\">Turn off this digest</a></p>\n", h(&dashboard_url), h(&profile_url));
 
     DigestMail {
         to: user_email.to_string(),
@@ -162,7 +148,18 @@ mod tests {
     }
 
     fn env(name: &str, requests: i64, failed_requests: i64, p95_ms: f64, top: Vec<TopIssue>) -> EnvDigest {
-        EnvDigest { name: name.into(), requests, failed_requests, p95_ms, jobs: 6196, failed_jobs: 0, new_issues: 1, resolved_issues: 0, deploys: 0, top_issues: top }
+        EnvDigest {
+            name: name.into(),
+            requests,
+            failed_requests,
+            p95_ms,
+            jobs: 6196,
+            failed_jobs: 0,
+            new_issues: 1,
+            resolved_issues: 0,
+            deploys: 0,
+            top_issues: top,
+        }
     }
 
     /// Bytes captured from Rails (bench/diff/digest, rw-baseline @ 464f0fd)
