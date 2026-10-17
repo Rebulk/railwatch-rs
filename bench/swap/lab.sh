@@ -28,9 +28,20 @@ case "${1:-}" in
 up)
   BIN=${2:?BIN_DIR}
   down
+  # Half-built labs are taken down again; cleared once the lab is up.
+  trap down EXIT
   # A CA and a leaf for the rehearsal names (webpki refuses a self-signed
   # CA:TRUE certificate as a server's own; the gem's Net::HTTP would too).
-  [ -f "$CERTS/ca.pem" ] || {
+  # Reused only while both are there, valid for another day and the leaf
+  # is the CA's.
+  certs_ok() {
+    local f
+    for f in ca.pem ca.key cert.pem key.pem; do [ -f "$CERTS/$f" ] || return 1; done
+    openssl x509 -checkend 86400 -noout -in "$CERTS/ca.pem" > /dev/null &&
+      openssl x509 -checkend 86400 -noout -in "$CERTS/cert.pem" > /dev/null &&
+      openssl verify -CAfile "$CERTS/ca.pem" "$CERTS/cert.pem" > /dev/null 2>&1
+  }
+  certs_ok || {
     mkdir -p "$CERTS"
     openssl req -x509 -newkey rsa:2048 -nodes -keyout "$CERTS/ca.key" -out "$CERTS/ca.pem" -days 30 -subj /CN=rwswap-ca 2> /dev/null
     openssl req -newkey rsa:2048 -nodes -keyout "$CERTS/key.pem" -out "$CERTS/leaf.csr" -subj /CN=railwatch.rehearsal 2> /dev/null
@@ -40,6 +51,11 @@ up)
   }
   docker image inspect rwswap-bookworm:amd64 > /dev/null 2>&1 || {
     docker pull -q --platform linux/amd64 debian:bookworm-slim > /dev/null && docker tag debian:bookworm-slim rwswap-bookworm:amd64
+  }
+  # zero_drop.sh counts rows with sqlite3.
+  docker image inspect rwswap-sqlite > /dev/null 2>&1 || {
+    printf 'FROM rwswap-bookworm:amd64\nRUN apt-get update -q && apt-get install -qy --no-install-recommends sqlite3 && rm -rf /var/lib/apt/lists/*\n' |
+      docker build -q --platform linux/amd64 -t rwswap-sqlite - > /dev/null
   }
   docker network create $NET > /dev/null
   docker volume create rwswap_rs_data > /dev/null
@@ -79,6 +95,7 @@ TLS_ARGS="--tls-certificate-path /certs/cert.pem --tls-private-key-path /certs/k
 RESOURCES="--memory 3g --memory-swap 3g --cpus 4 --pids-limit 512"
 IMAGE=rwswap-bookworm:amd64
 EOF
+  trap - EXIT
   echo "lab up: proxy https://127.0.0.1:18443, opt $LAB/opt"
   ;;
 down) down; echo "lab down" ;;

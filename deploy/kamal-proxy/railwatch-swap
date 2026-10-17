@@ -11,13 +11,46 @@
 #   1. start the other colour: `railwatch serve` blocks on <data>/serve.lock
 #      (the old one holds it), so it is up but neither writes nor listens
 #   2. kamal-proxy pause: new requests are held, in-flight ones finish
-#   3. docker stop the old colour: it drains its tenant writers and exits,
-#      which releases the lock; the new one takes it, opens, listens
+#   3. SIGTERM the old colour: it drains its tenant writers and exits,
+#      which releases the lock; the new one takes it, opens, listens. It is
+#      never SIGKILLed (see "Stopping" below)
 #   4. kamal-proxy deploy --target <new>: health-checked, then held requests
 #      go to the new colour on resume
 #   5. kamal-proxy resume; remove the old container
 # Any failure before 3 leaves the old colour serving (resume, remove the new
-# one). A failure at 4 brings the old colour back (start it, retarget).
+# one). A failure after 3 brings the old colour back (stop the new one,
+# start the old one on its own binary, health-check it, retarget) before
+# anything is resumed. Whatever happens, every service this run paused is
+# resumed when it exits.
+#
+# Binaries: each colour runs its own copy, bin/railwatch-<colour>, made from
+# bin/railwatch.new (an upgrade) or bin/railwatch when the colour starts. The
+# old colour's copy is not touched during a swap, so a rollback runs exactly
+# what it ran before. Only a successful swap promotes railwatch.new to
+# bin/railwatch (the one it replaced is kept as bin/railwatch.prev); a failed
+# one moves it to bin/railwatch.failed, so a later plain restart does not
+# try it again.
+#
+# Pause budget: kamal-proxy answers 504 to a request it has held for
+# MAX_PAUSE. A request held from the start of the pause waits for the drain
+# (DRAIN), the old colour's exit (STOP_TIMEOUT), BETWEEN (BETWEEN_TIMEOUT)
+# and the new colour's health check (DEPLOY_TIMEOUT, which includes taking
+# the lock and opening). MAX_PAUSE defaults to their sum plus 10 s of slack
+# and a smaller one is refused before anything is paused. A rollback adds
+# up to another DEPLOY_TIMEOUT; requests held past MAX_PAUSE then get 504,
+# which the gems retry.
+#
+# Stopping: on SIGTERM the server stops accepting, finishes its in-flight
+# requests (each one's 200 is sent only after its batch commits), then
+# drains its tenant writers and background work (usage counts, rollup
+# increments, issue grouping) and exits. A SIGKILL would lose no
+# acknowledged batch (docs/STORAGE.md, "Exactly-once": unanswered requests
+# are retried by the gem and land once), but it would lose that in-memory
+# derived state, so the swap never sends one. It waits STOP_TIMEOUT for
+# the exit; past that it says so and keeps waiting up to STOP_WAIT (bound:
+# the server's 600 s request-body timeout plus the writer drain). If the
+# old colour still has not exited, the swap fails, resumes the services and
+# leaves the container alone for an operator.
 #
 # Config: $RAILWATCH_SWAP_CONF (default /opt/railwatch-rs/swap.conf), sourced:
 #   ROOT          dir with bin/railwatch (bin/railwatch.new to upgrade); state lives here
@@ -32,7 +65,9 @@
 #                 service). Every swap pauses, moves and resumes all of them.
 #   TLS_ARGS      extra kamal-proxy TLS flags (empty: Let's Encrypt)
 #   BETWEEN       (env, one swap) a command to run while no server runs, see step 3b
-#   NAME, IMAGE, PORT, RESOURCES, MAX_PAUSE, DRAIN, STOP_TIMEOUT  (defaults below)
+#   NAME, IMAGE, PORT, RESOURCES  (defaults below)
+#   DRAIN, STOP_TIMEOUT, STOP_WAIT, DEPLOY_TIMEOUT, BETWEEN_TIMEOUT, MAX_PAUSE
+#                 seconds (defaults below; MAX_PAUSE is derived, see above)
 set -euo pipefail
 
 CONF=${RAILWATCH_SWAP_CONF:-/opt/railwatch-rs/swap.conf}
@@ -41,9 +76,28 @@ CONF=${RAILWATCH_SWAP_CONF:-/opt/railwatch-rs/swap.conf}
 : "${ROOT:?}" "${SERVICES:?}" "${VOLUME:?}" "${NETWORK:?}" "${PROXY:?}" "${ENV_FILE:?}"
 IMAGE=${IMAGE:-debian:bookworm-slim}
 PORT=${PORT:-8790}
-MAX_PAUSE=${MAX_PAUSE:-60s}
-DRAIN=${DRAIN:-30s}
+DRAIN=${DRAIN:-30}
 STOP_TIMEOUT=${STOP_TIMEOUT:-60}
+STOP_WAIT=${STOP_WAIT:-900}
+DEPLOY_TIMEOUT=${DEPLOY_TIMEOUT:-30}
+BETWEEN_TIMEOUT=${BETWEEN_TIMEOUT:-30}
+DRAIN=${DRAIN%s} STOP_TIMEOUT=${STOP_TIMEOUT%s} STOP_WAIT=${STOP_WAIT%s} DEPLOY_TIMEOUT=${DEPLOY_TIMEOUT%s} BETWEEN_TIMEOUT=${BETWEEN_TIMEOUT%s}
+MAX_PAUSE=${MAX_PAUSE:-0}; MAX_PAUSE=${MAX_PAUSE%s}
+for v in DRAIN STOP_TIMEOUT STOP_WAIT DEPLOY_TIMEOUT BETWEEN_TIMEOUT MAX_PAUSE; do
+  [[ ${!v} =~ ^[0-9]+$ ]] || { echo "$v=${!v}: expected seconds"; exit 2; }
+done
+budget=$(( DRAIN + STOP_TIMEOUT + DEPLOY_TIMEOUT + 10 ))
+[ -z "${BETWEEN:-}" ] || budget=$(( budget + BETWEEN_TIMEOUT ))
+[ "$MAX_PAUSE" != 0 ] || MAX_PAUSE=$budget
+if [ "$MAX_PAUSE" -lt "$budget" ]; then
+  echo "MAX_PAUSE=${MAX_PAUSE}s is under DRAIN + STOP_TIMEOUT + DEPLOY_TIMEOUT${BETWEEN:+ + BETWEEN_TIMEOUT} + 10 = ${budget}s:"
+  echo "a slow but successful swap would answer held requests 504. Raise it or lower those."
+  exit 2
+fi
+for v in STOP_TIMEOUT DEPLOY_TIMEOUT BETWEEN_TIMEOUT; do
+  [ "${!v}" -ge 1 ] || { echo "$v must be at least 1"; exit 2; }
+done
+[ "$STOP_WAIT" -ge "$STOP_TIMEOUT" ] || { echo "STOP_WAIT must be at least STOP_TIMEOUT"; exit 2; }
 RESOURCES=${RESOURCES:---memory 2g --memory-swap 2g --cpus 2 --pids-limit 512}
 NAME=${NAME:-railwatch-rs}
 
@@ -66,18 +120,27 @@ proxy_deploy() { # target service hosts-csv-or-host/path
   # shellcheck disable=SC2086
   kp deploy "$svc" --target "$target:$PORT" "${hosts[@]}" "${route[@]}" \
     --forward-headers --health-check-path /up --health-check-interval 500ms --health-check-timeout 5s \
-    --deploy-timeout 30s --drain-timeout "$DRAIN" --target-timeout 60s
+    --deploy-timeout "${DEPLOY_TIMEOUT}s" --drain-timeout "${DRAIN}s" --target-timeout 60s
 }
-# Each of SERVICES: deploy (onto a target) | pause | resume.
+# Each of SERVICES: deploy (onto a target) | pause. Paused ones are
+# remembered, and resume (also run on exit) resumes exactly those.
+PAUSED=()
 services() {
   local action=$1 target=${2:-} e
   for e in $SERVICES; do
     case $action in
       deploy) proxy_deploy "$target" "${e%%=*}" "${e#*=}" > /dev/null || return 1 ;;
-      pause) kp pause "${e%%=*}" --drain-timeout "$DRAIN" --max-pause "$MAX_PAUSE" > /dev/null ;;
-      resume) kp resume "${e%%=*}" > /dev/null ;;
+      pause)
+        kp pause "${e%%=*}" --drain-timeout "${DRAIN}s" --max-pause "${MAX_PAUSE}s" > /dev/null || return 1
+        PAUSED+=("${e%%=*}")
+        ;;
     esac
   done
+}
+resume() {
+  local s
+  for s in "${PAUSED[@]}"; do kp resume "$s" > /dev/null || log "WARNING: could not resume $s"; done
+  PAUSED=()
 }
 
 start_colour() {
@@ -92,11 +155,28 @@ start_colour() {
     --label service=railwatch_rs --label colour="$c" \
     -v "$VOLUME":/data \
     -v "$ROOT/bin":/opt/bin:ro \
-    --stop-timeout "$STOP_TIMEOUT" \
-    "$IMAGE" /opt/bin/railwatch serve > /dev/null
+    --stop-timeout "$STOP_WAIT" \
+    "$IMAGE" "/opt/bin/railwatch-$c" serve > /dev/null
 }
 
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
+
+# SIGTERM, then wait for the drain and exit; never SIGKILL (see "Stopping").
+# docker kill with the stop signal counts as a manual stop, so the restart
+# policy leaves it down; --restart no also ends a crash loop.
+stop_colour() { # container
+  local c=$1 code
+  docker update --restart no "$c" > /dev/null
+  docker kill -s TERM "$c" > /dev/null 2>&1 || true
+  if ! code=$(timeout "$STOP_TIMEOUT" docker wait "$c"); then
+    log "$c is still draining after ${STOP_TIMEOUT}s; waiting up to ${STOP_WAIT}s (requests held past ${MAX_PAUSE}s get 504, the gems retry)"
+    code=$(timeout $(( STOP_WAIT - STOP_TIMEOUT + 1 )) docker wait "$c") || {
+      log "FAILED: $c has not exited after ${STOP_WAIT}s; not killed (it may still be committing). Look at it: docker logs $c"
+      return 1
+    }
+  fi
+  [ "$code" = 0 ] || log "WARNING: $c exited with $code; anything it had not committed was never acknowledged, and the next server's recovery removes partial writes"
+}
 
 case "${1:-swap}" in
 status)
@@ -119,19 +199,40 @@ cd "$ROOT"
 exec 9> "$ROOT/swap.lock"
 flock -n 9 || { echo "another railwatch-swap is running"; exit 1; }
 
+trap resume EXIT
+
+new=
 if [ -x bin/railwatch.new ]; then
   docker run --rm -v "$ROOT/bin":/opt/bin:ro "$IMAGE" /opt/bin/railwatch.new version
-  cp -p bin/railwatch bin/railwatch.prev 2>/dev/null || true
-  mv -f bin/railwatch.new bin/railwatch
+  new=bin/railwatch.new
 fi
+# The binary a colour runs: its own copy of the release being started.
+install_for() {
+  cp -p "${new:-bin/railwatch}" "bin/railwatch-$1.tmp"
+  mv -f "bin/railwatch-$1.tmp" "bin/railwatch-$1"
+}
+# After a successful swap only: the upgrade becomes bin/railwatch.
+promote() {
+  [ -n "$new" ] || return 0
+  cp -p bin/railwatch bin/railwatch.prev 2> /dev/null || true
+  mv -f "$new" bin/railwatch
+}
+# After a failed one: set the upgrade aside.
+reject() {
+  [ -n "$new" ] || return 0
+  mv -f "$new" bin/railwatch.failed
+  log "upgrade not applied: moved to bin/railwatch.failed"
+}
 
 cur=$(active)
 if [ "$cur" = none ]; then
   # First start (or after a manual teardown): nothing to hand over from.
   next=blue
+  install_for $next
   start_colour $next
-  for _ in $(seq 100); do docker exec "$NAME-$next" /opt/bin/railwatch version > /dev/null 2>&1 && break; sleep 0.1; done
+  for _ in $(seq 100); do docker exec "$NAME-$next" "/opt/bin/railwatch-$next" version > /dev/null 2>&1 && break; sleep 0.1; done
   services deploy "$NAME-$next"
+  promote
   echo $next > "$ROOT/active"
   log "started $NAME-$next"
   exit 0
@@ -143,6 +244,7 @@ t0=$(date +%s%N)
 #    (A control DB swap starts it after step 3 instead: it must not open
 #    the old control DB the moment the old colour lets go of the lock.)
 start_waiting() {
+  install_for "$next"
   start_colour "$next"
   for _ in $(seq 50); do docker logs "$NAME-$next" 2>&1 | grep -q 'waiting for .*serve.lock' && break; sleep 0.1; done
   running "$NAME-$next" && docker logs "$NAME-$next" 2>&1 | grep -q 'waiting for .*serve.lock'
@@ -150,7 +252,9 @@ start_waiting() {
 if [ -z "${BETWEEN:-}" ]; then
   if ! start_waiting; then
     docker logs --tail 20 "$NAME-$next" || true
+    # It never got the lock, so it opened nothing: removing it loses nothing.
     docker rm -f "$NAME-$next" > /dev/null
+    reject
     log "ABORTED: $NAME-$next did not start; $NAME-$cur still serving"
     exit 1
   fi
@@ -159,24 +263,52 @@ fi
 
 # 2. Hold new requests at the proxy; in-flight ones finish on the old colour.
 t1=$(date +%s%N)
-services pause
+if ! services pause; then
+  docker rm -f "$NAME-$next" > /dev/null 2>&1 || true
+  log "ABORTED: could not pause every service; $NAME-$cur still serving"
+  exit 1
+fi
 log "2. paused $SERVICES ($(ms "$t1") ms drain)"
 
 # 3. Old colour drains its writers and exits; the new one takes over.
 t2=$(date +%s%N)
-docker stop -t "$STOP_TIMEOUT" "$NAME-$cur" > /dev/null
+if ! stop_colour "$NAME-$cur"; then
+  # It stopped accepting at SIGTERM, so nothing serves until it exits.
+  if [ -z "${BETWEEN:-}" ]; then
+    log "when it exits, $NAME-$next takes the data dir: then echo $next > $ROOT/active; railwatch-swap proxy"
+  else
+    log "when it exits: docker start $NAME-$cur (BETWEEN did not run)"
+  fi
+  exit 1
+fi
 log "3. $NAME-$cur stopped ($(ms "$t2") ms)"
+
+# The old colour again, on its own untouched binary, health-checked before
+# the caller resumes anything.
+bring_back() {
+  reject
+  docker update --restart unless-stopped "$NAME-$cur" > /dev/null
+  if docker start "$NAME-$cur" > /dev/null && services deploy "$NAME-$cur"; then
+    resume
+    log "ROLLED BACK to $NAME-$cur"
+  else
+    docker logs --tail 30 "$NAME-$cur" || true
+    log "FAILED: $NAME-$cur did not come back healthy; resuming (requests fail until a server is up)"
+  fi
+  exit 1
+}
 # BETWEEN="command": run now, while no server holds the data dir (the old
 # colour has exited, the new one is not started yet), e.g. swapping in a
 # control DB prepared beside the live one. If it fails, the old colour comes
 # back and nothing else changed.
 if [ -n "${BETWEEN:-}" ]; then
   t4=$(date +%s%N)
-  if ! bash -c "$BETWEEN"; then
-    log "BETWEEN failed; $NAME-$cur back"
-    docker start "$NAME-$cur" > /dev/null; services resume; exit 1
+  if ! timeout "$BETWEEN_TIMEOUT" bash -c "$BETWEEN"; then
+    log "BETWEEN failed; bringing $NAME-$cur back"
+    bring_back
   fi
   log "3b. BETWEEN done ($(ms "$t4") ms)"
+  install_for "$next"
   start_colour "$next"
 fi
 
@@ -185,18 +317,17 @@ t3=$(date +%s%N)
 if ! services deploy "$NAME-$next"; then
   log "new colour unhealthy; bringing $NAME-$cur back"
   docker logs --tail 30 "$NAME-$next" || true
-  docker rm -f "$NAME-$next" > /dev/null
-  docker start "$NAME-$cur" > /dev/null
-  services deploy "$NAME-$cur"
-  services resume
-  log "ROLLED BACK to $NAME-$cur"
-  exit 1
+  # It holds the data dir lock (or crash-loops on it): it must exit first.
+  stop_colour "$NAME-$next" || exit 1
+  docker rm "$NAME-$next" > /dev/null
+  bring_back
 fi
 log "4. $SERVICES -> $NAME-$next ($(ms "$t3") ms)"
 
 # 5. Release the held requests.
-services resume
+resume
 held=$(ms "$t1")
+promote
 echo "$next" > "$ROOT/active"
 docker rm "$NAME-$cur" > /dev/null
-log "5. resumed; requests were held ${held} ms; total $(ms "$t0") ms; serving: $NAME-$next ($(docker exec "$NAME-$next" /opt/bin/railwatch version))"
+log "5. resumed; requests were held ${held} ms; total $(ms "$t0") ms; serving: $NAME-$next ($(docker exec "$NAME-$next" "/opt/bin/railwatch-$next" version))"
