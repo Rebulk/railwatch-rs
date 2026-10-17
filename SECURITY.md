@@ -22,7 +22,8 @@ The latest release. `sudo railwatch upgrade` moves an install to it.
 
 Every release's `SHA256SUMS` is signed keyless with cosign by this
 repository's release workflow; there is no signing key to steal.
-`sudo railwatch upgrade` refuses an unverified release. To check one by
+`sudo railwatch upgrade` verifies it in-process (no cosign needed) and
+refuses an unverified release or an older one than it runs. To check one by
 hand (replace `vX.Y.Z` with the release you downloaded):
 
 ```sh

@@ -234,7 +234,7 @@ vulnerabilities fixed since. `install.sh` does the same when it would
 replace a newer installed binary.
 
 That downloads the release's `install.sh`, verifies it (the release's
-signed `SHA256SUMS`: needs `cosign` on PATH, see [Releases](#releases)),
+signed `SHA256SUMS`, see [Releases](#releases); no cosign needed),
 and runs it with `--upgrade`: download, checksum, atomic swap of
 `/usr/local/bin/railwatch`, `systemctl restart railwatch.service`. Re-running the original install command does
 the same, and also applies any new flags.
@@ -331,9 +331,17 @@ cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
 
 `sudo railwatch upgrade` does this itself before running the new
 `install.sh`: it fetches `install.sh`, `SHA256SUMS` and the bundle over
-https, verifies the bundle with `cosign` (it refuses, and says why, when
-cosign is not installed), checks `install.sh` against `SHA256SUMS`, and
-pipes the verified bytes to `sh` (nothing lands in `/tmp`).
+https and verifies the bundle in-process, the same checks as the command
+above (Fulcio certificate chain to Sigstore's public-good trusted root,
+which the binary embeds; the certificate's SCT; the Rekor inclusion proof
+and signed entry timestamp; the signature over `SHA256SUMS`; the exact
+identity, issuer, trigger and repository), with
+[sigstore-verify](https://crates.io/crates/sigstore-verify). If cosign is
+installed it runs it as well, and both must agree. Then it checks
+`install.sh` against `SHA256SUMS` and pipes the verified bytes to `sh`
+(nothing lands in `/tmp`). The trusted root is the snapshot built into the
+binary, not fetched over TUF: an older binary may need `install.sh` by
+hand once Sigstore rotates its Fulcio or Rekor keys.
 
 Replace `vX.Y.Z` with the release you downloaded: the exact identity pins
 the signature to that tag's run of the release workflow, triggered by the

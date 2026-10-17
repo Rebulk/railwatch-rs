@@ -713,7 +713,7 @@ fn upgrade(rest: &[&str]) -> ExitCode {
     }
     match get("SHA256SUMS.sigstore.json") {
         Ok(bundle) => {
-            if let Err(e) = cosign_verify(&sums, &bundle, &tag) {
+            if let Err(e) = verify_release_signature(&sums, &bundle, &tag) {
                 return fail(e);
             }
             println!("SHA256SUMS: signature verified (release workflow of {}, tag {tag})", railwatch_server::REPO);
@@ -854,16 +854,35 @@ fn release_tag(sums: &[u8]) -> Option<String> {
     })
 }
 
-/// `cosign verify-blob` of SHA256SUMS against the release workflow's
-/// identity for `tag` (docs/SELF-HOST.md, "Releases"). There is no mature
-/// Rust Sigstore verifier to embed yet, so cosign must be installed; without
-/// it the upgrade refuses rather than trusting an unverified installer.
-fn cosign_verify(sums: &[u8], bundle: &[u8], tag: &str) -> Result<(), String> {
+/// SHA256SUMS must be signed by the release workflow for `tag`
+/// (docs/SELF-HOST.md, "Releases"): checked in-process
+/// (release_signature.rs), then, when cosign is installed, by cosign too.
+fn verify_release_signature(sums: &[u8], bundle: &[u8], tag: &str) -> Result<(), String> {
     let valid = tag.strip_prefix('v').is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b)));
     if !valid {
         return Err(format!("{tag:?} is not a release tag"));
     }
-    let dir = private_temp_dir().map_err(|e| format!("temporary directory: {e}"))?;
+    railwatch_server::release_signature::verify(sums, bundle, railwatch_server::REPO, tag)?;
+    match cosign_verify(sums, bundle, tag) {
+        Err(CosignError::NotInstalled) => Ok(()),
+        Err(CosignError::Failed(e)) => Err(e),
+        Ok(()) => {
+            println!("SHA256SUMS: cosign agrees");
+            Ok(())
+        }
+    }
+}
+
+enum CosignError {
+    NotInstalled,
+    Failed(String),
+}
+
+/// `cosign verify-blob` of SHA256SUMS against the release workflow's
+/// identity for `tag`; an extra check when cosign is on PATH. `tag` is
+/// already validated.
+fn cosign_verify(sums: &[u8], bundle: &[u8], tag: &str) -> Result<(), CosignError> {
+    let dir = private_temp_dir().map_err(|e| CosignError::Failed(format!("temporary directory: {e}")))?;
     let result = (|| {
         let write = |name: &str, bytes: &[u8]| -> Result<std::path::PathBuf, String> {
             use std::os::unix::fs::OpenOptionsExt;
@@ -878,7 +897,7 @@ fn cosign_verify(sums: &[u8], bundle: &[u8], tag: &str) -> Result<(), String> {
             f.write_all(bytes).map_err(|e| e.to_string())?;
             Ok(p)
         };
-        let (sums_path, bundle_path) = (write("SHA256SUMS", sums)?, write("SHA256SUMS.sigstore.json", bundle)?);
+        let (sums_path, bundle_path) = (write("SHA256SUMS", sums).map_err(CosignError::Failed)?, write("SHA256SUMS.sigstore.json", bundle).map_err(CosignError::Failed)?);
         let repo = railwatch_server::REPO;
         let out = std::process::Command::new("cosign")
             .arg("verify-blob")
@@ -892,13 +911,9 @@ fn cosign_verify(sums: &[u8], bundle: &[u8], tag: &str) -> Result<(), String> {
             .output();
         match out {
             Ok(o) if o.status.success() => Ok(()),
-            Ok(o) => Err(format!("SHA256SUMS signature does not verify for {repo} {tag}: {}", String::from_utf8_lossy(&o.stderr).trim())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
-                "cosign is not installed, so the release's signature cannot be checked; refusing to run an unverified installer as root. \
-                 Install cosign (https://docs.sigstore.dev/cosign/system_config/installation/) and re-run, or verify and run the release's install.sh by hand (docs/SELF-HOST.md, \"Releases\")."
-                    .into(),
-            ),
-            Err(e) => Err(format!("cosign: {e}")),
+            Ok(o) => Err(CosignError::Failed(format!("cosign: SHA256SUMS signature does not verify for {repo} {tag}: {}", String::from_utf8_lossy(&o.stderr).trim()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(CosignError::NotInstalled),
+            Err(e) => Err(CosignError::Failed(format!("cosign: {e}"))),
         }
     })();
     let _ = std::fs::remove_dir_all(&dir);
@@ -1408,28 +1423,28 @@ mod tests {
         std::fs::remove_dir(&b).unwrap();
     }
 
-    /// Without cosign (or with a tag that is not one) the signature check
-    /// fails closed with an explanation; it never passes by default.
+    /// The signature check fails closed and needs no cosign (issue #7):
+    /// the real v0.1.0 release (tests/fixtures/release-v0.1.0) verifies for
+    /// its own tag; another tag, one changed byte, a bogus bundle or a tag
+    /// that is not one does not. With cosign on PATH it must agree too.
     #[test]
-    fn cosign_verify_fails_closed() {
-        assert!(cosign_verify(b"x", b"{}", "not-a-tag").unwrap_err().contains("not a release tag"));
-        assert!(cosign_verify(b"x", b"{}", "v1.0.0; rm -rf /").is_err());
-        if std::process::Command::new("cosign").arg("version").output().is_err() {
-            assert!(cosign_verify(b"x", b"{}", "v1.0.0").unwrap_err().contains("cosign is not installed"));
-            eprintln!("SKIPPED the real-signature half: cosign is not on PATH");
-            return;
-        }
-        assert!(cosign_verify(b"x", b"{}", "v1.0.0").is_err(), "a bogus bundle never verifies");
-        // The real v0.1.0 release (tests/fixtures/release-v0.1.0): its own
-        // tag verifies; another tag, or one changed byte, does not.
+    fn release_signature_fails_closed() {
+        assert!(verify_release_signature(b"x", b"{}", "not-a-tag").unwrap_err().contains("not a release tag"));
+        assert!(verify_release_signature(b"x", b"{}", "v1.0.0; rm -rf /").is_err());
+        assert!(verify_release_signature(b"x", b"{}", "v1.0.0").is_err(), "a bogus bundle never verifies");
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/release-v0.1.0");
         let sums = std::fs::read(format!("{dir}/SHA256SUMS")).unwrap();
         let bundle = std::fs::read(format!("{dir}/SHA256SUMS.sigstore.json")).unwrap();
         assert_eq!(release_tag(&sums).as_deref(), Some("v0.1.0"));
-        cosign_verify(&sums, &bundle, "v0.1.0").expect("the v0.1.0 release signature verifies");
-        assert!(cosign_verify(&sums, &bundle, "v0.1.1").is_err(), "the signature is pinned to its tag");
+        verify_release_signature(&sums, &bundle, "v0.1.0").expect("the v0.1.0 release signature verifies");
+        assert!(verify_release_signature(&sums, &bundle, "v0.1.1").is_err(), "the signature is pinned to its tag");
         let mut tampered = sums.clone();
         tampered[0] ^= 1;
-        assert!(cosign_verify(&tampered, &bundle, "v0.1.0").is_err(), "a changed SHA256SUMS does not verify");
+        assert!(verify_release_signature(&tampered, &bundle, "v0.1.0").is_err(), "a changed SHA256SUMS does not verify");
+        match cosign_verify(&sums, &bundle, "v0.1.0") {
+            Err(CosignError::NotInstalled) => eprintln!("cosign is not on PATH: verified in-process only"),
+            Err(CosignError::Failed(e)) => panic!("cosign disagrees: {e}"),
+            Ok(()) => assert!(matches!(cosign_verify(&tampered, &bundle, "v0.1.0"), Err(CosignError::Failed(_)))),
+        }
     }
 }

@@ -38,6 +38,7 @@ pub mod jobs;
 pub mod http;
 pub mod ingest;
 pub mod rate_limit;
+pub mod release_signature;
 pub mod rjson;
 pub mod rollup;
 pub mod schema;
