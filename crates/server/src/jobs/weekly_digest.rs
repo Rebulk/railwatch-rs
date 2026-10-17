@@ -330,6 +330,14 @@ pub fn dry_run(control: &Control, tenants_dir: &Path, base_url: &str, now: i64, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway password for fixture users (random, so no credential is
+    /// written into the source).
+    fn test_password() -> String {
+        let mut b = [0u8; 16];
+        getrandom::fill(&mut b).expect("random");
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
     use crate::control::{create_account, create_environment, insert_application, insert_membership, insert_user};
     use crate::rollup::random::RubyRandom;
     use crate::rollup::tdigest::TDigest;
@@ -381,9 +389,9 @@ mod tests {
         let (ada, bob, cyd) = c
             .tx(|tx| {
                 Ok((
-                    insert_user(tx, "Ada", "ada@example.com", "correct horse battery", true)?,
-                    insert_user(tx, "Bob", "bob@example.com", "correct horse battery", true)?,
-                    insert_user(tx, "Cyd", "cyd@example.com", "correct horse battery", true)?,
+                    insert_user(tx, "Ada", "ada@example.com", &test_password(), true)?,
+                    insert_user(tx, "Bob", "bob@example.com", &test_password(), true)?,
+                    insert_user(tx, "Cyd", "cyd@example.com", &test_password(), true)?,
                 ))
             })
             .unwrap();
@@ -451,7 +459,7 @@ mod tests {
     async fn alert_delivery_off_withholds_every_digest() {
         let f = fixture("off");
         let c = &f.control;
-        let ada = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", "correct horse battery", true)).unwrap();
+        let ada = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
         let acme = c.tx(|tx| create_account(tx, "Acme", ada)).unwrap();
         let shop = c.tx(|tx| insert_application(tx, acme, "Shop", "shop", "SHOP", None, "main")).unwrap();
         c.tx(|tx| create_environment(tx, shop, "production")).unwrap();
