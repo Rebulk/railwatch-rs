@@ -606,6 +606,36 @@ all of it (identical; 130/130).
     crash, not power loss or a kernel panic; the gem's receipted path is the
     answer for apps that need more.
 
+## Weekly digest (`jobs/weekly_digest.rs`, `web/digest_mailer.rs`)
+
+WeeklyDigestJob + DigestMailer#weekly. Checked by `bench/diff/digest/run.sh`:
+Rails renders every digest a run would send under `travel_to(NOW)`
+(`capture_rails.rb`), Rust renders from an `import-rails` copy of the same
+primary and tenant files (`digest-dump`), and subject, recipients, text and
+HTML are compared byte for byte; only the server's base URL is normalised.
+`setup_rails.rb` adds the edge cases (a member with the digest off, an
+account with no recipients, an empty and a stale tenant, singular counts,
+HTML-special characters, a title over 120 characters, a resolved issue).
+Last runs (2026-10-16): **3/3 mails identical** (181 environment sections)
+at a Monday after all data, the same with `SPLIT=1` (per-day layout), and
+**2/2** (48 sections) at a later NOW whose window cuts the data (`last-diff.txt`).
+
+1. **Delivery.** Rails enqueues one `deliver_later` per recipient; a
+   failed send lands in Solid Queue's failed jobs, not retried. Here the
+   run sends them in turn and logs each failure at ERROR with the
+   recipient, not retried either. With
+   `alert_delivery = off` or without SMTP nothing is sent and the run logs
+   how many digests it withheld (Rails has no such switch; a shadow must
+   not email people). From address: `smtp_from` (Rails: `SMTP_FROM_EMAIL`).
+2. **Environment order.** Rails' `account.environments` has no ORDER BY;
+   its plan yields application id, then environment id. The control DB has
+   the same indexes created in another order, so SQLite picks other ones;
+   the order is spelled out here (same result).
+3. **Missed runs** are not caught up, as with Solid Queue's recurring
+   tasks; the schedule is UTC, as Rails' (no `config.time_zone`).
+4. **`railwatch digest send --dry-run [--account ID]`** is new: it prints
+   what a run now would send.
+
 ## Issues (`web/issues.rs`, IssuesController + CommentsController)
 
 Read side checked against rw-baseline by `bench/diff/issues/run.sh` (on a

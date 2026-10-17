@@ -15,6 +15,7 @@ pub mod cable;
 pub mod controllers;
 pub mod cookies;
 pub mod dashboard_bridge;
+pub mod digest_mailer;
 pub mod document;
 pub mod env_pages;
 pub mod google_oauth2;

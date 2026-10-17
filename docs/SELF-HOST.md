@@ -125,7 +125,7 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `TRUST_PROXY` | off | key the per-IP limit on `X-Forwarded-For` |
 | `SIGNUP` | `invite` | `open` lets anyone create an account |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | | both turn on "Continue with Google" ([below](#sign-in-with-google)) |
-| `SMTP_ADDRESS`, `_PORT` (587), `_USERNAME`, `_PASSWORD`, `_SECURITY` (`starttls`/`tls`/`none`), `_FROM` | | password resets, invitations, email alerts |
+| `SMTP_ADDRESS`, `_PORT` (587), `_USERNAME`, `_PASSWORD`, `_SECURITY` (`starttls`/`tls`/`none`), `_FROM` | | password resets, invitations, email alerts, the weekly digest ([below](#weekly-digest)) |
 | `BACKUP_S3_ENDPOINT`, `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` | off | all four turn backups on |
 | `BACKUP_S3_REGION`, `_PREFIX` | `us-east-1`, none | |
 | `BACKUP_INTERVAL_SECONDS` | 300 | |
@@ -135,7 +135,7 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `SILENCE_SECONDS` | 60 | quiet time before "app stopped reporting" |
 | `DEADMAN_URL` | | pinged every 30 s while healthy (healthchecks.io etc.) |
 | `ALLOW_PRIVATE_ALERT_TARGETS` | off | alert destinations on private/loopback addresses (SSRF risk; README) |
-| `ALERT_DELIVERY` | `on` | `off` records alerts as skipped (shadow installs) |
+| `ALERT_DELIVERY` | `on` | `off` records alerts as skipped and withholds weekly digests (shadow installs) |
 | `SECRET_KEY_BASE` | generated into the data dir | |
 | `LOG` | `info` | `debug` logs every batch |
 | `HTTP_HEADER_TIMEOUT_SECONDS` | 30 | a request head must arrive within this; also the idle keep-alive limit |
@@ -145,6 +145,25 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `MAX_CONNECTIONS_PER_IP` | 256 | open connections from one address (an IPv6 /64); more are closed at once. Off with `TRUST_PROXY` (every connection comes from the proxy: limit per client there) |
 | `NEW_ISSUES_PER_HOUR`, `NEW_ISSUES_PER_BATCH` | 1000, 200 | per environment: past these, new exception groups count onto one "Too many new issues" issue |
 | `NEW_ISSUES_PER_ACCOUNT_PER_HOUR` | 3000 | the same across all of an account's environments |
+
+## Weekly digest
+
+Every Monday at 08:00 UTC the server emails each account member who has
+"Weekly digest" on (Settings > Profile; on by default) a summary of the
+past 7 days per environment: requests, p95, 5xx rate, job attempts and
+failures, new and resolved issues, deploys and the three most frequent open
+issues, linking to `URL`. Accounts and environments with no requests and no
+job attempts in the week are skipped.
+
+It needs SMTP. Without it, and with `ALERT_DELIVERY=off`, the digests are
+built and logged as not sent (the log line counts them), never emailed. A
+run missed while the server was down is not caught up. To see what the
+next run would send, without sending anything:
+
+```sh
+sudo railwatch digest send --dry-run              # every account
+sudo railwatch digest send --dry-run --account 3  # one account
+```
 
 ## `railwatch doctor`
 

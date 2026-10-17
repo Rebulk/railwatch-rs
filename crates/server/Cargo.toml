@@ -103,5 +103,9 @@ name = "api-dump"
 path = "src/bin/api_dump.rs"
 
 [[bin]]
+name = "digest-dump"
+path = "src/bin/digest_dump.rs"
+
+[[bin]]
 name = "page-hammer"
 path = "src/bin/page_hammer.rs"

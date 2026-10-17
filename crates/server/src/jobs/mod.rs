@@ -16,10 +16,11 @@
 //! | prune_telemetry daily 3am   | prune per environment, 03:00 UTC           |
 //! | auto_resolve_issues daily 4am | auto_resolve, 04:00 UTC                  |
 //! | quota_check 15 min          | quota_check                                |
+//! | weekly_digest every monday at 8am | weekly_digest::run_forever, 08:00 UTC Mondays |
 //! | (new) watchdog              | every 10 s; dead-man ping every 30 s       |
 //!
 //! Not ported (no counterpart needed): optimize/backup/restore-verification
-//! (operational, Litestream-era), operations_status, Linear, weekly digest,
+//! (operational, Litestream-era), operations_status, Linear,
 //! Solid Cable/Queue trims.
 
 pub mod detectors;
@@ -27,6 +28,7 @@ pub mod drain;
 pub mod prune;
 pub mod schedule;
 pub mod watchdog;
+pub mod weekly_digest;
 pub mod worker;
 
 /// The environment's retention: its account's retention_days, as Rails'
@@ -222,7 +224,7 @@ pub fn scan_targets(control: &Control, scan: &Scan, now: i64) -> Vec<(i64, Strin
 }
 
 /// Every recurring task on its cadence. Returns when `shutdown` resolves.
-pub async fn scheduler(control: Arc<Control>, bg: Background, shutdown: tokio::sync::watch::Receiver<bool>) {
+pub async fn scheduler(control: Arc<Control>, bg: Background, tenants_dir: PathBuf, shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut handles = Vec::new();
     let every = |secs: u64, name: &'static str, f: Box<dyn Fn() + Send + Sync>| {
         let mut sd = shutdown.clone();
@@ -326,6 +328,8 @@ pub async fn scheduler(control: Arc<Control>, bg: Background, shutdown: tokio::s
             }),
         ));
     }
+    // weekly_digest: every monday at 8am (UTC).
+    handles.push(tokio::spawn(weekly_digest::run_forever(control.clone(), tenants_dir, shutdown.clone())));
     // Daily: prune at 03:00 UTC, auto-resolve at 04:00 UTC.
     {
         let (c, bg) = (control.clone(), bg.clone());

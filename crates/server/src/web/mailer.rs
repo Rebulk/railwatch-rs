@@ -1,12 +1,13 @@
 //! UserMailer (password_reset, email_verification) and InvitationMailer
-//! (invite) over SMTP with lettre. Without SMTP configured nothing is sent:
+//! (invite) over SMTP with lettre; DigestMailer's multipart digest goes
+//! out through `send_alternative` (web/digest_mailer.rs). Without SMTP configured nothing is sent:
 //! the link is logged at WARN instead, so a self-hoster without mail can
 //! still reset a password from the server log (and `railwatch doctor` says
 //! mail is off). Delivery runs in the background (`deliver_later`).
 
 use std::time::Duration;
 
-use lettre::message::{Mailbox, header::ContentType};
+use lettre::message::{Mailbox, MultiPart, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -59,6 +60,19 @@ impl Mailer {
             .subject(&mail.subject)
             .header(ContentType::TEXT_PLAIN)
             .body(mail.text.clone())
+            .map_err(|e| e.to_string())?;
+        self.transport.send(msg).await.map(drop).map_err(|e| e.to_string())
+    }
+
+    /// multipart/alternative, text then HTML, as Action Mailer sends a
+    /// mail with both a .text and an .html view.
+    pub async fn send_alternative(&self, to: &str, subject: &str, text: &str, html: &str) -> Result<(), String> {
+        let to: Mailbox = to.parse().map_err(|e| format!("{e}"))?;
+        let msg = Message::builder()
+            .from(self.from.clone())
+            .to(to)
+            .subject(subject)
+            .multipart(MultiPart::alternative_plain_html(text.to_string(), html.to_string()))
             .map_err(|e| e.to_string())?;
         self.transport.send(msg).await.map(drop).map_err(|e| e.to_string())
     }
