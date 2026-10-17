@@ -26,8 +26,8 @@ use crate::ingest::payload::{self, MAX_BYTES};
 use crate::ingest::receipt_headers::{self, ReceiptHeaders};
 use crate::ingest::writer::WriteError;
 use crate::rate_limit::FixedWindow;
-use crate::rjson::{self, Value, ruby};
 use crate::rhash;
+use crate::rjson::{self, Value, ruby};
 use crate::tenants::{Job, Tenants};
 
 pub struct Config {
@@ -121,7 +121,12 @@ fn route(method: &Method, path: &str) -> Option<Action> {
 async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let path = req.uri().path().to_string();
     if path == "/up" && matches!(*req.method(), Method::GET | Method::HEAD) {
-        return (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], "<!DOCTYPE html><html><body style=\"background-color: green\"></body></html>").into_response();
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            "<!DOCTYPE html><html><body style=\"background-color: green\"></body></html>",
+        )
+            .into_response();
     }
     if !ingest_path(&path) {
         return StatusCode::NOT_FOUND.into_response();
@@ -129,8 +134,7 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
 
     // IngestRequestBodyLimit: a declared length over the cap is refused
     // before anything else.
-    let declared: Option<u64> =
-        req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
+    let declared: Option<u64> = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
     if declared.is_some_and(|n| n > MAX_BYTES as u64) {
         return too_large();
     }
@@ -180,10 +184,7 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
 
     match action {
         Action::Records => records(&state, env, &headers, raw, declared).await,
-        Action::Ping => json(
-            StatusCode::OK,
-            rhash! {"ok" => true, "environment" => env.slug.clone(), "retention_days" => env.retention_days},
-        ),
+        Action::Ping => json(StatusCode::OK, rhash! {"ok" => true, "environment" => env.slug.clone(), "retention_days" => env.retention_days}),
         Action::Deploys => deploys(&state, env, &headers, &raw).await,
         Action::Kamal => kamal(&state, env, &headers, &raw).await,
         Action::Sourcemaps => sourcemaps(&state, env, &headers, raw).await,
@@ -291,10 +292,9 @@ async fn create_direct(state: &Arc<AppState>, env: Environment, headers: &Header
     };
     let rejections = prepared.rejections.clone();
     match write(state, &env, prepared).await {
-        Ok(w) => json(
-            StatusCode::OK,
-            rhash! {"accepted" => w.accepted, "rejected" => rejections.len(), "rejections" => batch::rejections_value(&rejections, 10)},
-        ),
+        Ok(w) => {
+            json(StatusCode::OK, rhash! {"accepted" => w.accepted, "rejected" => rejections.len(), "rejections" => batch::rejections_value(&rejections, 10)})
+        }
         Err(e) => write_error(&env, e),
     }
 }
@@ -390,11 +390,7 @@ async fn create_receipted(
 
 async fn lookup(state: &Arc<AppState>, env: &Environment, r: &ReceiptHeaders) -> Result<Option<crate::tenants::StoredReceipt>, String> {
     let (tx, rx) = oneshot::channel();
-    state.tenants.send(
-        env.id,
-        &env.slug,
-        Job::LookupReceipt { producer_id: r.producer_id.clone(), delivery_id: r.delivery_id.clone(), reply: tx },
-    );
+    state.tenants.send(env.id, &env.slug, Job::LookupReceipt { producer_id: r.producer_id.clone(), delivery_id: r.delivery_id.clone(), reply: tx });
     rx.await.unwrap_or_else(|_| Err("writer stopped".into()))
 }
 
@@ -421,10 +417,7 @@ fn refuse_new(env: &Environment, r: &ReceiptHeaders) -> Option<Response> {
         return Some(json(StatusCode::OK, rhash! {"disposition" => "deferred", "reason" => "paused", "accepted" => 0i64, "rejected" => 0i64}));
     }
     if env.quota_exhausted(&current_month()) {
-        return Some(json(
-            StatusCode::PAYMENT_REQUIRED,
-            rhash! {"disposition" => "deferred", "reason" => "quota", "accepted" => 0i64, "rejected" => 0i64},
-        ));
+        return Some(json(StatusCode::PAYMENT_REQUIRED, rhash! {"disposition" => "deferred", "reason" => "quota", "accepted" => 0i64, "rejected" => 0i64}));
     }
     None
 }
@@ -516,9 +509,10 @@ async fn deploys(state: &Arc<AppState>, env: Environment, headers: &HeaderMap, r
         None
     };
     if let Some(u) = &url
-        && !web_url(u) {
-            return json(StatusCode::UNPROCESSABLE_ENTITY, rhash! {"error" => "Url must be a single http:// or https:// URL"});
-        }
+        && !web_url(u)
+    {
+        return json(StatusCode::UNPROCESSABLE_ENTITY, rhash! {"error" => "Url must be a single http:// or https:// URL"});
+    }
     let commits: Vec<Value> = match params.get("commits") {
         Value::Array(list) => list
             .iter()
@@ -599,9 +593,10 @@ fn save_deploy(control: &Control, env_id: i64, mut d: DeployRecord) -> rusqlite:
             .flatten();
     }
     if let Some(prev) = d.previous_ref.as_deref().filter(|p| !p.is_empty())
-        && let Some(i) = d.commits.iter().position(|c| ruby::to_s(c.get("sha")).starts_with(prev.as_bytes())) {
-            d.commits.truncate(i);
-        }
+        && let Some(i) = d.commits.iter().position(|c| ruby::to_s(c.get("sha")).starts_with(prev.as_bytes()))
+    {
+        d.commits.truncate(i);
+    }
     let now = crate::time::quoted_date_micros(crate::time::now_micros());
     let commits = rjson::generate(&Value::Array(d.commits)).unwrap_or_else(|_| "[]".into());
     let detail = rjson::generate(&d.detail).unwrap_or_else(|_| "{}".into());
@@ -709,12 +704,8 @@ async fn kamal(state: &Arc<AppState>, env: Environment, headers: &HeaderMap, raw
             Value::Array(a) => a.clone(),
             other => vec![other.clone()],
         };
-        let mut out: Vec<String> = items
-            .iter()
-            .take(100)
-            .map(|i| bounded_string(i, length).trim().to_string())
-            .filter(|s| !ruby::blank(s.as_bytes()))
-            .collect();
+        let mut out: Vec<String> =
+            items.iter().take(100).map(|i| bounded_string(i, length).trim().to_string()).filter(|s| !ruby::blank(s.as_bytes())).collect();
         let mut seen = std::collections::HashSet::new();
         out.retain(|s| seen.insert(s.clone()));
         out.sort();
@@ -815,7 +806,15 @@ mod tests {
         assert_eq!(parse_time("2026-10-13T12:00:00+02:00"), Some(1_791_885_600_000_000));
         assert_eq!(parse_time("garbage"), None);
         // Client text: multibyte anywhere must not panic (security-b PoC).
-        for t in ["\u{20ac}a\u{20ac}", "aa\u{20ac}\u{20ac}a", "\u{1F600}\u{1F600}", "a\u{1F600}aa\u{1F600}", "2026-10-13 10:00:00.\u{20ac}\u{20ac}\u{20ac}", "+\u{20ac}:00", "2026-10-13T10:00+\u{e9}:0"] {
+        for t in [
+            "\u{20ac}a\u{20ac}",
+            "aa\u{20ac}\u{20ac}a",
+            "\u{1F600}\u{1F600}",
+            "a\u{1F600}aa\u{1F600}",
+            "2026-10-13 10:00:00.\u{20ac}\u{20ac}\u{20ac}",
+            "+\u{20ac}:00",
+            "2026-10-13T10:00+\u{e9}:0",
+        ] {
             assert_eq!(parse_time(t), None, "{t:?}");
         }
         assert_eq!(parse_time("2026-10-13 10:00:00.123\u{20ac}"), None);

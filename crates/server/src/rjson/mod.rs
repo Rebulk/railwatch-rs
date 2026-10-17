@@ -201,8 +201,7 @@ fn write_value(out: &mut String, value: &Value, depth: usize) -> Result<(), Gene
 /// The json gem's basic escaping: `"`, `\` and C0 controls only. `/` and
 /// DEL pass through.
 fn write_string(out: &mut String, bytes: &[u8]) -> Result<(), GenerateError> {
-    let s = std::str::from_utf8(bytes)
-        .map_err(|_| GenerateError("source sequence is illegal/malformed utf-8".into()))?;
+    let s = std::str::from_utf8(bytes).map_err(|_| GenerateError("source sequence is illegal/malformed utf-8".into()))?;
     out.push('"');
     let mut start = 0;
     for (i, b) in s.bytes().enumerate() {

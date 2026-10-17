@@ -82,11 +82,14 @@ fn main() {
     // RW_SQL_PROFILE=1: every statement's time on stderr (finding slow SQL).
     if std::env::var_os("RW_SQL_PROFILE").is_some() {
         use rusqlite::trace::{TraceEvent, TraceEventCodes};
-        conn.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(|e: TraceEvent<'_>| {
-            if let TraceEvent::Profile(s, d) = e {
-                eprintln!("SQLPROF {:.3} {}", d.as_secs_f64() * 1e3, s.sql().replace('\n', " "));
-            }
-        }));
+        conn.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(|e: TraceEvent<'_>| {
+                if let TraceEvent::Profile(s, d) = e {
+                    eprintln!("SQLPROF {:.3} {}", d.as_secs_f64() * 1e3, s.sql().replace('\n', " "));
+                }
+            }),
+        );
     }
     let cases: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(&a[1]).unwrap()).unwrap();
     let control: StaticControl = serde_json::from_str(&std::fs::read_to_string(&a[2]).unwrap()).unwrap();

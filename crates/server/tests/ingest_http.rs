@@ -319,10 +319,7 @@ fn a_failing_batch_rolls_back_alone_when_coalesced() {
                 let mut q = fixture("query");
                 q["execution_id"] = json!(format!("exec-{i}"));
                 let body = gzip(&ndjson(&[q]));
-                let mut headers = vec![
-                    ("Authorization", format!("Bearer {token}")),
-                    ("Content-Encoding", "gzip".into()),
-                ];
+                let mut headers = vec![("Authorization", format!("Bearer {token}")), ("Content-Encoding", "gzip".into())];
                 if i % 4 == 0 {
                     headers.push(("X-Railwatch-Dropped", "99999999999999999999".into()));
                 }
@@ -358,8 +355,13 @@ fn deploys_kamal_and_sourcemaps() {
     let s = start(0, 0);
     let auth = ("Authorization", format!("Bearer {}", s.token));
     let ct = ("Content-Type", "application/json".to_string());
-    let (status, _, body) = request(s.addr, "POST", "/ingest/deploys", &[auth.clone(), ct.clone()],
-        br#"{"deploy":"v1","ref":"abc","timestamp":"2026-10-13T10:00:00Z","commits":[{"sha":"abc1","message":"m"}]}"#);
+    let (status, _, body) = request(
+        s.addr,
+        "POST",
+        "/ingest/deploys",
+        &[auth.clone(), ct.clone()],
+        br#"{"deploy":"v1","ref":"abc","timestamp":"2026-10-13T10:00:00Z","commits":[{"sha":"abc1","message":"m"}]}"#,
+    );
     assert_eq!((status, serde_json::from_slice::<Value>(&body).unwrap()), (201, json!({"ok": true, "deploy": "v1"})));
     let (status, _, body) = request(s.addr, "POST", "/ingest/deploys", &[auth.clone(), ct.clone()], br#"{"deploy":"v2","url":"javascript:x"}"#);
     assert_eq!((status, serde_json::from_slice::<Value>(&body).unwrap()), (422, json!({"error": "Url must be a single http:// or https:// URL"})));
@@ -370,9 +372,7 @@ fn deploys_kamal_and_sourcemaps() {
         "params.require(:deploy)"
     );
     // Without a timestamp a re-post keeps deployed_at; a new deploy gets now.
-    let deployed_at = |d: &str| -> String {
-        s.control.with(|c| c.query_row("SELECT deployed_at FROM deploys WHERE deploy = ?", [d], |r| r.get(0))).unwrap()
-    };
+    let deployed_at = |d: &str| -> String { s.control.with(|c| c.query_row("SELECT deployed_at FROM deploys WHERE deploy = ?", [d], |r| r.get(0))).unwrap() };
     let (status, _, _) = request(s.addr, "POST", "/ingest/deploys", &[auth.clone(), ct.clone()], br#"{"deploy":"v1","ref":"abd"}"#);
     assert_eq!(status, 201);
     assert_eq!(deployed_at("v1"), "2026-10-13 10:00:00", "a re-post without timestamp keeps deployed_at");
@@ -384,12 +384,17 @@ fn deploys_kamal_and_sourcemaps() {
     assert!(deployed_at("v3").as_str() > "2026-10-14", "a new deploy without timestamp is now");
     let (status, _, body) = request(s.addr, "POST", "/ingest/kamal", &[auth.clone(), ct.clone()], br#"{"hosts":[" b ","a","a",""],"roles":"web"}"#);
     assert_eq!((status, serde_json::from_slice::<Value>(&body).unwrap()), (201, json!({"ok": true, "hosts": ["a", "b"]})));
-    let (status, _, body) = request(s.addr, "POST", "/ingest/sourcemaps",
-        &[auth.clone(), ("X-Railwatch-Deploy", "v1".into()), ("X-Railwatch-Filename", "assets/app-123.js".into())], b"{\"version\":3}");
+    let (status, _, body) = request(
+        s.addr,
+        "POST",
+        "/ingest/sourcemaps",
+        &[auth.clone(), ("X-Railwatch-Deploy", "v1".into()), ("X-Railwatch-Filename", "assets/app-123.js".into())],
+        b"{\"version\":3}",
+    );
     assert_eq!((status, serde_json::from_slice::<Value>(&body).unwrap()), (201, json!({"ok": true, "filename": "assets/app-123.js", "bytes": 13})));
     assert_eq!(std::fs::read(s.dir.0.join("sourcemaps/test-env/v1/assets/app-123.js.map")).unwrap(), b"{\"version\":3}");
-    let (status, _, _) = request(s.addr, "POST", "/ingest/sourcemaps",
-        &[auth, ("X-Railwatch-Deploy", "v1".into()), ("X-Railwatch-Filename", "../../etc/passwd".into())], b"x");
+    let (status, _, _) =
+        request(s.addr, "POST", "/ingest/sourcemaps", &[auth, ("X-Railwatch-Deploy", "v1".into()), ("X-Railwatch-Filename", "../../etc/passwd".into())], b"x");
     assert_eq!(status, 422);
 }
 

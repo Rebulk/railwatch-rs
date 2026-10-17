@@ -91,8 +91,7 @@ fn validate<'a>(value: &'a [u8], ok: fn(&[u8]) -> bool, name: &str) -> Result<St
 }
 
 fn is_uuid(s: &[u8]) -> bool {
-    s.len() == 36
-        && s.iter().enumerate().all(|(i, b)| if [8, 13, 18, 23].contains(&i) { *b == b'-' } else { b.is_ascii_hexdigit() })
+    s.len() == 36 && s.iter().enumerate().all(|(i, b)| if [8, 13, 18, 23].contains(&i) { *b == b'-' } else { b.is_ascii_hexdigit() })
 }
 
 fn is_sha256(s: &[u8]) -> bool {

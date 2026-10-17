@@ -3,7 +3,8 @@
 //!  1. gzip bomb is bounded (SOUND): a tiny gzip that inflates to >>32 MiB is
 //!     refused at the 32 MiB ceiling with bounded memory and time.
 //!  2. a newline-free body is refused at the NDJSON line cap in linear time.
-//!  3. new issues per environment are capped (see the grouping test).
+//!  3. new issues per environment are capped (see the grouping test), and
+//!     per account, so more environments do not multiply the cap.
 
 use std::time::Instant;
 
@@ -138,7 +139,7 @@ fn exception_grouping_caps_new_issues_per_env() {
 
     // Later batches: the per-hour cap holds across them, an existing group
     // still records onto its own issue, and the next hour's cap is fresh.
-    let limits = grouping::Limits { new_issues_per_hour: 250, new_issues_per_batch: 200 };
+    let limits = grouping::Limits { new_issues_per_hour: 250, new_issues_per_batch: 200, ..Default::default() };
     let mut users = grouping::AffectedUsers::default();
     let batch = |from: usize, n: usize| -> Vec<ExceptionRow> {
         (from..from + n).map(|i| ExceptionRow { id: (N + i) as i64 + 1, group_hash: Some(format!("{i:032x}")), ..rows_template() }).collect()
@@ -148,6 +149,53 @@ fn exception_grouping_caps_new_issues_per_env() {
     assert_eq!((g.new, g.overflowed), (49, 51));
     let g = control.with(|c| Ok(grouping::group_with_limits(c, &tenant, env.id, batch(0, 10), None, &mut users, limits).unwrap())).unwrap();
     assert_eq!((g.new, g.seen, g.overflowed), (0, 10, 0), "existing groups are never diverted");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The per-environment caps alone scale with the number of environments: an
+/// account with 10 environments could create 10 x new_issues_per_hour. The
+/// per-account cap bounds the account's total; the excess goes to each
+/// environment's overflow issue, counted, never dropped.
+#[test]
+fn exception_grouping_caps_new_issues_per_account() {
+    let dir = std::env::temp_dir().join(format!("rw-secb-acct-{}", control::base58(8)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let control = Control::open_with(&dir.join("control.sqlite3"), true).unwrap();
+    // Control::create puts every 30-day environment in one account.
+    let envs: Vec<_> = (0..10).map(|i| control.create(&format!("acct-env-{i}"), &control::digest(&control::new_token()), 30).unwrap()).collect();
+    let other = control.create("other-account-env", &control::digest(&control::new_token()), 7).unwrap();
+    let tenant = railwatch_server::tenants::open_tenant(&dir.join("t.sqlite3")).unwrap();
+    let limits = grouping::Limits { new_issues_per_hour: 100, new_issues_per_batch: 100, new_issues_per_account_per_hour: 250 };
+    let mut users = grouping::AffectedUsers::default();
+    let batch = |env: usize, n: usize| -> Vec<ExceptionRow> {
+        (0..n).map(|i| ExceptionRow { id: (env * n + i) as i64 + 1, group_hash: Some(format!("{env:08x}{i:024x}")), ..rows_template() }).collect()
+    };
+    let (mut new, mut overflowed) = (0, 0);
+    for (i, env) in envs.iter().enumerate() {
+        let g = control.with(|c| Ok(grouping::group_with_limits(c, &tenant, env.id, batch(i, 100), None, &mut users, limits).unwrap())).unwrap();
+        new += g.new;
+        overflowed += g.overflowed;
+    }
+    let issues: i64 =
+        control.with(|c| c.query_row("SELECT COUNT(*) FROM issues WHERE group_hash != ?", [grouping::OVERFLOW_GROUP_HASH], |r| r.get(0))).unwrap();
+    let diverted: i64 = control
+        .with(|c| c.query_row("SELECT COALESCE(SUM(occurrences), 0) FROM issues WHERE group_hash = ?", [grouping::OVERFLOW_GROUP_HASH], |r| r.get(0)))
+        .unwrap();
+    eprintln!("10 environments x 100 new groups, account cap 250: new={new} overflowed={overflowed} issues={issues} diverted={diverted}");
+    // Without the account cap every environment stays under its own 100 and
+    // all 1,000 become issues. With it: envs 0-1 take 200, env 2 takes 50,
+    // and every group past that is counted onto its environment's overflow
+    // issue (envs 2-9: 8 of them).
+    assert_eq!(new, 250, "the account's new issues this hour stop at the cap");
+    assert_eq!(issues, 250);
+    assert_eq!(overflowed, 750, "every exception past the cap is accounted for");
+    assert_eq!(diverted, 750, "the overflow issues count every diverted exception");
+    let overflow_issues: i64 =
+        control.with(|c| c.query_row("SELECT COUNT(*) FROM issues WHERE group_hash = ?", [grouping::OVERFLOW_GROUP_HASH], |r| r.get(0))).unwrap();
+    assert_eq!(overflow_issues, 8, "one overflow issue per capped environment");
+    // Another account is not affected by this one's cap.
+    let g = control.with(|c| Ok(grouping::group_with_limits(c, &tenant, other.id, batch(99, 50), None, &mut users, limits).unwrap())).unwrap();
+    assert_eq!((g.new, g.overflowed), (50, 0), "the cap is per account");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -29,14 +29,13 @@ impl Mailer {
     pub fn new(s: &Smtp) -> Result<Mailer, String> {
         let from: Mailbox = s.from.parse().map_err(|e| format!("smtp_from {:?}: {e}", s.from))?;
         let tls = || TlsParameters::new(s.address.clone()).map_err(|e| e.to_string());
-        let mut b = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&s.address)
-            .port(s.port)
-            .timeout(Some(Duration::from_secs(30)))
-            .tls(match s.security.as_str() {
+        let mut b = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&s.address).port(s.port).timeout(Some(Duration::from_secs(30))).tls(
+            match s.security.as_str() {
                 "tls" => Tls::Wrapper(tls()?),
                 "none" => Tls::None,
                 _ => Tls::Required(tls()?),
-            });
+            },
+        );
         if let (Some(u), Some(p)) = (&s.username, &s.password) {
             b = b.credentials(Credentials::new(u.clone(), p.clone()));
         }
@@ -103,6 +102,8 @@ pub fn invite(base_url: &str, to: &str, inviter: &str, account: &str, token: &st
     Mail {
         to: to.into(),
         subject: format!("{inviter} invited you to {account} on Railwatch"),
-        text: format!("{inviter} invited you to join {account} on Railwatch.\n\nAccept the invitation (it expires in 7 days):\n{base_url}/invitations/{token}\n"),
+        text: format!(
+            "{inviter} invited you to join {account} on Railwatch.\n\nAccept the invitation (it expires in 7 days):\n{base_url}/invitations/{token}\n"
+        ),
     }
 }

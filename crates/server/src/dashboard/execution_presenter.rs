@@ -148,7 +148,11 @@ pub fn props(conn: &Connection, exe: &Rec, ctx: &PageContext, control: &dyn Cont
             "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"trace_id\" = ?1 ORDER BY \"executions\".\"occurred_at\" ASC LIMIT 50",
             [t],
         )?,
-        None => db::query(conn, "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"trace_id\" IS NULL ORDER BY \"executions\".\"occurred_at\" ASC LIMIT 50", [])?,
+        None => db::query(
+            conn,
+            "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"trace_id\" IS NULL ORDER BY \"executions\".\"occurred_at\" ASC LIMIT 50",
+            [],
+        )?,
     };
     let trace: Vec<Value> = trace_rows
         .iter()
@@ -168,9 +172,10 @@ pub fn props(conn: &Connection, exe: &Rec, ctx: &PageContext, control: &dyn Cont
     let mut groups: Vec<&str> = vec![];
     for e in &exceptions {
         if let Some(g) = e.s("group_hash")
-            && !groups.contains(&g) {
-                groups.push(g);
-            }
+            && !groups.contains(&g)
+        {
+            groups.push(g);
+        }
     }
     let issues = super::control::issues_in_groups(control, &groups);
     let person = match exe.s("user_ref") {
@@ -247,31 +252,70 @@ fn timeline(conn: &Connection, eid: &str, start: i64, exceptions: &[Rec], attach
     let all = |t: &str| children(conn, t, &format!("\"{t}\".*"), eid, "", None);
     for q in children(conn, "queries", models::QUERY_WITH_SQL, eid, "", None)? {
         let sql = q.s("resolved_sql").unwrap_or("");
-        entries.push(entry_sql("query", &q, start, dur_ms(&q), first120(sql), Some(sql), js(q.s("source")), obj(vec![("rows", ji(q.i("row_count"))), ("connection", js(q.s("connection")))])));
+        entries.push(entry_sql(
+            "query",
+            &q,
+            start,
+            dur_ms(&q),
+            first120(sql),
+            Some(sql),
+            js(q.s("source")),
+            obj(vec![("rows", ji(q.i("row_count"))), ("connection", js(q.s("connection")))]),
+        ));
     }
     for c in all("cache_events")? {
         let label = first120(&format!("{} {}", c.s("type").unwrap_or(""), c.s("key").unwrap_or("")));
-        entries.push(entry("cache_event", &c, start, dur_ms(&c), label, Value::Null, obj(vec![
-            ("key", js(c.s("key"))), ("op", js(c.s("type"))), ("store", js(c.s("store"))), ("hits", ji(c.i("hits"))), ("ttl", ji(c.i("ttl"))),
-        ])));
+        entries.push(entry(
+            "cache_event",
+            &c,
+            start,
+            dur_ms(&c),
+            label,
+            Value::Null,
+            obj(vec![("key", js(c.s("key"))), ("op", js(c.s("type"))), ("store", js(c.s("store"))), ("hits", ji(c.i("hits"))), ("ttl", ji(c.i("ttl")))]),
+        ));
     }
     for o in all("outgoing_requests")? {
-        entries.push(entry("outgoing_request", &o, start, dur_ms(&o), first120(o.s("url").unwrap_or("")), js(o.s("source")), obj(vec![
-            ("method", js(o.s("method"))), ("url", js(o.s("url"))), ("status", ji(o.i("status_code"))), ("host", js(o.s("host"))),
-            ("error", js(o.s("error"))), ("body", js(o.s("response_body"))),
-        ])));
+        entries.push(entry(
+            "outgoing_request",
+            &o,
+            start,
+            dur_ms(&o),
+            first120(o.s("url").unwrap_or("")),
+            js(o.s("source")),
+            obj(vec![
+                ("method", js(o.s("method"))),
+                ("url", js(o.s("url"))),
+                ("status", ji(o.i("status_code"))),
+                ("host", js(o.s("host"))),
+                ("error", js(o.s("error"))),
+                ("body", js(o.s("response_body"))),
+            ]),
+        ));
     }
     for m in all("mails")? {
-        entries.push(entry("mail", &m, start, dur_ms(&m), first120(m.s("mailer").unwrap_or("")), Value::Null, obj(vec![
-            ("subject", js(m.s("subject"))), ("mailer", js(m.s("mailer"))), ("to", ji(m.i("to"))),
-        ])));
+        entries.push(entry(
+            "mail",
+            &m,
+            start,
+            dur_ms(&m),
+            first120(m.s("mailer").unwrap_or("")),
+            Value::Null,
+            obj(vec![("subject", js(m.s("subject"))), ("mailer", js(m.s("mailer"))), ("to", ji(m.i("to")))]),
+        ));
     }
     for l in all("logs")? {
         let msg = l.s("message").unwrap_or("");
         // Log has no duration column: duration_ms is nil.
-        entries.push(entry("log", &l, start, None, first120(msg), js(l.s("source")), obj(vec![
-            ("level", js(l.s("level"))), ("message", Value::String(rb::first_chars(msg, 500).to_string())),
-        ])));
+        entries.push(entry(
+            "log",
+            &l,
+            start,
+            None,
+            first120(msg),
+            js(l.s("source")),
+            obj(vec![("level", js(l.s("level"))), ("message", Value::String(rb::first_chars(msg, 500).to_string()))]),
+        ));
     }
     for x in exceptions {
         let msg = x.s("message").unwrap_or("");
@@ -279,31 +323,64 @@ fn timeline(conn: &Connection, eid: &str, start: i64, exceptions: &[Rec], attach
             Some(f) => Value::String(format!("{f}:{}", x.i("line").map_or(String::new(), |l| l.to_string()))),
             None => Value::Null,
         };
-        entries.push(entry("exception", x, start, None, format!("{}: {}", x.s("class_name").unwrap_or(""), rb::first_chars(msg, 100)), source, obj(vec![
-            ("class", js(x.s("class_name"))), ("message", Value::String(rb::first_chars(msg, 300).to_string())),
-            ("handled", x.b("handled").map_or(Value::Null, Value::Bool)),
-        ])));
+        entries.push(entry(
+            "exception",
+            x,
+            start,
+            None,
+            format!("{}: {}", x.s("class_name").unwrap_or(""), rb::first_chars(msg, 100)),
+            source,
+            obj(vec![
+                ("class", js(x.s("class_name"))),
+                ("message", Value::String(rb::first_chars(msg, 300).to_string())),
+                ("handled", x.b("handled").map_or(Value::Null, Value::Bool)),
+            ]),
+        ));
     }
     for b in all("broadcasts")? {
-        entries.push(entry("broadcast", &b, start, dur_ms(&b), first120(b.s("channel").unwrap_or("")), Value::Null, obj(vec![
-            ("channel", js(b.s("channel"))), ("action", js(b.s("action"))), ("stream", js(b.s("stream"))),
-        ])));
+        entries.push(entry(
+            "broadcast",
+            &b,
+            start,
+            dur_ms(&b),
+            first120(b.s("channel").unwrap_or("")),
+            Value::Null,
+            obj(vec![("channel", js(b.s("channel"))), ("action", js(b.s("action"))), ("stream", js(b.s("stream")))]),
+        ));
     }
     for s in all("storage_ops")? {
         let label = first120(&format!("{} {}", s.s("op").unwrap_or(""), s.s("key").unwrap_or("")));
-        entries.push(entry("storage_op", &s, start, dur_ms(&s), label, Value::Null, obj(vec![
-            ("op", js(s.s("op"))), ("key", js(s.s("key"))), ("service", js(s.s("service"))),
-        ])));
+        entries.push(entry(
+            "storage_op",
+            &s,
+            start,
+            dur_ms(&s),
+            label,
+            Value::Null,
+            obj(vec![("op", js(s.s("op"))), ("key", js(s.s("key"))), ("service", js(s.s("service")))]),
+        ));
     }
     for v in all("view_renders")? {
-        entries.push(entry("view_render", &v, start, dur_ms(&v), first120(v.s("identifier").unwrap_or("")), Value::Null, obj(vec![
-            ("count", ji(v.i("count"))), ("cache_hits", ji(v.i("cache_hits"))),
-        ])));
+        entries.push(entry(
+            "view_render",
+            &v,
+            start,
+            dur_ms(&v),
+            first120(v.s("identifier").unwrap_or("")),
+            Value::Null,
+            obj(vec![("count", ji(v.i("count"))), ("cache_hits", ji(v.i("cache_hits")))]),
+        ));
     }
     for j in all("enqueued_jobs")? {
-        entries.push(entry("enqueued_job", &j, start, dur_ms(&j), first120(j.s("name").unwrap_or("")), Value::Null, obj(vec![
-            ("queue", js(j.s("queue"))), ("job_id", js(j.s("job_id"))),
-        ])));
+        entries.push(entry(
+            "enqueued_job",
+            &j,
+            start,
+            dur_ms(&j),
+            first120(j.s("name").unwrap_or("")),
+            Value::Null,
+            obj(vec![("queue", js(j.s("queue"))), ("job_id", js(j.s("job_id")))]),
+        ));
     }
     for s in all("spans")? {
         let mut d = obj(vec![("status", js(s.s("status")))]);
@@ -315,9 +392,15 @@ fn timeline(conn: &Connection, eid: &str, start: i64, exceptions: &[Rec], attach
         entries.push(entry("span", &s, start, dur_ms(&s), first120(s.s("name").unwrap_or("")), Value::Null, d));
     }
     for t in all("transactions")? {
-        entries.push(entry("transaction", &t, start, dur_ms(&t), first120(t.s("outcome").unwrap_or("")), Value::Null, obj(vec![
-            ("outcome", js(t.s("outcome"))), ("connection", js(t.s("connection"))),
-        ])));
+        entries.push(entry(
+            "transaction",
+            &t,
+            start,
+            dur_ms(&t),
+            first120(t.s("outcome").unwrap_or("")),
+            Value::Null,
+            obj(vec![("outcome", js(t.s("outcome"))), ("connection", js(t.s("connection")))]),
+        ));
     }
     for c in all("llm_calls")? {
         let label = if c.s("operation") == Some("tool") {
@@ -325,18 +408,43 @@ fn timeline(conn: &Connection, eid: &str, start: i64, exceptions: &[Rec], attach
         } else {
             format!("{}/{}", c.s("provider").unwrap_or(""), c.s("model").unwrap_or(""))
         };
-        entries.push(entry("llm_call", &c, start, dur_ms(&c), first120(&label), Value::Null, obj(vec![
-            ("operation", js(c.s("operation"))), ("provider", js(c.s("provider"))), ("model", js(c.s("model"))), ("tool", js(c.s("tool_name"))),
-            ("input_tokens", ji(c.i("input_tokens"))), ("output_tokens", ji(c.i("output_tokens"))),
-            ("cost", c.i("cost_nanos").map_or(Value::Null, |n| jf(n as f64 / 1e9))), ("status", js(c.s("status"))), ("error", js(c.s("error"))),
-            ("workflow", js(c.s("workflow_name"))), ("step", js(c.s("workflow_step_name"))),
-        ])));
+        entries.push(entry(
+            "llm_call",
+            &c,
+            start,
+            dur_ms(&c),
+            first120(&label),
+            Value::Null,
+            obj(vec![
+                ("operation", js(c.s("operation"))),
+                ("provider", js(c.s("provider"))),
+                ("model", js(c.s("model"))),
+                ("tool", js(c.s("tool_name"))),
+                ("input_tokens", ji(c.i("input_tokens"))),
+                ("output_tokens", ji(c.i("output_tokens"))),
+                ("cost", c.i("cost_nanos").map_or(Value::Null, |n| jf(n as f64 / 1e9))),
+                ("status", js(c.s("status"))),
+                ("error", js(c.s("error"))),
+                ("workflow", js(c.s("workflow_name"))),
+                ("step", js(c.s("workflow_step_name"))),
+            ]),
+        ));
     }
     for a in attachments {
-        entries.push(entry("attachment", a, start, None, first120(a.s("name").unwrap_or("")), Value::Null, obj(vec![
-            ("name", js(a.s("name"))), ("content_type", js(a.s("content_type"))), ("bytes", ji(a.i("bytes"))),
-            ("truncated", a.b("truncated").map_or(Value::Null, Value::Bool)),
-        ])));
+        entries.push(entry(
+            "attachment",
+            a,
+            start,
+            None,
+            first120(a.s("name").unwrap_or("")),
+            Value::Null,
+            obj(vec![
+                ("name", js(a.s("name"))),
+                ("content_type", js(a.s("content_type"))),
+                ("bytes", ji(a.i("bytes"))),
+                ("truncated", a.b("truncated").map_or(Value::Null, Value::Bool)),
+            ]),
+        ));
     }
     // sort_by { offset }: every key a Float -> MRI's uniform introsort.
     let sorted = rb::sort_by_num(entries, |(o, _)| rb::Num::F(*o));

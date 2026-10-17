@@ -28,21 +28,13 @@ pub struct Manifest {
 pub fn manifest() -> &'static Manifest {
     static M: std::sync::OnceLock<Manifest> = std::sync::OnceLock::new();
     M.get_or_init(|| {
-        let raw = DIST
-            .get_file(".vite/manifest.json")
-            .expect("frontend/dist/.vite/manifest.json is missing: run bin/build before cargo build")
-            .contents();
+        let raw = DIST.get_file(".vite/manifest.json").expect("frontend/dist/.vite/manifest.json is missing: run bin/build before cargo build").contents();
         let m: Value = serde_json::from_slice(raw).expect("manifest JSON");
         let entry = &m["app/frontend/entrypoints/inertia.tsx"];
         let url = |f: &Value| format!("{BASE}{}", f.as_str().unwrap_or_default());
         let mut css: Vec<String> = m["app/frontend/entrypoints/application.css"]["file"].as_str().map(|f| vec![format!("{BASE}{f}")]).unwrap_or_default();
         css.extend(entry["css"].as_array().into_iter().flatten().map(url));
-        let preload = entry["imports"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|k| m[k.as_str()?]["file"].as_str().map(|f| format!("{BASE}{f}")))
-            .collect();
+        let preload = entry["imports"].as_array().into_iter().flatten().filter_map(|k| m[k.as_str()?]["file"].as_str().map(|f| format!("{BASE}{f}"))).collect();
         let fonts = DIST
             .get_dir("assets")
             .map(|d| {
@@ -108,10 +100,7 @@ pub fn serve(path: &str, headers: &HeaderMap) -> Option<Response> {
     let mut res = (StatusCode::OK, Body::from(body)).into_response();
     let h = res.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type(path)));
-    h.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static(if hashed { "public, max-age=31536000, immutable" } else { "public, max-age=3600" }),
-    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static(if hashed { "public, max-age=31536000, immutable" } else { "public, max-age=3600" }));
     if DIST.get_file(format!("{path}.br")).is_some() || DIST.get_file(format!("{path}.gz")).is_some() {
         h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     }

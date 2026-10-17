@@ -25,8 +25,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
@@ -87,17 +87,11 @@ impl Hub {
 
 pub async fn upgrade(State(state): State<Arc<WebState>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
     let jar = cookies::parse(&headers);
-    let session_id: Option<i64> = cookies::get(&jar, cookies::SESSION_TOKEN)
-        .and_then(|c| state.keys.verify(cookies::SESSION_TOKEN, c))
-        .and_then(|v| v.parse().ok());
+    let session_id: Option<i64> =
+        cookies::get(&jar, cookies::SESSION_TOKEN).and_then(|c| state.keys.verify(cookies::SESSION_TOKEN, c)).and_then(|v| v.parse().ok());
     let origin_ok = super::session::same_origin(&headers);
     let user = match (origin_ok, session_id) {
-        (true, Some(sid)) => state
-            .db(move |c| c.with(|x| crate::control::find_session(x, sid)))
-            .await
-            .ok()
-            .flatten()
-            .map(|s| (s.id, s.user_id)),
+        (true, Some(sid)) => state.db(move |c| c.with(|x| crate::control::find_session(x, sid))).await.ok().flatten().map(|s| (s.id, s.user_id)),
         _ => None,
     };
     ws.protocols(["actioncable-v1-json"]).on_upgrade(move |socket| run(socket, state, user))

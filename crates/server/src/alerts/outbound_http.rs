@@ -109,16 +109,38 @@ pub fn ensure_public(ip: IpAddr) -> Result<(), Unsafe> {
     let blocked = match ip {
         IpAddr::V4(v) => {
             const R: &[([u8; 4], u32)] = &[
-                ([10, 0, 0, 0], 8), ([172, 16, 0, 0], 12), ([192, 168, 0, 0], 16), ([127, 0, 0, 0], 8), ([169, 254, 0, 0], 16),
-                ([0, 0, 0, 0], 8), ([100, 64, 0, 0], 10), ([192, 0, 0, 0], 24), ([192, 0, 2, 0], 24), ([198, 18, 0, 0], 15),
-                ([198, 51, 100, 0], 24), ([203, 0, 113, 0], 24), ([224, 0, 0, 0], 4), ([240, 0, 0, 0], 4),
+                ([10, 0, 0, 0], 8),
+                ([172, 16, 0, 0], 12),
+                ([192, 168, 0, 0], 16),
+                ([127, 0, 0, 0], 8),
+                ([169, 254, 0, 0], 16),
+                ([0, 0, 0, 0], 8),
+                ([100, 64, 0, 0], 10),
+                ([192, 0, 0, 0], 24),
+                ([192, 0, 2, 0], 24),
+                ([198, 18, 0, 0], 15),
+                ([198, 51, 100, 0], 24),
+                ([203, 0, 113, 0], 24),
+                ([224, 0, 0, 0], 4),
+                ([240, 0, 0, 0], 4),
             ];
             R.iter().any(|(n, b)| in_v4(v, *n, *b))
         }
         IpAddr::V6(v) => {
             let r: &[(&str, u32)] = &[
-                ("fc00::", 7), ("::1", 128), ("fe80::", 10), ("::", 96), ("64:ff9b::", 96), ("64:ff9b:1::", 48), ("100::", 64),
-                ("2001::", 32), ("2001:2::", 48), ("2001:db8::", 32), ("2002::", 16), ("fec0::", 10), ("ff00::", 8),
+                ("fc00::", 7),
+                ("::1", 128),
+                ("fe80::", 10),
+                ("::", 96),
+                ("64:ff9b::", 96),
+                ("64:ff9b:1::", 48),
+                ("100::", 64),
+                ("2001::", 32),
+                ("2001:2::", 48),
+                ("2001:db8::", 32),
+                ("2002::", 16),
+                ("fec0::", 10),
+                ("ff00::", 8),
             ];
             r.iter().any(|(n, b)| in_v6(v, n.parse().unwrap(), *b))
         }
@@ -145,18 +167,14 @@ pub struct Response {
 
 /// post_json: `body` is sent as given (a signed body is the sent body).
 pub async fn post_json(url: &str, body: String, headers: &[(&str, String)], kind: Kind) -> Result<Response, String> {
-    tokio::time::timeout(RESPONSE_TIMEOUT, post_inner(url, body, headers, kind))
-        .await
-        .map_err(|_| "destination response timed out".to_string())?
+    tokio::time::timeout(RESPONSE_TIMEOUT, post_inner(url, body, headers, kind)).await.map_err(|_| "destination response timed out".to_string())?
 }
 
 async fn post_inner(url: &str, body: String, headers: &[(&str, String)], kind: Kind) -> Result<Response, String> {
     let policy = Policy::from_env();
     let t = validate_with(url, kind, policy).map_err(|e| e.0)?;
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((t.host.as_str(), t.port))
-        .await
-        .map_err(|e| format!("destination hostname could not be resolved: {e}"))?
-        .collect();
+    let addrs: Vec<SocketAddr> =
+        tokio::net::lookup_host((t.host.as_str(), t.port)).await.map_err(|e| format!("destination hostname could not be resolved: {e}"))?.collect();
     if addrs.is_empty() {
         return Err("destination hostname did not resolve".into());
     }
@@ -200,9 +218,18 @@ mod tests {
     #[test]
     fn refuses_private_and_non_https_destinations() {
         for bad in [
-            "http://example.com/x", "https://user:pw@example.com/", "https://example.com/#f", "https://127.0.0.1/", "https://10.1.2.3/",
-            "https://[::1]/", "https://[::ffff:192.168.1.1]/", "https://169.254.169.254/latest", "https://100.64.0.1/", "https://[fd00::1]/",
-            "https://0.0.0.0/", "not a url",
+            "http://example.com/x",
+            "https://user:pw@example.com/",
+            "https://example.com/#f",
+            "https://127.0.0.1/",
+            "https://10.1.2.3/",
+            "https://[::1]/",
+            "https://[::ffff:192.168.1.1]/",
+            "https://169.254.169.254/latest",
+            "https://100.64.0.1/",
+            "https://[fd00::1]/",
+            "https://0.0.0.0/",
+            "not a url",
         ] {
             assert!(validate(bad, Kind::Webhook).is_err(), "{bad} should be refused");
         }
@@ -227,7 +254,12 @@ mod tests {
     #[test]
     fn slack_must_be_an_incoming_webhook() {
         assert!(validate("https://hooks.slack.com/services/T0/B1/abc_-9", Kind::Slack).is_ok());
-        for bad in ["https://hooks.slack.com/services/T0/B1", "https://evil.com/services/T0/B1/x", "https://hooks.slack.com/services/T0/B1/x?y=1", "https://hooks.slack.com:8443/services/a/b/c"] {
+        for bad in [
+            "https://hooks.slack.com/services/T0/B1",
+            "https://evil.com/services/T0/B1/x",
+            "https://hooks.slack.com/services/T0/B1/x?y=1",
+            "https://hooks.slack.com:8443/services/a/b/c",
+        ] {
             assert!(validate(bad, Kind::Slack).is_err(), "{bad}");
         }
     }

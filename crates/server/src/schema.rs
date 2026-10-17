@@ -98,29 +98,13 @@ fn load() -> Schema {
                     serde_json::Value::String(s) => Some(DefaultValue::Text(s.clone())),
                     other => panic!("unexpected default {other}"),
                 };
-                Column {
-                    name: c[0].as_str().unwrap().to_string(),
-                    ty,
-                    limit: c[2].as_u64().map(|l| l as usize),
-                    null: c[3].as_bool().unwrap(),
-                    default,
-                }
+                Column { name: c[0].as_str().unwrap().to_string(), ty, limit: c[2].as_u64().map(|l| l as usize), null: c[3].as_bool().unwrap(), default }
             })
             .collect();
         tables.insert(table.clone(), cols);
     }
-    let text_limits = raw["text_limits"]
-        .as_object()
-        .unwrap()
-        .iter()
-        .map(|(k, v)| (k.clone(), v.as_u64().unwrap() as usize))
-        .collect();
-    let schema_migrations = raw["schema_migrations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
+    let text_limits = raw["text_limits"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_u64().unwrap() as usize)).collect();
+    let schema_migrations = raw["schema_migrations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
     Schema { ddl, tables, text_limits, schema_migrations }
 }
 
@@ -166,10 +150,8 @@ pub fn configure(conn: &Connection) -> rusqlite::Result<()> {
 /// and the gem's plans are unchanged; they cost ~3% of a busy tenant's
 /// file and a B-tree insert per query row for nothing. Files that already
 /// exist (Rails-made, imported, older Rust ones) are never altered.
-pub const PARTIAL_INDEXES: [(&str, &str); 2] = [
-    ("idx_queries_tenant_duration_cursor", " WHERE app_tenant IS NOT NULL"),
-    ("idx_queries_duration_cursor", " WHERE app_tenant IS NOT NULL"),
-];
+pub const PARTIAL_INDEXES: [(&str, &str); 2] =
+    [("idx_queries_tenant_duration_cursor", " WHERE app_tenant IS NOT NULL"), ("idx_queries_duration_cursor", " WHERE app_tenant IS NOT NULL")];
 
 /// Creates the telemetry tables in an empty database the way the Rails
 /// migrations leave them: every sqlite_master row replayed in creation order

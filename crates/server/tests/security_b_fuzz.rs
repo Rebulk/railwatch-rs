@@ -14,7 +14,7 @@
 //! Run with: cargo test --test security_b_fuzz -- --nocapture
 //! Budget via env: SECB_FUZZ_MS (default 8000 total, split across targets).
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 
 use railwatch_server::ingest::{batch, mapper, payload};
@@ -74,9 +74,7 @@ fn rand_bytes(r: &mut Rng, max: usize) -> Vec<u8> {
     let n = r.below(max + 1);
     // Bias toward JSON-ish bytes so the parser gets past the first char often.
     const ALPHABET: &[u8] = b"{}[]\":,0123456789.-+eEtfnul \t\n\r\\/u\x00\x7f\xffNaIyx";
-    (0..n)
-        .map(|_| if r.bool() { ALPHABET[r.below(ALPHABET.len())] } else { r.byte() })
-        .collect()
+    (0..n).map(|_| if r.bool() { ALPHABET[r.below(ALPHABET.len())] } else { r.byte() }).collect()
 }
 
 /// A bounded random Ruby-JSON Value (depth-limited).
@@ -147,8 +145,8 @@ fn rand_small_str(r: &mut Rng) -> Vec<u8> {
         match r.below(8) {
             0 => out.extend_from_slice("€".as_bytes()),
             1 => out.extend_from_slice("😀".as_bytes()),
-            2 => out.push(r.byte()),       // may be invalid UTF-8
-            3 => out.push(0),              // NUL / control
+            2 => out.push(r.byte()), // may be invalid UTF-8
+            3 => out.push(0),        // NUL / control
             4 => out.push(b'/'),
             5 => out.extend_from_slice(b".."),
             6 => out.push(b'\\'),
@@ -162,8 +160,22 @@ fn rand_small_str(r: &mut Rng) -> Vec<u8> {
 /// mapper gets past validate_record often and into cast/serialize.
 fn rand_record(r: &mut Rng) -> Value {
     const TYPES: &[&str] = &[
-        "request", "query", "exception", "log", "llm_call", "attachment", "profile", "user", "session",
-        "process", "health", "span", "enqueued_job", "visit", "metric", "unknown",
+        "request",
+        "query",
+        "exception",
+        "log",
+        "llm_call",
+        "attachment",
+        "profile",
+        "user",
+        "session",
+        "process",
+        "health",
+        "span",
+        "enqueued_job",
+        "visit",
+        "metric",
+        "unknown",
     ];
     let mut h = rjson::Hash::new();
     h.insert(b"t".to_vec(), Value::Str(TYPES[r.below(TYPES.len())].as_bytes().to_vec()));
@@ -179,7 +191,27 @@ fn rand_record(r: &mut Rng) -> Value {
             _ => rand_value(r, 1),
         },
     );
-    for k in ["_group", "execution_id", "trace_id", "name", "message", "sql", "class", "level", "duration", "stacks", "data", "bytes", "frames", "stages", "counters", "locals", "id", "email", "tenant"] {
+    for k in [
+        "_group",
+        "execution_id",
+        "trace_id",
+        "name",
+        "message",
+        "sql",
+        "class",
+        "level",
+        "duration",
+        "stacks",
+        "data",
+        "bytes",
+        "frames",
+        "stages",
+        "counters",
+        "locals",
+        "id",
+        "email",
+        "tenant",
+    ] {
         if r.bool() {
             h.insert(k.as_bytes().to_vec(), rand_value(r, 2));
         }

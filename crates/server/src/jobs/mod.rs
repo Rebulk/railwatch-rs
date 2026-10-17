@@ -56,12 +56,31 @@ type TenantFn = Box<dyn FnOnce(&Connection, &Connection) + Send>;
 /// Work for the tenant worker thread.
 pub enum TenantWork {
     Committed(Followup),
-    Recompute { env: i64, slug: String, buckets: Vec<i64> },
-    RecomputeSessions { env: i64, slug: String, buckets: Vec<i64>, retention_floor: i64 },
-    Drain { env: i64, slug: String },
-    Prune { env: i64, slug: String },
+    Recompute {
+        env: i64,
+        slug: String,
+        buckets: Vec<i64>,
+    },
+    RecomputeSessions {
+        env: i64,
+        slug: String,
+        buckets: Vec<i64>,
+        retention_floor: i64,
+    },
+    Drain {
+        env: i64,
+        slug: String,
+    },
+    Prune {
+        env: i64,
+        slug: String,
+    },
     /// Runs on the worker with the tenant's (read, write) connections.
-    With { env: i64, slug: String, f: TenantFn },
+    With {
+        env: i64,
+        slug: String,
+        f: TenantFn,
+    },
 }
 
 impl TenantWork {
@@ -109,16 +128,24 @@ struct Env {
 
 fn environments(control: &Control) -> Vec<Env> {
     let c = control.conn();
-    let r = c.prepare(
-        "SELECT e.id, e.slug, a.retention_days, e.last_seen_at, e.paused_at IS NOT NULL \
+    let r = c
+        .prepare(
+            "SELECT e.id, e.slug, a.retention_days, e.last_seen_at, e.paused_at IS NOT NULL \
          FROM environments e JOIN applications ap ON ap.id = e.application_id JOIN accounts a ON a.id = ap.account_id ORDER BY e.id",
-    ).and_then(|mut s| {
-        s.query_map([], |r| {
-            let ls: Option<String> = r.get(3)?;
-            Ok(Env { id: r.get(0)?, slug: r.get(1)?, retention_days: r.get(2)?, last_seen_micros: ls.and_then(|s| time::parse_db_time(&s)), paused: r.get::<_, i64>(4)? != 0 })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()
-    });
+        )
+        .and_then(|mut s| {
+            s.query_map([], |r| {
+                let ls: Option<String> = r.get(3)?;
+                Ok(Env {
+                    id: r.get(0)?,
+                    slug: r.get(1)?,
+                    retention_days: r.get(2)?,
+                    last_seen_micros: ls.and_then(|s| time::parse_db_time(&s)),
+                    paused: r.get::<_, i64>(4)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        });
     r.unwrap_or_else(|e| {
         tracing::error!(error = %e, "could not list environments");
         vec![]
@@ -146,13 +173,34 @@ pub struct Scan {
 
 pub const SCANS: &[Scan] = &[
     // PerformanceScanJob: Environment.active.joins(:thresholds)
-    Scan { name: "performance_scan", every_secs: 300, gate: Some("SELECT EXISTS (SELECT 1 FROM thresholds WHERE environment_id = ?)"), recent_secs: None, recent_inclusive: false, run: detectors::detect_performance },
+    Scan {
+        name: "performance_scan",
+        every_secs: 300,
+        gate: Some("SELECT EXISTS (SELECT 1 FROM thresholds WHERE environment_id = ?)"),
+        recent_secs: None,
+        recent_inclusive: false,
+        run: detectors::detect_performance,
+    },
     // AnomalyScanJob: Environment.active.joins(:anomaly_rules).where(enabled: true)
-    Scan { name: "anomaly_scan", every_secs: 300, gate: Some("SELECT EXISTS (SELECT 1 FROM anomaly_rules WHERE environment_id = ? AND enabled = 1)"), recent_secs: None, recent_inclusive: false, run: detectors::detect_anomalies },
+    Scan {
+        name: "anomaly_scan",
+        every_secs: 300,
+        gate: Some("SELECT EXISTS (SELECT 1 FROM anomaly_rules WHERE environment_id = ? AND enabled = 1)"),
+        recent_secs: None,
+        recent_inclusive: false,
+        run: detectors::detect_anomalies,
+    },
     // SilentHostCheckJob: Environment.active.where(last_seen_at: 24.hours.ago..)
     Scan { name: "silent_host_check", every_secs: 300, gate: None, recent_secs: Some(86_400), recent_inclusive: true, run: detectors::silent_hosts },
     // ScheduledTaskScanJob: Environment.active.where("last_seen_at > ?", 1.day.ago)
-    Scan { name: "scheduled_task_check", every_secs: 600, gate: None, recent_secs: Some(86_400), recent_inclusive: false, run: detectors::check_scheduled_tasks },
+    Scan {
+        name: "scheduled_task_check",
+        every_secs: 600,
+        gate: None,
+        recent_secs: Some(86_400),
+        recent_inclusive: false,
+        run: detectors::check_scheduled_tasks,
+    },
     // ReleaseHealthCheckJob: Environment.active.where(last_seen_at: 24.hours.ago..)
     Scan { name: "release_health_check", every_secs: 600, gate: None, recent_secs: Some(86_400), recent_inclusive: true, run: detectors::release_health_check },
 ];
@@ -200,56 +248,83 @@ pub async fn scheduler(control: Arc<Control>, bg: Background, shutdown: tokio::s
     // rollup_catchup: active envs seen in the last 2 hours, current + previous hour.
     {
         let (c, bg) = (control.clone(), bg.clone());
-        handles.push(every(300, "rollup_catchup", Box::new(move || {
-            let now = time::now_micros() / 1_000_000;
-            let hour = now - now.rem_euclid(3600);
-            for e in environments(&c) {
-                if e.paused || e.last_seen_micros.is_none_or(|l| l <= (now - 7200) * 1_000_000) {
-                    continue;
+        handles.push(every(
+            300,
+            "rollup_catchup",
+            Box::new(move || {
+                let now = time::now_micros() / 1_000_000;
+                let hour = now - now.rem_euclid(3600);
+                for e in environments(&c) {
+                    if e.paused || e.last_seen_micros.is_none_or(|l| l <= (now - 7200) * 1_000_000) {
+                        continue;
+                    }
+                    send(&bg, TenantWork::Recompute { env: e.id, slug: e.slug.clone(), buckets: vec![hour, hour - 3600] });
+                    let floor = now - e.retention_days * 86_400;
+                    send(
+                        &bg,
+                        TenantWork::RecomputeSessions {
+                            env: e.id,
+                            slug: e.slug,
+                            buckets: vec![hour, hour - 3600],
+                            retention_floor: floor - floor.rem_euclid(3600),
+                        },
+                    );
                 }
-                send(&bg, TenantWork::Recompute { env: e.id, slug: e.slug.clone(), buckets: vec![hour, hour - 3600] });
-                let floor = now - e.retention_days * 86_400;
-                send(&bg, TenantWork::RecomputeSessions { env: e.id, slug: e.slug, buckets: vec![hour, hour - 3600], retention_floor: floor - floor.rem_euclid(3600) });
-            }
-        })));
+            }),
+        ));
     }
     // drain_ingest_followups: every environment, paused included.
     {
         let (c, bg) = (control.clone(), bg.clone());
-        handles.push(every(60, "drain_ingest_followups", Box::new(move || {
-            for e in environments(&c) {
-                send(&bg, TenantWork::Drain { env: e.id, slug: e.slug });
-            }
-        })));
+        handles.push(every(
+            60,
+            "drain_ingest_followups",
+            Box::new(move || {
+                for e in environments(&c) {
+                    send(&bg, TenantWork::Drain { env: e.id, slug: e.slug });
+                }
+            }),
+        ));
     }
     // Detectors that read telemetry run on the worker (its read connection).
     for scan in SCANS {
         let (c, bg) = (control.clone(), bg.clone());
-        handles.push(every(scan.every_secs, scan.name, Box::new(move || {
-            let now = time::now_micros() / 1_000_000;
-            for (id, slug) in scan_targets(&c, scan, now) {
-                let c2 = c.clone();
-                send(&bg, TenantWork::With {
-                    env: id,
-                    slug,
-                    f: Box::new(move |read, _write| {
-                        let conn = c2.conn();
-                        if let Err(err) = (scan.run)(&conn, read, id, now) {
-                            tracing::error!(task = scan.name, environment = id, error = %err, "detector failed");
-                        }
-                    }),
-                });
-            }
-        })));
+        handles.push(every(
+            scan.every_secs,
+            scan.name,
+            Box::new(move || {
+                let now = time::now_micros() / 1_000_000;
+                for (id, slug) in scan_targets(&c, scan, now) {
+                    let c2 = c.clone();
+                    send(
+                        &bg,
+                        TenantWork::With {
+                            env: id,
+                            slug,
+                            f: Box::new(move |read, _write| {
+                                let conn = c2.conn();
+                                if let Err(err) = (scan.run)(&conn, read, id, now) {
+                                    tracing::error!(task = scan.name, environment = id, error = %err, "detector failed");
+                                }
+                            }),
+                        },
+                    );
+                }
+            }),
+        ));
     }
     // quota_check
     {
         let c = control.clone();
-        handles.push(every(900, "quota_check", Box::new(move || {
-            if let Err(e) = detectors::quota_check(&c.conn(), time::now_micros() / 1_000_000) {
-                tracing::error!(error = %e, "quota check failed");
-            }
-        })));
+        handles.push(every(
+            900,
+            "quota_check",
+            Box::new(move || {
+                if let Err(e) = detectors::quota_check(&c.conn(), time::now_micros() / 1_000_000) {
+                    tracing::error!(error = %e, "quota check failed");
+                }
+            }),
+        ));
     }
     // Daily: prune at 03:00 UTC, auto-resolve at 04:00 UTC.
     {

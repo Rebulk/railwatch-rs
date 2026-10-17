@@ -84,10 +84,7 @@ pub fn routes() -> Router<S> {
     for (path, component) in PAGES {
         let full = if *path == "/" { "/apps/{app}/envs/{env}".to_string() } else { format!("/apps/{{app}}/envs/{{env}}{path}") };
         let component: &'static str = component;
-        r = r.route(
-            &full,
-            get(move |cx: Ctx, Path(segments): Path<Vec<(String, String)>>, RawQuery(q): RawQuery| page(cx, component, segments, q)),
-        );
+        r = r.route(&full, get(move |cx: Ctx, Path(segments): Path<Vec<(String, String)>>, RawQuery(q): RawQuery| page(cx, component, segments, q)));
     }
     r.route("/apps/{app}/envs/{env}/saved_views", post(saved_view_create))
         .route("/apps/{app}/envs/{env}/saved_views/{id}", patch(saved_view_update).put(saved_view_update).delete(saved_view_destroy))
@@ -411,7 +408,8 @@ async fn editable(cx: &Ctx, env: i64, id: i64) -> Result<(), Response> {
         .state
         .db(move |c| {
             c.with(|x| {
-                let owner: Option<i64> = x.query_row("SELECT user_id FROM saved_views WHERE id = ? AND environment_id = ?", params![id, env], |r| r.get(0)).optional()?;
+                let owner: Option<i64> =
+                    x.query_row("SELECT user_id FROM saved_views WHERE id = ? AND environment_id = ?", params![id, env], |r| r.get(0)).optional()?;
                 let role = crate::control::membership_role(x, account, user)?;
                 Ok((owner, role))
             })
@@ -497,7 +495,6 @@ mod tests {
         assert_eq!((d["window"].as_str(), d["step"].as_str()), (Some("24h"), Some("1h")));
         assert_eq!(d["steps"], json!(["5m", "15m", "1h", "6h"]));
     }
-
 
     #[test]
     fn saved_view_urls_use_the_index_route() {

@@ -102,8 +102,11 @@ pub fn points(
 ) -> rusqlite::Result<Vec<Value>> {
     let step_secs = step_seconds(step).expect("known step");
     let raw = step_secs < 3600 || tenant.is_some();
-    let pts =
-        if raw { raw_series(conn, record_type, from, to, group_hash, step_secs, tenant)? } else { rollup_series(conn, record_type, from, to, group_hash, step_secs)? };
+    let pts = if raw {
+        raw_series(conn, record_type, from, to, group_hash, step_secs, tenant)?
+    } else {
+        rollup_series(conn, record_type, from, to, group_hash, step_secs)?
+    };
     Ok(fill(pts, from, to, step_secs, empty_point))
 }
 
@@ -175,15 +178,7 @@ fn raw_series(
 // -- grouped -------------------------------------------------------------
 
 /// `Aggregations.grouped`.
-pub fn grouped(
-    conn: &Connection,
-    record_type: &str,
-    from: i64,
-    to: i64,
-    limit: usize,
-    order: Option<&str>,
-    dir: Option<&str>,
-) -> rusqlite::Result<Vec<Value>> {
+pub fn grouped(conn: &Connection, record_type: &str, from: i64, to: i64, limit: usize, order: Option<&str>, dir: Option<&str>) -> rusqlite::Result<Vec<Value>> {
     let rows = rollup::between(conn, record_type, from, to)?;
     Ok(grouped_rows(&rows, from, to, limit, order, dir))
 }
@@ -242,13 +237,7 @@ pub fn sparkline_counts(items: impl Iterator<Item = (i64, i64)>, from: i64, to: 
 }
 
 /// `Aggregations.summary_with_delta`.
-pub fn summary_with_delta(
-    conn: &Connection,
-    record_type: &str,
-    window: (i64, i64),
-    previous: (i64, i64),
-    group_hash: Option<&str>,
-) -> rusqlite::Result<Value> {
+pub fn summary_with_delta(conn: &Connection, record_type: &str, window: (i64, i64), previous: (i64, i64), group_hash: Option<&str>) -> rusqlite::Result<Value> {
     let load = |(f, t): (i64, i64)| match group_hash {
         Some(g) => rollup::between_group(conn, record_type, f, t, g),
         None => rollup::between(conn, record_type, f, t),

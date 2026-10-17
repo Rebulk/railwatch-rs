@@ -61,9 +61,8 @@ struct Pending {
 }
 
 fn pending(read: &Connection, tried: &HashSet<i64>) -> rusqlite::Result<Vec<Pending>> {
-    let not_in = if tried.is_empty() { String::new() } else {
-        format!(" AND id NOT IN ({})", tried.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","))
-    };
+    let not_in =
+        if tried.is_empty() { String::new() } else { format!(" AND id NOT IN ({})", tried.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")) };
     let sql = format!(
         "SELECT id, producer_id, delivery_id, delivery_created_at, committed_at, followups FROM ingest_receipts WHERE followups IS NOT NULL{not_in} ORDER BY committed_at, id LIMIT {PAGE}"
     );

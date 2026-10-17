@@ -257,9 +257,7 @@ fn p95_ms(conn: &Connection, kind: &str, tenant: Option<&str>, from: i64, to: i6
              AND \"executions\".\"app_tenant\" {} ORDER BY \"executions\".\"duration\" DESC LIMIT 1 OFFSET {offset}",
             if tenant.is_some() { "= ?4" } else { "IS NULL" }
         ),
-        rusqlite::params_from_iter(
-            [Sql::Text(kind.into()), Sql::Text(qt(from)), Sql::Text(qt(to))].into_iter().chain(tenant.map(|t| Sql::Text(t.into()))),
-        ),
+        rusqlite::params_from_iter([Sql::Text(kind.into()), Sql::Text(qt(from)), Sql::Text(qt(to))].into_iter().chain(tenant.map(|t| Sql::Text(t.into())))),
     )?;
     Ok(r.map_or(0.0, |r| ms(r.at(0))))
 }
@@ -306,8 +304,11 @@ pub fn overview(conn: &Connection, rows: &[Value], from: i64, to: i64) -> rusqli
 
 /// `Telemetry::Tenant.summary`.
 pub fn summary(conn: &Connection, t: &str, from: i64, to: i64) -> rusqlite::Result<Value> {
-    let base = "FROM \"executions\" WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 AND \"executions\".\"app_tenant\" = ?4";
-    let r = db::query_one(conn, &format!("SELECT COUNT(*), {ERRORS}, COUNT(DISTINCT user_ref) {base} LIMIT 1"), rusqlite::params!["request", qt(from), qt(to), t])?.unwrap();
+    let base =
+        "FROM \"executions\" WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 AND \"executions\".\"app_tenant\" = ?4";
+    let r =
+        db::query_one(conn, &format!("SELECT COUNT(*), {ERRORS}, COUNT(DISTINCT user_ref) {base} LIMIT 1"), rusqlite::params!["request", qt(from), qt(to), t])?
+            .unwrap();
     let count = int(r.at(0));
     let j = db::query_one(conn, &format!("SELECT COUNT(*), {FAILED} {base} LIMIT 1"), rusqlite::params!["job_attempt", qt(from), qt(to), t])?.unwrap();
     let cnt = |table: &str| {
@@ -324,7 +325,16 @@ pub fn summary(conn: &Connection, t: &str, from: i64, to: i64) -> rusqlite::Resu
 }
 
 #[allow(clippy::too_many_arguments)]
-fn grouped_executions(conn: &Connection, kind: &str, t: &str, from: i64, to: i64, error_sql: &str, error_key: &str, limit: usize) -> rusqlite::Result<Vec<Value>> {
+fn grouped_executions(
+    conn: &Connection,
+    kind: &str,
+    t: &str,
+    from: i64,
+    to: i64,
+    error_sql: &str,
+    error_key: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<Value>> {
     let rows = db::query(
         conn,
         &format!(

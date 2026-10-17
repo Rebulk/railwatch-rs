@@ -146,10 +146,7 @@ pub struct SessionData {
 
 impl SessionData {
     pub fn load(keys: &Keys, cookies: &[(String, String)]) -> SessionData {
-        let map = get(cookies, SESSION)
-            .and_then(|c| keys.decrypt(c))
-            .and_then(|b| serde_json::from_slice::<Map<String, Value>>(&b).ok())
-            .unwrap_or_default();
+        let map = get(cookies, SESSION).and_then(|c| keys.decrypt(c)).and_then(|b| serde_json::from_slice::<Map<String, Value>>(&b).ok()).unwrap_or_default();
         SessionData { map, dirty: false }
     }
 

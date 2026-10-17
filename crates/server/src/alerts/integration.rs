@@ -79,17 +79,25 @@ impl SettingsCipher {
                 return Err("integration secrets are corrupt (too short)".into());
             }
             let cipher = XChaCha20Poly1305::new((&self.0).into());
-            let plain = cipher.decrypt(XNonce::from_slice(&raw[..24]), &raw[24..]).map_err(|_| {
-                "integration secrets cannot be decrypted with this secret_key_base; re-enter them in Settings > Integrations".to_string()
-            })?;
+            let plain = cipher
+                .decrypt(XNonce::from_slice(&raw[..24]), &raw[24..])
+                .map_err(|_| "integration secrets cannot be decrypted with this secret_key_base; re-enter them in Settings > Integrations".to_string())?;
             return match serde_json::from_slice(&plain) {
                 Ok(Value::Object(m)) => Ok(m),
                 _ => Err("integration secrets are corrupt (not an object)".into()),
             };
         }
+        Self::decrypt_plain(stored)
+    }
+
+    /// A stored value that is not this server's ciphertext: plain JSON (a row
+    /// written by hand or by an earlier build), or Rails' Active Record
+    /// encryption, which cannot be read here. Needs no key.
+    pub fn decrypt_plain(stored: &str) -> Result<Map<String, Value>, String> {
         match serde_json::from_str::<Value>(stored) {
             Ok(Value::Object(m)) if m.contains_key("p") && m.contains_key("h") => {
-                Err("integration secrets were encrypted by Rails (Active Record encryption) and cannot be read here; re-enter them in Settings > Integrations".into())
+                Err("integration secrets were encrypted by Rails (Active Record encryption) and cannot be read here; re-enter them in Settings > Integrations"
+                    .into())
             }
             Ok(Value::Object(m)) => Ok(m),
             _ => Err("integration secrets are unreadable".into()),
@@ -126,9 +134,8 @@ fn row(r: &rusqlite::Row<'_>, cipher: Option<&SettingsCipher>) -> rusqlite::Resu
         let decrypted = match cipher {
             Some(c) => c.decrypt(&stored),
             // Without a key only the legacy plain-JSON form is readable.
-            None => SettingsCipher([0; 32]).decrypt(&stored).and_then(|m| {
-                if stored.starts_with(PREFIX) { Err("integration secrets key is not configured".into()) } else { Ok(m) }
-            }),
+            None if stored.starts_with(PREFIX) => Err("integration secrets key is not configured".into()),
+            None => SettingsCipher::decrypt_plain(&stored),
         };
         match decrypted {
             Ok(m) => settings.extend(m),
@@ -267,12 +274,19 @@ impl Integration {
             "webhook" => s("url"),
             // settings["webhook_url"].to_s[%r{/(B[A-Z0-9]+)(?:/|\z)}, 1]
             "slack" => s("webhook_url").and_then(|u| {
-                u.split('/').find(|seg| seg.len() > 1 && seg.starts_with('B') && seg.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())).map(str::to_string)
+                u.split('/')
+                    .find(|seg| seg.len() > 1 && seg.starts_with('B') && seg.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
+                    .map(str::to_string)
             }),
             "linear" => {
                 let team_id = s("team_id");
                 let team = self.settings.get("team_options").and_then(Value::as_array).and_then(|teams| {
-                    teams.iter().find(|t| t.get("id").and_then(Value::as_str) == team_id.as_deref()).and_then(|t| t.get("name")).and_then(Value::as_str).map(str::to_string)
+                    teams
+                        .iter()
+                        .find(|t| t.get("id").and_then(Value::as_str) == team_id.as_deref())
+                        .and_then(|t| t.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
                 });
                 let parts: Vec<String> = [s("organization_name"), team.or(team_id)].into_iter().flatten().collect();
                 Some(parts.join(" / ")).filter(|p| !p.is_empty())
@@ -286,6 +300,22 @@ impl Integration {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Without a key: plain JSON is read, this server's ciphertext is refused
+    /// as "not configured", and Rails' AR envelope is refused, all without
+    /// ever deriving a cipher from a fixed key.
+    #[test]
+    fn keyless_reads_only_plain_json() {
+        let plain = SettingsCipher::decrypt_plain(r#"{"url":"https://example.com/hook"}"#).unwrap();
+        assert_eq!(plain["url"], json!("https://example.com/hook"));
+        let rails = SettingsCipher::decrypt_plain(r#"{"p":"x","h":{"iv":"y"}}"#).unwrap_err();
+        assert!(rails.contains("Rails"), "{rails}");
+        assert!(SettingsCipher::decrypt_plain("not json").is_err());
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("random");
+        let ours = SettingsCipher(key).encrypt(&Map::new());
+        assert!(ours.starts_with(PREFIX));
+    }
 
     fn obj(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
@@ -323,8 +353,17 @@ mod tests {
     #[test]
     fn destination_names_what_the_integration_points_at() {
         let i = |kind: &str, s: Value| Integration {
-            id: 1, account_id: 1, kind: kind.into(), name: "n".into(), enabled: true, settings: obj(s), settings_error: None,
-            last_delivered_at: None, last_received_at: None, last_synced_at: None, last_error: None,
+            id: 1,
+            account_id: 1,
+            kind: kind.into(),
+            name: "n".into(),
+            enabled: true,
+            settings: obj(s),
+            settings_error: None,
+            last_delivered_at: None,
+            last_received_at: None,
+            last_synced_at: None,
+            last_error: None,
         };
         assert_eq!(i("slack", json!({"webhook_url": "https://hooks.slack.com/services/T0/B07ABC/xyz"})).destination().as_deref(), Some("B07ABC"));
         assert_eq!(i("email", json!({"to": "a@b.c"})).destination().as_deref(), Some("a@b.c"));

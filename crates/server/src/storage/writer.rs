@@ -412,9 +412,9 @@ impl Target for DayWriter {
         let placeholders = vec!["?"; ids.len()].join(", ");
         let mut newest: HashMap<String, i64> = HashMap::new();
         for &i in &targets {
-            let mut s = self.files[i - 1].conn.prepare_cached(&format!(
-                "SELECT execution_id, MAX(id) FROM profiles WHERE execution_id IN ({placeholders}) GROUP BY execution_id"
-            ))?;
+            let mut s = self.files[i - 1]
+                .conn
+                .prepare_cached(&format!("SELECT execution_id, MAX(id) FROM profiles WHERE execution_id IN ({placeholders}) GROUP BY execution_id"))?;
             for row in s.query_map(rusqlite::params_from_iter(ids), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
                 let (e, id) = row?;
                 let v = newest.entry(e).or_insert(id);
@@ -422,9 +422,7 @@ impl Target for DayWriter {
             }
         }
         for &i in &targets {
-            let mut s = self.files[i - 1]
-                .conn
-                .prepare_cached("UPDATE \"executions\" SET profile_id = ?1 WHERE \"executions\".\"execution_id\" = ?2")?;
+            let mut s = self.files[i - 1].conn.prepare_cached("UPDATE \"executions\" SET profile_id = ?1 WHERE \"executions\".\"execution_id\" = ?2")?;
             for id in ids {
                 s.execute(rusqlite::params![newest.get(*id), id])?;
             }
@@ -452,11 +450,7 @@ pub fn read_marks(meta: &Connection) -> rusqlite::Result<HashMap<&'static str, i
 }
 
 fn get_seq(conn: &Connection, table: &str) -> rusqlite::Result<i64> {
-    Ok(conn
-        .prepare_cached("SELECT seq FROM sqlite_sequence WHERE name = ?")?
-        .query_row([table], |r| r.get::<_, i64>(0))
-        .optional()?
-        .unwrap_or(0))
+    Ok(conn.prepare_cached("SELECT seq FROM sqlite_sequence WHERE name = ?")?.query_row([table], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0))
 }
 
 /// sqlite_sequence has no key on name: UPDATE, else INSERT.

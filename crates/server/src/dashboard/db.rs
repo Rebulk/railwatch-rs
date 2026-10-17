@@ -110,11 +110,7 @@ pub fn raw_json(v: &Sql) -> Value {
 /// INDEXED BY / NOT INDEXED hints go to the reader's hinted views, as views
 /// cannot take them.
 pub fn prepare<'c>(conn: &'c Connection, sql: &str) -> rusqlite::Result<rusqlite::CachedStatement<'c>> {
-    if crate::storage::reader::is_union(conn) {
-        conn.prepare_cached(&crate::storage::reader::rewrite_index_hints(sql))
-    } else {
-        conn.prepare_cached(sql)
-    }
+    if crate::storage::reader::is_union(conn) { conn.prepare_cached(&crate::storage::reader::rewrite_index_hints(sql)) } else { conn.prepare_cached(sql) }
 }
 
 pub fn query<P: Params>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Vec<Rec>> {

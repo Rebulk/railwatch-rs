@@ -14,7 +14,7 @@
 //!   railwatch integrations [--show-secrets]   one JSON line per alert destination
 //!   railwatch integrations test <id>   Send test: one synthetic alert to that destination
 //!   railwatch doctor
-//!   railwatch upgrade [--version vX.Y.Z]   fetch the release's install.sh and re-run it
+//!   railwatch upgrade [--version vX.Y.Z] [--allow-downgrade]   fetch the release's install.sh and re-run it
 //!   railwatch version
 
 #[global_allocator]
@@ -49,7 +49,9 @@ const USAGE: &str = "usage:
   railwatch integrations [--show-secrets]
   railwatch integrations test <id>
   railwatch doctor
-  railwatch upgrade [--version vX.Y.Z]   as root: install.sh from the release, re-run (zero-drop restart)
+  railwatch upgrade [--version vX.Y.Z] [--allow-downgrade]
+                                         as root: install.sh from the release, re-run (zero-drop restart);
+                                         an older release only with --allow-downgrade
   railwatch version
 
 Configuration: RAILWATCH_* env vars (RAILWATCH_ENV_FILE=PATH reads them from a KEY=VALUE file),
@@ -350,7 +352,8 @@ fn prompt(label: &str, default: Option<&str>) -> String {
 }
 
 fn setup(rest: &[&str]) -> ExitCode {
-    let known = ["--email", "--name", "--account", "--app", "--env", "--password-stdin", "--alert-webhook", "--alert-webhook-secret", "--alert-slack", "--alert-email"];
+    let known =
+        ["--email", "--name", "--account", "--app", "--env", "--password-stdin", "--alert-webhook", "--alert-webhook-secret", "--alert-slack", "--alert-email"];
     if rest.iter().any(|a| a.starts_with("--") && !known.contains(a)) {
         return usage();
     }
@@ -394,9 +397,13 @@ fn setup(rest: &[&str]) -> ExitCode {
     };
     let default_name = email.split('@').next().unwrap_or("Admin").to_string();
     let name = flag(rest, "--name").map(str::to_string).unwrap_or_else(|| if interactive { prompt("Your name", Some(&default_name)) } else { default_name });
-    let account = flag(rest, "--account").map(str::to_string).unwrap_or_else(|| if interactive { prompt("Account name", Some("My company")) } else { "My company".into() });
-    let app = flag(rest, "--app").map(str::to_string).unwrap_or_else(|| if interactive { prompt("First application", Some("My app")) } else { "My app".into() });
-    let env = flag(rest, "--env").map(str::to_string).unwrap_or_else(|| if interactive { prompt("Environment", Some("production")) } else { "production".into() });
+    let account = flag(rest, "--account")
+        .map(str::to_string)
+        .unwrap_or_else(|| if interactive { prompt("Account name", Some("My company")) } else { "My company".into() });
+    let app =
+        flag(rest, "--app").map(str::to_string).unwrap_or_else(|| if interactive { prompt("First application", Some("My app")) } else { "My app".into() });
+    let env =
+        flag(rest, "--env").map(str::to_string).unwrap_or_else(|| if interactive { prompt("Environment", Some("production")) } else { "production".into() });
 
     let errors = control::validate_new_user(&name, &control::normalize_email(&email), &password, None);
     if !errors.is_empty() {
@@ -438,7 +445,10 @@ fn setup(rest: &[&str]) -> ExitCode {
         for (kind, name, _) in &alerts.integrations {
             println!("Alerts: {name} ({kind}) gets {}.", SETUP_ALERT_EVENTS.join(", "));
         }
-        println!("Silence is noticed after {} s without data (RAILWATCH_SILENCE_SECONDS). Try it: Settings > Integrations > Send test.", railwatch_server::jobs::watchdog::silence_secs());
+        println!(
+            "Silence is noticed after {} s without data (RAILWATCH_SILENCE_SECONDS). Try it: Settings > Integrations > Send test.",
+            railwatch_server::jobs::watchdog::silence_secs()
+        );
     }
     let host = cfg.url.trim_start_matches("http://").split(['/', ':']).next().unwrap_or("");
     if cfg.url.starts_with("http://") && !["localhost", "127.0.0.1", "[::1]"].contains(&host) {
@@ -593,7 +603,8 @@ fn integrations(show_secrets: bool) -> ExitCode {
     for id in ids {
         let Ok(Some(i)) = control.with(|c| integration::find(c, Some(&cipher), id)) else { continue };
         unreadable += usize::from(i.settings_error.is_some());
-        let mut line = serde_json::json!({"id": i.id, "account_id": i.account_id, "kind": i.kind, "name": i.name, "enabled": i.enabled, "error": i.settings_error});
+        let mut line =
+            serde_json::json!({"id": i.id, "account_id": i.account_id, "kind": i.kind, "name": i.name, "enabled": i.enabled, "error": i.settings_error});
         if show_secrets {
             line["settings"] = serde_json::Value::Object(i.settings);
         }
@@ -670,6 +681,15 @@ fn upgrade(rest: &[&str]) -> ExitCode {
         return fail(format!("{base}: releases are only fetched over https (RAILWATCH_ALLOW_HTTP_RELEASE=1 is for tests)"));
     }
     let version = flag(rest, "--version");
+    let allow_downgrade = rest.contains(&"--allow-downgrade");
+    // An explicit older version is refused before anything is fetched;
+    // `latest` is checked once SHA256SUMS names its tag, below.
+    if let Some(v) = version
+        && !allow_downgrade
+        && let Err(e) = not_a_downgrade(railwatch_server::VERSION, v)
+    {
+        return fail(e);
+    }
     let dir = match version {
         Some(v) => format!("{base}/download/{v}"),
         None => format!("{base}/latest/download"),
@@ -697,19 +717,23 @@ fn upgrade(rest: &[&str]) -> ExitCode {
             None => return fail("SHA256SUMS names no release tarball; cannot tell which release this is"),
         },
     };
+    if !allow_downgrade && let Err(e) = not_a_downgrade(railwatch_server::VERSION, &tag) {
+        return fail(e);
+    }
     match get("SHA256SUMS.sigstore.json") {
         Ok(bundle) => {
-            if let Err(e) = cosign_verify(&sums, &bundle, &tag) {
+            if let Err(e) = verify_release_signature(&sums, &bundle, &tag) {
                 return fail(e);
             }
             println!("SHA256SUMS: signature verified (release workflow of {}, tag {tag})", railwatch_server::REPO);
         }
-        Err(_) if insecure => eprintln!("railwatch: WARNING: no signature at {dir} (RAILWATCH_ALLOW_HTTP_RELEASE test mode): install.sh is checked against SHA256SUMS only"),
+        Err(_) if insecure => {
+            eprintln!("railwatch: WARNING: no signature at {dir} (RAILWATCH_ALLOW_HTTP_RELEASE test mode): install.sh is checked against SHA256SUMS only")
+        }
         Err(e) => return fail(format!("{e}: the release has no signature, refusing to run its installer")),
     }
-    let want = String::from_utf8_lossy(&sums)
-        .lines()
-        .find_map(|l| l.strip_suffix("  install.sh").or_else(|| l.strip_suffix(" *install.sh")).map(str::to_string));
+    let want =
+        String::from_utf8_lossy(&sums).lines().find_map(|l| l.strip_suffix("  install.sh").or_else(|| l.strip_suffix(" *install.sh")).map(str::to_string));
     let got = railwatch_server::ingest::receipt_headers::hex(&<sha2::Sha256 as sha2::Digest>::digest(&script));
     if want.as_deref() != Some(got.as_str()) {
         return fail(format!("install.sh sha256 {got} does not match SHA256SUMS ({}); not running it", want.as_deref().unwrap_or("absent")));
@@ -719,6 +743,11 @@ fn upgrade(rest: &[&str]) -> ExitCode {
     // between the check and the run.
     let mut cmd = std::process::Command::new("sh");
     cmd.args(["-s", "--", "--upgrade", "--version", &tag]);
+    // An installer from before --allow-downgrade has no downgrade check and
+    // would refuse the unknown flag.
+    if allow_downgrade && script.windows(19).any(|w| w == b"--allow-downgrade) ") {
+        cmd.arg("--allow-downgrade");
+    }
     if std::env::var_os("RAILWATCH_RELEASE_BASE").is_some() {
         // The binary and SHA256SUMS come from the same place as the script.
         cmd.args(["--release-url", &dir]);
@@ -740,6 +769,91 @@ fn upgrade(rest: &[&str]) -> ExitCode {
     }
 }
 
+/// Err when `target` is an older release than `running` (Semantic
+/// Versioning 2.0 precedence, so v1.0.0-rc.1 < v1.0.0). A version that does
+/// not parse, on either side, is also refused: without an order, rolling
+/// back cannot be ruled out. `--allow-downgrade` skips this.
+fn not_a_downgrade(running: &str, target: &str) -> Result<(), String> {
+    let (Some(r), Some(t)) = (Semver::parse(running), Semver::parse(target)) else {
+        return Err(format!("cannot compare versions {running:?} and {target:?}; pass --allow-downgrade if {target} is the release you want"));
+    };
+    if t < r {
+        return Err(format!(
+            "{target} is older than the running {running}; an older release may have fixed vulnerabilities. Pass --allow-downgrade to install it anyway"
+        ));
+    }
+    Ok(())
+}
+
+/// `[v]MAJOR.MINOR.PATCH[-PRE][+BUILD]`, ordered by semver precedence (the
+/// build metadata is ignored).
+#[derive(Debug, PartialEq, Eq)]
+struct Semver {
+    core: [u64; 3],
+    pre: Vec<String>,
+}
+
+impl Semver {
+    fn parse(s: &str) -> Option<Semver> {
+        let s = s.strip_prefix('v').unwrap_or(s);
+        let s = s.split_once('+').map_or(s, |(v, _build)| v);
+        let (core, pre) = match s.split_once('-') {
+            Some((c, p)) => (c, Some(p)),
+            None => (s, None),
+        };
+        let mut parts = core.split('.');
+        let mut n = || -> Option<u64> {
+            let p = parts.next()?;
+            (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && (p == "0" || !p.starts_with('0'))).then(|| p.parse().ok())?
+        };
+        let core = [n()?, n()?, n()?];
+        if parts.next().is_some() {
+            return None;
+        }
+        let pre: Vec<String> = match pre {
+            None => Vec::new(),
+            Some(p) => p.split('.').map(str::to_string).collect(),
+        };
+        if pre.iter().any(|i| i.is_empty() || !i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+            return None;
+        }
+        Some(Semver { core, pre })
+    }
+}
+
+impl PartialOrd for Semver {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Semver {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        self.core.cmp(&other.core).then_with(|| match (self.pre.is_empty(), other.pre.is_empty()) {
+            (true, true) => Ordering::Equal,
+            // A pre-release comes before its release.
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => {
+                for (a, b) in self.pre.iter().zip(&other.pre) {
+                    let numeric = |s: &str| s.bytes().all(|b| b.is_ascii_digit()).then(|| s.parse::<u64>().ok()).flatten();
+                    let o = match (numeric(a), numeric(b)) {
+                        (Some(x), Some(y)) => x.cmp(&y),
+                        (Some(_), None) => Ordering::Less,
+                        (None, Some(_)) => Ordering::Greater,
+                        (None, None) => a.cmp(b),
+                    };
+                    if o != Ordering::Equal {
+                        return o;
+                    }
+                }
+                self.pre.len().cmp(&other.pre.len())
+            }
+        })
+    }
+}
+
 /// The release tag a SHA256SUMS describes: from `railwatch-<tag>-<arch>-linux-musl.tar.gz`.
 fn release_tag(sums: &[u8]) -> Option<String> {
     String::from_utf8_lossy(sums).lines().find_map(|l| {
@@ -750,16 +864,35 @@ fn release_tag(sums: &[u8]) -> Option<String> {
     })
 }
 
-/// `cosign verify-blob` of SHA256SUMS against the release workflow's
-/// identity for `tag` (docs/SELF-HOST.md, "Releases"). There is no mature
-/// Rust Sigstore verifier to embed yet, so cosign must be installed; without
-/// it the upgrade refuses rather than trusting an unverified installer.
-fn cosign_verify(sums: &[u8], bundle: &[u8], tag: &str) -> Result<(), String> {
+/// SHA256SUMS must be signed by the release workflow for `tag`
+/// (docs/SELF-HOST.md, "Releases"): checked in-process
+/// (release_signature.rs), then, when cosign is installed, by cosign too.
+fn verify_release_signature(sums: &[u8], bundle: &[u8], tag: &str) -> Result<(), String> {
     let valid = tag.strip_prefix('v').is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b)));
     if !valid {
         return Err(format!("{tag:?} is not a release tag"));
     }
-    let dir = private_temp_dir().map_err(|e| format!("temporary directory: {e}"))?;
+    railwatch_server::release_signature::verify(sums, bundle, railwatch_server::REPO, tag)?;
+    match cosign_verify(sums, bundle, tag) {
+        Err(CosignError::NotInstalled) => Ok(()),
+        Err(CosignError::Failed(e)) => Err(e),
+        Ok(()) => {
+            println!("SHA256SUMS: cosign agrees");
+            Ok(())
+        }
+    }
+}
+
+enum CosignError {
+    NotInstalled,
+    Failed(String),
+}
+
+/// `cosign verify-blob` of SHA256SUMS against the release workflow's
+/// identity for `tag`; an extra check when cosign is on PATH. `tag` is
+/// already validated.
+fn cosign_verify(sums: &[u8], bundle: &[u8], tag: &str) -> Result<(), CosignError> {
+    let dir = private_temp_dir().map_err(|e| CosignError::Failed(format!("temporary directory: {e}")))?;
     let result = (|| {
         let write = |name: &str, bytes: &[u8]| -> Result<std::path::PathBuf, String> {
             use std::os::unix::fs::OpenOptionsExt;
@@ -774,7 +907,8 @@ fn cosign_verify(sums: &[u8], bundle: &[u8], tag: &str) -> Result<(), String> {
             f.write_all(bytes).map_err(|e| e.to_string())?;
             Ok(p)
         };
-        let (sums_path, bundle_path) = (write("SHA256SUMS", sums)?, write("SHA256SUMS.sigstore.json", bundle)?);
+        let (sums_path, bundle_path) =
+            (write("SHA256SUMS", sums).map_err(CosignError::Failed)?, write("SHA256SUMS.sigstore.json", bundle).map_err(CosignError::Failed)?);
         let repo = railwatch_server::REPO;
         let out = std::process::Command::new("cosign")
             .arg("verify-blob")
@@ -788,13 +922,12 @@ fn cosign_verify(sums: &[u8], bundle: &[u8], tag: &str) -> Result<(), String> {
             .output();
         match out {
             Ok(o) if o.status.success() => Ok(()),
-            Ok(o) => Err(format!("SHA256SUMS signature does not verify for {repo} {tag}: {}", String::from_utf8_lossy(&o.stderr).trim())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
-                "cosign is not installed, so the release's signature cannot be checked; refusing to run an unverified installer as root. \
-                 Install cosign (https://docs.sigstore.dev/cosign/system_config/installation/) and re-run, or verify and run the release's install.sh by hand (docs/SELF-HOST.md, \"Releases\")."
-                    .into(),
-            ),
-            Err(e) => Err(format!("cosign: {e}")),
+            Ok(o) => Err(CosignError::Failed(format!(
+                "cosign: SHA256SUMS signature does not verify for {repo} {tag}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(CosignError::NotInstalled),
+            Err(e) => Err(CosignError::Failed(format!("cosign: {e}"))),
         }
     })();
     let _ = std::fs::remove_dir_all(&dir);
@@ -860,14 +993,14 @@ fn doctor() -> ExitCode {
     match Control::open(&cfg.control_path()) {
         Ok(c) => {
             let counts = c.with(|x| {
-                x.query_row(
-                    "SELECT (SELECT count(*) FROM users), (SELECT count(*) FROM accounts), (SELECT count(*) FROM environments)",
-                    [],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
-                )
+                x.query_row("SELECT (SELECT count(*) FROM users), (SELECT count(*) FROM accounts), (SELECT count(*) FROM environments)", [], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                })
             });
             match counts {
-                Ok((u, a, e)) => println!("ok    control DB: {u} users, {a} accounts, {e} environments{}", if u == 0 { " (run `railwatch setup`)" } else { "" }),
+                Ok((u, a, e)) => {
+                    println!("ok    control DB: {u} users, {a} accounts, {e} environments{}", if u == 0 { " (run `railwatch setup`)" } else { "" })
+                }
                 Err(e) => {
                     ok = false;
                     println!("FAIL  control DB: {e}");
@@ -971,7 +1104,13 @@ fn doctor_network(cfg: &Config) -> bool {
     for p in ports {
         let reached = addrs.iter().any(|a| TcpStream::connect_timeout(&std::net::SocketAddr::new(a.ip(), p), Duration::from_secs(3)).is_ok());
         let what = if p == 80 && cfg.tls.is_some() { " (ACME TLS-ALPN-01 needs 443; 80 is the redirect)" } else { "" };
-        ok &= check(reached, format!("port {p} on {host} {}{what}", if reached { "accepts connections" } else { "does not accept connections (is the server running? firewall?)" }));
+        ok &= check(
+            reached,
+            format!(
+                "port {p} on {host} {}{what}",
+                if reached { "accepts connections" } else { "does not accept connections (is the server running? firewall?)" }
+            ),
+        );
     }
     ok
 }
@@ -1005,7 +1144,11 @@ fn doctor_tls(cfg: &Config) -> bool {
                 line.push_str(" (does not name tls_domain)");
             }
             if !healthy {
-                line.push_str(if matches!(tls, railwatch_server::tls::Tls::Acme { .. }) { " (past its renewal point: renewal is failing, see journalctl -u railwatch)" } else { " (replace it)" });
+                line.push_str(if matches!(tls, railwatch_server::tls::Tls::Acme { .. }) {
+                    " (past its renewal point: renewal is failing, see journalctl -u railwatch)"
+                } else {
+                    " (replace it)"
+                });
             }
             check(named && healthy, line)
         }
@@ -1021,7 +1164,15 @@ fn doctor_backups(cfg: &Config) -> bool {
         return true;
     };
     let reach = b.s3.list("control/");
-    let mut ok = check(reach.is_ok(), format!("backup bucket {}/{}: {}", b.s3.endpoint, b.s3.bucket, reach.as_ref().map_or_else(|e| e.clone(), |k| format!("reachable, {} control snapshot(s)", k.len()))));
+    let mut ok = check(
+        reach.is_ok(),
+        format!(
+            "backup bucket {}/{}: {}",
+            b.s3.endpoint,
+            b.s3.bucket,
+            reach.as_ref().map_or_else(|e| e.clone(), |k| format!("reachable, {} control snapshot(s)", k.len()))
+        ),
+    );
     let last = std::fs::read_to_string(railwatch_server::storage::backup::last_ok_path(&cfg.data_dir)).ok().and_then(|s| s.trim().parse::<i64>().ok());
     let now = railwatch_server::time::now_micros() / 1_000_000;
     let limit = (3 * b.interval_secs as i64).max(900);
@@ -1036,9 +1187,7 @@ fn doctor_backups(cfg: &Config) -> bool {
 // serve
 
 fn serve() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("RAILWATCH_LOG").unwrap_or_else(|_| "info".into()))
-        .init();
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("RAILWATCH_LOG").unwrap_or_else(|_| "info".into())).init();
     let cfg = config();
     // Held until the process exits, after the writers have drained.
     let _lock = match lock_data_dir(&cfg, true) {
@@ -1081,8 +1230,7 @@ fn serve() -> ExitCode {
         let (stop_jobs, jobs_stopped) = tokio::sync::watch::channel(false);
         let scheduler = tokio::spawn(railwatch_server::jobs::scheduler(control.clone(), jobs.background.clone(), jobs_stopped));
         let hub = web::cable::Hub::new();
-        let followups_task =
-            tokio::spawn(followups::run_with(control.clone(), followups_rx, Some(hub.clone()), Some(jobs.background.clone())));
+        let followups_task = tokio::spawn(followups::run_with(control.clone(), followups_rx, Some(hub.clone()), Some(jobs.background.clone())));
         let web_state = match WebState::new(control, cfg.clone(), tenants.clone(), hub) {
             Ok(s) => Arc::new(s),
             Err(e) => {
@@ -1270,6 +1418,28 @@ mod tests {
         assert_eq!(release_tag(b"cc  install.sh\n"), None);
     }
 
+    /// Issue #5: `upgrade --version` must not roll back to an older signed
+    /// release (one with since-fixed vulnerabilities) unless asked to.
+    #[test]
+    fn upgrade_refuses_to_go_backwards() {
+        assert!(not_a_downgrade("0.2.0", "v0.2.0").is_ok(), "re-installing the same release");
+        assert!(not_a_downgrade("0.2.0", "v0.2.1").is_ok());
+        assert!(not_a_downgrade("0.2.0", "v1.0.0").is_ok());
+        assert!(not_a_downgrade("v0.2.0-rc.1", "v0.2.0").is_ok(), "a release is newer than its pre-releases");
+        assert!(not_a_downgrade("0.2.0", "v0.1.9").unwrap_err().contains("--allow-downgrade"));
+        assert!(not_a_downgrade("0.10.0", "v0.9.0").is_err(), "numeric, not lexical");
+        assert!(not_a_downgrade("0.2.0", "v0.2.0-rc.1").is_err(), "a pre-release of the running version is older");
+        assert!(not_a_downgrade("0.0.0-test.10", "v0.0.0-test.9").is_err());
+        assert!(not_a_downgrade("0.0.0-test.2", "v0.0.0-test.10").is_ok(), "numeric pre-release identifiers compare as numbers");
+        assert!(not_a_downgrade("1.0.0-alpha.1", "v1.0.0-alpha").is_err(), "fewer identifiers sort first");
+        assert!(not_a_downgrade("1.0.0-alpha", "v1.0.0-beta").is_ok());
+        assert!(not_a_downgrade("1.0.0-rc.1", "v1.0.0-1").is_err(), "numeric identifiers sort before alphanumeric ones");
+        assert!(not_a_downgrade("1.0.0+build.5", "v1.0.0+build.1").is_ok(), "build metadata is ignored");
+        assert!(not_a_downgrade("0.2.0", "latest").is_err(), "an unparseable version is refused");
+        assert!(not_a_downgrade("0.2.0", "v01.2.3").is_err(), "leading zeros are not semver");
+        assert!(not_a_downgrade("0.2.0", "v1.2").is_err());
+    }
+
     /// The upgrade's scratch directory is fresh, private and unpredictable.
     #[test]
     fn upgrade_temp_dir_is_private_and_unique() {
@@ -1282,28 +1452,28 @@ mod tests {
         std::fs::remove_dir(&b).unwrap();
     }
 
-    /// Without cosign (or with a tag that is not one) the signature check
-    /// fails closed with an explanation; it never passes by default.
+    /// The signature check fails closed and needs no cosign (issue #7):
+    /// the real v0.1.0 release (tests/fixtures/release-v0.1.0) verifies for
+    /// its own tag; another tag, one changed byte, a bogus bundle or a tag
+    /// that is not one does not. With cosign on PATH it must agree too.
     #[test]
-    fn cosign_verify_fails_closed() {
-        assert!(cosign_verify(b"x", b"{}", "not-a-tag").unwrap_err().contains("not a release tag"));
-        assert!(cosign_verify(b"x", b"{}", "v1.0.0; rm -rf /").is_err());
-        if std::process::Command::new("cosign").arg("version").output().is_err() {
-            assert!(cosign_verify(b"x", b"{}", "v1.0.0").unwrap_err().contains("cosign is not installed"));
-            eprintln!("SKIPPED the real-signature half: cosign is not on PATH");
-            return;
-        }
-        assert!(cosign_verify(b"x", b"{}", "v1.0.0").is_err(), "a bogus bundle never verifies");
-        // The real v0.1.0 release (tests/fixtures/release-v0.1.0): its own
-        // tag verifies; another tag, or one changed byte, does not.
+    fn release_signature_fails_closed() {
+        assert!(verify_release_signature(b"x", b"{}", "not-a-tag").unwrap_err().contains("not a release tag"));
+        assert!(verify_release_signature(b"x", b"{}", "v1.0.0; rm -rf /").is_err());
+        assert!(verify_release_signature(b"x", b"{}", "v1.0.0").is_err(), "a bogus bundle never verifies");
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/release-v0.1.0");
         let sums = std::fs::read(format!("{dir}/SHA256SUMS")).unwrap();
         let bundle = std::fs::read(format!("{dir}/SHA256SUMS.sigstore.json")).unwrap();
         assert_eq!(release_tag(&sums).as_deref(), Some("v0.1.0"));
-        cosign_verify(&sums, &bundle, "v0.1.0").expect("the v0.1.0 release signature verifies");
-        assert!(cosign_verify(&sums, &bundle, "v0.1.1").is_err(), "the signature is pinned to its tag");
+        verify_release_signature(&sums, &bundle, "v0.1.0").expect("the v0.1.0 release signature verifies");
+        assert!(verify_release_signature(&sums, &bundle, "v0.1.1").is_err(), "the signature is pinned to its tag");
         let mut tampered = sums.clone();
         tampered[0] ^= 1;
-        assert!(cosign_verify(&tampered, &bundle, "v0.1.0").is_err(), "a changed SHA256SUMS does not verify");
+        assert!(verify_release_signature(&tampered, &bundle, "v0.1.0").is_err(), "a changed SHA256SUMS does not verify");
+        match cosign_verify(&sums, &bundle, "v0.1.0") {
+            Err(CosignError::NotInstalled) => eprintln!("cosign is not on PATH: verified in-process only"),
+            Err(CosignError::Failed(e)) => panic!("cosign disagrees: {e}"),
+            Ok(()) => assert!(matches!(cosign_verify(&tampered, &bundle, "v0.1.0"), Err(CosignError::Failed(_)))),
+        }
     }
 }

@@ -16,8 +16,19 @@ const MAX_FUTURE_AGE: f64 = 3_600.0;
 
 /// Ingest::Batch::ROLLED_UP
 const ROLLED_UP: &[&str] = &[
-    "request", "job_attempt", "scheduled_task", "command", "channel_action", "query", "outgoing_request",
-    "cache_event", "mail", "visit", "notification", "span", "llm_call",
+    "request",
+    "job_attempt",
+    "scheduled_task",
+    "command",
+    "channel_action",
+    "query",
+    "outgoing_request",
+    "cache_event",
+    "mail",
+    "visit",
+    "notification",
+    "span",
+    "llm_call",
 ];
 
 #[derive(Debug, Clone)]
@@ -260,10 +271,21 @@ mod tests {
     #[test]
     fn to_i_matches_ruby() {
         let cases: &[(&str, Value)] = &[
-            ("12abc", Value::Int(12)), (" 12", Value::Int(12)), ("-5", Value::Int(-5)), ("1_000", Value::Int(1000)),
-            ("abc", Value::Int(0)), ("", Value::Int(0)), ("0x10", Value::Int(0)), ("+7", Value::Int(7)),
-            ("1e3", Value::Int(1)), ("  -3x", Value::Int(-3)), ("1__0", Value::Int(1)), ("_1", Value::Int(0)),
-            ("1_", Value::Int(1)), ("\n5", Value::Int(5)), ("99999999999999999999", Value::BigInt("99999999999999999999".into())),
+            ("12abc", Value::Int(12)),
+            (" 12", Value::Int(12)),
+            ("-5", Value::Int(-5)),
+            ("1_000", Value::Int(1000)),
+            ("abc", Value::Int(0)),
+            ("", Value::Int(0)),
+            ("0x10", Value::Int(0)),
+            ("+7", Value::Int(7)),
+            ("1e3", Value::Int(1)),
+            ("  -3x", Value::Int(-3)),
+            ("1__0", Value::Int(1)),
+            ("_1", Value::Int(0)),
+            ("1_", Value::Int(1)),
+            ("\n5", Value::Int(5)),
+            ("99999999999999999999", Value::BigInt("99999999999999999999".into())),
         ];
         for (s, want) in cases {
             assert_eq!(&string_to_i(s.as_bytes()), want, "{s:?}.to_i");

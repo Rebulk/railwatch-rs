@@ -20,12 +20,7 @@ pub struct Window {
 impl Window {
     /// `Window.preset(key)`: a preset ending now, or the default.
     pub fn preset(key: Option<&str>, now: i64) -> Window {
-        let (k, span) = PRESETS
-            .iter()
-            .find(|(k, _)| Some(*k) == key)
-            .or_else(|| PRESETS.iter().find(|(k, _)| *k == DEFAULT))
-            .copied()
-            .unwrap();
+        let (k, span) = PRESETS.iter().find(|(k, _)| Some(*k) == key).or_else(|| PRESETS.iter().find(|(k, _)| *k == DEFAULT)).copied().unwrap();
         Window { key: k.to_string(), from: now - span, to: now }
     }
 
@@ -88,19 +83,20 @@ fn split_offset(s: &str) -> (&str, i64) {
     if s.len() > 16 {
         let tail = &s[s.len() - 6..];
         let b = tail.as_bytes();
-        if (b[0] == b'+' || b[0] == b'-') && b[3] == b':'
-            && let (Ok(h), Ok(m)) = (tail[1..3].parse::<i64>(), tail[4..6].parse::<i64>()) {
-                let sign = if b[0] == b'-' { -1 } else { 1 };
-                return (&s[..s.len() - 6], sign * (h * 3600 + m * 60));
-            }
+        if (b[0] == b'+' || b[0] == b'-')
+            && b[3] == b':'
+            && let (Ok(h), Ok(m)) = (tail[1..3].parse::<i64>(), tail[4..6].parse::<i64>())
+        {
+            let sign = if b[0] == b'-' { -1 } else { 1 };
+            return (&s[..s.len() - 6], sign * (h * 3600 + m * 60));
+        }
     }
     (s, 0)
 }
 
 // -- Aggregations::STEPS ---------------------------------------------------
 
-pub const STEPS: [(&str, i64); 6] =
-    [("1m", MINUTE), ("5m", 5 * MINUTE), ("15m", 15 * MINUTE), ("1h", HOUR), ("6h", 6 * HOUR), ("1d", DAY)];
+pub const STEPS: [(&str, i64); 6] = [("1m", MINUTE), ("5m", 5 * MINUTE), ("15m", 15 * MINUTE), ("1h", HOUR), ("6h", 6 * HOUR), ("1d", DAY)];
 pub const MAX_POINTS: f64 = 400.0;
 
 pub fn step_seconds(key: &str) -> Option<i64> {

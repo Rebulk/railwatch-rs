@@ -328,12 +328,10 @@ fn insert_table(
             let conn = t.conn(file);
             let mut stmt = conn.prepare_cached(&sql)?;
             for row in run {
-                let changed = stmt
-                    .execute(params_from_iter(row.iter().map(|(_, v)| v)))
-                    .map_err(|e| match e {
-                        rusqlite::Error::ToSqlConversionFailure(m) => WriteError::Internal(m.to_string()),
-                        e => e.into(),
-                    })?;
+                let changed = stmt.execute(params_from_iter(row.iter().map(|(_, v)| v))).map_err(|e| match e {
+                    rusqlite::Error::ToSqlConversionFailure(m) => WriteError::Internal(m.to_string()),
+                    e => e.into(),
+                })?;
                 if changed > 0 {
                     let id = conn.last_insert_rowid();
                     match table {
@@ -376,9 +374,10 @@ fn link_profiles(t: &mut dyn Target, p: &Prepared) -> Result<(), WriteError> {
     let mut ids: Vec<&str> = Vec::new();
     for row in rows {
         if let Some((_, Bind::Text(id))) = row.iter().find(|(c, _)| *c == "execution_id")
-            && !ids.contains(&id.as_str()) {
-                ids.push(id);
-            }
+            && !ids.contains(&id.as_str())
+        {
+            ids.push(id);
+        }
     }
     if ids.is_empty() {
         return Ok(());

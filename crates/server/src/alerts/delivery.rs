@@ -186,11 +186,8 @@ impl Context {
                 _ => None,
             },
         };
-        let parts: Vec<String> = [Some(self.heading()), self.issue.as_ref().map(|i| i.kind.clone()), self.environment()]
-            .into_iter()
-            .flatten()
-            .filter(|s| !s.is_empty())
-            .collect();
+        let parts: Vec<String> =
+            [Some(self.heading()), self.issue.as_ref().map(|i| i.kind.clone()), self.environment()].into_iter().flatten().filter(|s| !s.is_empty()).collect();
         let mut header = [icon.map(String::from), Some(parts.join(" · "))].into_iter().flatten().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
         if self.payload().get("test").truthy() {
             header = format!("[TEST] {header}");
@@ -326,7 +323,8 @@ pub async fn deliver(ctx: &Context, smtp: Option<&crate::config::Smtp>) -> Resul
 async fn send_email(to: &str, ctx: &Context, smtp: Option<&crate::config::Smtp>) -> Result<(), String> {
     let smtp = smtp.ok_or("email alerts need SMTP: set smtp_address (RAILWATCH_SMTP_ADDRESS) and friends; see `railwatch doctor`")?;
     let text = ctx.text();
-    let mail = crate::web::mailer::Mail { to: to.to_string(), subject: format!("[Railwatch] {}", first(&text, 120)), text: format!("{text}\n\n{}\n", ctx.link()) };
+    let mail =
+        crate::web::mailer::Mail { to: to.to_string(), subject: format!("[Railwatch] {}", first(&text, 120)), text: format!("{text}\n\n{}\n", ctx.link()) };
     crate::web::mailer::Mailer::new(smtp)?.send(&mail).await
 }
 

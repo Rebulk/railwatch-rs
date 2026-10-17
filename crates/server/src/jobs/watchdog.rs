@@ -102,12 +102,13 @@ pub fn check(c: &Connection, hb: &Heartbeats, now_micros: i64, threshold_secs: i
         };
         for (env, server, last, silent_since) in rows {
             let quiet = now_micros - last;
-            let paused: bool = c
-                .query_row("SELECT paused_at IS NOT NULL FROM environments WHERE id = ?", [env], |r| r.get::<_, bool>(0))
-                .unwrap_or(true);
+            let paused: bool = c.query_row("SELECT paused_at IS NOT NULL FROM environments WHERE id = ?", [env], |r| r.get::<_, bool>(0)).unwrap_or(true);
             match silent_since {
                 None if !paused && quiet > threshold_secs * 1_000_000 && quiet < WATCH_WINDOW_SECS * 1_000_000 => {
-                    c.execute("UPDATE environment_heartbeats SET silent_since_micros = ? WHERE environment_id = ? AND server = ?", params![now_micros, env, server])?;
+                    c.execute(
+                        "UPDATE environment_heartbeats SET silent_since_micros = ? WHERE environment_id = ? AND server = ?",
+                        params![now_micros, env, server],
+                    )?;
                     out.push(Transition::Silent { env, server, last_seen: last });
                 }
                 Some(since) if last > since - threshold_secs * 1_000_000 && quiet <= threshold_secs * 1_000_000 => {
@@ -138,19 +139,27 @@ fn fire(c: &Connection, t: &Transition) -> rusqlite::Result<()> {
             let name = issue::environment_name(c, *env);
             let quiet = (time::now_micros() - last_seen) / 1_000_000;
             let who = if server.is_empty() { name.clone() } else { format!("{server} in {name}") };
-            (*env, "silent_environment", crate::rhash! {
-                "environment" => name.clone(), "environment_id" => *env, "server" => server.clone(),
-                "last_seen_at" => time::iso8601(last_seen / 1_000_000),
-                "message" => format!("{who} has sent nothing for {quiet} s (last data {} UTC)", &time::utc_seconds_string(last_seen / 1_000_000)[11..19]),
-            })
+            (
+                *env,
+                "silent_environment",
+                crate::rhash! {
+                    "environment" => name.clone(), "environment_id" => *env, "server" => server.clone(),
+                    "last_seen_at" => time::iso8601(last_seen / 1_000_000),
+                    "message" => format!("{who} has sent nothing for {quiet} s (last data {} UTC)", &time::utc_seconds_string(last_seen / 1_000_000)[11..19]),
+                },
+            )
         }
         Transition::Recovered { env, server, silent_for_secs } => {
             let name = issue::environment_name(c, *env);
             let who = if server.is_empty() { name.clone() } else { format!("{server} in {name}") };
-            (*env, "environment_recovered", crate::rhash! {
-                "environment" => name.clone(), "environment_id" => *env, "server" => server.clone(),
-                "message" => format!("{who} is reporting again after about {silent_for_secs} s of silence"),
-            })
+            (
+                *env,
+                "environment_recovered",
+                crate::rhash! {
+                    "environment" => name.clone(), "environment_id" => *env, "server" => server.clone(),
+                    "message" => format!("{who} is reporting again after about {silent_for_secs} s of silence"),
+                },
+            )
         }
     };
     let payload = crate::alerts::as_hash(payload);

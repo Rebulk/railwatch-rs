@@ -13,6 +13,16 @@ pub mod tdigest;
 
 /// Tables RollupJob and ReleaseHealthRollupJob read.
 pub const ROLLED_TABLES: &[&str] = &[
-    "executions", "queries", "outgoing_requests", "cache_events", "mails", "visits", "spans", "notifications", "view_renders",
-    "transactions", "llm_calls", "sessions",
+    "executions",
+    "queries",
+    "outgoing_requests",
+    "cache_events",
+    "mails",
+    "visits",
+    "spans",
+    "notifications",
+    "view_renders",
+    "transactions",
+    "llm_calls",
+    "sessions",
 ];

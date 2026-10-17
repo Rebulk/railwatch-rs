@@ -20,10 +20,10 @@
 //! `tls_cert_file` + `tls_key_file` serve a certificate you manage instead
 //! (re-read on SIGHUP is not implemented: restart to pick up a new one).
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;

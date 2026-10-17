@@ -15,7 +15,7 @@ use railwatch_server::config::Config;
 use railwatch_server::control::{self, Control};
 use railwatch_server::followups;
 use railwatch_server::tenants::Tenants;
-use railwatch_server::web::{self, cookies, WebState};
+use railwatch_server::web::{self, WebState, cookies};
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -70,9 +70,8 @@ async fn security_pocs() {
             .unwrap();
         let sa = control.with(|c| control::create_session(c, ua, Some("ua"), Some("127.0.0.1"))).unwrap();
         // An API+read+write token for user A, scoped to all of A's accounts.
-        let (_id, raw) = control
-            .tx(|tx| control::issue_api_token(tx, ua, "t", &["api".into(), "read".into(), "write".into(), "mcp".into()], None, None, None))
-            .unwrap();
+        let (_id, raw) =
+            control.tx(|tx| control::issue_api_token(tx, ua, "t", &["api".into(), "read".into(), "write".into(), "mcp".into()], None, None, None)).unwrap();
         (ua, aa, ia, sa, raw)
     };
 
@@ -207,34 +206,80 @@ async fn security_pocs() {
     let anon = http.get(format!("{base}/api/v1/issues/{issue_a}")).send().await.unwrap();
     assert_eq!(anon.status(), 401, "no token -> 401");
 
-    // ===== Sign-in throttle keyed on the email (audit A, info) ==============
-    // Behind a proxy without trust_proxy every client shares one IP, so the
-    // per-IP limit (30 / 5 min) is global. The per-email limit (10 / 5 min)
-    // throttles guessing one account regardless: after 10 wrong passwords
-    // for ada@ (any case), even the right one is refused for now, while
-    // bo@ from the same IP still signs in.
+    // ===== Sign-in throttles: per email without lockout, per IP refusing =====
+    // Failures are counted per email (10 / 5 min), but a full email bucket
+    // never refuses: whoever knows ada@'s address must not be able to keep
+    // Ada out (issue #4). Past the bucket a wrong password gets exactly the
+    // usual answer, after the same bcrypt work, so nothing says the bucket
+    // is full; the right password signs in. Only the per-IP limit (30 /
+    // 5 min) refuses outright.
     let anon = http.get(format!("{base}/sign_in")).send().await.unwrap();
     let anon_xsrf = set_cookie(&anon, "XSRF-TOKEN").expect("XSRF-TOKEN for an anonymous session");
     let anon_cookies = format!("{}={}", cookies::SESSION, set_cookie(&anon, cookies::SESSION).expect("anonymous session cookie"));
+    // (Location, flash alert, seconds): the redirect is followed with the
+    // session cookie it set, which carries the flash.
     let sign_in = |email: &str, password: &str| {
-        http.post(format!("{base}/sign_in"))
+        let req = http
+            .post(format!("{base}/sign_in"))
             .header("Cookie", &anon_cookies)
             .header("Origin", &origin)
             .header("X-XSRF-TOKEN", &anon_xsrf)
             .header("Content-Type", "application/json")
-            .body(format!(r#"{{"email":"{email}","password":"{password}"}}"#))
-            .send()
+            .body(format!(r#"{{"email":"{email}","password":"{password}"}}"#));
+        let (http, base) = (http.clone(), base.clone());
+        async move {
+            let t = std::time::Instant::now();
+            let r = req.send().await.unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            let to = r.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            let mut alert = String::new();
+            if to == "/sign_in" {
+                let cookie = format!("{}={}", cookies::SESSION, set_cookie(&r, cookies::SESSION).expect("the flash rides in the session cookie"));
+                let body = http.get(format!("{base}/sign_in")).header("Cookie", cookie).send().await.unwrap().text().await.unwrap();
+                let start = body.find("type=\"application/json\">").map(|i| i + 24).expect("an Inertia page");
+                let end = body[start..].find("</script>").unwrap() + start;
+                let page: serde_json::Value = serde_json::from_str(&body[start..end].replace("\\/", "/")).unwrap();
+                alert = page["props"]["flash"]["alert"].as_str().unwrap_or("").to_string();
+            }
+            (to, alert, secs)
+        }
     };
-    let location = |r: &reqwest::Response| r.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let incorrect = "That email or password is incorrect";
+    let mut before = Vec::new();
     for i in 0..10 {
-        let r = sign_in(if i % 2 == 0 { "ADA@example.com" } else { "ada@example.com" }, "wrong").await.unwrap();
-        assert_eq!(location(&r), "/sign_in");
+        let (to, alert, secs) = sign_in(if i % 2 == 0 { "ADA@example.com" } else { "ada@example.com" }, "wrong").await;
+        assert_eq!((to.as_str(), alert.as_str()), ("/sign_in", incorrect));
+        before.push(secs);
     }
-    let ada = sign_in("ada@example.com", "correct horse battery").await.unwrap();
-    let bo = sign_in("bo@example.com", "correct horse battery").await.unwrap();
-    println!("[sign-in] ada@ right password after 10 wrong -> {:?}; bo@ -> {:?}", location(&ada), location(&bo));
-    assert_eq!(location(&ada), "/sign_in", "the 11th attempt for one email is throttled");
-    assert_eq!(location(&bo), "/dashboard", "another email from the same IP is not");
+    // ada@'s bucket is full. A wrong password: the same answer, the same work.
+    let mut after = Vec::new();
+    for _ in 0..3 {
+        let (to, alert, secs) = sign_in("ada@example.com", "still wrong").await;
+        assert_eq!((to.as_str(), alert.as_str()), ("/sign_in", incorrect), "a full bucket looks like a wrong password");
+        after.push(secs);
+    }
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let (b, a) = (median(&mut before), median(&mut after));
+    println!("[sign-in] wrong password: median {:.0} ms before the email bucket filled, {:.0} ms after", b * 1e3, a * 1e3);
+    assert!(a > b * 0.5, "bcrypt still runs once the bucket is full, so timing does not tell ({a:.3} s vs {b:.3} s)");
+    let (to, _, _) = sign_in("ada@example.com", "correct horse battery").await;
+    assert_eq!(to, "/dashboard", "the owner's right password signs in although ada@'s failure bucket is full");
+    let (to, _, _) = sign_in("bo@example.com", "correct horse battery").await;
+    assert_eq!(to, "/dashboard", "another email from the same IP signs in");
+    // Brute force from one IP: 15 attempts so far; the per-IP limit (30)
+    // refuses from the 31st on, even with the right password.
+    for _ in 15..30 {
+        let (to, alert, _) = sign_in("ada@example.com", "guess").await;
+        assert_eq!((to.as_str(), alert.as_str()), ("/sign_in", incorrect));
+    }
+    let too_many = "Too many sign-in attempts. Try again in a few minutes.";
+    let (to, alert, _) = sign_in("ada@example.com", "guess").await;
+    assert_eq!((to.as_str(), alert.as_str()), ("/sign_in", too_many), "the 31st attempt from one IP is refused");
+    let (to, alert, _) = sign_in("ada@example.com", "correct horse battery").await;
+    assert_eq!((to.as_str(), alert.as_str()), ("/sign_in", too_many), "the per-IP limit refuses even the right password");
 
     std::fs::remove_dir_all(&dir).ok();
     println!("\nAll PoCs ran: open redirect FIXED; CSRF + tenant isolation SOUND.");

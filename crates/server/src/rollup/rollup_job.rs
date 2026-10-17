@@ -95,8 +95,17 @@ impl Table {
             Table::Transaction => &["outcome", "connection"],
             Table::Span => &["name", "status"],
             Table::LlmCall => &[
-                "operation", "model", "tool_name", "status", "input_tokens", "output_tokens", "cache_read_tokens",
-                "cache_write_tokens", "cost_nanos", "finish_reason", "attachments",
+                "operation",
+                "model",
+                "tool_name",
+                "status",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "cost_nanos",
+                "finish_reason",
+                "attachments",
             ],
         }
     }
@@ -263,11 +272,7 @@ pub fn fresh_attributes(source: &Source, group_hash: &[u8], bucket: i64, group: 
         bucket,
         count: group.len() as i64,
         error_count: group.iter().filter(|r| error(t, r)).count() as i64,
-        client_error_count: if t == "request" {
-            group.iter().filter(|r| (400..=499).contains(&col(source, r, "status").to_i())).count() as i64
-        } else {
-            0
-        },
+        client_error_count: if t == "request" { group.iter().filter(|r| (400..=499).contains(&col(source, r, "status").to_i())).count() as i64 } else { 0 },
         duration_sum: sum,
         duration_max: max.unwrap_or(0),
         p50: p(&mut digest, 0.5),
@@ -301,7 +306,13 @@ fn name_for(source: &Source, row: &RawRow) -> Vec<u8> {
         "mail" => c("mailer").s().to_vec(),
         "visit" => c("component").s().to_vec(),
         // `row.notifier || row.delivery_method`: only nil falls through.
-        "notification" => if c("notifier").is_null() { c("delivery_method").s().to_vec() } else { c("notifier").s().to_vec() },
+        "notification" => {
+            if c("notifier").is_null() {
+                c("delivery_method").s().to_vec()
+            } else {
+                c("notifier").s().to_vec()
+            }
+        }
         "view_render" => c("identifier").s().to_vec(),
         "transaction" => join(c("connection").s(), " · ", c("outcome").s()),
         "llm_call" => join(c("model").s(), " · ", c("operation").s()),

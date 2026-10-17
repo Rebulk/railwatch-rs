@@ -142,7 +142,9 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `HTTP_BODY_TIMEOUT_SECONDS` | 600 | a request body must arrive within this (32 MiB at ~450 kbit/s) |
 | `HTTP_IDLE_TIMEOUT_SECONDS` | 300 | a connection with no bytes moving either way is closed |
 | `MAX_CONNECTIONS` | 4096 | open connections; more wait in the kernel's backlog |
-| `NEW_ISSUES_PER_HOUR`, `NEW_ISSUES_PER_BATCH` | 1000, 200 | past these, new exception groups count onto one "Too many new issues" issue |
+| `MAX_CONNECTIONS_PER_IP` | 256 | open connections from one address (an IPv6 /64); more are closed at once. Off with `TRUST_PROXY` (every connection comes from the proxy: limit per client there) |
+| `NEW_ISSUES_PER_HOUR`, `NEW_ISSUES_PER_BATCH` | 1000, 200 | per environment: past these, new exception groups count onto one "Too many new issues" issue |
+| `NEW_ISSUES_PER_ACCOUNT_PER_HOUR` | 3000 | the same across all of an account's environments |
 
 ## `railwatch doctor`
 
@@ -222,11 +224,17 @@ or integration secrets must be re-entered.
 
 ```sh
 sudo railwatch upgrade                   # the latest release
-sudo railwatch upgrade --version v0.3.0  # a specific one (or back to an older one)
+sudo railwatch upgrade --version v0.3.0  # a specific one
+sudo railwatch upgrade --version v0.2.0 --allow-downgrade  # back to an older one
 ```
 
+An older release than the running one (semver order, so `v1.0.0-rc.1` is
+older than `v1.0.0`) is refused without `--allow-downgrade`: it may have
+vulnerabilities fixed since. `install.sh` does the same when it would
+replace a newer installed binary.
+
 That downloads the release's `install.sh`, verifies it (the release's
-signed `SHA256SUMS`: needs `cosign` on PATH, see [Releases](#releases)),
+signed `SHA256SUMS`, see [Releases](#releases); no cosign needed),
 and runs it with `--upgrade`: download, checksum, atomic swap of
 `/usr/local/bin/railwatch`, `systemctl restart railwatch.service`. Re-running the original install command does
 the same, and also applies any new flags.
@@ -323,9 +331,17 @@ cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
 
 `sudo railwatch upgrade` does this itself before running the new
 `install.sh`: it fetches `install.sh`, `SHA256SUMS` and the bundle over
-https, verifies the bundle with `cosign` (it refuses, and says why, when
-cosign is not installed), checks `install.sh` against `SHA256SUMS`, and
-pipes the verified bytes to `sh` (nothing lands in `/tmp`).
+https and verifies the bundle in-process, the same checks as the command
+above (Fulcio certificate chain to Sigstore's public-good trusted root,
+which the binary embeds; the certificate's SCT; the Rekor inclusion proof
+and signed entry timestamp; the signature over `SHA256SUMS`; the exact
+identity, issuer, trigger and repository), with
+[sigstore-verify](https://crates.io/crates/sigstore-verify). If cosign is
+installed it runs it as well, and both must agree. Then it checks
+`install.sh` against `SHA256SUMS` and pipes the verified bytes to `sh`
+(nothing lands in `/tmp`). The trusted root is the snapshot built into the
+binary, not fetched over TUF: an older binary may need `install.sh` by
+hand once Sigstore rotates its Fulcio or Rekor keys.
 
 Replace `vX.Y.Z` with the release you downloaded: the exact identity pins
 the signature to that tag's run of the release workflow, triggered by the

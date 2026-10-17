@@ -74,7 +74,14 @@ impl Tenants {
     pub fn new(dir: PathBuf, idle: Duration, followups: FollowupSender) -> Tenants {
         std::fs::create_dir_all(&dir).expect("create telemetry dir");
         Tenants {
-            inner: Arc::new(Inner { dir, idle, writers: Mutex::new(HashMap::new()), generation: Default::default(), followups: Mutex::new(Some(followups)), threads: Mutex::new(Vec::new()) }),
+            inner: Arc::new(Inner {
+                dir,
+                idle,
+                writers: Mutex::new(HashMap::new()),
+                generation: Default::default(),
+                followups: Mutex::new(Some(followups)),
+                threads: Mutex::new(Vec::new()),
+            }),
         }
     }
 
@@ -176,10 +183,8 @@ pub fn open_tenant(path: &Path) -> rusqlite::Result<Connection> {
     // committing frames count either way, so durability is unchanged; the
     // cost is a transaction's dirty pages held in memory until commit.
     conn.execute_batch("PRAGMA cache_spill = OFF;")?;
-    let has_schema: bool = conn
-        .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'", [], |_| Ok(true))
-        .optional()?
-        .unwrap_or(false);
+    let has_schema: bool =
+        conn.query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'", [], |_| Ok(true)).optional()?.unwrap_or(false);
     if fresh || !has_schema {
         let now = crate::time::quoted_date_micros(crate::time::now_micros());
         schema::create_tenant(&mut conn, &now)?;
@@ -305,11 +310,9 @@ fn process(env_id: i64, slug: &str, store: &mut Store, jobs: Vec<Job>, followups
 }
 
 fn lookup_receipt(conn: &Connection, producer_id: &str, delivery_id: &str) -> rusqlite::Result<Option<StoredReceipt>> {
-    conn.prepare_cached(
-        "SELECT body_sha256, metadata_sha256, ack, committed_at FROM ingest_receipts WHERE producer_id = ? AND delivery_id = ? LIMIT 1",
-    )?
-    .query_row([producer_id, delivery_id], |r| {
-        Ok(StoredReceipt { body_sha256: r.get(0)?, metadata_sha256: r.get(1)?, ack: r.get(2)?, committed_at: r.get(3)? })
-    })
-    .optional()
+    conn.prepare_cached("SELECT body_sha256, metadata_sha256, ack, committed_at FROM ingest_receipts WHERE producer_id = ? AND delivery_id = ? LIMIT 1")?
+        .query_row([producer_id, delivery_id], |r| {
+            Ok(StoredReceipt { body_sha256: r.get(0)?, metadata_sha256: r.get(1)?, ack: r.get(2)?, committed_at: r.get(3)? })
+        })
+        .optional()
 }

@@ -138,9 +138,10 @@ pub fn rows_with_identity(conn: &Connection, rows: &[Rec]) -> rusqlite::Result<V
     let mut refs: Vec<String> = Vec::new();
     for r in rows {
         if let Some(u) = r.s("user_ref")
-            && !refs.iter().any(|x| x == u) {
-                refs.push(u.to_string());
-            }
+            && !refs.iter().any(|x| x == u)
+        {
+            refs.push(u.to_string());
+        }
     }
     let people = if refs.is_empty() { HashMap::new() } else { people_by_ref(conn, &refs)? };
     Ok(rows

@@ -39,8 +39,7 @@ pub struct ExceptionRow {
 }
 
 /// The columns `exception_row` reads, in its order.
-pub const EXCEPTION_COLUMNS: &str =
-    "id, group_hash, class_name, message, file, line, occurred_at, deploy, user_ref, source, handled, execution_id, execution_preview, fingerprint, fingerprint_source";
+pub const EXCEPTION_COLUMNS: &str = "id, group_hash, class_name, message, file, line, occurred_at, deploy, user_ref, source, handled, execution_id, execution_preview, fingerprint, fingerprint_source";
 
 /// One exceptions row selected with EXCEPTION_COLUMNS.
 pub fn exception_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ExceptionRow> {
@@ -107,14 +106,7 @@ pub fn claim(c: &Connection, environment_id: i64, r: &Receipt, effect_key: &str)
             "INSERT INTO ingest_followup_receipts (environment_id, producer_id, delivery_id, delivery_created_at, effect_key, created_at)
              VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (environment_id, producer_id, delivery_id, effect_key) DO NOTHING",
         )?
-        .execute(params![
-            environment_id,
-            r.producer_id,
-            r.delivery_id,
-            time::quoted_date_micros(r.delivery_created_at),
-            effect_key,
-            issue::now_db()
-        ])?;
+        .execute(params![environment_id, r.producer_id, r.delivery_id, time::quoted_date_micros(r.delivery_created_at), effect_key, issue::now_db()])?;
     Ok(n == 1)
 }
 
@@ -149,11 +141,14 @@ pub struct Limits {
     pub new_issues_per_hour: usize,
     /// New groups per grouping pass (one batch).
     pub new_issues_per_batch: usize,
+    /// New issues across all of an account's environments in the trailing
+    /// hour, so creating environments does not multiply the cap above.
+    pub new_issues_per_account_per_hour: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { new_issues_per_hour: 1_000, new_issues_per_batch: 200 }
+        Limits { new_issues_per_hour: 1_000, new_issues_per_batch: 200, new_issues_per_account_per_hour: 3_000 }
     }
 }
 
@@ -215,7 +210,11 @@ impl AffectedUsers {
                 ValueRef::Text(t) => users.insert(t.to_vec()),
                 _ => {
                     self.groups.remove(group_hash);
-                    return tenant.query_row("SELECT COUNT(DISTINCT user_ref) FROM exceptions WHERE group_hash = ? AND user_ref IS NOT NULL", [group_hash], |r| r.get(0));
+                    return tenant.query_row(
+                        "SELECT COUNT(DISTINCT user_ref) FROM exceptions WHERE group_hash = ? AND user_ref IS NOT NULL",
+                        [group_hash],
+                        |r| r.get(0),
+                    );
                 }
             };
         }
@@ -273,15 +272,28 @@ pub fn group_with_limits(
     let mut created_this_hour: usize = control
         .query_row("SELECT COUNT(*) FROM issues WHERE environment_id = ? AND created_at >= ?", params![environment_id, hour_ago], |r| r.get::<_, i64>(0))
         .map_err(e)? as usize;
+    // The same for the environment's whole account.
+    let mut account_created_this_hour: usize = control
+        .query_row(
+            "SELECT COUNT(*) FROM issues WHERE created_at >= ?2 AND environment_id IN (
+               SELECT environments.id FROM environments JOIN applications ON applications.id = environments.application_id
+               WHERE applications.account_id = (SELECT applications.account_id FROM environments JOIN applications ON applications.id = environments.application_id WHERE environments.id = ?1))",
+            params![environment_id, hour_ago],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(e)? as usize;
     let mut created_this_batch = 0usize;
     for (group_hash, group) in groups {
         control.execute_batch("BEGIN IMMEDIATE").map_err(e)?;
         let result = (|| -> Result<Option<(Outcome, bool)>, String> {
             if let Some(r) = receipt
-                && !claim(control, environment_id, r, &format!("group:{group_hash}")).map_err(e)? {
-                    return Ok(None);
-                }
-            let capped = (created_this_batch >= limits.new_issues_per_batch || created_this_hour >= limits.new_issues_per_hour)
+                && !claim(control, environment_id, r, &format!("group:{group_hash}")).map_err(e)?
+            {
+                return Ok(None);
+            }
+            let capped = (created_this_batch >= limits.new_issues_per_batch
+                || created_this_hour >= limits.new_issues_per_hour
+                || account_created_this_hour >= limits.new_issues_per_account_per_hour)
                 && issue::find_by_group(control, environment_id, &group_hash).map_err(e)?.is_none();
             let target = if capped { OVERFLOW_GROUP_HASH } else { group_hash.as_str() };
             record(control, tenant, environment_id, target, &group, users).map(|o| Some((o, capped)))
@@ -297,12 +309,14 @@ pub fn group_with_limits(
                         out.overflowed += group.len();
                         if o == Outcome::New {
                             created_this_hour += 1;
+                            account_created_this_hour += 1;
                         }
                     }
                     Some((Outcome::New, false)) => {
                         out.new += 1;
                         created_this_batch += 1;
                         created_this_hour += 1;
+                        account_created_this_hour += 1;
                     }
                     Some((Outcome::Regressed, false)) => out.regressed += 1,
                     Some((Outcome::Seen, false)) => out.seen += 1,
@@ -320,13 +334,21 @@ pub fn group_with_limits(
             overflowed = out.overflowed,
             per_hour = limits.new_issues_per_hour,
             per_batch = limits.new_issues_per_batch,
+            per_account_per_hour = limits.new_issues_per_account_per_hour,
             "too many new exception groups: counted onto the overflow issue instead of creating issues"
         );
     }
     Ok(out)
 }
 
-fn record(control: &Connection, tenant: &Connection, environment_id: i64, group_hash: &str, group: &[ExceptionRow], users: &mut AffectedUsers) -> Result<Outcome, String> {
+fn record(
+    control: &Connection,
+    tenant: &Connection,
+    environment_id: i64,
+    group_hash: &str,
+    group: &[ExceptionRow],
+    users: &mut AffectedUsers,
+) -> Result<Outcome, String> {
     let e = |e: rusqlite::Error| e.to_string();
     // max_by(&:occurred_at): the first of equal maxima.
     let latest = group.iter().fold(&group[0], |a, b| if b.occurred_at > a.occurred_at { b } else { a });

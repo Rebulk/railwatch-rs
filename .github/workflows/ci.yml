@@ -1,4 +1,4 @@
-# CI for pull requests and main: tests, clippy (warnings are errors),
+# CI for pull requests and main: tests, rustfmt, clippy (warnings are errors),
 # cargo audit (RustSec advisories) and cargo deny (licenses, bans, sources,
 # advisories; deny.toml). Read-only token, no credentials kept, every
 # action pinned to a full commit SHA (the comment is its release).
@@ -29,7 +29,7 @@ jobs:
       # Pinned, so a new stable's new lints never fail a PR that did not
       # touch the code they flag; bump it deliberately (and fix what it finds).
       - name: toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component clippy && rustup default 1.95.0
+        run: rustup toolchain install 1.99.1 --profile minimal --component clippy,rustfmt && rustup default 1.99.1
       - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1.329.0
         with:
           ruby-version: "3.4"
@@ -43,6 +43,8 @@ jobs:
         run: command -v brotli || (sudo apt-get update -qq && sudo apt-get install -y -qq brotli)
       - name: frontend (include_dir! embeds frontend/dist)
         run: SKIP_CARGO=1 bin/build
+      - name: fmt
+        run: cargo fmt --check
       - name: clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: test

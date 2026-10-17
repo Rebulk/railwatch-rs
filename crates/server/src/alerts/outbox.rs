@@ -150,10 +150,8 @@ pub fn claim_due(c: &Connection, limit: i64) -> rusqlite::Result<Vec<Claimed>> {
                    delivery_lease_id = ?, delivery_lease_expires_at = ?, delivery_enqueued_until = NULL, updated_at = ? WHERE id = ?",
                 params![uuid(), lease, at(DELIVERY_LEASE_SECS), now, id],
             )?;
-            let claimed = c.query_row(
-                "SELECT event, integration_id, issue_id, payload, delivery_key, delivery_attempts FROM alerts WHERE id = ?",
-                [id],
-                |r| {
+            let claimed =
+                c.query_row("SELECT event, integration_id, issue_id, payload, delivery_key, delivery_attempts FROM alerts WHERE id = ?", [id], |r| {
                     let p: String = r.get(3)?;
                     Ok(Claimed {
                         id,
@@ -165,8 +163,7 @@ pub fn claim_due(c: &Connection, limit: i64) -> rusqlite::Result<Vec<Claimed>> {
                         delivery_key: r.get(4)?,
                         attempts: r.get(5)?,
                     })
-                },
-            )?;
+                })?;
             out.push(claimed);
         }
         Ok(out)
@@ -233,8 +230,7 @@ pub fn summarize_bursts(c: &Connection) -> rusqlite::Result<usize> {
         let mut s = c.prepare_cached(
             "SELECT DISTINCT alert_rule_id FROM (SELECT alert_rule_id FROM alerts WHERE status = 'collapsed' AND created_at >= ? AND created_at <= ? AND alert_rule_id IS NOT NULL ORDER BY created_at LIMIT ?)",
         )?;
-        s.query_map(params![at(-RECONCILE_WINDOW_SECS), at(-super::rules::BURST_WINDOW_SECS), BATCH_SIZE], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?
+        s.query_map(params![at(-RECONCILE_WINDOW_SECS), at(-super::rules::BURST_WINDOW_SECS), BATCH_SIZE], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
     };
     let mut made = 0;
     for rule_id in rule_ids {
@@ -249,7 +245,8 @@ pub fn summarize_bursts(c: &Connection) -> rusqlite::Result<usize> {
 
 fn summarize_rule(c: &Connection, rule_id: i64) -> rusqlite::Result<bool> {
     let collapsed: Vec<(i64, String, Value)> = {
-        let mut s = c.prepare_cached("SELECT id, created_at, payload FROM alerts WHERE alert_rule_id = ? AND status = 'collapsed' ORDER BY created_at, id LIMIT ?")?;
+        let mut s =
+            c.prepare_cached("SELECT id, created_at, payload FROM alerts WHERE alert_rule_id = ? AND status = 'collapsed' ORDER BY created_at, id LIMIT ?")?;
         s.query_map(params![rule_id, MAX_COLLAPSED_PER_SUMMARY], |r| {
             let p: String = r.get(2)?;
             Ok((r.get(0)?, r.get(1)?, rjson::parse(p.as_bytes()).unwrap_or(Value::Nil)))
@@ -259,14 +256,16 @@ fn summarize_rule(c: &Connection, rule_id: i64) -> rusqlite::Result<bool> {
     if collapsed.is_empty() {
         return Ok(false);
     }
-    let (event, integration_id): (String, i64) = c.query_row("SELECT event, integration_id FROM alert_rules WHERE id = ?", [rule_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let (event, integration_id): (String, i64) =
+        c.query_row("SELECT event, integration_id FROM alert_rules WHERE id = ?", [rule_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
     // tally.max_by(&:last)&.first: the first environment to reach the top count.
     let mut tally: indexmap::IndexMap<Vec<u8>, usize> = indexmap::IndexMap::new();
     for (_, _, p) in &collapsed {
         if let Value::Str(e) = p.get("environment")
-            && !rjson::ruby::blank(e) {
-                *tally.entry(e.clone()).or_default() += 1;
-            }
+            && !rjson::ruby::blank(e)
+        {
+            *tally.entry(e.clone()).or_default() += 1;
+        }
     }
     let mut env: Option<Vec<u8>> = None;
     let mut best = 0;

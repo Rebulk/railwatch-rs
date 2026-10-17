@@ -71,6 +71,16 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 # Google sign-in (web::google): ID-token claims; RS256 is verified with ring (no aws-lc, no `rsa` crate).
 jsonwebtoken = { version = "11", default-features = false }
 oauth2 = { version = "5", default-features = false, features = ["reqwest", "rustls-tls"] }
+# `railwatch upgrade` verifies the release's Sigstore bundle in-process
+# (release_signature.rs) against the embedded public-good trust root.
+# Without aws-lc-rs: signatures are checked with ring (already here) through
+# sigstore-crypto's CryptoProvider, prehashed ECDSA with p256/p384.
+sigstore-verify = { version = "0.15", default-features = false }
+sigstore-trust-root = { version = "0.15", default-features = false }
+sigstore-crypto = { version = "0.15", default-features = false }
+sigstore-types = "0.15"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [[bin]]
 name = "props-dump"

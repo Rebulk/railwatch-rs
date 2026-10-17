@@ -14,14 +14,33 @@ pub fn thirteen_months_ago(now_secs: i64) -> i64 {
     let d: u32 = s[8..10].parse().unwrap();
     let total = y * 12 + (m - 1) - 13;
     let (ny, nm) = (total.div_euclid(12), total.rem_euclid(12) as u32 + 1);
-    let days_in = |y: i64, m: u32| (time::days_from_civil(if m == 12 { y + 1 } else { y }, if m == 12 { 1 } else { m + 1 }, 1) - time::days_from_civil(y, m, 1)) as u32;
+    let days_in =
+        |y: i64, m: u32| (time::days_from_civil(if m == 12 { y + 1 } else { y }, if m == 12 { 1 } else { m + 1 }, 1) - time::days_from_civil(y, m, 1)) as u32;
     let nd = d.min(days_in(ny, nm));
     time::days_from_civil(ny, nm, nd) * 86_400 + now_secs.rem_euclid(86_400)
 }
 
 pub const RAW: &[&str] = &[
-    "executions", "queries", "exceptions", "cache_events", "mails", "broadcasts", "notifications", "outgoing_requests", "storage_ops", "view_renders",
-    "logs", "enqueued_jobs", "transactions", "n_plus_ones", "deprecations", "visits", "spans", "llm_calls", "profiles", "attachments",
+    "executions",
+    "queries",
+    "exceptions",
+    "cache_events",
+    "mails",
+    "broadcasts",
+    "notifications",
+    "outgoing_requests",
+    "storage_ops",
+    "view_renders",
+    "logs",
+    "enqueued_jobs",
+    "transactions",
+    "n_plus_ones",
+    "deprecations",
+    "visits",
+    "spans",
+    "llm_calls",
+    "profiles",
+    "attachments",
 ];
 pub const SESSION_HOURS_PER_RUN: usize = 48;
 pub const BATCH: i64 = 5_000;
@@ -53,7 +72,10 @@ pub fn prune(control: &Control, w: &Connection, env: i64) -> Result<Pruned, Stri
     for t in RAW {
         loop {
             let n = w
-                .execute(&format!("DELETE FROM \"{t}\" WHERE id IN (SELECT id FROM \"{t}\" WHERE occurred_at < ? ORDER BY occurred_at LIMIT {BATCH})"), [&cutoff])
+                .execute(
+                    &format!("DELETE FROM \"{t}\" WHERE id IN (SELECT id FROM \"{t}\" WHERE occurred_at < ? ORDER BY occurred_at LIMIT {BATCH})"),
+                    [&cutoff],
+                )
                 .map_err(e)? as i64;
             out.raw += n;
             if n < BATCH {
@@ -70,7 +92,8 @@ pub fn prune(control: &Control, w: &Connection, env: i64) -> Result<Pruned, Stri
         let Some(o) = oldest.and_then(|s| time::parse_db_time(&s)) else { break };
         let h = o / 1_000_000;
         let h = h - h.rem_euclid(3600);
-        w.execute("DELETE FROM sessions WHERE occurred_at >= ? AND occurred_at < ?", params![time::utc_seconds_string(h), time::utc_seconds_string(h + 3600)]).map_err(e)?;
+        w.execute("DELETE FROM sessions WHERE occurred_at >= ? AND occurred_at < ?", params![time::utc_seconds_string(h), time::utc_seconds_string(h + 3600)])
+            .map_err(e)?;
     }
     out.rollups = w.execute("DELETE FROM rollups WHERE bucket < ?", [&agg]).map_err(e)?;
     w.execute("DELETE FROM release_health WHERE bucket < ?", [&agg]).map_err(e)?;
@@ -85,7 +108,13 @@ pub fn prune(control: &Control, w: &Connection, env: i64) -> Result<Pruned, Stri
 /// The per-day layout's prune: whole files (storage::retention).
 /// raw_pruned_through is recorded first, as in `prune`, so the ingest floor
 /// rejects rows for the days about to be deleted.
-pub fn prune_days(control: &Control, dir: &std::path::Path, meta: &Connection, env: i64, tiers: crate::storage::retention::Tiers) -> Result<crate::storage::retention::Pruned, String> {
+pub fn prune_days(
+    control: &Control,
+    dir: &std::path::Path,
+    meta: &Connection,
+    env: i64,
+    tiers: crate::storage::retention::Tiers,
+) -> Result<crate::storage::retention::Pruned, String> {
     let e = |e: rusqlite::Error| e.to_string();
     let now = time::now_micros();
     let retention: i64 = super::retention_days(&control.conn(), env).map_err(e)?;

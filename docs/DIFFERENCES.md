@@ -968,12 +968,14 @@ security audits. Regression tests: `crates/server/tests/security_*.rs`.
 2. **Deploy `timestamp` parsing is byte-safe and checked.** A multibyte
    timestamp used to panic the handler task (no response); a 19-digit year
    wrapped. Both now answer the usual 422 "Deployed at can't be blank".
-3. **New issues are capped per environment.** `_group` is client-chosen, so
+3. **New issues are capped per environment and per account.** `_group` is client-chosen, so
    one ingest token could mint an issue (and an alert) per exception in the
    shared control database: 5,000 distinct hashes made 5,000 issues (+2.9 MB).
-   Now at most `new_issues_per_batch` (200) new issues per grouping pass and
-   `new_issues_per_hour` (1,000, trailing hour, per environment) are created;
-   a busy real deployment creates a handful a day. Past a cap, a group that
+   Now at most `new_issues_per_batch` (200) new issues per grouping pass,
+   `new_issues_per_hour` (1,000, trailing hour, per environment) and
+   `new_issues_per_account_per_hour` (3,000, trailing hour, across all of an
+   account's environments, so making environments does not multiply the
+   cap) are created; a busy real deployment creates a handful a day. Past a cap, a group that
    has no issue yet is recorded onto one overflow issue per environment
    (group hash `railwatch:too-many-new-issues`, which `_group` validation
    can never produce; title "Too many new issues: ..."), its `occurrences`
@@ -995,16 +997,31 @@ security audits. Regression tests: `crates/server/tests/security_*.rs`.
    at the limit (1.0 s with the test's 1 s setting). Socket-activated
    restarts are unchanged (bench/restart/run.sh restart and overlap: every
    generation inherited the socket, 2,399/2,399 posts accepted).
+   One address (an IPv6 /64) may hold at most `max_connections_per_ip`
+   (256) of them; a further connection from it is closed as soon as it is
+   accepted. Without it one source could take all 4,096 slots and keep other
+   clients, the gems included, in the backlog (`serve::tests::
+   one_source_cannot_take_every_connection`: with 8 slots and the flood
+   holding 20 connections, a second address was not served within 2 s; with
+   4 per address it is, and the flood's 16 extra connections are closed).
+   The cap uses the TCP peer, since X-Forwarded-For is not read until a
+   request is, so with `trust_proxy` it is off: every connection is the
+   proxy's, and per-client connection limits belong in the proxy.
 5. **Back-redirects refuse `//` and `/\` paths.** `redirect_back_or_to`
    (`Ctx::back_or`) reflected the Referer's path; a path starting `//` or
    `/\` is protocol-relative to a browser, so it now falls back like a
    missing Referer (Rails' `url_from` would also refuse it). Control
    characters are refused as well. Every other redirect target is a fixed
    path.
-6. **Sign-in is also throttled per email** (10 attempts per 5 minutes per
-   lower-cased email, on top of Rails' 30 per 5 minutes per IP), so guessing
-   one account's password is limited even when the per-IP bucket is spread
-   over addresses or collapsed onto a proxy's. `serve` and `doctor` warn
+6. **Failed sign-ins are also counted per email** (10 per 5 minutes per
+   lower-cased email, on top of Rails' 30 attempts per 5 minutes per IP).
+   A full email bucket never refuses: the password is still checked (the
+   same bcrypt work), the right one signs in, and a wrong one gets the usual
+   "That email or password is incorrect", so the response says nothing
+   about the bucket and knowing someone's email does not let you lock them
+   out. It logs a warning instead. Only the per-IP limit refuses outright,
+   so guessing one account's password from many addresses is bounded by the
+   per-IP limit times the addresses, as in Rails. `serve` and `doctor` warn
    when the url is https, the bind is loopback/private, there is no built-in
    TLS and `trust_proxy` is off (every client looks like the proxy).
 7. **HSTS** (`Strict-Transport-Security: max-age=31536000`) on every

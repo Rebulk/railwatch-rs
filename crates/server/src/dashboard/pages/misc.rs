@@ -80,7 +80,13 @@ pub fn processes_index(conn: &Connection, ctx: &PageContext, control: &dyn Contr
             }
         }
     }
-    let qs: Vec<(String, i64)> = qorder.into_iter().map(|k| { let d = depths[&k]; (k, d) }).collect();
+    let qs: Vec<(String, i64)> = qorder
+        .into_iter()
+        .map(|k| {
+            let d = depths[&k];
+            (k, d)
+        })
+        .collect();
     let qs = rb::sort_by_num(qs, |(_, d)| rb::Num::I(-d));
     // live servers | servers_since
     let mut live_servers: Vec<Option<String>> = vec![];
@@ -180,10 +186,7 @@ pub fn release_health_series(conn: &Connection, deploy: Option<&str>, from: i64,
     .iter()
     .map(|r| {
         let (t, s, e, c) = (i(r.at(0)), i(r.at(1)), i(r.at(2)), i(r.at(3)));
-        aggregations::Point {
-            t,
-            json: crate::obj! { "t" => rb::t_json(t * 1_000_000), "sessions" => s, "ok" => s - e - c, "errored" => e, "crashed" => c },
-        }
+        aggregations::Point { t, json: crate::obj! { "t" => rb::t_json(t * 1_000_000), "sessions" => s, "ok" => s - e - c, "errored" => e, "crashed" => c } }
     })
     .collect();
     Ok(Value::Array(aggregations::fill(pts, from, to, secs, |t| {
@@ -214,8 +217,7 @@ pub fn releases_index(conn: &Connection, ctx: &PageContext, control: &dyn Contro
     if !deploys.is_empty() {
         let mut ordered = deploys.clone();
         ordered.sort_by_key(|d| d.deployed_at);
-        let first_seen: Vec<i64> =
-            control.issues().iter().map(|i| i.first_seen_at).filter(|t| *t >= ordered[0].deployed_at && *t <= to).collect();
+        let first_seen: Vec<i64> = control.issues().iter().map(|i| i.first_seen_at).filter(|t| *t >= ordered[0].deployed_at && *t <= to).collect();
         for (k, d) in ordered.iter().enumerate() {
             let end = ordered.get(k + 1).map_or(to, |n| n.deployed_at);
             new_issues.insert(d.id, first_seen.iter().filter(|t| **t >= d.deployed_at && **t < end).count() as i64);
@@ -440,7 +442,13 @@ pub fn usage_show(conn: &Connection, ctx: &PageContext, _control: &dyn ControlDa
         m.insert("dropped".into(), Value::from(i(r.at(2))));
         m.insert("rejected".into(), Value::from(i(r.at(3))));
         m.insert("backpressure_batches".into(), Value::from(i(r.at(4))));
-        m.insert("backpressure_peak".into(), match r.at(5) { Sql::Null => Value::Null, v => jf(fl(v)) });
+        m.insert(
+            "backpressure_peak".into(),
+            match r.at(5) {
+                Sql::Null => Value::Null,
+                v => jf(fl(v)),
+            },
+        );
         Ok((m, by_type))
     };
     let since_day = rb::beginning_of_day(since);
@@ -454,18 +462,30 @@ pub fn usage_show(conn: &Connection, ctx: &PageContext, _control: &dyn ControlDa
     }
     let (m, bt) = fig(today, None)?;
     match days.iter_mut().find(|x| x.0 == today) {
-        Some(x) => { x.1 = m; x.2 = bt; }
+        Some(x) => {
+            x.1 = m;
+            x.2 = bt;
+        }
         None => days.push((today, m, bt)),
     }
     let mut torder: Vec<String> = vec![];
     let mut totals: HashMap<String, i64> = HashMap::new();
     for (_, _, bt) in &days {
         for (t, n) in bt {
-            let e = totals.entry(t.clone()).or_insert_with(|| { torder.push(t.clone()); 0 });
+            let e = totals.entry(t.clone()).or_insert_with(|| {
+                torder.push(t.clone());
+                0
+            });
             *e += n;
         }
     }
-    let mut by_type: Vec<(String, i64)> = torder.into_iter().map(|t| { let n = totals[&t]; (t, n) }).collect();
+    let mut by_type: Vec<(String, i64)> = torder
+        .into_iter()
+        .map(|t| {
+            let n = totals[&t];
+            (t, n)
+        })
+        .collect();
     by_type.sort_by(|a, b| (-a.1).cmp(&-b.1).then(a.0.cmp(&b.0)));
     let sum = |k: &str| days.iter().map(|d| d.1[k].as_i64().unwrap_or(0)).sum::<i64>();
     let peak = days.iter().filter_map(|d| d.1["backpressure_peak"].as_f64()).fold(None, |a: Option<f64>, b| Some(a.map_or(b, |a| a.max(b))));
@@ -535,7 +555,11 @@ pub fn issue_telemetry(conn: &Connection, ctx: &PageContext, issue: &control::Is
          ORDER BY \"exceptions\".\"occurred_at\" DESC LIMIT 50",
         range,
     )?;
-    let latest = db::query_one(conn, "SELECT \"exceptions\".* FROM \"exceptions\" WHERE \"exceptions\".\"group_hash\" = ?1 ORDER BY \"exceptions\".\"occurred_at\" DESC LIMIT 1", [g])?;
+    let latest = db::query_one(
+        conn,
+        "SELECT \"exceptions\".* FROM \"exceptions\" WHERE \"exceptions\".\"group_hash\" = ?1 ORDER BY \"exceptions\".\"occurred_at\" DESC LIMIT 1",
+        [g],
+    )?;
     let ctx_json = |e: &db::Rec| -> Map<String, Value> {
         match serde_json::from_str::<Value>(e.s("context").unwrap_or("")) {
             Ok(Value::Object(m)) => m,
@@ -549,7 +573,11 @@ pub fn issue_telemetry(conn: &Connection, ctx: &PageContext, issue: &control::Is
         .and_then(|t| t.as_array().cloned())
         .map(|a| {
             a.into_iter()
-                .filter_map(|c| c.as_object().map(|o| Value::Object(o.iter().filter(|(k, _)| ["at", "kind", "text"].contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect())))
+                .filter_map(|c| {
+                    c.as_object().map(|o| {
+                        Value::Object(o.iter().filter(|(k, _)| ["at", "kind", "text"].contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect())
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -607,14 +635,19 @@ pub fn issue_telemetry(conn: &Connection, ctx: &PageContext, issue: &control::Is
         .unwrap_or_else(|| issue.sample.get("fingerprint_source").cloned().unwrap_or(Value::Null));
     let messages = db::query(
         conn,
-        &format!("SELECT \"exceptions\".\"message\" FROM \"exceptions\" WHERE \"exceptions\".\"group_hash\" = ?1 ORDER BY \"exceptions\".\"occurred_at\" DESC LIMIT {SPLIT_SAMPLE}"),
+        &format!(
+            "SELECT \"exceptions\".\"message\" FROM \"exceptions\" WHERE \"exceptions\".\"group_hash\" = ?1 ORDER BY \"exceptions\".\"occurred_at\" DESC LIMIT {SPLIT_SAMPLE}"
+        ),
         [g],
     )?;
     let mut morder: Vec<Option<String>> = vec![];
     let mut mcount: HashMap<Option<String>, i64> = HashMap::new();
     for r in &messages {
         let k = r.s("message").map(str::to_string);
-        let e = mcount.entry(k.clone()).or_insert_with(|| { morder.push(k.clone()); 0 });
+        let e = mcount.entry(k.clone()).or_insert_with(|| {
+            morder.push(k.clone());
+            0
+        });
         *e += 1;
     }
     let tally: Vec<(Option<String>, i64)> = morder.iter().map(|k| (k.clone(), mcount[k])).collect();

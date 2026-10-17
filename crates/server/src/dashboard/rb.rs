@@ -63,7 +63,7 @@ fn frexp_exp(x: f64) -> i32 {
     if exp == 0 {
         // subnormal
         let m = bits & ((1u64 << 52) - 1);
-        return -1022 - (m.leading_zeros() as i32 - 12) ;
+        return -1022 - (m.leading_zeros() as i32 - 12);
     }
     exp - 1022
 }
@@ -285,11 +285,7 @@ pub fn max_by<T, K: PartialOrd>(items: &[T], mut key: impl FnMut(&T) -> K) -> Op
 /// `Time - Time` in seconds, as a Float, for times held as epoch micros.
 pub fn time_sub(a_us: i64, b_us: i64) -> f64 {
     let ns = (a_us as i128 - b_us as i128) * 1000;
-    if ns % 1_000_000_000 == 0 {
-        (ns / 1_000_000_000) as f64
-    } else {
-        ns as f64 / 1e9
-    }
+    if ns % 1_000_000_000 == 0 { (ns / 1_000_000_000) as f64 } else { ns as f64 / 1e9 }
 }
 
 /// `Time#as_json` for a UTC time: "2026-10-13T12:00:00.123Z" (ms truncated).

@@ -11,10 +11,19 @@ use crate::rjson::{self, Value};
 use crate::time;
 
 pub const EVENTS: &[&str] = &[
-    "new_issue", "regressed_issue", "resolved_issue", "ignored_issue", "assigned_issue", "threshold", "anomaly", "silent_host", "quota",
+    "new_issue",
+    "regressed_issue",
+    "resolved_issue",
+    "ignored_issue",
+    "assigned_issue",
+    "threshold",
+    "anomaly",
+    "silent_host",
+    "quota",
     "crash_free_drop",
     // Rust-only (docs/DIFFERENCES.md): the environment watchdog.
-    "silent_environment", "environment_recovered",
+    "silent_environment",
+    "environment_recovered",
 ];
 pub const BURST_EVENTS: &[&str] = &["new_issue", "regressed_issue"];
 pub const BURST_WINDOW_SECS: i64 = 60;
@@ -51,7 +60,8 @@ fn rule_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AlertRule> {
 }
 
 pub fn rules_for(c: &Connection, application_id: i64, event: &str) -> rusqlite::Result<Vec<AlertRule>> {
-    let mut s = c.prepare_cached("SELECT id, application_id, integration_id, event, filters FROM alert_rules WHERE application_id = ? AND event = ? ORDER BY id")?;
+    let mut s =
+        c.prepare_cached("SELECT id, application_id, integration_id, event, filters FROM alert_rules WHERE application_id = ? AND event = ? ORDER BY id")?;
     let rows = s.query_map(params![application_id, event], rule_row)?;
     rows.collect()
 }
@@ -243,9 +253,10 @@ pub fn fire_issueless(c: &Connection, application_id: i64, event: &str, payload:
     let mut ids = Vec::new();
     for rule in rules_for(c, application_id, event)? {
         if rule.matches(&Subject { issue: None, payload })
-            && let Some(id) = fire(c, &rule, event, None, payload)? {
-                ids.push(id);
-            }
+            && let Some(id) = fire(c, &rule, event, None, payload)?
+        {
+            ids.push(id);
+        }
     }
     Ok(ids)
 }

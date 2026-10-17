@@ -224,10 +224,8 @@ impl Read for GzipMember<'_> {
             let input = &self.src[self.pos..];
             let before_in = self.inflate.total_in();
             let before_out = self.inflate.total_out();
-            let status = self
-                .inflate
-                .decompress(input, out, FlushDecompress::None)
-                .map_err(|e| zerr(e.message().unwrap_or("invalid compressed data").to_string()))?;
+            let status =
+                self.inflate.decompress(input, out, FlushDecompress::None).map_err(|e| zerr(e.message().unwrap_or("invalid compressed data").to_string()))?;
             let consumed = (self.inflate.total_in() - before_in) as usize;
             let produced = (self.inflate.total_out() - before_out) as usize;
             self.pos += consumed;
@@ -291,10 +289,7 @@ mod tests {
         assert_eq!(parse_bytes(b" \n\t", false).unwrap_err().0, "empty body");
         assert_eq!(parse_bytes(b"\0{\"a\":1}\0\n\r\n", false).unwrap().len(), 1);
         assert_eq!(parse_bytes(b"\x0c{\"a\":1}\x0b\n", false).unwrap().len(), 1);
-        assert_eq!(
-            parse_bytes(b"{\"a\":1}\r{\"b\":2}\n", false).unwrap_err().0,
-            "bad json: unexpected token at end of stream '{\"b\":2}' at line 1 column 9"
-        );
+        assert_eq!(parse_bytes(b"{\"a\":1}\r{\"b\":2}\n", false).unwrap_err().0, "bad json: unexpected token at end of stream '{\"b\":2}' at line 1 column 9");
         assert_eq!(parse_bytes(b"\"x\"\n1\nnull\n[1]\n", false).unwrap().len(), 4);
         let many = b"{}\n".repeat(MAX_RECORDS + 1);
         assert_eq!(parse_bytes(&many, false).unwrap_err().0, "too many records");

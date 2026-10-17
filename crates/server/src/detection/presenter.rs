@@ -299,7 +299,10 @@ fn rollups(t: &Connection, record_type: &str, group_hash: &str, from: i64, to: i
         if ordered { " ORDER BY bucket ASC" } else { "" }
     );
     t.prepare(&sql)?
-        .query_map(params![record_type, group_hash, crate::time::quoted_date_micros(rb::beginning_of_hour(from)), crate::time::quoted_date_micros(to)], summary::stored_from_row)?
+        .query_map(
+            params![record_type, group_hash, crate::time::quoted_date_micros(rb::beginning_of_hour(from)), crate::time::quoted_date_micros(to)],
+            summary::stored_from_row,
+        )?
         .collect()
 }
 
@@ -338,15 +341,27 @@ fn metric_value(metric: &str, s: &Summary, minutes: f64) -> Value {
         "max" => ms(s.max),
         "avg" => ms(s.avg),
         "error_rate" | "failure_rate" => {
-            if s.count == 0 { Value::Null } else { jf(rb::round(s.errors as f64 * 100.0 / s.count as f64, 2)) }
+            if s.count == 0 {
+                Value::Null
+            } else {
+                jf(rb::round(s.errors as f64 * 100.0 / s.count as f64, 2))
+            }
         }
         "count" => {
-            if minutes > 0.0 { jf(rb::round(s.count as f64 / minutes, 2)) } else { Value::Null }
+            if minutes > 0.0 {
+                jf(rb::round(s.count as f64 / minutes, 2))
+            } else {
+                Value::Null
+            }
         }
         "spend" => jf(rb::round(summary::extra_i(&s.extra, "cost_nanos") as f64 / 1e9, 6)),
         "tokens" => json!(summary::extra_i(&s.extra, "input_tokens") + summary::extra_i(&s.extra, "output_tokens")),
         "truncation_rate" => {
-            if s.count == 0 { Value::Null } else { jf(rb::round(summary::extra_i(&s.extra, "truncated") as f64 * 100.0 / s.count as f64, 2)) }
+            if s.count == 0 {
+                Value::Null
+            } else {
+                jf(rb::round(summary::extra_i(&s.extra, "truncated") as f64 * 100.0 / s.count as f64, 2))
+            }
         }
         _ => Value::Null,
     }
@@ -366,8 +381,11 @@ fn deploy_comparison(t: &Connection, ty: &str, group: &str, now: i64) -> rusqlit
     let since = crate::time::quoted_date_micros(now - TREND_DAYS * 86_400_000_000);
     let row = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<f64>>(2)?, r.get::<_, Option<i64>>(3)?));
     let mut s = t.prepare(&sql)?;
-    let rows: Vec<(String, i64, Option<f64>, Option<i64>)> =
-        if execution { s.query_map(params![group, since, ty], row)?.collect::<rusqlite::Result<_>>()? } else { s.query_map(params![group, since], row)?.collect::<rusqlite::Result<_>>()? };
+    let rows: Vec<(String, i64, Option<f64>, Option<i64>)> = if execution {
+        s.query_map(params![group, since, ty], row)?.collect::<rusqlite::Result<_>>()?
+    } else {
+        s.query_map(params![group, since], row)?.collect::<rusqlite::Result<_>>()?
+    };
     let sorted = rb::sort_by_num(rows, |r| rb::Num::I(-r.1));
     Ok(Value::Array(
         sorted
@@ -426,7 +444,10 @@ fn representatives(d: &Value, t: &Connection) -> rusqlite::Result<Value> {
     let common = "id, group_hash, execution_id, execution_source, execution_preview, occurred_at, duration, deploy, user_ref, app_tenant";
     let (cols, kind) = match table {
         "executions" => ("name, status, outcome", " AND kind = ?3"),
-        "queries" => ("COALESCE(NULLIF(queries.sql, ''), (SELECT query_shapes.sql FROM query_shapes WHERE query_shapes.group_hash = queries.group_hash), ''), source, connection, role", ""),
+        "queries" => (
+            "COALESCE(NULLIF(queries.sql, ''), (SELECT query_shapes.sql FROM query_shapes WHERE query_shapes.group_hash = queries.group_hash), ''), source, connection, role",
+            "",
+        ),
         "outgoing_requests" => ("method || ' ' || host, status_code, source", ""),
         _ => ("operation, tool_name, provider, model, status, finish_reason, input_tokens, output_tokens, cost_nanos, attachments, attachment_types", ""),
     };

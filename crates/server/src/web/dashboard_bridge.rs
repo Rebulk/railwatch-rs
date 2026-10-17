@@ -92,8 +92,7 @@ impl DbControl {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let servers: Option<String> =
-            c.query_row("SELECT expected_servers FROM environments WHERE id = ?", [environment_id], |r| r.get(0)).optional()?;
+        let servers: Option<String> = c.query_row("SELECT expected_servers FROM environments WHERE id = ?", [environment_id], |r| r.get(0)).optional()?;
         let expected_servers = servers.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         // environment.issues (merged ones included, as the association is),
         // keyed "<issue_prefix>-<number>" like Issue#key.

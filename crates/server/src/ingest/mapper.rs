@@ -16,10 +16,34 @@ pub const PARENTS: &[&str] = &["request", "job_attempt", "scheduled_task", "comm
 
 /// Railwatch::Record::VERSIONS: every known type is at v1.
 pub const TYPES: &[&str] = &[
-    "request", "job_attempt", "scheduled_task", "command", "channel_action", "query", "n_plus_one", "transaction",
-    "exception", "cache_event", "mail", "broadcast", "notification", "outgoing_request", "storage_op", "view_render",
-    "log", "enqueued_job", "user", "deprecation", "visit", "process", "span", "health", "profile", "attachment",
-    "session", "llm_call",
+    "request",
+    "job_attempt",
+    "scheduled_task",
+    "command",
+    "channel_action",
+    "query",
+    "n_plus_one",
+    "transaction",
+    "exception",
+    "cache_event",
+    "mail",
+    "broadcast",
+    "notification",
+    "outgoing_request",
+    "storage_op",
+    "view_render",
+    "log",
+    "enqueued_job",
+    "user",
+    "deprecation",
+    "visit",
+    "process",
+    "span",
+    "health",
+    "profile",
+    "attachment",
+    "session",
+    "llm_call",
 ];
 
 const PROFILE_MAX_INGEST_BYTES: i64 = 4 * 1024 * 1024;
@@ -40,9 +64,16 @@ impl MapError {
     /// rescues by name report "Class: message", anything else "invalid record".
     pub fn rejection_reason(&self) -> String {
         const NAMED: &[&str] = &[
-            "ArgumentError", "TypeError", "KeyError", "NoMethodError", "RangeError", "FloatDomainError",
-            "JSON::GeneratorError", "Railwatch::Telemetry::BoundedGzip::Malformed",
-            "Railwatch::Telemetry::BoundedGzip::TooLarge", "Railwatch::Telemetry::BoundedGzip::SizeMismatch",
+            "ArgumentError",
+            "TypeError",
+            "KeyError",
+            "NoMethodError",
+            "RangeError",
+            "FloatDomainError",
+            "JSON::GeneratorError",
+            "Railwatch::Telemetry::BoundedGzip::Malformed",
+            "Railwatch::Telemetry::BoundedGzip::TooLarge",
+            "Railwatch::Telemetry::BoundedGzip::SizeMismatch",
         ];
         if NAMED.contains(&self.class) { format!("{}: {}", self.class, self.message) } else { "invalid record".into() }
     }
@@ -101,9 +132,16 @@ pub fn validate_record(rec: &Value) -> R<()> {
     validate_identifier(rec, "execution_id", is_identifier, "a printable token of at most 36 characters")?;
     validate_identifier(rec, "trace_id", is_identifier, "a printable token of at most 36 characters")?;
     for (field, expected) in [
-        ("stages", "hash"), ("counters", "hash"), ("inertia", "hash"), ("params", "hash"),
-        ("frames", "array"), ("fingerprint", "array"), ("tags", "array"),
-        ("only", "array"), ("attributes", "hash"), ("locals", "hash"),
+        ("stages", "hash"),
+        ("counters", "hash"),
+        ("inertia", "hash"),
+        ("params", "hash"),
+        ("frames", "array"),
+        ("fingerprint", "array"),
+        ("tags", "array"),
+        ("only", "array"),
+        ("attributes", "hash"),
+        ("locals", "hash"),
     ] {
         let v = rec.get(field);
         let ok = match v {
@@ -134,10 +172,7 @@ fn validate_version(rec: &Value, t: &[u8]) -> R<()> {
     }
     match rec.get("v") {
         Value::Int(1) => Ok(()),
-        v => Err(MapError::type_error(format!(
-            "{t} v{} is not v1",
-            String::from_utf8_lossy(&ruby::inspect(v))
-        ))),
+        v => Err(MapError::type_error(format!("{t} v{} is not v1", String::from_utf8_lossy(&ruby::inspect(v))))),
     }
 }
 
@@ -203,11 +238,7 @@ fn validate_frames(v: &Value) -> R<()> {
 
 fn validate_locals(v: &Value) -> R<()> {
     let Value::Hash(h) = v else { return Ok(()) };
-    if h.values().all(|v| !matches!(v, Value::Hash(_) | Value::Array(_))) {
-        Ok(())
-    } else {
-        Err(MapError::type_error("locals must contain scalar values"))
-    }
+    if h.values().all(|v| !matches!(v, Value::Hash(_) | Value::Array(_))) { Ok(()) } else { Err(MapError::type_error("locals must contain scalar values")) }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +317,11 @@ fn set(attrs: &mut Attrs, key: &'static str, value: Value) {
 
 fn mapped(t: &str, rec: &Value) -> R<Option<(&'static str, Attrs)>> {
     let pair = match t {
-        "query" => child(rec, "queries", &["sql", "name", "duration", "connection", "adapter", "role", "async", "in_transaction", "row_count", "source", "allocations", "explain"])?,
+        "query" => child(
+            rec,
+            "queries",
+            &["sql", "name", "duration", "connection", "adapter", "role", "async", "in_transaction", "row_count", "source", "allocations", "explain"],
+        )?,
         "span" => {
             let mut attrs = envelope(rec)?;
             set(&mut attrs, "name", take(rec, "name"));
@@ -298,16 +333,57 @@ fn mapped(t: &str, rec: &Value) -> R<Option<(&'static str, Attrs)>> {
         "health" => health(rec)?,
         "exception" => exception(rec)?,
         "cache_event" => child(rec, "cache_events", &["store", "key", "type", "duration", "ttl", "hits"])?,
-        "mail" => child(rec, "mails", &["mailer", "subject", "to", "cc", "bcc", "attachments", "delivery_method", "perform_deliveries", "duration", "failed", "message_id"])?,
+        "mail" => child(
+            rec,
+            "mails",
+            &["mailer", "subject", "to", "cc", "bcc", "attachments", "delivery_method", "perform_deliveries", "duration", "failed", "message_id"],
+        )?,
         "broadcast" => child(rec, "broadcasts", &["kind", "stream", "channel", "action", "bytes", "duration", "failed"])?,
         "notification" => child(rec, "notifications", &["notifier", "delivery_method", "channel", "duration", "failed"])?,
-        "outgoing_request" => child(rec, "outgoing_requests", &["host", "method", "url", "duration", "status_code", "request_size", "response_size", "error", "source", "response_body", "in_transaction"])?,
-        "llm_call" => child(rec, "llm_calls", &[
-            "operation", "provider", "model", "response_model", "tool_name", "duration", "status", "error",
-            "streaming", "message_count", "tool_count", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "thinking_tokens",
-            "cost_nanos", "workflow_id", "workflow_name", "workflow_step_id", "workflow_step_name", "workflow_step_parent_id", "prompt", "completion",
-            "finish_reason", "provider_request_id", "tools", "cost_reported", "attachments", "attachment_types", "attachment_names", "tool_call_id", "params",
-        ])?,
+        "outgoing_request" => child(
+            rec,
+            "outgoing_requests",
+            &["host", "method", "url", "duration", "status_code", "request_size", "response_size", "error", "source", "response_body", "in_transaction"],
+        )?,
+        "llm_call" => child(
+            rec,
+            "llm_calls",
+            &[
+                "operation",
+                "provider",
+                "model",
+                "response_model",
+                "tool_name",
+                "duration",
+                "status",
+                "error",
+                "streaming",
+                "message_count",
+                "tool_count",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "thinking_tokens",
+                "cost_nanos",
+                "workflow_id",
+                "workflow_name",
+                "workflow_step_id",
+                "workflow_step_name",
+                "workflow_step_parent_id",
+                "prompt",
+                "completion",
+                "finish_reason",
+                "provider_request_id",
+                "tools",
+                "cost_reported",
+                "attachments",
+                "attachment_types",
+                "attachment_names",
+                "tool_call_id",
+                "params",
+            ],
+        )?,
         "profile" => profile(rec)?,
         "attachment" => attachment(rec)?,
         "storage_op" => child(rec, "storage_ops", &["service", "op", "key", "duration"])?,
@@ -332,7 +408,11 @@ fn mapped(t: &str, rec: &Value) -> R<Option<(&'static str, Attrs)>> {
         "transaction" => child(rec, "transactions", &["duration", "outcome", "connection", "statement_count"])?,
         "n_plus_one" => child(rec, "n_plus_ones", &["sql", "count", "source"])?,
         "deprecation" => child(rec, "deprecations", &["message", "gem_name", "horizon", "source"])?,
-        "visit" => child(rec, "visits", &["component", "url", "method", "duration", "status", "partial", "only", "props_bytes", "user_agent", "lcp", "cls", "inp", "ttfb"])?,
+        "visit" => child(
+            rec,
+            "visits",
+            &["component", "url", "method", "duration", "status", "partial", "only", "props_bytes", "user_agent", "lcp", "cls", "inp", "ttfb"],
+        )?,
         "session" => {
             let mut attrs = envelope(rec)?;
             set(&mut attrs, "session_id", Value::Str(ruby::to_s(rec.get("id"))));
@@ -404,7 +484,26 @@ fn execution(rec: &Value) -> R<(&'static str, Attrs)> {
         _ => ruby::to_s(rec.get("name")),
     };
     let detail_keys: &[&str] = match kind_s.as_str() {
-        "request" => &["url", "path", "ip", "headers", "payload", "context", "user_agent", "view_runtime", "db_runtime", "redirect_to", "halted_callback", "unpermitted_parameters", "rate_limited", "format", "inertia", "request_size", "response_size", "gc_time"],
+        "request" => &[
+            "url",
+            "path",
+            "ip",
+            "headers",
+            "payload",
+            "context",
+            "user_agent",
+            "view_runtime",
+            "db_runtime",
+            "redirect_to",
+            "halted_callback",
+            "unpermitted_parameters",
+            "rate_limited",
+            "format",
+            "inertia",
+            "request_size",
+            "response_size",
+            "gc_time",
+        ],
         "command" => &["context", "gc_time", "interactive"],
         "channel_action" => &["channel", "context", "gc_time"],
         _ => &["job_id", "provider_job_id", "attempt_id", "adapter", "priority", "db_runtime", "arguments_preview", "context", "gc_time", "schedule"],
@@ -483,23 +582,26 @@ fn exception(rec: &Value) -> R<(&'static str, Attrs)> {
 }
 
 fn health(rec: &Value) -> R<(&'static str, Attrs)> {
-    Ok(("health_samples", vec![
-        ("sampled_at", Value::Str(timestamp_string(rec.get("timestamp"))?.into_bytes())),
-        ("pid", take(rec, "pid")),
-        ("role", take(rec, "role")),
-        ("server", take(rec, "server")),
-        ("deploy", take(rec, "deploy")),
-        ("threads_max", take(rec, "threads_max")),
-        ("threads_busy", take(rec, "threads_busy")),
-        ("backlog", take(rec, "backlog")),
-        ("pool_size", take(rec, "pool_size")),
-        ("pool_busy", take(rec, "pool_busy")),
-        ("pool_waiting", take(rec, "pool_waiting")),
-        ("queue_depth", take(rec, "queue_depth")),
-        ("queue_latency", take(rec, "queue_latency")),
-        ("memory", take(rec, "memory")),
-        ("detail", or_empty_hash(rec.get("detail"))),
-    ]))
+    Ok((
+        "health_samples",
+        vec![
+            ("sampled_at", Value::Str(timestamp_string(rec.get("timestamp"))?.into_bytes())),
+            ("pid", take(rec, "pid")),
+            ("role", take(rec, "role")),
+            ("server", take(rec, "server")),
+            ("deploy", take(rec, "deploy")),
+            ("threads_max", take(rec, "threads_max")),
+            ("threads_busy", take(rec, "threads_busy")),
+            ("backlog", take(rec, "backlog")),
+            ("pool_size", take(rec, "pool_size")),
+            ("pool_busy", take(rec, "pool_busy")),
+            ("pool_waiting", take(rec, "pool_waiting")),
+            ("queue_depth", take(rec, "queue_depth")),
+            ("queue_latency", take(rec, "queue_latency")),
+            ("memory", take(rec, "memory")),
+            ("detail", or_empty_hash(rec.get("detail"))),
+        ],
+    ))
 }
 
 fn profile(rec: &Value) -> R<(&'static str, Attrs)> {
@@ -512,8 +614,7 @@ fn profile(rec: &Value) -> R<(&'static str, Attrs)> {
     let declared = declared_bytes(rec.get("stacks_bytes"), "stacks_bytes", PROFILE_MAX_INGEST_BYTES)?;
     set(&mut attrs, "stacks_bytes", Value::Int(declared));
     let stacks = compressed_blob(rec.get("stacks"), "stacks")?;
-    crate::ingest::bounded_gzip::verify(&stacks, PROFILE_MAX_INGEST_BYTES as u64, declared, true)
-        .map_err(|e| MapError::new(e.class(), e.to_string()))?;
+    crate::ingest::bounded_gzip::verify(&stacks, PROFILE_MAX_INGEST_BYTES as u64, declared, true).map_err(|e| MapError::new(e.class(), e.to_string()))?;
     set(&mut attrs, "stacks", Value::Str(blob_marker(stacks)));
     Ok(("profiles", attrs))
 }
@@ -525,8 +626,7 @@ fn attachment(rec: &Value) -> R<(&'static str, Attrs)> {
     let declared = declared_bytes(rec.get("bytes"), "bytes", ATTACHMENT_MAX_BODY_BYTES)?;
     set(&mut attrs, "bytes", Value::Int(declared));
     let data = compressed_blob(rec.get("data"), "data")?;
-    crate::ingest::bounded_gzip::verify(&data, ATTACHMENT_MAX_BODY_BYTES as u64, declared, false)
-        .map_err(|e| MapError::new(e.class(), e.to_string()))?;
+    crate::ingest::bounded_gzip::verify(&data, ATTACHMENT_MAX_BODY_BYTES as u64, declared, false).map_err(|e| MapError::new(e.class(), e.to_string()))?;
     set(&mut attrs, "data", Value::Str(blob_marker(data)));
     set(&mut attrs, "exception_group_hash", take(rec, "exception_group_hash"));
     set(&mut attrs, "truncated", Value::Bool(rec.get("truncated").truthy()));
@@ -547,9 +647,7 @@ fn blob_marker(bytes: Vec<u8>) -> Vec<u8> {
 fn compressed_blob(value: &Value, field: &str) -> R<Vec<u8>> {
     use base64::Engine;
     // Base64.strict_decode64(value.to_s)
-    base64::engine::general_purpose::STANDARD
-        .decode(ruby::to_s(value))
-        .map_err(|_| MapError::argument(format!("{field} is not valid base64")))
+    base64::engine::general_purpose::STANDARD.decode(ruby::to_s(value)).map_err(|_| MapError::argument(format!("{field} is not valid base64")))
 }
 
 fn declared_bytes(value: &Value, field: &str, max: i64) -> R<i64> {
@@ -581,10 +679,12 @@ fn serialize(table: &'static str, attrs: Attrs, truncations: &mut Vec<String>) -
     for column in columns {
         let Some(pos) = attrs.iter().position(|(k, _)| *k == column.name) else { continue };
         let (name, mut value) = std::mem::replace(&mut attrs[pos], ("", Value::Nil));
-        if value.is_nil() && !column.null
-            && let Some(default) = &column.default {
-                value = default_value(default);
-            }
+        if value.is_nil()
+            && !column.null
+            && let Some(default) = &column.default
+        {
+            value = default_value(default);
+        }
         out.push((name, cast_value(value, column, table, truncations)?));
     }
     Ok(out)
@@ -614,8 +714,7 @@ pub fn cast_value(value: Value, column: &Column, table: &str, truncations: &mut 
         ColType::Json => {
             // Health detail is already JSON-encoded on the wire: decode it.
             let value = match value {
-                Value::Str(s) => rjson::parse(&sanitize_string(&s))
-                    .map_err(|e| MapError::new("JSON::ParserError", e.0))?,
+                Value::Str(s) => rjson::parse(&sanitize_string(&s)).map_err(|e| MapError::new("JSON::ParserError", e.0))?,
                 v => v,
             };
             let sanitized = sanitize_json(value);
@@ -644,11 +743,7 @@ pub fn cast_value(value: Value, column: &Column, table: &str, truncations: &mut 
 
 fn generic(value: Value, column: &Column, table: &str, truncations: &mut Vec<String>) -> R<Bind> {
     if matches!(value, Value::Hash(_) | Value::Array(_)) {
-        return Err(MapError::type_error(format!(
-            "unexpected {} for :{} column",
-            value.class_name(),
-            ty_name(column.ty)
-        )));
+        return Err(MapError::type_error(format!("unexpected {} for :{} column", value.class_name(), ty_name(column.ty))));
     }
     match column.ty {
         ColType::String => {

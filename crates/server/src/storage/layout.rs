@@ -24,9 +24,7 @@ pub const DETAIL_TABLES: &[&str] = &["queries", "cache_events", "view_renders", 
 
 /// Rows that must outlive any one day: the dedup state, the rollups, and
 /// rows keyed by something other than time.
-pub const META_TABLES: &[&str] = &[
-    "rollups", "release_health", "ingest_receipts", "people", "query_shapes", "export_destinations", "export_deliveries",
-];
+pub const META_TABLES: &[&str] = &["rollups", "release_health", "ingest_receipts", "people", "query_shapes", "export_destinations", "export_deliveries"];
 
 impl Tier {
     pub fn of(table: &str) -> Tier {

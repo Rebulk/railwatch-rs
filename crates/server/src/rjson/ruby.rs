@@ -97,12 +97,7 @@ fn inspect_str(out: &mut Vec<u8>, s: &[u8]) {
 }
 
 fn nonprintable(cp: u32) -> bool {
-    cp < 0x20
-        || (0x7F..=0x9F).contains(&cp)
-        || cp == 0x2028
-        || cp == 0x2029
-        || (0xFDD0..=0xFDEF).contains(&cp)
-        || (cp & 0xFFFE) == 0xFFFE
+    cp < 0x20 || (0x7F..=0x9F).contains(&cp) || cp == 0x2028 || cp == 0x2029 || (0xFDD0..=0xFDEF).contains(&cp) || (cp & 0xFFFE) == 0xFFFE
 }
 
 /// Decodes one UTF-8 char (also accepting encoded surrogates, which Ruby's
@@ -188,10 +183,7 @@ pub fn float(v: &Value) -> Result<f64, (&'static str, String)> {
             if s.contains(&0) {
                 ("ArgumentError", "string for Float contains null byte".to_string())
             } else {
-                (
-                    "ArgumentError",
-                    format!("invalid value for Float(): {}", String::from_utf8_lossy(&inspect(v))),
-                )
+                ("ArgumentError", format!("invalid value for Float(): {}", String::from_utf8_lossy(&inspect(v))))
             }
         }),
         Value::Nil => Err(("TypeError", "can't convert nil into Float".into())),
@@ -309,9 +301,9 @@ pub fn valid_utf8(s: &[u8]) -> bool {
 /// raises there, which no caller reaches with one.
 pub fn blank(s: &[u8]) -> bool {
     match std::str::from_utf8(s) {
-        Ok(t) => t.chars().all(|c| {
-            matches!(c as u32, 0x09..=0x0D | 0x20 | 0x85 | 0xA0 | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F | 0x3000)
-        }),
+        Ok(t) => {
+            t.chars().all(|c| matches!(c as u32, 0x09..=0x0D | 0x20 | 0x85 | 0xA0 | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F | 0x3000))
+        }
         Err(_) => false,
     }
 }
@@ -339,10 +331,6 @@ pub fn time_at_float(f: f64) -> (i64, u32) {
     let exp = ((bits >> 52) & 0x7FF) as i32;
     let mant = if exp == 0 { (bits & ((1 << 52) - 1)) << 1 } else { (bits & ((1 << 52) - 1)) | (1 << 52) };
     let shift = 1075 - exp; // frac = mant / 2^shift
-    let usec = if shift >= 107 {
-        0
-    } else {
-        ((mant as u128 * 1_000_000u128) >> shift) as u32
-    };
+    let usec = if shift >= 107 { 0 } else { ((mant as u128 * 1_000_000u128) >> shift) as u32 };
     (secs as i64, usec)
 }

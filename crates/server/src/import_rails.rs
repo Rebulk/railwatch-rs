@@ -99,10 +99,7 @@ pub fn run(control_path: &Path, primary: &Path, telemetry_dir: &Path, target_ten
     let existing: i64 = c.query_row("SELECT count(*) FROM accounts", [], |r| r.get(0)).map_err(|e| e.to_string())?;
     let existing_envs: i64 = c.query_row("SELECT count(*) FROM environments", [], |r| r.get(0)).map_err(|e| e.to_string())?;
     if existing > 0 || existing_envs > 0 {
-        return Err(format!(
-            "{} already has {existing} account(s) and {existing_envs} environment(s); import into a fresh data dir",
-            control_path.display()
-        ));
+        return Err(format!("{} already has {existing} account(s) and {existing_envs} environment(s); import into a fresh data dir", control_path.display()));
     }
     // Even a read-only open of a WAL database writes its -shm, and the last
     // connection to close may checkpoint. So the source is never opened at
