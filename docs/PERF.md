@@ -115,6 +115,96 @@ files) and the queries@7d family 68 -> 82 ms (ORDER BY duration LIMIT 51 needs e
 51 merged). Both are per-file work that grows with the number of files, not waste; a merged FTS
 index or a per-day top-N cache would change what is stored, so not done.
 
+## Slow dashboard pages (branch fix-slow-pages, from main fc318ed)
+
+### Method
+
+`bench/storage/slow_pages.sh` (setup / run / report): one tenant in two data dirs, the single
+file and a `railwatch split` copy, with one control DB and API token; every props-diff page case
+under every window preset (1h, 6h, 24h, 7d, 30d) and every `/api/v1` environment endpoint under
+every window it takes plus filters, sorts and second pages: 276 page + 107 API cases. props-dump
+and api-dump on CPUs 4-7; `report` diffs the outputs byte for byte (single vs per-day, and a base
+label vs this one in each layout) and lists the slowest cases. Tenant: 1.03M rows over 10 days
+(562k queries, 139k logs, 139k cache events, 71k executions, 32k rollups), 600 MB single, 21
+files per-day, on /var/tmp (disk). Table: 3 rounds alternating main and branch binaries, 5 warm
+runs each (first run dropped), median of the per-round medians, ms. Busy shared workstation.
+
+| case | main single | main per-day | branch single | branch per-day |
+|---|---:|---:|---:|---:|
+| queries.q@30d | 477.1 | 275.0 | 222.0 | 315.2 |
+| queries.q@7d | 385.3 | 216.4 | 178.0 | 246.8 |
+| logs.fts@30d | 159.6 | 265.6 | 47.7 | 48.1 |
+| logs.fts@7d | 158.5 | 261.4 | 45.5 | 44.5 |
+| queries.parallel_cursor@30d | 48.0 | 254.8 | 30.8 | 32.6 |
+| api.queries.adapter@30d | 84.9 | 241.5 | 69.7 | 85.0 |
+| logs.fts@24h | 150.6 | 238.8 | 38.7 | 32.0 |
+| queries.parallel_cursor@7d | 43.6 | 199.8 | 26.1 | 32.7 |
+| api.queries.adapter@7d | 62.6 | 183.6 | 52.7 | 67.6 |
+| queries@30d | 95.3 | 134.5 | 34.0 | 42.8 |
+| queries@7d | 77.6 | 109.8 | 31.5 | 38.0 |
+| logs@7d | 35.5 | 47.8 | 34.3 | 33.0 |
+| profiles@7d | 7.9 | 31.4 | 7.7 | 7.7 |
+| sum of all 383 medians | 4186 | 6273 | 2517 | 2999 |
+
+Pages at 7d over 50 ms: main 5 single / 7 per-day, branch 1 / 1 (queries.q). Cases where
+per-day is over 1.2x single and at least 2 ms slower: main 86, branch 42. Every output identical:
+main == branch in both layouts, single == per-day, 383/383.
+
+### What each change did (EXPLAIN QUERY PLAN and RW_SQL_PROFILE=1 per statement)
+
+1. **Log snippets** (`filter_query::fts_snippets`): `rowid IN (50 ids)` with MATCH is one FTS5
+   pass per id (plan `INDEX 0:=M1`, 120 ms). `rowid BETWEEN min AND max AND +rowid IN (...)` is
+   one pass bounded by the range (`INDEX 0:M1><`, 3 ms), same rows. Both layouts.
+2. **Rollup decode** (`rollup::load`): straight from the statement instead of through `db::Rec`
+   (owned copies of every column first). The 7-day queries page reads ~31k rollup rows 3 times;
+   perf had `load`, `from_utf8_lossy` and `parse_db_time` above the SQL.
+3. **One rollup read per page** (`grouped_and_summary`, overview): the grouped table and
+   summary_with_delta's current window ran the same statement twice.
+4. **Per-day cursor pages** (`cursor_page::per_file`): the union view's `ORDER BY duration DESC
+   LIMIT 51` sorted every row in range of every file (`MERGE (UNION ALL)` over full ranges). Each
+   file now returns its own top N, merged; (col, id) is a total order, so the same rows. Log
+   text filters name each file's own `logs_fts` (through the view, the 17-file FTS union ran
+   inside each of 17 branches). `idx_queries_slowest` only in files whose whole day is in the
+   window.
+5. **Per-day aggregates** (`reader::aggregate`, logs' level counts): SQLite does not push
+   COUNT / GROUP BY into a view's branches. COUNT, queue stats (AVG as SUM/COUNT of the integer
+   column, exact), active people and logs' level counts run per file and are combined; GROUP BY
+   keys come back sorted as the single file's temp b-tree returns them. COUNT over 7 days 26 -> 4
+   ms per-day.
+6. **Filtered slowest queries, single file** (`cursor_page::slowest_probe`): the forced
+   `idx_queries_slowest` visits every row of the window in duration order when a filter matches
+   nothing (queries.q: 0 of 440k). The page first filters the index's top 2,000 rows; a full page
+   from them is the answer, otherwise the statement runs on the occurred_at plan.
+
+`per_day_pages_equal_the_single_file` (dashboard/pages/telemetry.rs) covers what the bench tenant
+cannot: four log levels, two queues with real latencies, three users, five day files, the probe's
+full-page and fallback paths. It fails if the per-file GROUP BY order or the bind renumbering is
+wrong (both were checked by breaking them).
+
+### Targets
+
+- **Every page under 50 ms at 7d: not met for one page.** queries.q@7d (`widgets role:reading`)
+  is 178 ms single / 247 ms per-day: the filter matches none of the window's 440k queries, so any
+  plan reads all of them (`role` has no index; text is `LIKE '%..%'`). An index on `role` would be
+  a schema change to the gem's files and only helps that one field. Every other page at 7d is
+  under 50 ms in both layouts (next: cache_events.store 49 ms per-day).
+- **No per-day page over 1.2x single: not met.** 42 cases are over 1.2x and at least 2 ms
+  slower. Profiled: queries.q (1.39x; single got cheaper), the cache store filter (`SELECT
+  DISTINCT group_hash` over the union, 32 -> 49 ms). Not profiled, causes read from the code:
+  `/api/v1/logs` without a cursor (3 -> 15 ms; its offset page's `COUNT(*)` and OFFSET query
+  still go through the views), queries.parallel_cursor@24h (5 -> 32 ms; the window covers no
+  whole day, so no file gets the hint), a ~3 ms fixed cost on `executions#show` (lookups by
+  execution_id in every file). In ratio the worst are sub-5 ms pages.
+
+### Not done / did not help
+
+- A MATERIALIZED CTE for the FTS subquery: the view's branches still re-ran it (133 ms).
+- A join view pairing `logs` with `logs_fts` per file: FTS5 rejects MATCH through it.
+- `idx_queries_slowest` in every file under any filter: queries.q per-day 206 -> 271 ms.
+- No index or schema change: files stay byte-compatible with the gem's.
+- Not rerun: bench/diff/props, api and mcp against Rails (the `rw-baseline` container was
+  stopped); this branch's gate is Rust-only (main vs branch, single vs per-day).
+
 ### Not waste (measured, left alone)
 
 - Idle: 3 environments, 60 s: 0.01 s CPU, ~5 wakeups/s, 18 MB RSS, 6 threads.
