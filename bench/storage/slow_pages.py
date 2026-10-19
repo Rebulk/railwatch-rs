@@ -11,7 +11,7 @@ api-tokens.json). page-cases: every props-diff case under every window
 preset (cases make_cases.py gives one window keep it). api-cases: every
 /api/v1 environment endpoint under every window it takes, plus the
 filtered, sorted and second-page variants. report: the identity gate and
-the slowest cases.
+the slowest cases (exits 1 on any difference, missing case or 5xx).
 """
 import datetime, hashlib, json, os, secrets, sqlite3, statistics, sys
 
@@ -104,39 +104,56 @@ def load(path):
 
 def report(work, label, base=None):
     bad = 0
+    expected = {kind: [c["name"] for c in json.load(open(f"{work}/{kind}.json"))] for kind in ["pages", "api"]}
 
-    def same(a, b, what):
+    def same(pa, pb, kind, what):
+        # Byte identity of the two dump files; the per-case diff only names
+        # what differs. Every case must be present and none may be a 5xx.
         nonlocal bad
-        if a is None or b is None:
+        if not (os.path.exists(pa) and os.path.exists(pb)):
             print(f"GATE {what}: missing output")
             bad += 1
             return
-        diff = [k for k in a if json.dumps(a[k]) != json.dumps(b.get(k))] + [k for k in b if k not in a]
-        errs = [k for k, v in a.items() if isinstance(v, dict) and (v.get("status") in (500, "no such page") or str(v.get("status")).startswith("5"))]
-        print(f"GATE {what}: {len(a) - len(diff)}/{len(a)} identical" + (f"; DIFF {diff[:10]}" if diff else "") + (f"; 5xx {errs[:5]}" if errs else ""))
-        bad += len(diff) + len(errs)
+        a, b = load(pa), load(pb)
+        missing = [k for k in expected[kind] if k not in a or k not in b]
+        identical = open(pa, "rb").read() == open(pb, "rb").read()
+        diff = [] if identical else [k for k in expected[kind] if json.dumps(a.get(k)) != json.dumps(b.get(k))] or ["<bytes differ>"]
+        errs = [k for k, v in a.items() if isinstance(v, dict) and (v.get("status") == "no such page" or str(v.get("status")).startswith("5"))]
+        n = len(expected[kind])
+        print(
+            f"GATE {what}: {'bytes identical' if identical else 'DIFFERENT'}, {n - len(missing)}/{n} cases present"
+            + (f"; DIFF {diff[:10]}" if diff else "")
+            + (f"; MISSING {missing[:5]}" if missing else "")
+            + (f"; 5xx {errs[:5]}" if errs else "")
+        )
+        bad += len(diff) + len(missing) + len(errs)
 
     for kind in ["pages", "api"]:
-        same(load(f"{work}/{label}-single-{kind}.json"), load(f"{work}/{label}-split-{kind}.json"), f"{label} single vs per-day {kind}")
+        same(f"{work}/{label}-single-{kind}.json", f"{work}/{label}-split-{kind}.json", kind, f"{label} single vs per-day {kind}")
         if base:
             for v in ["single", "split"]:
-                same(load(f"{work}/{base}-{v}-{kind}.json"), load(f"{work}/{label}-{v}-{kind}.json"), f"{base} vs {label} {v} {kind}")
+                same(f"{work}/{base}-{v}-{kind}.json", f"{work}/{label}-{v}-{kind}.json", kind, f"{base} vs {label} {v} {kind}")
 
-    med = lambda path: {k: statistics.median(v) for k, v in (load(path) or {}).items()}
+    def med(path, kind):
+        t = load(path)
+        if t is None or any(k not in t for k in expected[kind]):
+            sys.exit(f"timings missing: {path}")
+        return {k: statistics.median(v) for k, v in t.items()}
+
     rows = []
     for kind in ["pages", "api"]:
-        s, p = med(f"{work}/{label}-single-{kind}.json.timings.json"), med(f"{work}/{label}-split-{kind}.json.timings.json")
-        bs = med(f"{work}/{base}-single-{kind}.json.timings.json") if base else {}
-        bp = med(f"{work}/{base}-split-{kind}.json.timings.json") if base else {}
-        for k in s:
-            rows.append((k, bs.get(k, 0), bp.get(k, 0), s[k], p.get(k, 0)))
+        s, p = med(f"{work}/{label}-single-{kind}.json.timings.json", kind), med(f"{work}/{label}-split-{kind}.json.timings.json", kind)
+        bs = med(f"{work}/{base}-single-{kind}.json.timings.json", kind) if base else {}
+        bp = med(f"{work}/{base}-split-{kind}.json.timings.json", kind) if base else {}
+        for k in expected[kind]:
+            rows.append((k, bs.get(k, 0), bp.get(k, 0), s[k], p[k]))
     pages = [r for r in rows if not r[0].startswith("api.")]
     print(f"sum of medians: single {sum(r[3] for r in rows):.0f} ms, per-day {sum(r[4] for r in rows):.0f} ms ({len(rows)} cases)")
     at7 = [r for r in pages if r[0].endswith("@7d")]
     print(f"pages @7d over 50 ms: single {[r[0] for r in at7 if r[3] > 50]}, per-day {[r[0] for r in at7 if r[4] > 50]} (of {len(at7)})")
-    ratio = sorted((r[4] / max(r[3], 0.01), r[0]) for r in rows if max(r[3], r[4]) >= 2)
-    over = [f"{n} {x:.2f}x" for x, n in ratio if x > 1.2]
-    print(f"per-day / single (cases >= 2 ms): median {statistics.median(x for x, _ in ratio):.2f}x; {len(over)} over 1.2x, worst: {over[::-1][:12]}")
+    ratio = sorted((r[4] / max(r[3], 0.01), r[0], r[4] - r[3]) for r in rows if max(r[3], r[4]) >= 2)
+    over = [f"{n} {x:.2f}x" for x, n, d in ratio if x > 1.2 and d >= 2]
+    print(f"per-day / single (cases >= 2 ms): median {statistics.median(x for x, _, _ in ratio):.2f}x; {len(over)} over 1.2x and >= 2 ms slower, worst: {over[::-1][:12]}")
     top = int(os.environ.get("TOP", "15"))
     print(f"slowest {top} (median ms)" + (f", {base} -> {label}" if base else ""))
     for k, b1, b2, s, p in sorted(rows, key=lambda r: -max(r[1:]))[:top]:

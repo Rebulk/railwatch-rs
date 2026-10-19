@@ -22,6 +22,8 @@
 # report: the gate (single == split for LABEL; LABEL == BASE_LABEL per
 # layout, byte for byte) and the slowest cases; exits 1 on any difference.
 set -euo pipefail
+# The work dir holds a copy of the tenant's telemetry: owner-only.
+umask 077
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$ROOT/bench/storage
 cmd=${1:?usage: slow_pages.sh setup|run|report ...}

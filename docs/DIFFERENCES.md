@@ -741,8 +741,8 @@ see STORAGE.md, was data drift, not storage),
    files whose whole day is in the window), log text filters use each file's
    own FTS index, and COUNT / logs' level counts / queue stats / active
    people are computed per file and summed (AVG as SUM/COUNT, exact for the
-   integer column). Same rows and order as one file: `bench/storage/
-   slow_pages.sh` 383/383 cases byte-identical single vs per-day, and
+   integer column). Same rows and order as one file:
+   `bench/storage/slow_pages.sh` 383/383 cases byte-identical single vs per-day, and
    `per_day_pages_equal_the_single_file` (docs/PERF.md, "Slow dashboard
    pages").
 8. **Profile links across days**: `link_profiles!` looks for an
