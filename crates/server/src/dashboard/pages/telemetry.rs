@@ -74,12 +74,13 @@ pub fn queries_index(conn: &Connection, ctx: &PageContext, _control: &dyn Contro
         Order::Slowest,
         &ctx.cursor_context("queries"),
     )??;
+    let (queries, summary) = grouped_and_summary(conn, ctx, "query", 200, true)?;
     Ok(crate::obj! {
-        "queries" => grouped(conn, ctx, "query", 200, true)?,
+        "queries" => queries,
         "n_plus_ones" => n_plus_ones(conn, from, to)?,
         "slowest" => page.rows.iter().map(models::query_row).collect::<Vec<_>>(),
         "pagination" => page.meta, "q" => ctx.param_s("q"),
-        "summary" => summary_with_delta(conn, ctx, "query", None)?,
+        "summary" => summary,
         "sort" => sort_param(ctx, "count"), "dir" => dir_param(ctx),
     })
 }
@@ -649,7 +650,7 @@ pub fn logs_index(conn: &Connection, ctx: &PageContext, _control: &dyn ControlDa
 // -- spans -------------------------------------------------------------------
 
 pub fn spans_index(conn: &Connection, ctx: &PageContext, _control: &dyn ControlData) -> R {
-    let mut spans = grouped(conn, ctx, "span", 200, true)?;
+    let (mut spans, summary) = grouped_and_summary(conn, ctx, "span", 200, true)?;
     let p = filter_query::parse(ctx.param("q"));
     if let Some(n) = p.field("name") {
         spans.retain(|s| s["name"].as_str().unwrap_or("").contains(n));
@@ -658,7 +659,7 @@ pub fn spans_index(conn: &Connection, ctx: &PageContext, _control: &dyn ControlD
         spans.retain(|s| s["errors"].as_i64().unwrap_or(0) > 0);
     }
     Ok(crate::obj! {
-        "spans" => spans, "series" => series(conn, ctx, "span", None)?, "summary" => summary_with_delta(conn, ctx, "span", None)?,
+        "spans" => spans, "series" => series(conn, ctx, "span", None)?, "summary" => summary,
         "sort" => sort_param(ctx, "count"), "dir" => dir_param(ctx), "q" => ctx.param_s("q"),
     })
 }

@@ -12,19 +12,22 @@ use crate::dashboard::cursor_page::{self, Order};
 use crate::dashboard::db::{jf, ji, js, jt};
 use crate::dashboard::filter_query::{self, Resource, s};
 use crate::dashboard::models::{self, execution_row};
-use crate::dashboard::{execution_presenter, rb, tenant};
+use crate::dashboard::{execution_presenter, rb, rollup, tenant};
 
 // -- overview ----------------------------------------------------------------
 
 pub fn overview_show(conn: &Connection, ctx: &PageContext, control: &dyn ControlData) -> R {
     let (from, to) = ctx.range();
-    let requests = aggregations::grouped(conn, "request", from, to, 8, Some("p95"), None)?;
-    let jobs = aggregations::grouped(conn, "job_attempt", from, to, 8, None, None)?;
+    // One rollup read per type for its table and its totals.
+    let request_rows = rollup::between(conn, "request", from, to)?;
+    let job_rows = rollup::between(conn, "job_attempt", from, to)?;
+    let requests = aggregations::grouped_rows(&request_rows, from, to, 8, Some("p95"), None);
+    let jobs = aggregations::grouped_rows(&job_rows, from, to, 8, None, None);
     let issues: Vec<Value> = recent_issues(control.issues()).into_iter().filter(|i| i.status == "open").take(8).map(|i| issue_row(&i)).collect();
     Ok(crate::obj! {
         "totals" => crate::obj! {
-            "requests" => summary_with_delta(conn, ctx, "request", None)?,
-            "jobs" => summary_with_delta(conn, ctx, "job_attempt", None)?,
+            "requests" => aggregations::summary_with_delta_of(conn, "request", &request_rows, ctx.previous_range())?,
+            "jobs" => aggregations::summary_with_delta_of(conn, "job_attempt", &job_rows, ctx.previous_range())?,
         },
         "request_series" => series(conn, ctx, "request", None)?,
         "job_series" => series(conn, ctx, "job_attempt", None)?,

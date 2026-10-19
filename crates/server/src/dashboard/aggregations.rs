@@ -246,3 +246,11 @@ pub fn summary_with_delta(conn: &Connection, record_type: &str, window: (i64, i6
     let prev = rollup::summarize_owned(&load(previous)?);
     Ok(crate::obj! { "current" => current.to_json(), "previous" => prev.to_json() })
 }
+
+/// `summary_with_delta` over all groups, given the current window's rows
+/// (`rollup::between(record_type, window)`) a page already read for its
+/// grouped table: the same statement, so the same rows in the same order.
+pub fn summary_with_delta_of(conn: &Connection, record_type: &str, current: &[Rollup], previous: (i64, i64)) -> rusqlite::Result<Value> {
+    let prev = rollup::summarize_owned(&rollup::between(conn, record_type, previous.0, previous.1)?);
+    Ok(crate::obj! { "current" => rollup::summarize_owned(current).to_json(), "previous" => prev.to_json() })
+}
