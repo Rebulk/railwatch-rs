@@ -822,24 +822,17 @@ fn executions_in(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<i64>
     let first = if fh == from { from } else { fh + 3_600_000_000 };
     let last = rb::beginning_of_hour(to);
     if first >= last {
-        return db::count(
-            conn,
-            "SELECT COUNT(*) FROM \"executions\" WHERE \"executions\".\"occurred_at\" BETWEEN ?1 AND ?2",
-            rusqlite::params![qt(from), qt(to)],
-        );
+        return db::count_where(conn, "executions", "\"executions\".\"occurred_at\" BETWEEN ?1 AND ?2", &[s(&qt(from)), s(&qt(to))]);
     }
-    let a = db::count(
-        conn,
-        "SELECT COUNT(*) FROM \"executions\" WHERE \"executions\".\"occurred_at\" >= ?1 AND \"executions\".\"occurred_at\" < ?2",
-        rusqlite::params![qt(from), qt(first)],
-    )?;
+    let a =
+        db::count_where(conn, "executions", "\"executions\".\"occurred_at\" >= ?1 AND \"executions\".\"occurred_at\" < ?2", &[s(&qt(from)), s(&qt(first))])?;
     let b = db::count(
         conn,
         "SELECT SUM(\"rollups\".\"count\") FROM \"rollups\" WHERE \"rollups\".\"record_type\" IN ('request', 'job_attempt', 'scheduled_task', 'command', 'channel_action') \
          AND \"rollups\".\"bucket\" >= ?1 AND \"rollups\".\"bucket\" < ?2",
         rusqlite::params![qt(first), qt(last)],
     )?;
-    let c = db::count(conn, "SELECT COUNT(*) FROM \"executions\" WHERE \"executions\".\"occurred_at\" BETWEEN ?1 AND ?2", rusqlite::params![qt(last), qt(to)])?;
+    let c = db::count_where(conn, "executions", "\"executions\".\"occurred_at\" BETWEEN ?1 AND ?2", &[s(&qt(last)), s(&qt(to))])?;
     Ok(a + b + c)
 }
 
@@ -1425,9 +1418,10 @@ mod per_day_tests {
     use super::*;
     use crate::dashboard::control::StaticControl;
 
-    /// The per-file rewrites (cursor pages, logs' level counts, FTS paired
-    /// per file) give the single file's props: several levels, rows on three
-    /// days, a text filter, a cursor page and the slowest-queries page.
+    /// The per-file rewrites (cursor pages, FTS paired per file, the summed
+    /// aggregates) give the single file's props: four log levels, two queues
+    /// with real latencies, three users, rows on five days, a text filter, a
+    /// cursor page and the slowest-queries page.
     #[test]
     fn per_day_pages_equal_the_single_file() {
         let dir = std::env::temp_dir().join(format!("rw-perday-{}", crate::control::base58(8)));
@@ -1436,7 +1430,8 @@ mod per_day_tests {
         let t = crate::tenants::open_tenant(&file).unwrap();
         let now = crate::time::parse_db_time("2026-10-16 12:00:00").unwrap();
         let mut id = 0;
-        for day in ["2026-10-14", "2026-10-15", "2026-10-16"] {
+        // Five days: enough files that per-file binds renumber past ?3.
+        for day in ["2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16"] {
             for (i, level) in ["warn", "info", "error", "debug", "info", "info"].iter().enumerate() {
                 id += 1;
                 let at = format!("{day} 0{i}:00:00.{id:06}");
@@ -1445,6 +1440,24 @@ mod per_day_tests {
                 t.execute(
                     "INSERT INTO queries (id, sql, name, duration, occurred_at, adapter, group_hash) VALUES (?, 'SELECT 1', 'Widget Load', ?, ?, 'sqlite', 'g')",
                     rusqlite::params![id, (id * 7919) % 50, at],
+                )
+                .unwrap();
+                // Jobs on two queues with odd latencies (AVG over files must be
+                // exact) and requests from three users, some failing.
+                t.execute(
+                    "INSERT INTO executions (id, execution_id, kind, name, occurred_at, duration, queue, queue_latency, outcome, status, user_ref, group_hash) \
+                     VALUES (?1, ?2, ?3, 'X', ?4, 1000, ?5, ?6, ?7, ?8, ?9, 'g')",
+                    rusqlite::params![
+                        id,
+                        format!("e{id}"),
+                        if i % 2 == 0 { "job_attempt" } else { "request" },
+                        at,
+                        if i % 4 == 0 { "default" } else { "mailers" },
+                        if i == 2 { None } else { Some(id * 37 + 1) },
+                        if i == 4 { "failed" } else { "ok" },
+                        if i == 3 { 503 } else { 200 },
+                        ["ada", "bob", "cy"][id as usize % 3],
+                    ],
                 )
                 .unwrap();
             }
@@ -1470,9 +1483,16 @@ mod per_day_tests {
             let a = queries_index(&single, &c, &StaticControl::default()).unwrap();
             let b = queries_index(&days, &c, &StaticControl::default()).unwrap();
             assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap(), "queries {params:?}");
+            for page in [crate::dashboard::pages::jobs_index as fn(&Connection, &PageContext, &dyn ControlData) -> R, people_index, profiles_index] {
+                let a = page(&single, &c, &StaticControl::default()).unwrap();
+                let b = page(&days, &c, &StaticControl::default()).unwrap();
+                assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap(), "{params:?}");
+            }
         }
+        let queues = crate::dashboard::pages::queue_stats(&days, now - 7 * 86_400_000_000, now).unwrap();
+        assert_eq!(queues.as_array().unwrap().len(), 2, "{queues}");
         let counts = logs_index(&days, &ctx(&[("window", "7d")]), &StaticControl::default()).unwrap()["counts"].clone();
-        assert_eq!(serde_json::to_string(&counts).unwrap(), r#"{"debug":3,"error":3,"info":9,"warn":3}"#);
+        assert_eq!(serde_json::to_string(&counts).unwrap(), r#"{"debug":5,"error":5,"info":15,"warn":5}"#);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

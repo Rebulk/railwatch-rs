@@ -153,6 +153,18 @@ pub fn count<P: Params>(conn: &Connection, sql: &str, params: P) -> rusqlite::Re
     prepare(conn, sql)?.query_row(params, |r| r.get::<_, Option<i64>>(0)).map(|v| v.unwrap_or(0))
 }
 
+/// `SELECT COUNT(*) FROM "<table>" WHERE <cond>` (`cond` with `?1`...
+/// binds). Over a per-day tenant each day file counts its own rows and the
+/// counts are added (storage::reader::aggregate), which gives the same
+/// number without the union materializing every row.
+pub fn count_where(conn: &Connection, table: &str, cond: &str, binds: &[Sql]) -> rusqlite::Result<i64> {
+    let inner = format!("SELECT COUNT(*) AS n FROM {{t}} WHERE {cond}");
+    if let Some(rows) = crate::storage::reader::aggregate(conn, table, &inner, "SELECT SUM(n) FROM {u}", binds)? {
+        return Ok(rows.first().and_then(|r| r.i("SUM(n)")).unwrap_or(0));
+    }
+    count(conn, &format!("SELECT COUNT(*) FROM \"{table}\" WHERE {cond}"), rusqlite::params_from_iter(binds.iter()))
+}
+
 /// A bind for a time, as Active Record quotes it (quoted_date).
 pub fn qt(micros: i64) -> String {
     crate::time::quoted_date_micros(micros)

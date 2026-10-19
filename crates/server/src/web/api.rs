@@ -1131,13 +1131,7 @@ impl Api<'_> {
     fn users(&self, e: &Scoped) -> R<Rendered> {
         let (from, to) = self.window().range();
         let active = self.telemetry(e, |conn| {
-            let rows = db::query(
-                conn,
-                "SELECT \"executions\".\"user_ref\", COUNT(*), SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END), MAX(occurred_at) FROM \"executions\" \
-                 WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 AND \"executions\".\"user_ref\" IS NOT NULL \
-                 GROUP BY \"executions\".\"user_ref\"",
-                params!["request", qt(from), qt(to)],
-            )?;
+            let rows = crate::dashboard::pages::active_people(conn, from, to)?;
             let active: Vec<(i64, Value)> = rows
                 .iter()
                 .map(|r| {

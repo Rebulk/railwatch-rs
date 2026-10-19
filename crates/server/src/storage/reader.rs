@@ -228,6 +228,63 @@ pub fn per_file(
     Ok(Some((parts.join(" UNION ALL "), all)))
 }
 
+/// `?i` -> `?{i + by}` for every numbered parameter (none sit in string
+/// literals in the dashboard's SQL).
+fn renumber(sql: &str, by: usize) -> String {
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut rest = sql;
+    while let Some(i) = rest.find('?') {
+        out.push_str(&rest[..=i]);
+        rest = &rest[i + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 {
+            out.push_str(&(rest[..digits].parse::<usize>().unwrap() + by).to_string());
+            rest = &rest[digits..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// An aggregate over a day table's rows, computed per day file and combined:
+/// `inner` is one file's statement with `{t}` where the table goes (each
+/// branch reads `<file>."table" AS "table"`, so qualified column names
+/// resolve), `outer` combines the branches, read as `{u}`. `binds` are the
+/// inner statement's, numbered `?1`... and repeated per branch. None on a
+/// single file or before any day file exists: run the plain statement.
+///
+/// Through the views, SQLite runs an aggregate over the union's rows (it
+/// does not push GROUP BY or COUNT into the branches), materializing every
+/// file's matching rows first: COUNT(*) over 7 days 4 -> 26 ms per-day.
+pub fn aggregate(
+    conn: &Connection,
+    table: &str,
+    inner: &str,
+    outer: &str,
+    binds: &[rusqlite::types::Value],
+) -> rusqlite::Result<Option<Vec<crate::dashboard::db::Rec>>> {
+    if !is_union(conn) {
+        return Ok(None);
+    }
+    let files = branches(conn, table)?;
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let n = binds.len();
+    let parts: Vec<String> = files
+        .iter()
+        .enumerate()
+        .map(|(k, f)| {
+            // ?i -> this branch's own slot, in one pass over the SQL.
+            let sql = renumber(&inner.replace("{t}", &format!("{}.\"{table}\" AS \"{table}\"", f.alias)), k * n);
+            format!("SELECT * FROM ({sql})")
+        })
+        .collect();
+    let all: Vec<rusqlite::types::Value> = (0..files.len()).flat_map(|_| binds.iter().cloned()).collect();
+    let sql = outer.replace("{u}", &format!("({})", parts.join(" UNION ALL ")));
+    crate::dashboard::db::query_as_is(conn, &sql, rusqlite::params_from_iter(all.iter())).map(Some)
+}
+
 /// The index hints the dashboard's SQL carries (dashboard::filter_query,
 /// tenant): (table, Some(index)) for `INDEXED BY index`, None for `NOT
 /// INDEXED`. Each gets a hinted view in attach_all. cursor_page's
@@ -302,6 +359,11 @@ pub fn strip_index_hints(sql: &str) -> std::borrow::Cow<'_, str> {
 mod tests {
     use super::*;
     use crate::storage::layout::{day_path, meta_path, open_or_create};
+
+    #[test]
+    fn renumbers_parameters_once() {
+        assert_eq!(renumber("a = ?1 AND b BETWEEN ?2 AND ?3 OR c = ?12", 3), "a = ?4 AND b BETWEEN ?5 AND ?6 OR c = ?15");
+    }
 
     #[test]
     fn strips_hints() {

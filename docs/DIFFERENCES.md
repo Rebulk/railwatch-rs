@@ -734,9 +734,17 @@ see STORAGE.md, was data drift, not storage),
    the row retention cutoff), same rule otherwise. `ingest_batches`,
    `processes`, `health_samples` go with their core day file instead of a
    DELETE by time.
-7. **INDEXED BY / NOT INDEXED are dropped** on per-day reads (views can't
-   take them). Each file's planner chooses; props are identical, timings
-   in STORAGE.md (+15% summed over 122 cases; the slowest page is faster).
+7. **Per-day reads are rewritten, not just unioned.** INDEXED BY / NOT
+   INDEXED go to hinted views (a view can't take them), and the statements
+   that were slow over the union run inside each day file and are combined:
+   cursor pages take each file's own top N (`idx_queries_slowest` only in
+   files whose whole day is in the window), log text filters use each file's
+   own FTS index, and COUNT / logs' level counts / queue stats / active
+   people are computed per file and summed (AVG as SUM/COUNT, exact for the
+   integer column). Same rows and order as one file: `bench/storage/
+   slow_pages.sh` 383/383 cases byte-identical single vs per-day, and
+   `per_day_pages_equal_the_single_file` (docs/PERF.md, "Slow dashboard
+   pages").
 8. **Profile links across days**: `link_profiles!` looks for an
    execution's profiles in the core files of the days the batch writes and
    the day either side of each. An execution whose profile arrives more
