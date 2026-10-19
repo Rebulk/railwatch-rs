@@ -12,19 +12,22 @@ use crate::dashboard::cursor_page::{self, Order};
 use crate::dashboard::db::{jf, ji, js, jt};
 use crate::dashboard::filter_query::{self, Resource, s};
 use crate::dashboard::models::{self, execution_row};
-use crate::dashboard::{execution_presenter, rb, tenant};
+use crate::dashboard::{execution_presenter, rb, rollup, tenant};
 
 // -- overview ----------------------------------------------------------------
 
 pub fn overview_show(conn: &Connection, ctx: &PageContext, control: &dyn ControlData) -> R {
     let (from, to) = ctx.range();
-    let requests = aggregations::grouped(conn, "request", from, to, 8, Some("p95"), None)?;
-    let jobs = aggregations::grouped(conn, "job_attempt", from, to, 8, None, None)?;
+    // One rollup read per type for its table and its totals.
+    let request_rows = rollup::between(conn, "request", from, to)?;
+    let job_rows = rollup::between(conn, "job_attempt", from, to)?;
+    let requests = aggregations::grouped_rows(&request_rows, from, to, 8, Some("p95"), None);
+    let jobs = aggregations::grouped_rows(&job_rows, from, to, 8, None, None);
     let issues: Vec<Value> = recent_issues(control.issues()).into_iter().filter(|i| i.status == "open").take(8).map(|i| issue_row(&i)).collect();
     Ok(crate::obj! {
         "totals" => crate::obj! {
-            "requests" => summary_with_delta(conn, ctx, "request", None)?,
-            "jobs" => summary_with_delta(conn, ctx, "job_attempt", None)?,
+            "requests" => aggregations::summary_with_delta_of(conn, "request", &request_rows, ctx.previous_range())?,
+            "jobs" => aggregations::summary_with_delta_of(conn, "job_attempt", &job_rows, ctx.previous_range())?,
         },
         "request_series" => series(conn, ctx, "request", None)?,
         "job_series" => series(conn, ctx, "job_attempt", None)?,
@@ -149,12 +152,27 @@ pub fn jobs_index(conn: &Connection, ctx: &PageContext, control: &dyn ControlDat
 }
 
 pub fn queue_stats(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<Value> {
-    let rows = db::query(
+    let binds = [s("job_attempt"), s(&qt(from)), s(&qt(to))];
+    // Per day file and combined on a per-day tenant (storage::reader::
+    // aggregate). AVG of an integer column is its exact sum over its count.
+    let per_file = crate::storage::reader::aggregate(
         conn,
-        "SELECT \"executions\".\"queue\", COUNT(*), AVG(queue_latency), SUM(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END) FROM \"executions\" \
+        "executions",
+        "SELECT \"executions\".\"queue\" AS queue, COUNT(*) AS n, SUM(queue_latency) AS lat, COUNT(queue_latency) AS lat_n, \
+         SUM(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END) AS failed FROM {t} \
          WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 GROUP BY \"executions\".\"queue\"",
-        rusqlite::params!["job_attempt", qt(from), qt(to)],
+        "SELECT queue, SUM(n), CAST(SUM(lat) AS REAL) / SUM(lat_n), SUM(failed) FROM {u} GROUP BY queue",
+        &binds,
     )?;
+    let rows = match per_file {
+        Some(rows) => rows,
+        None => db::query(
+            conn,
+            "SELECT \"executions\".\"queue\", COUNT(*), AVG(queue_latency), SUM(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END) FROM \"executions\" \
+             WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 GROUP BY \"executions\".\"queue\"",
+            rusqlite::params_from_iter(binds.iter()),
+        )?,
+    };
     Ok(Value::Array(
         rows.iter()
             .map(|r| {
@@ -357,15 +375,35 @@ pub fn traces_show(conn: &Connection, ctx: &PageContext, _control: &dyn ControlD
 
 // -- people ------------------------------------------------------------------
 
+/// `requests.between(..).where.not(user_ref: nil).group(:user_ref)` with
+/// its count, errors and last seen, sorted by user_ref (the GROUP BY's
+/// order). Per day file and combined on a per-day tenant.
+pub fn active_people(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<Vec<db::Rec>> {
+    let binds = [s("request"), s(&qt(from)), s(&qt(to))];
+    let per_file = crate::storage::reader::aggregate(
+        conn,
+        "executions",
+        "SELECT \"executions\".\"user_ref\" AS user_ref, COUNT(*) AS n, SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END) AS errors, MAX(occurred_at) AS last \
+         FROM {t} WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 AND \"executions\".\"user_ref\" IS NOT NULL \
+         GROUP BY \"executions\".\"user_ref\"",
+        "SELECT user_ref AS \"user_ref\", SUM(n) AS \"COUNT(*)\", SUM(errors), MAX(last) FROM {u} GROUP BY user_ref",
+        &binds,
+    )?;
+    match per_file {
+        Some(rows) => Ok(rows),
+        None => db::query(
+            conn,
+            "SELECT \"executions\".\"user_ref\", COUNT(*), SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END), MAX(occurred_at) FROM \"executions\" \
+             WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 AND \"executions\".\"user_ref\" IS NOT NULL \
+             GROUP BY \"executions\".\"user_ref\"",
+            rusqlite::params_from_iter(binds.iter()),
+        ),
+    }
+}
+
 pub fn people_index(conn: &Connection, ctx: &PageContext, _control: &dyn ControlData) -> R {
     let (from, to) = ctx.range();
-    let rows = db::query(
-        conn,
-        "SELECT \"executions\".\"user_ref\", COUNT(*), SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END), MAX(occurred_at) FROM \"executions\" \
-         WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 AND \"executions\".\"user_ref\" IS NOT NULL \
-         GROUP BY \"executions\".\"user_ref\"",
-        rusqlite::params!["request", qt(from), qt(to)],
-    )?;
+    let rows = active_people(conn, from, to)?;
     let active: Vec<(String, i64, Value, Value)> =
         rows.iter().map(|r| (r.s("user_ref").unwrap_or("").to_string(), r.i("COUNT(*)").unwrap_or(0), db::raw_json(r.at(2)), db::raw_json(r.at(3)))).collect();
     let active = rb::sort_by_num(active, |a| rb::Num::I(-a.1));

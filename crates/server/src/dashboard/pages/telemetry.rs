@@ -74,12 +74,13 @@ pub fn queries_index(conn: &Connection, ctx: &PageContext, _control: &dyn Contro
         Order::Slowest,
         &ctx.cursor_context("queries"),
     )??;
+    let (queries, summary) = grouped_and_summary(conn, ctx, "query", 200, true)?;
     Ok(crate::obj! {
-        "queries" => grouped(conn, ctx, "query", 200, true)?,
+        "queries" => queries,
         "n_plus_ones" => n_plus_ones(conn, from, to)?,
         "slowest" => page.rows.iter().map(models::query_row).collect::<Vec<_>>(),
         "pagination" => page.meta, "q" => ctx.param_s("q"),
-        "summary" => summary_with_delta(conn, ctx, "query", None)?,
+        "summary" => summary,
         "sort" => sort_param(ctx, "count"), "dir" => dir_param(ctx),
     })
 }
@@ -624,18 +625,21 @@ pub fn logs_index(conn: &Connection, ctx: &PageContext, _control: &dyn ControlDa
     let ids: Vec<i64> = page.rows.iter().filter_map(|r| r.i("id")).collect();
     let highlights = filter_query::fts_snippets(conn, &ids, &filter_query::parse(ctx.param("q")).text)?;
     let counts_cond = filter_query::apply(conn, Resource::Logs, ctx.param("q"), from, to, &["level", "status"])?;
-    let counts = select(
-        conn,
-        "logs",
-        "COUNT(*) AS \"count_all\", \"logs\".\"level\" AS \"logs_level\"",
-        &{
-            let mut c = counts_cond;
-            c.parts.push("1=1 GROUP BY \"logs\".\"level\"".into());
-            c
-        },
-        "",
-        None,
-    )?;
+    let counts = match log_level_counts_per_file(conn, &counts_cond)? {
+        Some(rows) => rows,
+        None => select(
+            conn,
+            "logs",
+            "COUNT(*) AS \"count_all\", \"logs\".\"level\" AS \"logs_level\"",
+            &{
+                let mut c = counts_cond;
+                c.parts.push("1=1 GROUP BY \"logs\".\"level\"".into());
+                c
+            },
+            "",
+            None,
+        )?,
+    };
     let mut cm = Map::new();
     for r in &counts {
         cm.insert(db::raw_json(r.at(1)).as_str().map_or("".into(), str::to_string), db::raw_json(r.at(0)));
@@ -646,10 +650,30 @@ pub fn logs_index(conn: &Connection, ctx: &PageContext, _control: &dyn ControlDa
     })
 }
 
+/// logs#index's `group(:level).count` over a per-day tenant: each day file
+/// counts its own rows (on its own indexes, FTS paired to its own index) and
+/// the counts are summed per level. Through the views the GROUP BY ran over
+/// the union's rows: logs.fts@7d's counts 140 -> 40 ms. Levels come back
+/// sorted, as the single file's GROUP BY (a sorted temp b-tree or the
+/// level index) returns them, and `counts` is a hash keyed in that order.
+/// None on a single file.
+fn log_level_counts_per_file(conn: &Connection, cond: &filter_query::Cond) -> rusqlite::Result<Option<Vec<db::Rec>>> {
+    let (Some(range), false) = (cond.range, cond.none) else { return Ok(None) };
+    if !crate::storage::reader::is_union(conn) || cond.from.is_some() {
+        return Ok(None);
+    }
+    let per_file = crate::storage::reader::per_file(conn, "logs", range, &cond.sql(), &cond.binds, |f, _, cond_sql| {
+        format!("SELECT COUNT(*) AS n, \"logs\".\"level\" AS level FROM {}.\"logs\" AS \"logs\" WHERE {cond_sql} GROUP BY \"logs\".\"level\"", f.alias)
+    })?;
+    let Some((union, binds)) = per_file else { return Ok(None) };
+    let sql = format!("SELECT SUM(n) AS \"count_all\", level AS \"logs_level\" FROM ({union}) GROUP BY level ORDER BY level");
+    Ok(Some(db::query_as_is(conn, &sql, rusqlite::params_from_iter(binds.iter()))?))
+}
+
 // -- spans -------------------------------------------------------------------
 
 pub fn spans_index(conn: &Connection, ctx: &PageContext, _control: &dyn ControlData) -> R {
-    let mut spans = grouped(conn, ctx, "span", 200, true)?;
+    let (mut spans, summary) = grouped_and_summary(conn, ctx, "span", 200, true)?;
     let p = filter_query::parse(ctx.param("q"));
     if let Some(n) = p.field("name") {
         spans.retain(|s| s["name"].as_str().unwrap_or("").contains(n));
@@ -658,7 +682,7 @@ pub fn spans_index(conn: &Connection, ctx: &PageContext, _control: &dyn ControlD
         spans.retain(|s| s["errors"].as_i64().unwrap_or(0) > 0);
     }
     Ok(crate::obj! {
-        "spans" => spans, "series" => series(conn, ctx, "span", None)?, "summary" => summary_with_delta(conn, ctx, "span", None)?,
+        "spans" => spans, "series" => series(conn, ctx, "span", None)?, "summary" => summary,
         "sort" => sort_param(ctx, "count"), "dir" => dir_param(ctx), "q" => ctx.param_s("q"),
     })
 }
@@ -798,24 +822,17 @@ fn executions_in(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<i64>
     let first = if fh == from { from } else { fh + 3_600_000_000 };
     let last = rb::beginning_of_hour(to);
     if first >= last {
-        return db::count(
-            conn,
-            "SELECT COUNT(*) FROM \"executions\" WHERE \"executions\".\"occurred_at\" BETWEEN ?1 AND ?2",
-            rusqlite::params![qt(from), qt(to)],
-        );
+        return db::count_where(conn, "executions", "\"executions\".\"occurred_at\" BETWEEN ?1 AND ?2", &[s(&qt(from)), s(&qt(to))]);
     }
-    let a = db::count(
-        conn,
-        "SELECT COUNT(*) FROM \"executions\" WHERE \"executions\".\"occurred_at\" >= ?1 AND \"executions\".\"occurred_at\" < ?2",
-        rusqlite::params![qt(from), qt(first)],
-    )?;
+    let a =
+        db::count_where(conn, "executions", "\"executions\".\"occurred_at\" >= ?1 AND \"executions\".\"occurred_at\" < ?2", &[s(&qt(from)), s(&qt(first))])?;
     let b = db::count(
         conn,
         "SELECT SUM(\"rollups\".\"count\") FROM \"rollups\" WHERE \"rollups\".\"record_type\" IN ('request', 'job_attempt', 'scheduled_task', 'command', 'channel_action') \
          AND \"rollups\".\"bucket\" >= ?1 AND \"rollups\".\"bucket\" < ?2",
         rusqlite::params![qt(first), qt(last)],
     )?;
-    let c = db::count(conn, "SELECT COUNT(*) FROM \"executions\" WHERE \"executions\".\"occurred_at\" BETWEEN ?1 AND ?2", rusqlite::params![qt(last), qt(to)])?;
+    let c = db::count_where(conn, "executions", "\"executions\".\"occurred_at\" BETWEEN ?1 AND ?2", &[s(&qt(last)), s(&qt(to))])?;
     Ok(a + b + c)
 }
 
@@ -1392,6 +1409,95 @@ mod like_tests {
         assert_eq!(l["recent"].as_array().unwrap().iter().map(|x| x["model"].clone()).collect::<Vec<_>>(), ["gpt_4"]);
         let l = page(llm_calls_index, "attachments:100%");
         assert_eq!(l["recent"].as_array().unwrap().iter().map(|x| x["attachment_types"].clone()).collect::<Vec<_>>(), ["100%png"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod per_day_tests {
+    use super::*;
+    use crate::dashboard::control::StaticControl;
+
+    /// The per-file rewrites (cursor pages, FTS paired per file, the summed
+    /// aggregates) give the single file's props: four log levels, two queues
+    /// with real latencies, three users, rows on five days, a text filter, a
+    /// cursor page and the slowest-queries page.
+    #[test]
+    fn per_day_pages_equal_the_single_file() {
+        let dir = std::env::temp_dir().join(format!("rw-perday-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t.sqlite3");
+        let t = crate::tenants::open_tenant(&file).unwrap();
+        let now = crate::time::parse_db_time("2026-10-16 12:00:00").unwrap();
+        let mut id = 0;
+        // Five days: enough files that per-file binds renumber past ?3.
+        for day in ["2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16"] {
+            for (i, level) in ["warn", "info", "error", "debug", "info", "info"].iter().enumerate() {
+                id += 1;
+                let at = format!("{day} 0{i}:00:00.{id:06}");
+                let msg = if i % 2 == 0 { format!("Completed {id}") } else { format!("Started {id}") };
+                t.execute("INSERT INTO logs (id, level, message, occurred_at) VALUES (?, ?, ?, ?)", rusqlite::params![id, level, msg, at]).unwrap();
+                t.execute(
+                    "INSERT INTO queries (id, sql, name, duration, occurred_at, adapter, group_hash) VALUES (?, 'SELECT 1', 'Widget Load', ?, ?, 'sqlite', 'g')",
+                    rusqlite::params![id, (id * 7919) % 50, at],
+                )
+                .unwrap();
+                // Jobs on two queues with odd latencies (AVG over files must be
+                // exact) and requests from three users, some failing.
+                t.execute(
+                    "INSERT INTO executions (id, execution_id, kind, name, occurred_at, duration, queue, queue_latency, outcome, status, user_ref, group_hash) \
+                     VALUES (?1, ?2, ?3, 'X', ?4, 1000, ?5, ?6, ?7, ?8, ?9, 'g')",
+                    rusqlite::params![
+                        id,
+                        format!("e{id}"),
+                        if i % 2 == 0 { "job_attempt" } else { "request" },
+                        at,
+                        if i % 4 == 0 { "default" } else { "mailers" },
+                        if i == 2 { None } else { Some(id * 37 + 1) },
+                        if i == 4 { "failed" } else { "ok" },
+                        if i == 3 { 503 } else { 200 },
+                        ["ada", "bob", "cy"][id as usize % 3],
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        t.execute("INSERT INTO logs_fts (rowid, message) SELECT id, message FROM logs", []).unwrap();
+        drop(t);
+        crate::storage::export::split(&file, &dir.join("t")).unwrap();
+        let single = crate::dashboard::pool::open_reader(&file).unwrap();
+        let (days, _) = crate::storage::reader::open(&dir.join("t")).unwrap();
+        let ctx = |params: &[(&str, &str)]| {
+            PageContext::new(1, now, params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), crate::dashboard::CursorKey(b"k".to_vec()))
+        };
+        for params in [
+            vec![("window", "7d")],
+            vec![("window", "7d"), ("q", "complet")],
+            vec![("window", "24h"), ("limit", "2")],
+            vec![("window", "7d"), ("q", "level:info")],
+            // The single file's slowest-queries probe: filters matching every
+            // row (a full page from the probe) and none (the fallback).
+            vec![("window", "7d"), ("q", "widget"), ("limit", "2")],
+            vec![("window", "7d"), ("q", "adapter:sqlite"), ("limit", "3")],
+            vec![("window", "7d"), ("q", "adapter:mysql")],
+        ] {
+            let c = ctx(&params);
+            let a = logs_index(&single, &c, &StaticControl::default()).unwrap();
+            let b = logs_index(&days, &c, &StaticControl::default()).unwrap();
+            assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap(), "logs {params:?}");
+            let a = queries_index(&single, &c, &StaticControl::default()).unwrap();
+            let b = queries_index(&days, &c, &StaticControl::default()).unwrap();
+            assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap(), "queries {params:?}");
+            for page in [crate::dashboard::pages::jobs_index as fn(&Connection, &PageContext, &dyn ControlData) -> R, people_index, profiles_index] {
+                let a = page(&single, &c, &StaticControl::default()).unwrap();
+                let b = page(&days, &c, &StaticControl::default()).unwrap();
+                assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap(), "{params:?}");
+            }
+        }
+        let queues = crate::dashboard::pages::queue_stats(&days, now - 7 * 86_400_000_000, now).unwrap();
+        assert_eq!(queues.as_array().unwrap().len(), 2, "{queues}");
+        let counts = logs_index(&days, &ctx(&[("window", "7d")]), &StaticControl::default()).unwrap()["counts"].clone();
+        assert_eq!(serde_json::to_string(&counts).unwrap(), r#"{"debug":5,"error":5,"info":15,"warn":5}"#);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -114,7 +114,17 @@ pub fn prepare<'c>(conn: &'c Connection, sql: &str) -> rusqlite::Result<rusqlite
 }
 
 pub fn query<P: Params>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Vec<Rec>> {
-    let mut stmt = prepare(conn, sql)?;
+    rows(prepare(conn, sql)?, params)
+}
+
+/// `query` for SQL that names attached day files itself (storage::reader's
+/// per-file branches): its index hints are meant for those files and are
+/// kept.
+pub fn query_as_is<P: Params>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Vec<Rec>> {
+    rows(conn.prepare_cached(sql)?, params)
+}
+
+fn rows<P: Params>(mut stmt: rusqlite::CachedStatement<'_>, params: P) -> rusqlite::Result<Vec<Rec>> {
     let cols: Arc<Vec<String>> = Arc::new(stmt.column_names().into_iter().map(str::to_string).collect());
     let n = cols.len();
     let mut rows = stmt.query(params)?;
@@ -141,6 +151,18 @@ pub fn query_one<P: Params>(conn: &Connection, sql: &str, params: P) -> rusqlite
 
 pub fn count<P: Params>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<i64> {
     prepare(conn, sql)?.query_row(params, |r| r.get::<_, Option<i64>>(0)).map(|v| v.unwrap_or(0))
+}
+
+/// `SELECT COUNT(*) FROM "<table>" WHERE <cond>` (`cond` with `?1`...
+/// binds). Over a per-day tenant each day file counts its own rows and the
+/// counts are added (storage::reader::aggregate), which gives the same
+/// number without the union materializing every row.
+pub fn count_where(conn: &Connection, table: &str, cond: &str, binds: &[Sql]) -> rusqlite::Result<i64> {
+    let inner = format!("SELECT COUNT(*) AS n FROM {{t}} WHERE {cond}");
+    if let Some(rows) = crate::storage::reader::aggregate(conn, table, &inner, "SELECT SUM(n) FROM {u}", binds)? {
+        return Ok(rows.first().and_then(|r| r.i("SUM(n)")).unwrap_or(0));
+    }
+    count(conn, &format!("SELECT COUNT(*) FROM \"{table}\" WHERE {cond}"), rusqlite::params_from_iter(binds.iter()))
 }
 
 /// A bind for a time, as Active Record quotes it (quoted_date).

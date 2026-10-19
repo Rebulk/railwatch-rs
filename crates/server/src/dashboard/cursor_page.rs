@@ -143,7 +143,27 @@ pub fn call(
         cond.from.clone().unwrap_or_else(|| format!("\"{table}\""))
     };
     let sql = format!("SELECT {select} FROM {from} WHERE {} ORDER BY \"{table}\".\"{col}\" DESC, \"{table}\".\"id\" DESC LIMIT {}", cond.sql(), limit + 1);
-    let rows = match db::query(conn, &sql, rusqlite::params_from_iter(cond.binds.iter())) {
+    let per_file = match per_file(conn, table, select, &cond, order, limit + 1) {
+        Ok(p) => p,
+        Err(e) => return Ok(Err(e)),
+    };
+    let rows = match per_file.map_or_else(
+        || match slowest_probe(conn, table, select, &cond, order, limit + 1) {
+            Ok(Some(rows)) => Ok(rows),
+            Ok(None) if probed(table, &cond, order) && !crate::storage::reader::is_union(conn) => db::query(
+                conn,
+                &format!(
+                    "SELECT {select} FROM \"{table}\" WHERE {} ORDER BY \"{table}\".\"{col}\" DESC, \"{table}\".\"id\" DESC LIMIT {}",
+                    cond.sql(),
+                    limit + 1
+                ),
+                rusqlite::params_from_iter(cond.binds.iter()),
+            ),
+            Ok(None) => db::query(conn, &sql, rusqlite::params_from_iter(cond.binds.iter())),
+            Err(e) => Err(e),
+        },
+        |(sql, binds)| db::query_as_is(conn, &sql, rusqlite::params_from_iter(binds.iter())),
+    ) {
         Ok(r) => r,
         Err(e) => return Ok(Err(e)),
     };
@@ -162,6 +182,83 @@ pub fn call(
         Value::Null
     };
     Ok(Ok(Page { rows, meta: crate::obj! { "limit" => limit, "next_cursor" => next, "has_more" => has_more } }))
+}
+
+/// The page's statement over a per-day tenant as each day file's own top
+/// `n` (`ORDER BY col DESC, id DESC LIMIT n` inside the file, on its
+/// indexes), merged and cut to `n`. (col, id) is a total order and ids are
+/// environment-wide, so these are the rows the view returns, in its order.
+/// Through the view, SQLite sorted every row in range of every file first:
+/// queries@7d 31 -> 5 ms, logs.fts@7d (FTS paired per file) 150 -> 50 ms.
+/// `idx_queries_slowest` (the single file's hint) is used only in files
+/// whose whole day is in the window: at a window's edge it walks the file's
+/// slowest rows outside the window first (docs/PERF.md #5). As in the single
+/// file it is slow when a filter matches almost nothing (queries.q). None
+/// (use the view) on a single file, or for conditions with their own hints.
+fn per_file(
+    conn: &Connection,
+    table: &str,
+    select: &str,
+    cond: &Cond,
+    order: Order,
+    n: i64,
+) -> rusqlite::Result<Option<(String, Vec<rusqlite::types::Value>)>> {
+    let Some(range) = cond.range else { return Ok(None) };
+    let cond_sql = cond.sql();
+    if !crate::storage::reader::is_union(conn) || cond.from.is_some() || cond_sql.contains("INDEXED") {
+        return Ok(None);
+    }
+    let col = order.column();
+    let Some((union, binds)) = crate::storage::reader::per_file(conn, table, range, &cond_sql, &cond.binds, |f, covered, cond_sql| {
+        let hint = if covered && order == Order::Slowest && table == "queries" { " INDEXED BY idx_queries_slowest" } else { "" };
+        format!(
+            "SELECT {select} FROM {}.\"{table}\" AS \"{table}\"{hint} WHERE {cond_sql} ORDER BY \"{table}\".\"{col}\" DESC, \"{table}\".\"id\" DESC LIMIT {n}",
+            f.alias
+        )
+    })?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((format!("{union} ORDER BY \"{col}\" DESC, \"id\" DESC LIMIT {n}"), binds)))
+}
+
+/// How many rows of `idx_queries_slowest` the slowest-queries probe reads.
+const PROBE_ROWS: i64 = 2_000;
+
+/// The filtered slowest-queries page on one file: `idx_queries_slowest`
+/// stops after n rows when most rows match, but when a filter matches
+/// almost nothing it visits every row in the window in duration order
+/// (queries.q@7d: 440k rows, 355 ms). So walk only the index's first
+/// PROBE_ROWS rows in the window and filter those. If that gives a full
+/// page (`n` rows), they are the page: every row past the probe sorts after
+/// them. Otherwise None, and the caller runs the statement on the planner's
+/// own plan (the occurred_at range). (duration, id) is a total order, so
+/// either way the rows and their order are the statement's.
+fn slowest_probe(conn: &Connection, table: &str, select: &str, cond: &Cond, order: Order, n: i64) -> rusqlite::Result<Option<Vec<Rec>>> {
+    if !probed(table, cond, order) || crate::storage::reader::is_union(conn) {
+        return Ok(None);
+    }
+    // apply's first part is the window, with its two binds.
+    let rest = cond.parts[1..].join(" AND ");
+    let sql = format!(
+        "SELECT {select} FROM (SELECT * FROM \"queries\" INDEXED BY idx_queries_slowest WHERE {} \
+         ORDER BY \"queries\".\"duration\" DESC, \"queries\".\"id\" DESC LIMIT {PROBE_ROWS}) AS \"queries\" \
+         WHERE {rest} ORDER BY \"queries\".\"duration\" DESC, \"queries\".\"id\" DESC LIMIT {n}",
+        cond.parts[0]
+    );
+    let rows = db::query(conn, &sql, rusqlite::params_from_iter(cond.binds.iter()))?;
+    Ok((rows.len() as i64 == n).then_some(rows))
+}
+
+/// The single-file slowest-queries page with conditions beyond its window.
+fn probed(table: &str, cond: &Cond, order: Order) -> bool {
+    order == Order::Slowest
+        && table == "queries"
+        && !cond.none
+        && cond.from.is_none()
+        && cond.range.is_some()
+        && cond.parts.len() > 1
+        && cond.parts[0].starts_with("\"queries\".\"occurred_at\" ")
 }
 
 fn value_int(v: &Value) -> Option<i64> {

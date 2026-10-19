@@ -77,6 +77,16 @@ pub(crate) fn summary_with_delta(conn: &Connection, ctx: &PageContext, record_ty
     aggregations::summary_with_delta(conn, record_type, ctx.range(), ctx.previous_range(), group_hash)
 }
 
+/// `grouped` and the all-groups `summary_with_delta` of one record type
+/// from one read of the window's rollups (both read the same rows).
+pub(crate) fn grouped_and_summary(conn: &Connection, ctx: &PageContext, record_type: &str, limit: usize, sort: bool) -> rusqlite::Result<(Vec<Value>, Value)> {
+    let (from, to) = ctx.range();
+    let (order, dir) = if sort { (ctx.param("sort"), ctx.param("dir")) } else { (None, None) };
+    let rows = super::rollup::between(conn, record_type, from, to)?;
+    let grouped = aggregations::grouped_rows(&rows, from, to, limit, order, dir);
+    Ok((grouped, aggregations::summary_with_delta_of(conn, record_type, &rows, ctx.previous_range())?))
+}
+
 pub(crate) fn deploys_in_window(control: &dyn ControlData, ctx: &PageContext) -> Value {
     let (from, to) = ctx.range();
     control::deploys_in_window(control, from, to)

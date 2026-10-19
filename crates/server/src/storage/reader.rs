@@ -143,6 +143,148 @@ pub fn is_union(conn: &Connection) -> bool {
     conn.path().is_none_or(str::is_empty)
 }
 
+/// One attached day file a table's rows can be in: its schema alias (`c3`,
+/// `d0`) and its day (`YYYY-MM-DD`, from the file name).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Branch {
+    pub alias: String,
+    pub day: String,
+    pub tier: Tier,
+}
+
+/// The attached day files `table` reads from, as its view unions them
+/// (detail tables: the detail files, then the core files). Empty for a meta
+/// table, or before any day file exists.
+pub fn branches(conn: &Connection, table: &str) -> rusqlite::Result<Vec<Branch>> {
+    let tier = Tier::of(table);
+    if tier == Tier::Meta {
+        return Ok(vec![]);
+    }
+    let mut files: Vec<Branch> = conn
+        .prepare_cached("SELECT name, file FROM pragma_database_list")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .filter_map(|r| {
+            let (alias, file) = match r {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            let t = match alias.as_bytes().first() {
+                Some(b'c') => Tier::Core,
+                Some(b'd') => Tier::Detail,
+                _ => return None,
+            };
+            if !alias[1..].bytes().all(|b| b.is_ascii_digit()) || (t == Tier::Detail && tier != Tier::Detail) {
+                return None;
+            }
+            let day = Path::new(&file).file_stem()?.to_str()?.to_string();
+            Some(Ok(Branch { alias, day, tier: t }))
+        })
+        .collect::<rusqlite::Result<_>>()?;
+    files.sort_by_key(|b| (b.tier != Tier::Detail, b.alias[1..].parse::<usize>().unwrap_or(0)));
+    Ok(files)
+}
+
+/// `cond_sql` for one day file: `logs_fts` (filter_query's full-text term)
+/// names that file's own index. A log's FTS entry is always in the file that
+/// holds the log (ingest, exemplars and export index per file), so the
+/// pairing returns the same rows, and the whole union of FTS indexes is not
+/// re-run inside every file's branch.
+pub fn pair_fts(cond_sql: &str, alias: &str) -> String {
+    cond_sql.replace("FROM logs_fts WHERE", &format!("FROM {alias}.logs_fts WHERE"))
+}
+
+/// A statement over `table` as one branch per day file it reads,
+/// `(b1) UNION ALL (b2) ...`: `branch(file, covered, cond)` writes each, with
+/// `cond` the WHERE clause whose FTS term is paired to that file and
+/// `covered` when [lo, hi] (epoch micros, the statement's own occurred_at
+/// bounds) spans the file's whole day. `binds` repeat per branch. None when
+/// there is no day file (the view, over meta's empty table, is as cheap).
+///
+/// Every file is read, so the rows are the view's rows whatever a file
+/// holds; what this buys is that a page's ORDER BY ... LIMIT and GROUP BY run
+/// inside each file on its own indexes, instead of over the union's rows.
+/// `covered` only picks a plan (an index hint); it never drops a row.
+pub fn per_file(
+    conn: &Connection,
+    table: &str,
+    (lo, hi): (i64, i64),
+    cond_sql: &str,
+    binds: &[rusqlite::types::Value],
+    branch: impl Fn(&Branch, bool, &str) -> String,
+) -> rusqlite::Result<Option<(String, Vec<rusqlite::types::Value>)>> {
+    let files = branches(conn, table)?;
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let (from_day, to_day) = (crate::time::quoted_date_micros(lo)[..10].to_string(), crate::time::quoted_date_micros(hi)[..10].to_string());
+    let mut all = Vec::with_capacity(binds.len() * files.len());
+    let parts: Vec<String> = files
+        .iter()
+        .map(|f| {
+            all.extend_from_slice(binds);
+            format!("SELECT * FROM ({})", branch(f, f.day > from_day && f.day < to_day, &pair_fts(cond_sql, &f.alias)))
+        })
+        .collect();
+    Ok(Some((parts.join(" UNION ALL "), all)))
+}
+
+/// `?i` -> `?{i + by}` for every numbered parameter (none sit in string
+/// literals in the dashboard's SQL).
+fn renumber(sql: &str, by: usize) -> String {
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut rest = sql;
+    while let Some(i) = rest.find('?') {
+        out.push_str(&rest[..=i]);
+        rest = &rest[i + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 {
+            out.push_str(&(rest[..digits].parse::<usize>().unwrap() + by).to_string());
+            rest = &rest[digits..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// An aggregate over a day table's rows, computed per day file and combined:
+/// `inner` is one file's statement with `{t}` where the table goes (each
+/// branch reads `<file>."table" AS "table"`, so qualified column names
+/// resolve), `outer` combines the branches, read as `{u}`. `binds` are the
+/// inner statement's, numbered `?1`... and repeated per branch. None on a
+/// single file or before any day file exists: run the plain statement.
+///
+/// Through the views, SQLite runs an aggregate over the union's rows (it
+/// does not push GROUP BY or COUNT into the branches), materializing every
+/// file's matching rows first: COUNT(*) over 7 days 4 -> 26 ms per-day.
+pub fn aggregate(
+    conn: &Connection,
+    table: &str,
+    inner: &str,
+    outer: &str,
+    binds: &[rusqlite::types::Value],
+) -> rusqlite::Result<Option<Vec<crate::dashboard::db::Rec>>> {
+    if !is_union(conn) {
+        return Ok(None);
+    }
+    let files = branches(conn, table)?;
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let n = binds.len();
+    let parts: Vec<String> = files
+        .iter()
+        .enumerate()
+        .map(|(k, f)| {
+            // ?i -> this branch's own slot, in one pass over the SQL.
+            let sql = renumber(&inner.replace("{t}", &format!("{}.\"{table}\" AS \"{table}\"", f.alias)), k * n);
+            format!("SELECT * FROM ({sql})")
+        })
+        .collect();
+    let all: Vec<rusqlite::types::Value> = (0..files.len()).flat_map(|_| binds.iter().cloned()).collect();
+    let sql = outer.replace("{u}", &format!("({})", parts.join(" UNION ALL ")));
+    crate::dashboard::db::query_as_is(conn, &sql, rusqlite::params_from_iter(all.iter())).map(Some)
+}
+
 /// The index hints the dashboard's SQL carries (dashboard::filter_query,
 /// tenant): (table, Some(index)) for `INDEXED BY index`, None for `NOT
 /// INDEXED`. Each gets a hinted view in attach_all. cursor_page's
@@ -217,6 +359,11 @@ pub fn strip_index_hints(sql: &str) -> std::borrow::Cow<'_, str> {
 mod tests {
     use super::*;
     use crate::storage::layout::{day_path, meta_path, open_or_create};
+
+    #[test]
+    fn renumbers_parameters_once() {
+        assert_eq!(renumber("a = ?1 AND b BETWEEN ?2 AND ?3 OR c = ?12", 3), "a = ?4 AND b BETWEEN ?5 AND ?6 OR c = ?15");
+    }
 
     #[test]
     fn strips_hints() {

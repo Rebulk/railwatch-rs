@@ -44,25 +44,56 @@ pub fn bucket_range(conn: &Connection, record_type: &str, lo: i64, hi: i64) -> r
     load(conn, BETWEEN, rusqlite::params![record_type, qt(lo), qt(hi)])
 }
 
+/// Decodes straight from the statement (the 7-day queries page reads ~30k
+/// rollup rows; going through `db::Rec` copied every column into an owned
+/// value first and cost more than the SQL). Same values as `Rec`'s
+/// accessors: text columns lossily as UTF-8, numbers as `Rec::i`.
 pub fn load<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Vec<Rollup>> {
-    Ok(db::query(conn, sql, params)?
-        .into_iter()
-        .map(|r| Rollup {
-            group_hash: r.s("group_hash").unwrap_or_default().to_string(),
-            name: r.s("name").map(str::to_string),
-            bucket: r.t("bucket").unwrap_or(0),
-            count: r.i("count").unwrap_or(0),
-            error_count: r.i("error_count").unwrap_or(0),
-            client_error_count: r.i("client_error_count").unwrap_or(0),
-            duration_sum: r.i("duration_sum").unwrap_or(0),
-            duration_max: r.i("duration_max").unwrap_or(0),
-            digest: r.blob("digest").map(<[u8]>::to_vec),
-            extra: match r.json("extra") {
-                Value::Object(m) => m,
-                _ => Map::new(),
+    use rusqlite::types::ValueRef;
+    let mut stmt = db::prepare(conn, sql)?;
+    let col = |name: &str| stmt.column_index(name).ok();
+    let [group_hash, name, bucket, count, error_count, client_error_count, duration_sum, duration_max, digest, extra] =
+        ["group_hash", "name", "bucket", "count", "error_count", "client_error_count", "duration_sum", "duration_max", "digest", "extra"].map(col);
+    fn text(v: ValueRef<'_>) -> Option<std::borrow::Cow<'_, str>> {
+        match v {
+            ValueRef::Text(t) => Some(String::from_utf8_lossy(t)),
+            _ => None,
+        }
+    }
+    let int = |v: ValueRef<'_>| match v {
+        ValueRef::Integer(i) => i,
+        ValueRef::Real(f) => f as i64,
+        ValueRef::Text(t) => std::str::from_utf8(t).ok().and_then(|t| t.parse().ok()).unwrap_or(0),
+        _ => 0,
+    };
+    let mut rows = stmt.query(params)?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let get = |i: Option<usize>| -> rusqlite::Result<ValueRef<'_>> { i.map_or(Ok(ValueRef::Null), |i| r.get_ref(i)) };
+        out.push(Rollup {
+            group_hash: text(get(group_hash)?).unwrap_or_default().into_owned(),
+            name: text(get(name)?).map(|n| n.into_owned()),
+            bucket: text(get(bucket)?).and_then(|b| crate::time::parse_db_time(&b)).unwrap_or(0),
+            count: int(get(count)?),
+            error_count: int(get(error_count)?),
+            client_error_count: int(get(client_error_count)?),
+            duration_sum: int(get(duration_sum)?),
+            duration_max: int(get(duration_max)?),
+            digest: match get(digest)? {
+                ValueRef::Blob(b) | ValueRef::Text(b) => Some(b.to_vec()),
+                _ => None,
             },
-        })
-        .collect())
+            extra: match text(get(extra)?) {
+                Some(t) if t == "{}" => Map::new(),
+                Some(t) => match serde_json::from_str(&t) {
+                    Ok(Value::Object(m)) => m,
+                    _ => Map::new(),
+                },
+                None => Map::new(),
+            },
+        });
+    }
+    Ok(out)
 }
 
 /// Rollup.summarize's hash.

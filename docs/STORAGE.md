@@ -34,10 +34,13 @@ meta and every day file read-only, and creates one TEMP view per gem table
 (`UNION ALL` over the files that can hold it; detail tables also read the
 core files, which hold exemplars). `logs_fts` is a view with `rowid`, the
 hidden column and `message`, so `MATCH`, `rowid IN (...)` and `snippet()`
-work. The dashboard's SQL is unchanged; `INDEXED BY` / `NOT INDEXED` are
-dropped (a view can't take them) and each file's planner picks its index.
-Pushing the hint into every branch was measured slower (below), so it is not
-done. Readers re-attach when a day file appears or is deleted (checked on
+work. `INDEXED BY` / `NOT INDEXED` go to hinted views with the hint on
+every branch (docs/PERF.md #5). SQLite does not push ORDER BY ... LIMIT,
+GROUP BY or COUNT into a view's branches, so the statements that were slow
+over the union are written per file and combined: cursor pages
+(`cursor_page::per_file`, each file's top N, FTS paired to the file's own
+index) and the aggregates (`reader::aggregate`); docs/PERF.md, "Slow
+dashboard pages". Readers re-attach when a day file appears or is deleted (checked on
 pool checkout). `SQLITE_MAX_ATTACHED` is raised to 125
 (`.cargo/config.toml`): 90 days x 2 tiers would not fit, but detail is 7
 days, so 30-day retention is 1 + 30 + 7 = 38 files, 90 days 98.
