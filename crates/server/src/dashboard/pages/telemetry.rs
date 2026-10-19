@@ -1475,6 +1475,11 @@ mod per_day_tests {
             vec![("window", "7d"), ("q", "complet")],
             vec![("window", "24h"), ("limit", "2")],
             vec![("window", "7d"), ("q", "level:info")],
+            // The single file's slowest-queries probe: filters matching every
+            // row (a full page from the probe) and none (the fallback).
+            vec![("window", "7d"), ("q", "widget"), ("limit", "2")],
+            vec![("window", "7d"), ("q", "adapter:sqlite"), ("limit", "3")],
+            vec![("window", "7d"), ("q", "adapter:mysql")],
         ] {
             let c = ctx(&params);
             let a = logs_index(&single, &c, &StaticControl::default()).unwrap();
