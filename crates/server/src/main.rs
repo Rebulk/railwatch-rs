@@ -122,6 +122,52 @@ fn lock_data_dir(cfg: &Config, wait: bool) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
+/// serve's lock. With `standby_relay`, when another server holds it and
+/// this one can bind its own address (it is in another network namespace:
+/// a second container on the same volume), the address is served at once,
+/// relayed to the holder through serve.sock, until the lock is ours
+/// (standby.rs); the listener is returned with the lock. Otherwise (no
+/// relay, an inherited socket, TLS, the address taken by the holder
+/// itself) this waits for the lock as before.
+fn acquire_data_dir(cfg: &Config, runtime: &tokio::runtime::Runtime) -> Result<(std::fs::File, Option<tokio::net::TcpListener>), String> {
+    let relayable = cfg.standby_relay && cfg.tls.is_none() && std::env::var_os("LISTEN_FDS").is_none();
+    if !relayable {
+        return lock_data_dir(cfg, true).map(|l| (l, None));
+    }
+    if let Ok(l) = lock_data_dir(cfg, false) {
+        return Ok((l, None));
+    }
+    let Some(socket) = railwatch_server::standby::socket_path(&cfg.data_dir) else {
+        eprintln!("railwatch: standby_relay: {} is too long for a socket path; waiting without relaying", cfg.data_dir.display());
+        return lock_data_dir(cfg, true).map(|l| (l, None));
+    };
+    let listener = match std::net::TcpListener::bind(&cfg.bind) {
+        Ok(l) => l,
+        Err(e) => {
+            // The holder has this address: same host and network, so every
+            // client already reaches it.
+            eprintln!("railwatch: standby: cannot bind {} ({e}); the server holding the data dir answers there", cfg.bind);
+            return lock_data_dir(cfg, true).map(|l| (l, None));
+        }
+    };
+    listener.set_nonblocking(true).map_err(|e| format!("{}: {e}", cfg.bind))?;
+    eprintln!(
+        "railwatch: standby: another server holds {}/serve.lock; relaying {} to it through {} until it exits",
+        cfg.data_dir.display(),
+        cfg.bind,
+        socket.display()
+    );
+    let wait_cfg = cfg.clone();
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| format!("{}: {e}", wait_cfg.bind))?;
+        let lock_cfg = wait_cfg.clone();
+        let held = tokio::task::spawn_blocking(move || lock_data_dir(&lock_cfg, true));
+        let (listener, held) = railwatch_server::standby::relay(listener, socket, wait_cfg.http.max_connections, held).await;
+        let lock = held.map_err(|e| format!("waiting for serve.lock: {e}"))??;
+        Ok((lock, Some(listener)))
+    })
+}
+
 /// Runs an offline command only while no server holds the data dir.
 fn offline(f: impl FnOnce() -> ExitCode) -> ExitCode {
     match lock_data_dir(&config(), false) {
@@ -1217,12 +1263,14 @@ fn doctor_backups(cfg: &Config) -> bool {
 fn serve() -> ExitCode {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("RAILWATCH_LOG").unwrap_or_else(|_| "info".into())).init();
     let cfg = config();
-    // Held until the process exits, after the writers have drained.
-    let _lock = match lock_data_dir(&cfg, true) {
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+    // Held until the process exits, after the writers have drained. On
+    // standby (standby_relay) the address is served, relayed to the holder,
+    // while this waits, and the listener comes back with the lock.
+    let (_lock, standby_listener) = match acquire_data_dir(&cfg, &runtime) {
         Ok(l) => l,
         Err(e) => return fail(e),
     };
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     runtime.block_on(async {
         let control = open_control(&cfg);
         match cfg.secret() {
@@ -1299,9 +1347,25 @@ fn serve() -> ExitCode {
             }
             _ => None,
         };
-        let listener = match inherited.pop() {
-            Some(l) => l,
-            None => bind_or_exit(&cfg.bind).await,
+        let listener = match (inherited.pop(), standby_listener) {
+            (Some(l), _) => l,
+            (None, Some(l)) => l,
+            (None, None) => bind_or_exit(&cfg.bind).await,
+        };
+        // The holder also answers on serve.sock, for standby servers in other
+        // network namespaces (standby.rs).
+        let socket = match cfg.standby_relay.then(|| railwatch_server::standby::socket_path(&cfg.data_dir)).flatten() {
+            None => None,
+            Some(path) => match railwatch_server::standby::bind(&path) {
+                Ok(l) => {
+                    tracing::info!(socket = %path.display(), "also listening on the data dir's serve.sock for standby servers");
+                    Some(l)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, socket = %path.display(), "cannot listen on serve.sock: standby servers cannot relay to this one");
+                    None
+                }
+            },
         };
         let redirect = match (redirect_inherited, &cfg.tls_redirect_bind) {
             (Some(l), _) => Some(l),
@@ -1346,7 +1410,16 @@ fn serve() -> ExitCode {
         let app = web::mounted(&base_path, web::router(web_state), http::router(state.clone()));
         let app = railwatch_server::serve::source_link(railwatch_server::serve::hsts(app, cfg.hsts()));
         let listener = railwatch_server::tls::Listener::new(listener, tls);
-        railwatch_server::serve::run(listener, app, cfg.http, shutdown_signal()).await;
+        match socket {
+            None => railwatch_server::serve::run(listener, app, cfg.http, shutdown_signal()).await,
+            Some(socket) => {
+                let socket_app = app.clone();
+                tokio::join!(
+                    railwatch_server::serve::run(listener, app, cfg.http, shutdown_signal()),
+                    railwatch_server::serve::run(railwatch_server::standby::Socket(socket), socket_app, cfg.http, shutdown_signal()),
+                );
+            }
+        }
         let _ = stop_redirect.send(true);
         if let Some(t) = redirect_task {
             t.await.ok();

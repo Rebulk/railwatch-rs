@@ -147,13 +147,14 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `NEW_ISSUES_PER_ACCOUNT_PER_HOUR` | 3000 | the same across all of an account's environments |
 | `BASE_PATH` | none | serve every page under this prefix ([below](#running-behind-an-app)) |
 | `TRUSTED_PROXY_SECRET_FILE` | off | accept a signed `X-Railwatch-Proxy-Auth` header as the signed-in user ([below](#running-behind-an-app)) |
+| `STANDBY_RELAY` | off | a second server on a held data dir relays to the first ([below](#running-behind-an-app)) |
 
 ## Running behind an app
 
 For the railwatch-server gem, or anything else that runs this server next
 to one Rails app and shows the dashboard inside it (at `/railwatch`, behind
-the app's own login). A normal install needs neither, and both settings
-are off by default.
+the app's own login). A normal install needs none of this, and all three
+settings are off by default.
 
 **`RAILWATCH_BASE_PATH=/railwatch`** serves every page, asset, the live
 channel (`/railwatch/cable`), `/railwatch/mcp` and `/railwatch/api/v1`
@@ -216,6 +217,36 @@ The security model:
   loopback (`RAILWATCH_BIND=127.0.0.1:...`) and keep the key file
   readable only by the app's user (a world-readable one is warned about).
   Requests without the header still use cookie sign-in as usual.
+
+**`RAILWATCH_STANDBY_RELAY=1`** is for two containers of one app sharing
+the data volume during a blue/green deploy. Each container has its own
+loopback, and only one server may write the data (`serve.lock`). The
+server holding the lock also listens on `<data_dir>/serve.sock`. A second
+server started on the same data dir binds its own address at once and
+relays every connection to that socket until it gets the lock, then serves
+the address itself. The new container's agent is never refused during the
+overlap. A connection that arrives in the gap between the old server
+exiting and the new one listening waits for up to 30 s. Batches are
+stored once: a receipted batch whose answer was lost when the old server
+exited is retried by the agent and acknowledged as a duplicate by the
+new one.
+
+- No new network listener: the standby binds the address it would serve
+  anyway, and `serve.sock` is a Unix socket, mode 0600. Both ends check
+  the other's uid, so only the data dir's user can connect, and a standby
+  relays only to a server of that user.
+- The relay copies bytes and nothing else. Every relayed request is
+  authenticated by the holder exactly as if it had come in directly
+  (cookies, tokens, the proxy header, CSRF), and it can reach nothing but
+  the holder.
+- At most `MAX_CONNECTIONS` are relayed at once; more wait in the kernel's
+  backlog. The holder's HTTP timeouts apply to relayed connections, and it
+  sees them all as `127.0.0.1` (the agent's own address in this setup), so
+  `MAX_CONNECTIONS_PER_IP` and `RATE_LIMIT_IP` count them together.
+- Not used with built-in TLS or socket activation, or when the data dir's
+  path is too long for a socket (about 100 bytes). In those cases, and
+  when the holder already has the address (same host and network), the
+  second server waits for the lock as before.
 
 ## Weekly digest
 

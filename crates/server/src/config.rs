@@ -92,6 +92,12 @@ pub struct Config {
     pub trusted_proxy_secret: Option<Vec<u8>>,
     /// Where it was read from, for `railwatch doctor`.
     pub trusted_proxy_secret_file: Option<PathBuf>,
+    /// `standby_relay`: while another server holds the data dir, listen on
+    /// `bind` anyway and relay every connection to the holder through
+    /// `<data_dir>/serve.sock` (standby.rs); the holder listens there too.
+    /// For servers in separate network namespaces sharing one volume. Off:
+    /// a second server refuses connections until the first exits.
+    pub standby_relay: bool,
     /// Where the values came from, for `railwatch doctor`.
     pub sources: BTreeMap<&'static str, String>,
     pub file: Option<PathBuf>,
@@ -326,6 +332,7 @@ impl Config {
             }
             _ => return Err("backups need all of backup_s3_endpoint, backup_s3_bucket, backup_s3_access_key_id, backup_s3_secret_access_key".into()),
         };
+        let standby_relay = get("standby_relay", &["RAILWATCH_STANDBY_RELAY"]).is_some_and(|v| truthy(&v));
         let alert_delivery = match get("alert_delivery", &["RAILWATCH_ALERT_DELIVERY"]).as_deref().map(str::trim) {
             None | Some("on") => true,
             Some("off") => false,
@@ -425,6 +432,7 @@ impl Config {
             base_path,
             trusted_proxy_secret,
             trusted_proxy_secret_file: trusted_proxy_secret_file.map(PathBuf::from),
+            standby_relay,
             sources,
             file: l.file,
         })
@@ -580,6 +588,7 @@ impl Config {
                 },
                 src("trusted_proxy_secret_file"),
             ),
+            ("standby_relay".into(), self.standby_relay.to_string(), src("standby_relay")),
             ("alert_delivery".into(), if self.alert_delivery { "on" } else { "off (alerts recorded as skipped, never sent)" }.into(), src("alert_delivery")),
             ("secret_key_base".into(), if self.secret_key_base.is_some() { "(set)".into() } else { "(generated file)".into() }, src("secret_key_base")),
         ];
