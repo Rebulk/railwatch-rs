@@ -143,6 +143,91 @@ pub fn is_union(conn: &Connection) -> bool {
     conn.path().is_none_or(str::is_empty)
 }
 
+/// One attached day file a table's rows can be in: its schema alias (`c3`,
+/// `d0`) and its day (`YYYY-MM-DD`, from the file name).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Branch {
+    pub alias: String,
+    pub day: String,
+    pub tier: Tier,
+}
+
+/// The attached day files `table` reads from, as its view unions them
+/// (detail tables: the detail files, then the core files). Empty for a meta
+/// table, or before any day file exists.
+pub fn branches(conn: &Connection, table: &str) -> rusqlite::Result<Vec<Branch>> {
+    let tier = Tier::of(table);
+    if tier == Tier::Meta {
+        return Ok(vec![]);
+    }
+    let mut files: Vec<Branch> = conn
+        .prepare_cached("SELECT name, file FROM pragma_database_list")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .filter_map(|r| {
+            let (alias, file) = match r {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            let t = match alias.as_bytes().first() {
+                Some(b'c') => Tier::Core,
+                Some(b'd') => Tier::Detail,
+                _ => return None,
+            };
+            if !alias[1..].bytes().all(|b| b.is_ascii_digit()) || (t == Tier::Detail && tier != Tier::Detail) {
+                return None;
+            }
+            let day = Path::new(&file).file_stem()?.to_str()?.to_string();
+            Some(Ok(Branch { alias, day, tier: t }))
+        })
+        .collect::<rusqlite::Result<_>>()?;
+    files.sort_by_key(|b| (b.tier != Tier::Detail, b.alias[1..].parse::<usize>().unwrap_or(0)));
+    Ok(files)
+}
+
+/// `cond_sql` for one day file: `logs_fts` (filter_query's full-text term)
+/// names that file's own index. A log's FTS entry is always in the file that
+/// holds the log (ingest, exemplars and export index per file), so the
+/// pairing returns the same rows, and the whole union of FTS indexes is not
+/// re-run inside every file's branch.
+pub fn pair_fts(cond_sql: &str, alias: &str) -> String {
+    cond_sql.replace("FROM logs_fts WHERE", &format!("FROM {alias}.logs_fts WHERE"))
+}
+
+/// A statement over `table` as one branch per day file it reads,
+/// `(b1) UNION ALL (b2) ...`: `branch(file, covered, cond)` writes each, with
+/// `cond` the WHERE clause whose FTS term is paired to that file and
+/// `covered` when [lo, hi] (epoch micros, the statement's own occurred_at
+/// bounds) spans the file's whole day. `binds` repeat per branch. None when
+/// there is no day file (the view, over meta's empty table, is as cheap).
+///
+/// Every file is read, so the rows are the view's rows whatever a file
+/// holds; what this buys is that a page's ORDER BY ... LIMIT and GROUP BY run
+/// inside each file on its own indexes, instead of over the union's rows.
+/// `covered` only picks a plan (an index hint); it never drops a row.
+pub fn per_file(
+    conn: &Connection,
+    table: &str,
+    (lo, hi): (i64, i64),
+    cond_sql: &str,
+    binds: &[rusqlite::types::Value],
+    branch: impl Fn(&Branch, bool, &str) -> String,
+) -> rusqlite::Result<Option<(String, Vec<rusqlite::types::Value>)>> {
+    let files = branches(conn, table)?;
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let (from_day, to_day) = (crate::time::quoted_date_micros(lo)[..10].to_string(), crate::time::quoted_date_micros(hi)[..10].to_string());
+    let mut all = Vec::with_capacity(binds.len() * files.len());
+    let parts: Vec<String> = files
+        .iter()
+        .map(|f| {
+            all.extend_from_slice(binds);
+            format!("SELECT * FROM ({})", branch(f, f.day > from_day && f.day < to_day, &pair_fts(cond_sql, &f.alias)))
+        })
+        .collect();
+    Ok(Some((parts.join(" UNION ALL "), all)))
+}
+
 /// The index hints the dashboard's SQL carries (dashboard::filter_query,
 /// tenant): (table, Some(index)) for `INDEXED BY index`, None for `NOT
 /// INDEXED`. Each gets a hinted view in attach_all. cursor_page's

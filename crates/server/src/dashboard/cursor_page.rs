@@ -143,7 +143,14 @@ pub fn call(
         cond.from.clone().unwrap_or_else(|| format!("\"{table}\""))
     };
     let sql = format!("SELECT {select} FROM {from} WHERE {} ORDER BY \"{table}\".\"{col}\" DESC, \"{table}\".\"id\" DESC LIMIT {}", cond.sql(), limit + 1);
-    let rows = match db::query(conn, &sql, rusqlite::params_from_iter(cond.binds.iter())) {
+    let per_file = match per_file(conn, table, select, &cond, order, limit + 1) {
+        Ok(p) => p,
+        Err(e) => return Ok(Err(e)),
+    };
+    let rows = match per_file.map_or_else(
+        || db::query(conn, &sql, rusqlite::params_from_iter(cond.binds.iter())),
+        |(sql, binds)| db::query_as_is(conn, &sql, rusqlite::params_from_iter(binds.iter())),
+    ) {
         Ok(r) => r,
         Err(e) => return Ok(Err(e)),
     };
@@ -162,6 +169,44 @@ pub fn call(
         Value::Null
     };
     Ok(Ok(Page { rows, meta: crate::obj! { "limit" => limit, "next_cursor" => next, "has_more" => has_more } }))
+}
+
+/// The page's statement over a per-day tenant as each day file's own top
+/// `n` (`ORDER BY col DESC, id DESC LIMIT n` inside the file, on its
+/// indexes), merged and cut to `n`. (col, id) is a total order and ids are
+/// environment-wide, so these are the rows the view returns, in its order.
+/// Through the view, SQLite sorted every row in range of every file first:
+/// queries@7d 31 -> 5 ms, logs.fts@7d (FTS paired per file) 150 -> 50 ms.
+/// `idx_queries_slowest` (the single file's hint) is used only in files
+/// whose whole day is in the window: at a window's edge it walks the file's
+/// slowest rows outside the window first (docs/PERF.md #5). As in the single
+/// file it is slow when a filter matches almost nothing (queries.q). None
+/// (use the view) on a single file, or for conditions with their own hints.
+fn per_file(
+    conn: &Connection,
+    table: &str,
+    select: &str,
+    cond: &Cond,
+    order: Order,
+    n: i64,
+) -> rusqlite::Result<Option<(String, Vec<rusqlite::types::Value>)>> {
+    let Some(range) = cond.range else { return Ok(None) };
+    let cond_sql = cond.sql();
+    if !crate::storage::reader::is_union(conn) || cond.from.is_some() || cond_sql.contains("INDEXED") {
+        return Ok(None);
+    }
+    let col = order.column();
+    let Some((union, binds)) = crate::storage::reader::per_file(conn, table, range, &cond_sql, &cond.binds, |f, covered, cond_sql| {
+        let hint = if covered && order == Order::Slowest && table == "queries" { " INDEXED BY idx_queries_slowest" } else { "" };
+        format!(
+            "SELECT {select} FROM {}.\"{table}\" AS \"{table}\"{hint} WHERE {cond_sql} ORDER BY \"{table}\".\"{col}\" DESC, \"{table}\".\"id\" DESC LIMIT {n}",
+            f.alias
+        )
+    })?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((format!("{union} ORDER BY \"{col}\" DESC, \"id\" DESC LIMIT {n}"), binds)))
 }
 
 fn value_int(v: &Value) -> Option<i64> {

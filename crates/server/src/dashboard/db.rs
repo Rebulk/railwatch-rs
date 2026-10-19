@@ -114,7 +114,17 @@ pub fn prepare<'c>(conn: &'c Connection, sql: &str) -> rusqlite::Result<rusqlite
 }
 
 pub fn query<P: Params>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Vec<Rec>> {
-    let mut stmt = prepare(conn, sql)?;
+    rows(prepare(conn, sql)?, params)
+}
+
+/// `query` for SQL that names attached day files itself (storage::reader's
+/// per-file branches): its index hints are meant for those files and are
+/// kept.
+pub fn query_as_is<P: Params>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Vec<Rec>> {
+    rows(conn.prepare_cached(sql)?, params)
+}
+
+fn rows<P: Params>(mut stmt: rusqlite::CachedStatement<'_>, params: P) -> rusqlite::Result<Vec<Rec>> {
     let cols: Arc<Vec<String>> = Arc::new(stmt.column_names().into_iter().map(str::to_string).collect());
     let n = cols.len();
     let mut rows = stmt.query(params)?;

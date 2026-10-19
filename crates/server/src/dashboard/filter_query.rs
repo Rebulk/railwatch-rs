@@ -113,6 +113,9 @@ pub struct Cond {
     pub none: bool,
     /// Overrides "FROM <table>" (INDEXED BY / NOT INDEXED hints).
     pub from: Option<String>,
+    /// The occurred_at range `apply` filtered on (epoch micros), so a
+    /// per-day read can tell which day files it covers whole.
+    pub range: Option<(i64, i64)>,
 }
 
 impl Cond {
@@ -153,6 +156,7 @@ pub fn bounded_time_range(p: &Parsed, from: i64, to: i64) -> (i64, i64, bool) {
 }
 
 fn time_range(c: &mut Cond, table: &str, (lo, hi, empty): (i64, i64, bool)) {
+    c.range = Some((lo, hi));
     if empty {
         c.and(format!("\"{table}\".\"occurred_at\" >= ? AND \"{table}\".\"occurred_at\" < ?"), vec![s(&qt(lo)), s(&qt(hi))]);
     } else {
