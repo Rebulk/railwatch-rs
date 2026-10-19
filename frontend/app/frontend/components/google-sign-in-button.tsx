@@ -2,6 +2,7 @@ import type { SVGAttributes } from "react"
 
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
+import { mountPath } from "@/lib/mount"
 
 function GoogleIcon(props: SVGAttributes<SVGElement>) {
   return (
@@ -64,8 +65,8 @@ export function GoogleSignInButton({
         method="post"
         action={
           reauthenticateFor
-            ? `/auth/google_oauth2?reauthenticate=${reauthenticateFor}`
-            : "/auth/google_oauth2"
+            ? `${mountPath()}/auth/google_oauth2?reauthenticate=${reauthenticateFor}`
+            : `${mountPath()}/auth/google_oauth2`
         }
       >
         <input type="hidden" name="authenticity_token" value={csrfToken()} />
