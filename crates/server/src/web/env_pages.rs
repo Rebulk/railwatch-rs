@@ -168,7 +168,7 @@ pub fn window_props(p: &Params, now: i64) -> Value {
 }
 
 /// SavedView.props_for(environment, user).
-fn saved_views(x: &rusqlite::Connection, env: i64, app: i64, user: i64) -> rusqlite::Result<Vec<Value>> {
+fn saved_views(x: &rusqlite::Connection, env: i64, app: i64, user: i64, base_path: &str) -> rusqlite::Result<Vec<Value>> {
     x.prepare(
         "SELECT id, name, page, query, \"window\", params, pinned, shared, user_id FROM saved_views
          WHERE environment_id = ?1 AND (shared = 1 OR user_id = ?2) ORDER BY name",
@@ -180,7 +180,7 @@ fn saved_views(x: &rusqlite::Connection, env: i64, app: i64, user: i64) -> rusql
         let extra: Value = serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or(json!({}));
         Ok(json!({"id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?, "page": page, "query": query, "window": window,
                   "params": extra, "pinned": r.get::<_, bool>(6)?, "shared": r.get::<_, bool>(7)?, "mine": r.get::<_, i64>(8)? == user,
-                  "url": saved_view_path(app, env, &page, window.as_deref(), query.as_deref(), &extra)}))
+                  "url": format!("{base_path}{}", saved_view_path(app, env, &page, window.as_deref(), query.as_deref(), &extra))}))
     })?
     .collect()
 }
@@ -333,7 +333,8 @@ async fn page(cx: Ctx, component: &'static str, segments: Vec<(String, String)>,
     };
     let params = Params::from_query(q.as_deref());
     let user = cx.user_id();
-    let views = match cx.state.db(move |c| c.with(|x| saved_views(x, env, app, user))).await {
+    let base = cx.state.config.base_path.clone();
+    let views = match cx.state.db(move |c| c.with(|x| saved_views(x, env, app, user, &base))).await {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = %e, "saved views failed");

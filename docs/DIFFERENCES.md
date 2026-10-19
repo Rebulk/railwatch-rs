@@ -252,6 +252,11 @@ cloud-only page driven in a real browser.
 14. **Security headers on pages** are a fixed subset (X-Frame-Options,
     nosniff, Referrer-Policy, a CSP without script-src). Rails' report-only
     CSP with nonces is not reproduced.
+15. **Running behind an app** (`base_path`, `trusted_proxy_secret_file`;
+    docs/SELF-HOST.md) has no Rails counterpart. Both are off by default, and off, every page, prop and response is the same
+    as before. With a base path the frontend is built with Vite's relative
+    `base: "./"` (asset and font URLs resolve against their own file), and
+    the entry script, icons and fonts in the document carry the prefix.
 
 ## Google sign-in (`web/google_oauth2.rs`, `web/sessions_oauth.rs`)
 

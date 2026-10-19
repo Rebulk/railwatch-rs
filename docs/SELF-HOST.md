@@ -145,6 +145,77 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `MAX_CONNECTIONS_PER_IP` | 256 | open connections from one address (an IPv6 /64); more are closed at once. Off with `TRUST_PROXY` (every connection comes from the proxy: limit per client there) |
 | `NEW_ISSUES_PER_HOUR`, `NEW_ISSUES_PER_BATCH` | 1000, 200 | per environment: past these, new exception groups count onto one "Too many new issues" issue |
 | `NEW_ISSUES_PER_ACCOUNT_PER_HOUR` | 3000 | the same across all of an account's environments |
+| `BASE_PATH` | none | serve every page under this prefix ([below](#running-behind-an-app)) |
+| `TRUSTED_PROXY_SECRET_FILE` | off | accept a signed `X-Railwatch-Proxy-Auth` header as the signed-in user ([below](#running-behind-an-app)) |
+
+## Running behind an app
+
+For the railwatch-server gem, or anything else that runs this server next
+to one Rails app and shows the dashboard inside it (at `/railwatch`, behind
+the app's own login). A normal install needs neither, and both settings
+are off by default.
+
+**`RAILWATCH_BASE_PATH=/railwatch`** serves every page, asset, the live
+channel (`/railwatch/cable`), `/railwatch/mcp` and `/railwatch/api/v1`
+under the prefix. Redirects, cookie `Path`s, links in emails and alerts,
+and the MCP and Google callback URLs carry it too. **`/ingest` and `/up`
+stay at the root**, so the agent's `RAILWATCH_INGEST_URL` is the same with
+or without it. The prefix is letters, digits, `-`, `_` and `.` between
+single slashes. `..`, `//`, percent-encodings, `/up` and `/ingest` are
+refused at startup. Paths are matched as sent, never decoded or normalized
+first, so `/railwatch/../x` or `/railwatch%2fx` reach no page, and a
+redirect back to the Referer only goes to a path under the prefix.
+
+**`RAILWATCH_TRUSTED_PROXY_SECRET_FILE=/path/to/secret`** lets the app in
+front say who is signed in, so nobody signs in to Railwatch separately.
+The file holds a random key of at least 32 bytes, e.g.
+`openssl rand -hex 32 > secret && chmod 600 secret`. The server will not start if the file is
+missing, unreadable or shorter. On every request the proxy sends
+
+```
+X-Railwatch-Proxy-Auth: v1.<base64url(claims)>.<base64url(HMAC-SHA256(key, "v1." + base64url(claims)))>
+claims: {"email": "ada@example.com", "name": "Ada", "role": "admin" | "member", "exp": <unix seconds>}
+```
+
+(base64url without padding, `exp` at most 300 seconds ahead; the
+railwatch-server gem signs a fresh one per request, valid for 60 s).
+
+The security model:
+
+- **Off, the header means nothing.** Without the setting, a forged header
+  is ignored and stripped, not checked, so it cannot do anything to a
+  normal install.
+- **On, a present header must verify or the request is refused (401)** on
+  every dashboard route (pages, the live channel, MCP, the API). It is
+  never quietly treated as signed out. `/ingest` and `/up` never read it. The MAC is compared in constant
+  time; an expired header, one valid more than 300 s ahead, an unknown
+  claim, or a role other than `admin`/`member` is refused. The header is
+  removed before any handler, so it is never logged, stored or forwarded.
+- **What a valid header grants**: that user, created on first sight
+  (verified, with a random password nobody knows) in the server's first
+  account, the one `railwatch setup` made, with the claimed role. The role
+  follows the proxy on every request, but the proxy can never create an
+  owner, demote the owner, or add anyone to another account. An email that
+  matches an existing user (one who signed up directly, or the owner) *is*
+  that user, with their access: the proxy is trusted to name people, so
+  only run it in front of an app whose login you trust with that. Each
+  proxied user has one session row, reused; Settings > Sessions shows it
+  as "railwatch trusted proxy". Proxy-created users have no usable
+  password, so the actions that ask for one (changing email or password,
+  deleting the user or an account) are not available to them.
+- **CSRF still applies**: a state-changing request needs the Origin check
+  and the session's token, which the browser gets and sends through the
+  proxy like any cookie.
+- **Replay**: there is no nonce. A header captured in transit can be
+  replayed until its `exp`, at most 300 s (60 s from the gem), the same
+  exposure as the session cookie that travels with it. Keep the hop between
+  proxy and server on loopback or a Unix socket, and have the proxy drop
+  any `X-Railwatch-Proxy-Auth` the browser sent.
+- **Who can reach the server** decides everything else: anyone who can
+  send it requests and knows the key is whoever they claim. Bind it to
+  loopback (`RAILWATCH_BIND=127.0.0.1:...`) and keep the key file
+  readable only by the app's user (a world-readable one is warned about).
+  Requests without the header still use cookie sign-in as usual.
 
 ## Weekly digest
 

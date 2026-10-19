@@ -126,9 +126,10 @@ async fn show(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Respons
 fn base_url(state: &WebState, headers: &HeaderMap) -> String {
     let configured = state.config.url.trim_end_matches('/');
     let scheme = configured.split_once("://").map_or("http", |(s, _)| s);
+    let base_path = &state.config.base_path;
     match headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
-        Some(host) => format!("{scheme}://{host}"),
-        None => configured.to_string(),
+        Some(host) => format!("{scheme}://{host}{base_path}"),
+        None => format!("{configured}{base_path}"),
     }
 }
 

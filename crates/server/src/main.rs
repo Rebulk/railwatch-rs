@@ -438,7 +438,7 @@ fn setup(rest: &[&str]) -> ExitCode {
     if let Err(e) = tenants(&cfg).ensure(&slug) {
         return fail(format!("creating the telemetry file for {slug}: {e}"));
     }
-    println!("Railwatch is set up. Sign in at {}/sign_in as {}.", cfg.url, control::normalize_email(&email));
+    println!("Railwatch is set up. Sign in at {}/sign_in as {}.", cfg.pages_url(), control::normalize_email(&email));
     println!();
     println!("Add these to the Rails app's environment (the token is shown once):");
     println!();
@@ -447,7 +447,7 @@ fn setup(rest: &[&str]) -> ExitCode {
     println!();
     if alerts.integrations.is_empty() {
         println!("No alert destination yet: nothing will tell you when the app goes down. Add one at");
-        println!("{}/settings/integrations, or rerun setup on a fresh data dir with --alert-webhook/--alert-slack/--alert-email.", cfg.url);
+        println!("{}/settings/integrations, or rerun setup on a fresh data dir with --alert-webhook/--alert-slack/--alert-email.", cfg.pages_url());
     } else {
         for (kind, name, _) in &alerts.integrations {
             println!("Alerts: {name} ({kind}) gets {}.", SETUP_ALERT_EVENTS.join(", "));
@@ -576,7 +576,7 @@ fn integration_test(id: &str) -> ExitCode {
         Ok(secret) => control.configure_alerting(railwatch_server::alerts::integration::Alerting {
             cipher: railwatch_server::alerts::integration::SettingsCipher::new(&secret),
             smtp: cfg.smtp.clone(),
-            url: cfg.url.clone(),
+            url: cfg.pages_url(),
             deliver: cfg.alert_delivery,
         }),
         Err(e) => return fail(format!("secret_key_base: {e}")),
@@ -631,7 +631,7 @@ fn digest_dry_run(account: Option<i64>) -> ExitCode {
         (Some(_), true) => "on (SMTP)",
     };
     let now = railwatch_server::time::now_micros();
-    match railwatch_server::jobs::weekly_digest::dry_run(&control, &cfg.tenants_dir(), &cfg.url, now, account, delivery) {
+    match railwatch_server::jobs::weekly_digest::dry_run(&control, &cfg.tenants_dir(), &cfg.pages_url(), now, account, delivery) {
         Ok(out) => {
             print!("{out}");
             ExitCode::SUCCESS
@@ -1229,7 +1229,7 @@ fn serve() -> ExitCode {
             Ok(secret) => control.configure_alerting(railwatch_server::alerts::integration::Alerting {
                 cipher: railwatch_server::alerts::integration::SettingsCipher::new(&secret),
                 smtp: cfg.smtp.clone(),
-                url: cfg.url.clone(),
+                url: cfg.pages_url(),
                 deliver: cfg.alert_delivery,
             }),
             Err(e) => {
@@ -1336,7 +1336,14 @@ fn serve() -> ExitCode {
         });
         // Pages first; anything they do not route (/ingest, /up) goes to the
         // ingest API unchanged.
-        let app = web::router(web_state).fallback_service(http::router(state.clone()));
+        let base_path = cfg.base_path.clone();
+        if !base_path.is_empty() {
+            tracing::info!(base_path, "pages served under the base path; /ingest and /up stay at the root");
+        }
+        if cfg.trusted_proxy_secret.is_some() {
+            tracing::warn!("trusted proxy auth on: a request signed with trusted_proxy_secret_file's secret is whoever it names");
+        }
+        let app = web::mounted(&base_path, web::router(web_state), http::router(state.clone()));
         let app = railwatch_server::serve::source_link(railwatch_server::serve::hsts(app, cfg.hsts()));
         let listener = railwatch_server::tls::Listener::new(listener, tls);
         railwatch_server::serve::run(listener, app, cfg.http, shutdown_signal()).await;

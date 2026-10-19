@@ -119,8 +119,9 @@ pub struct SetCookie {
 }
 
 impl SetCookie {
-    pub fn header(&self) -> HeaderValue {
-        let mut s = format!("{}={}; Path=/; SameSite=Lax", self.name, self.value.as_deref().unwrap_or(""));
+    /// `path`: Config::cookie_path (the base path, or `/`).
+    pub fn header(&self, path: &str) -> HeaderValue {
+        let mut s = format!("{}={}; Path={path}; SameSite=Lax", self.name, self.value.as_deref().unwrap_or(""));
         match (&self.value, self.permanent) {
             (None, _) => s.push_str("; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"),
             (Some(_), true) => s.push_str(&format!("; Max-Age={PERMANENT_SECONDS}")),

@@ -326,7 +326,7 @@ async fn sign_up_create(cx: Ctx, p: Params) -> Response {
 async fn send_verification(cx: &Ctx, user_id: i64) {
     let Ok(Some(user)) = cx.state.db(move |c| c.with(|x| control::find_user(x, user_id))).await else { return };
     let sid = signed_token(cx, "email_verification", user.id, &user.email, 2 * 86_400);
-    mailer::deliver_later(cx.state.mailer.clone(), mailer::email_verification(&cx.state.config.url, &user.email, &sid));
+    mailer::deliver_later(cx.state.mailer.clone(), mailer::email_verification(&cx.state.config.pages_url(), &user.email, &sid));
 }
 
 async fn session_destroy(cx: Ctx, Path(id): Path<i64>) -> Response {
@@ -501,7 +501,7 @@ async fn password_reset_create(cx: Ctx, p: Params) -> Response {
     match claimed {
         Ok(Some(u)) => {
             let sid = signed_token(&cx, "password_reset", u.id, &reset_bind(&u.password_digest), 20 * 60);
-            mailer::deliver_later(cx.state.mailer.clone(), mailer::password_reset(&cx.state.config.url, &u.email, &sid));
+            mailer::deliver_later(cx.state.mailer.clone(), mailer::password_reset(&cx.state.config.pages_url(), &u.email, &sid));
         }
         Ok(None) => {}
         Err(e) => return internal(e),
@@ -1318,7 +1318,7 @@ async fn profile_show(cx: Ctx) -> Response {
         "settings/profiles/show",
         json!({"mcp_token": cx.flash_value("generated_api_token"), "api_tokens": tokens, "token_targets": targets,
                "token_scopes": ["api", "mcp", "read", "write"], "weekly_digest": user.weekly_digest,
-               "mcp_url": format!("{}/mcp", cx.state.config.url), "deletion": {"blocking_accounts": blocking}}),
+               "mcp_url": format!("{}/mcp", cx.state.config.pages_url()), "deletion": {"blocking_accounts": blocking}}),
         None,
     )
     .await
@@ -1618,7 +1618,7 @@ async fn members_create(cx: Ctx, p: Params) -> Response {
         Ok(Out::Added(name)) => cx.redirect(Redirect::to("/settings/members").notice(format!("{name} added"))),
         Ok(Out::Invited(inv)) => {
             let user = cx.current.user.as_ref().map(|u| u.name.clone()).unwrap_or_default();
-            mailer::deliver_later(cx.state.mailer.clone(), mailer::invite(&cx.state.config.url, &email, &user, &account_name, &inv.token));
+            mailer::deliver_later(cx.state.mailer.clone(), mailer::invite(&cx.state.config.pages_url(), &email, &user, &account_name, &inv.token));
             cx.redirect(Redirect::to("/settings/members").notice(format!("Invitation sent to {email}")))
         }
         Ok(Out::Invalid(e)) => cx.redirect(Redirect::to("/settings/members").errors(e)),
@@ -1761,7 +1761,7 @@ async fn invitation_resend(cx: Ctx, Path(id): Path<i64>) -> Response {
         Ok(Some(email)) => {
             let inviter = cx.current.user.as_ref().map(|u| u.name.clone()).unwrap_or_default();
             let account_name = cx.current.account.as_ref().map(|a| a.name.clone()).unwrap_or_default();
-            mailer::deliver_later(cx.state.mailer.clone(), mailer::invite(&cx.state.config.url, &email, &inviter, &account_name, &token));
+            mailer::deliver_later(cx.state.mailer.clone(), mailer::invite(&cx.state.config.pages_url(), &email, &inviter, &account_name, &token));
             cx.redirect(Redirect::to("/settings/members").notice("Invitation resent"))
         }
         Ok(None) => not_found(),

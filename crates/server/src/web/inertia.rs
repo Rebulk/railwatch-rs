@@ -145,6 +145,22 @@ fn local_path(referer: &str) -> Option<&str> {
     ok.then_some(path)
 }
 
+/// `path` without the `base` prefix (`/railwatch/issues` -> `/issues`);
+/// None when it is not under it.
+fn unprefixed<'a>(path: &'a str, base: &str) -> Option<&'a str> {
+    if base.is_empty() {
+        return Some(path);
+    }
+    let rest = path.strip_prefix(base)?;
+    match rest.as_bytes() {
+        [] => Some("/"),
+        // `/railwatch//evil.example` is not a path under the base either.
+        [b'/', b'/' | b'\\', ..] => None,
+        [b'/', ..] => Some(rest),
+        _ => None,
+    }
+}
+
 impl Ctx {
     pub fn user_id(&self) -> i64 {
         self.current.user.as_ref().map(|u| u.id).expect("authenticated route")
@@ -154,9 +170,11 @@ impl Ctx {
         self.current.account.as_ref().map(|a| a.id).expect("account route")
     }
 
-    /// `redirect_back_or_to`
+    /// `redirect_back_or_to`. A site path, like `fallback`: the Referer's
+    /// path with the base path taken off (one outside it is not ours).
     pub fn back_or(&self, fallback: &str) -> String {
-        self.referer.as_deref().and_then(local_path).map_or_else(|| fallback.to_string(), str::to_string)
+        let base = self.state.config.base_path.as_str();
+        self.referer.as_deref().and_then(local_path).and_then(|p| unprefixed(p, base)).map_or_else(|| fallback.to_string(), str::to_string)
     }
 
     pub fn redirect(&self, r: Redirect) -> Response {
@@ -184,7 +202,11 @@ impl Ctx {
         if r.clear_history {
             self.inertia.clear_history();
         }
-        let mut res = (StatusCode::FOUND, [(header::LOCATION, r.to)]).into_response();
+        // Handlers redirect to site paths (`/dashboard`); the browser needs
+        // them under the base path. Absolute URLs (Google, /source's repo)
+        // go as they are.
+        let to = if r.to.starts_with('/') { self.state.config.page_path(&r.to) } else { r.to };
+        let mut res = (StatusCode::FOUND, [(header::LOCATION, to)]).into_response();
         res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
         res
     }
@@ -220,7 +242,11 @@ impl Ctx {
             }
         }
         let csrf = csrf_token(&self.session);
-        self.inertia.render(component, page).with_view_data(document::CSRF, csrf).into_response()
+        self.inertia
+            .render(component, page)
+            .with_view_data(document::CSRF, csrf)
+            .with_view_data(document::BASE_PATH, self.state.config.base_path.clone())
+            .into_response()
     }
 
     async fn shared_props(&self) -> rusqlite::Result<Vec<(String, omega::Prop)>> {
@@ -347,6 +373,17 @@ mod tests {
         ] {
             assert_eq!(local_path(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn back_paths_lose_the_base_path_or_are_refused() {
+        assert_eq!(unprefixed("/railwatch/issues?s=1", "/railwatch"), Some("/issues?s=1"));
+        assert_eq!(unprefixed("/railwatch", "/railwatch"), Some("/"));
+        assert_eq!(unprefixed("/railwatchx/issues", "/railwatch"), None, "a sibling path is not under the base");
+        assert_eq!(unprefixed("/admin", "/railwatch"), None, "the host app's own pages are not ours to redirect to");
+        assert_eq!(unprefixed("/issues", ""), Some("/issues"));
+        assert_eq!(unprefixed("/railwatch//evil.example", "/railwatch"), None, "protocol-relative once the base is off");
+        assert_eq!(unprefixed("/railwatch/\\evil.example", "/railwatch"), None);
     }
 
     #[test]
