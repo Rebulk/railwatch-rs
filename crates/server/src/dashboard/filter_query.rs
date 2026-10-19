@@ -457,9 +457,14 @@ pub fn fts_snippets(conn: &Connection, ids: &[i64], text: &str) -> rusqlite::Res
         return Ok(out);
     }
     let Some(m) = match_expression(text) else { return Ok(out) };
+    // `rowid IN (...)` alone makes FTS5 run the whole MATCH once per id (50
+    // ids: 120 ms on 139k logs). A rowid range is one MATCH pass bounded to
+    // the page's ids, and `+rowid IN` filters it: the same rows in the same
+    // (rowid) order, 3 ms (docs/PERF.md, "Slow dashboard pages").
     let ph = vec!["?"; ids.len()].join(",");
-    let sql = format!("SELECT rowid, snippet(logs_fts, 0, ?, ?, ?, 24) FROM logs_fts WHERE logs_fts MATCH ? AND rowid IN ({ph})");
-    let mut binds: Vec<Sql> = vec![s(SNIPPET_MARK), s(SNIPPET_MARK), s("…"), s(&m)];
+    let sql = format!("SELECT rowid, snippet(logs_fts, 0, ?, ?, ?, 24) FROM logs_fts WHERE logs_fts MATCH ? AND rowid BETWEEN ? AND ? AND +rowid IN ({ph})");
+    let (lo, hi) = (ids.iter().min().unwrap(), ids.iter().max().unwrap());
+    let mut binds: Vec<Sql> = vec![s(SNIPPET_MARK), s(SNIPPET_MARK), s("…"), s(&m), Sql::Integer(*lo), Sql::Integer(*hi)];
     binds.extend(ids.iter().map(|i| Sql::Integer(*i)));
     for r in db::query(conn, &sql, rusqlite::params_from_iter(binds))? {
         out.insert(db::raw_json(r.at(0)).to_string(), db::raw_json(r.at(1)));
@@ -481,6 +486,23 @@ mod tests {
         assert_eq!(status_range(Some("4XX")), Some((400, 499)));
         assert_eq!(status_range(Some("404")), Some((404, 404)));
         assert_eq!(status_range(Some("1xx")), None);
+    }
+
+    /// The rowid-range form returns exactly the page's matching ids (not
+    /// the other matches inside the range, not the page's non-matching ids).
+    #[test]
+    fn fts_snippets_only_for_the_given_ids() {
+        let dir = std::env::temp_dir().join(format!("rw-snip-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = crate::tenants::open_tenant(&dir.join("t.sqlite3")).unwrap();
+        for (id, m) in [(1, "Completed 200"), (2, "Completed 500"), (3, "Started GET"), (4, "Completed 302"), (5, "Completed 404")] {
+            t.execute("INSERT INTO logs (id, level, message, occurred_at) VALUES (?, 'info', ?, '2026-10-16 12:00:00')", rusqlite::params![id, m]).unwrap();
+        }
+        t.execute("INSERT INTO logs_fts (rowid, message) SELECT id, message FROM logs", []).unwrap();
+        let got = fts_snippets(&t, &[4, 1, 3], "complet").unwrap();
+        assert_eq!(got.keys().collect::<Vec<_>>(), vec!["1", "4"]);
+        assert_eq!(got["4"], Value::String(format!("{SNIPPET_MARK}Completed{SNIPPET_MARK} 302")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
