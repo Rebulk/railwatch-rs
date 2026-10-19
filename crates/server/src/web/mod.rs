@@ -25,6 +25,7 @@ pub mod issues;
 pub mod mailer;
 pub mod mcp;
 pub mod params;
+pub mod proxy_auth;
 pub mod session;
 pub mod sessions_oauth;
 
@@ -131,6 +132,7 @@ impl WebState {
 /// Everything browser-facing. The ingest router (http.rs) handles /ingest,
 /// /up and is the fallback for anything this one does not route.
 pub fn router(state: Arc<WebState>) -> Router {
+    let mounted = !state.config.base_path.is_empty();
     let pages = controllers::routes()
         .merge(env_pages::routes())
         .merge(issues::routes())
@@ -139,7 +141,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .merge(sessions_oauth::routes());
     let pages = inertia::layer(pages);
     let pages = session::layer(pages, state.clone());
-    Router::new()
+    let router = Router::new()
         .merge(pages)
         // McpController: bearer-token auth, outside the session layer.
         .merge(mcp::routes())
@@ -155,8 +157,24 @@ pub fn router(state: Arc<WebState>) -> Router {
         // visits here. Rails cloud records them through the mounted gem engine;
         // this server does not monitor itself, so it answers like the gem's
         // BeaconController with beacon_enabled off: 204, nothing stored.
-        .route("/railwatch/beacon", axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }))
-        .with_state(state)
+        .route("/railwatch/beacon", axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }));
+    // Mounted at /railwatch, the bundle's hard-coded /railwatch/beacon
+    // arrives here as /beacon.
+    let router = if mounted { router.route("/beacon", axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT })) } else { router };
+    // Outermost: X-Railwatch-Proxy-Auth is checked and removed before any
+    // route (pages, cable, MCP, API) sees the request.
+    router.layer(axum::middleware::from_fn_with_state(state.clone(), proxy_auth::layer)).with_state(state)
+}
+
+/// `router` under `base_path` (when set), with `fallback` (the ingest API)
+/// for everything else, so `/ingest` and `/up` stay at the root. The
+/// ingest API never reads X-Railwatch-Proxy-Auth; it is dropped there too.
+pub fn mounted(base_path: &str, pages: Router, fallback: Router) -> Router {
+    let fallback = fallback.layer(axum::middleware::map_request(|mut req: Request| async move {
+        req.headers_mut().remove(proxy_auth::HEADER);
+        req
+    }));
+    if base_path.is_empty() { pages.fallback_service(fallback) } else { Router::new().nest(base_path, pages).fallback_service(fallback) }
 }
 
 /// The telemetry cursor signing key (CursorPage's message_verifier).

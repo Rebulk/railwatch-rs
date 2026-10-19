@@ -4,8 +4,13 @@ import { createRoot } from "react-dom/client"
 
 import { initializeTheme } from "@/hooks/use-appearance"
 import PersistentLayout from "@/layouts/persistent-layout"
+import { applyMount } from "@/lib/mount"
 import { loadPage } from "@/lib/pages"
 import { railwatchRootOptions, startRailwatch } from "@/lib/railwatch"
+
+// Served under a base path (RAILWATCH_BASE_PATH), every route helper must
+// carry it; the server emits it the way the gem's embedded engine does.
+applyMount()
 
 const appName = import.meta.env.VITE_APP_NAME ?? "Railwatch"
 

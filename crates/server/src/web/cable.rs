@@ -85,13 +85,21 @@ impl Hub {
     }
 }
 
-pub async fn upgrade(State(state): State<Arc<WebState>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+pub async fn upgrade(
+    State(state): State<Arc<WebState>>,
+    proxied: Option<axum::Extension<super::proxy_auth::Proxied>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
     let jar = cookies::parse(&headers);
     let session_id: Option<i64> =
         cookies::get(&jar, cookies::SESSION_TOKEN).and_then(|c| state.keys.verify(cookies::SESSION_TOKEN, c)).and_then(|v| v.parse().ok());
     let origin_ok = super::session::same_origin(&headers);
-    let user = match (origin_ok, session_id) {
-        (true, Some(sid)) => state.db(move |c| c.with(|x| crate::control::find_session(x, sid))).await.ok().flatten().map(|s| (s.id, s.user_id)),
+    // Verified (and the header removed) by proxy_auth::layer.
+    let proxied = proxied.map(|axum::Extension(p)| p.0);
+    let user = match (origin_ok, proxied, session_id) {
+        (true, Some(claims), _) => state.db(move |c| c.tx(|tx| super::proxy_auth::resolve(tx, &claims))).await.ok().map(|(s, u)| (s.id, u.id)),
+        (true, None, Some(sid)) => state.db(move |c| c.with(|x| crate::control::find_session(x, sid))).await.ok().flatten().map(|s| (s.id, s.user_id)),
         _ => None,
     };
     ws.protocols(["actioncable-v1-json"]).on_upgrade(move |socket| run(socket, state, user))

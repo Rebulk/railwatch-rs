@@ -9,7 +9,10 @@ import { defineConfig } from "vite"
 import { gemFrontend, twoRoots } from "./frontend.config"
 
 export default defineConfig({
-  base: "/vite/",
+  // Relative, so chunk imports and CSS font URLs resolve against the file
+  // that names them: the same build works at / and under a base path
+  // (RAILWATCH_BASE_PATH). The server still serves dist/ at /vite/.
+  base: "./",
   // icon.png and icon.svg land at dist/ root.
   publicDir: "tmp/railwatch-frontend/public",
   server: { fs: { allow: [".", gemFrontend] } },

@@ -11,8 +11,8 @@
 # looked up in frontend/dist/.vite/manifest.json.
 set -euo pipefail
 
-GEM_VERSION=0.9.2
-GEM_SHA256=7fc2efe2af14fc73295743133677f9bbf98c234a675760dd642f4110aebfe653
+GEM_VERSION=0.9.3
+GEM_SHA256=a559e1e585867b87da6447a169fe69bf4571e95330d7427bd66f7d7ffd5e57e0
 NODE=node@22.23.2
 PNPM=pnpm@10.30.3
 

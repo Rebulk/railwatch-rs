@@ -80,6 +80,24 @@ pub struct Config {
     pub new_issues: crate::grouping::Limits,
     /// HTTP timeouts and the connection cap (serve::Limits).
     pub http: crate::serve::Limits,
+    /// The path prefix every page is served under (`/railwatch`), or empty
+    /// for the root. Ingest (`/ingest`, `/up`) always stays at the root, so
+    /// the gem's RAILWATCH_INGEST_URL does not change. For a reverse proxy
+    /// that mounts the dashboard inside another app (the railwatch-server
+    /// gem mounts it in the Rails app it monitors).
+    pub base_path: String,
+    /// `trusted_proxy_secret_file`: the proxy in front signs who is signed in
+    /// (web::proxy_auth); a request with a valid `X-Railwatch-Proxy-Auth`
+    /// header is that user, provisioned on first sight. None: off (default).
+    pub trusted_proxy_secret: Option<Vec<u8>>,
+    /// Where it was read from, for `railwatch doctor`.
+    pub trusted_proxy_secret_file: Option<PathBuf>,
+    /// `standby_relay`: while another server holds the data dir, listen on
+    /// `bind` anyway and relay every connection to the holder through
+    /// `<data_dir>/serve.sock` (standby.rs); the holder listens there too.
+    /// For servers in separate network namespaces sharing one volume. Off:
+    /// a second server refuses connections until the first exits.
+    pub standby_relay: bool,
     /// Where the values came from, for `railwatch doctor`.
     pub sources: BTreeMap<&'static str, String>,
     pub file: Option<PathBuf>,
@@ -169,6 +187,49 @@ pub fn load_env_file() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `""`, `"/"` -> `""`; `"railwatch/"` -> `"/railwatch"`. Only letters,
+/// digits, `-`, `_`, `.` and `/` between segments: it is written into HTML
+/// attributes, cookies and Location headers unescaped.
+pub fn normalize_base_path(raw: &str) -> Result<String, String> {
+    // One slash off each end; any more is an empty segment, refused below.
+    let raw_trimmed = raw.trim();
+    let trimmed = raw_trimmed.strip_prefix('/').unwrap_or(raw_trimmed);
+    let trimmed = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let ok = trimmed
+        .split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && seg.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')));
+    if !ok {
+        return Err(format!("base_path: expected a path like /railwatch, got {raw:?}"));
+    }
+    // The ingest API answers these at the root whatever the base path is.
+    let first = trimmed.split('/').next().unwrap_or("");
+    if first == "up" || first == "ingest" || first.starts_with("ingest.") {
+        return Err(format!("base_path: {raw:?} is where the ingest API answers (/ingest, /up); pick another prefix"));
+    }
+    Ok(format!("/{trimmed}"))
+}
+
+/// The trusted proxy's HMAC key: the file's bytes, surrounding whitespace
+/// trimmed. Refused (the server does not start) when it cannot be read or is
+/// shorter than 32 bytes, so a misconfigured proxy fails at boot rather than
+/// on every request. A file others can read is allowed (container secret
+/// mounts are often 0444) but warned about.
+pub fn read_proxy_secret(path: &str) -> Result<Vec<u8>, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let raw = std::fs::read(path).map_err(|e| format!("trusted_proxy_secret_file {path}: {e}"))?;
+    let secret = raw.trim_ascii().to_vec();
+    if secret.len() < 32 {
+        return Err(format!("trusted_proxy_secret_file {path}: the secret must be at least 32 bytes, got {}", secret.len()));
+    }
+    if std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+        eprintln!("railwatch: warning: trusted_proxy_secret_file {path} is readable by other users; chmod 600 it");
+    }
+    Ok(secret)
 }
 
 fn truthy(s: &str) -> bool {
@@ -271,6 +332,7 @@ impl Config {
             }
             _ => return Err("backups need all of backup_s3_endpoint, backup_s3_bucket, backup_s3_access_key_id, backup_s3_secret_access_key".into()),
         };
+        let standby_relay = get("standby_relay", &["RAILWATCH_STANDBY_RELAY"]).is_some_and(|v| truthy(&v));
         let alert_delivery = match get("alert_delivery", &["RAILWATCH_ALERT_DELIVERY"]).as_deref().map(str::trim) {
             None | Some("on") => true,
             Some("off") => false,
@@ -338,6 +400,10 @@ impl Config {
                 num(get("max_connections_per_ip", &["RAILWATCH_MAX_CONNECTIONS_PER_IP"]), "max_connections_per_ip", dh.max_connections_per_ip as u64)? as usize
             },
         };
+        let base_path = normalize_base_path(&get("base_path", &["RAILWATCH_BASE_PATH"]).unwrap_or_default())?;
+        let trusted_proxy_secret_file =
+            get("trusted_proxy_secret_file", &["RAILWATCH_TRUSTED_PROXY_SECRET_FILE"]).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let trusted_proxy_secret = trusted_proxy_secret_file.as_deref().map(read_proxy_secret).transpose()?;
         // With automatic certificates the public URL is the domain's.
         let url = match (&tls, url_given) {
             (Some(crate::tls::Tls::Acme { domain, .. }), None) => format!("https://{domain}"),
@@ -363,6 +429,10 @@ impl Config {
             tls_redirect_bind,
             new_issues,
             http,
+            base_path,
+            trusted_proxy_secret,
+            trusted_proxy_secret_file: trusted_proxy_secret_file.map(PathBuf::from),
+            standby_relay,
             sources,
             file: l.file,
         })
@@ -379,7 +449,26 @@ impl Config {
     /// The OAuth redirect URI to register with Google (Rails' OmniAuth
     /// callback path, so a migrated install keeps its registration).
     pub fn google_redirect_uri(&self) -> String {
-        format!("{}/auth/google_oauth2/callback", self.url)
+        format!("{}/auth/google_oauth2/callback", self.pages_url())
+    }
+
+    /// The Path every cookie is set with: the base path, so cookies of the
+    /// app it is mounted in (its own `XSRF-TOKEN`, `session_token`) are not
+    /// overwritten.
+    pub fn cookie_path(&self) -> &str {
+        if self.base_path.is_empty() { "/" } else { &self.base_path }
+    }
+
+    /// A site path (`/dashboard`) as the browser sees it (`/railwatch/dashboard`).
+    pub fn page_path(&self, path: &str) -> String {
+        format!("{}{path}", self.base_path)
+    }
+
+    /// The public URL pages live under: `url` plus the base path. Links in
+    /// emails and alerts, the MCP endpoint and Google's callback start here;
+    /// the ingest URL is `url` alone.
+    pub fn pages_url(&self) -> String {
+        format!("{}{}", self.url, self.base_path)
     }
 
     pub fn secure_cookies(&self) -> bool {
@@ -490,6 +579,16 @@ impl Config {
                 src(if self.sources.contains_key("tls_domain") { "tls_domain" } else { "tls_cert_file" }),
             ),
             ("tls_redirect_bind".into(), self.tls_redirect_bind.clone().unwrap_or_else(|| "(off)".into()), src("tls_redirect_bind")),
+            ("base_path".into(), if self.base_path.is_empty() { "(none: pages at the root)".into() } else { self.base_path.clone() }, src("base_path")),
+            (
+                "trusted_proxy".into(),
+                match &self.trusted_proxy_secret_file {
+                    None => "(off)".into(),
+                    Some(f) => format!("on: X-Railwatch-Proxy-Auth signed with {}", f.display()),
+                },
+                src("trusted_proxy_secret_file"),
+            ),
+            ("standby_relay".into(), self.standby_relay.to_string(), src("standby_relay")),
             ("alert_delivery".into(), if self.alert_delivery { "on" } else { "off (alerts recorded as skipped, never sent)" }.into(), src("alert_delivery")),
             ("secret_key_base".into(), if self.secret_key_base.is_some() { "(set)".into() } else { "(generated file)".into() }, src("secret_key_base")),
         ];
@@ -539,6 +638,47 @@ mod tests {
         c.trust_proxy = trust_proxy;
         c.tls = None;
         c
+    }
+
+    #[test]
+    fn base_path_is_one_clean_prefix_or_nothing() {
+        assert_eq!(normalize_base_path("").unwrap(), "");
+        assert_eq!(normalize_base_path("/").unwrap(), "");
+        assert_eq!(normalize_base_path("railwatch/").unwrap(), "/railwatch");
+        assert_eq!(normalize_base_path("/admin/railwatch").unwrap(), "/admin/railwatch");
+        // Traversal, empty segments, encodings, anything that needs escaping
+        // in HTML, a cookie Path or a Location header.
+        for bad in ["/a//b", "//evil.example", "/../x", "/railwatch/..", "/./x", "/a b", "/a\"b", "/x?y", "/x#y", "/%2e", "/a%2fb", "/a\\b", "/a;b", "/é"] {
+            assert!(normalize_base_path(bad).is_err(), "{bad:?}");
+        }
+        // The ingest API's own paths cannot be shadowed.
+        for taken in ["/up", "/ingest", "/ingest/x", "/ingest.json"] {
+            assert!(normalize_base_path(taken).is_err(), "{taken:?}");
+        }
+        assert_eq!(normalize_base_path("/upgrade").unwrap(), "/upgrade", "only the exact segments are taken");
+        let mut c = cfg("127.0.0.1:8790", "http://127.0.0.1:8790", false);
+        assert_eq!((c.cookie_path(), c.page_path("/dashboard").as_str(), c.pages_url().as_str()), ("/", "/dashboard", "http://127.0.0.1:8790"));
+        c.base_path = "/railwatch".into();
+        assert_eq!((c.cookie_path(), c.page_path("/dashboard").as_str()), ("/railwatch", "/railwatch/dashboard"));
+        assert_eq!(c.pages_url(), "http://127.0.0.1:8790/railwatch");
+        assert_eq!(c.google_redirect_uri(), "http://127.0.0.1:8790/railwatch/auth/google_oauth2/callback");
+    }
+
+    #[test]
+    fn a_proxy_secret_must_be_readable_and_long_enough() {
+        let dir = std::env::temp_dir().join(format!("rw-proxy-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, body: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p.to_str().unwrap().to_string()
+        };
+        assert_eq!(read_proxy_secret(&file("ok", b"  0123456789abcdef0123456789abcdef\n")).unwrap(), b"0123456789abcdef0123456789abcdef");
+        let short = read_proxy_secret(&file("short", b"0123456789abcdef0123456789abcde\n")).unwrap_err();
+        assert!(short.contains("at least 32 bytes"), "{short}");
+        assert!(read_proxy_secret(&file("blank", b"   \n")).is_err(), "whitespace is not a secret");
+        assert!(read_proxy_secret(dir.join("missing").to_str().unwrap()).is_err(), "an unreadable file stops the server");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

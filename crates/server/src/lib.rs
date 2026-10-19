@@ -44,6 +44,7 @@ pub mod rjson;
 pub mod rollup;
 pub mod schema;
 pub mod serve;
+pub mod standby;
 pub mod storage;
 pub mod tenants;
 pub mod time;

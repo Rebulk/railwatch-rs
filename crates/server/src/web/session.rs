@@ -190,9 +190,24 @@ async fn middleware(State(state): State<Arc<WebState>>, mut req: Request, next: 
         cookies::get(&jar, cookies::ACCOUNT_ID).and_then(|c| state.keys.verify(cookies::ACCOUNT_ID, c)).and_then(|v| v.parse().ok());
     let ip = state.client_ip(&req).to_string();
     let user_agent = req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(str::to_string);
+    // Verified (and the header removed) by proxy_auth::layer.
+    let proxied = req.extensions().get::<super::proxy_auth::Proxied>().map(|p| p.0.clone());
 
     let resolved = state
         .db(move |c| {
+            if let Some(claims) = proxied {
+                return c
+                    .tx(|tx| {
+                        let (s, u) = super::proxy_auth::resolve(tx, &claims)?;
+                        let account = find_account(tx, u.id, account_pref)?;
+                        Ok((Some(s), Some(u), account))
+                    })
+                    .map_err(|e| match e {
+                        control::ModelError::Sql(e) => e,
+                        // No account yet: setup has not run.
+                        control::ModelError::Invalid(m) => rusqlite::Error::InvalidParameterName(format!("trusted proxy: {m:?}")),
+                    });
+            }
             c.with(|conn| {
                 let Some(s) = session_id.map(|id| control::find_session(conn, id)).transpose()?.flatten() else {
                     return Ok((None, None, None));
@@ -281,7 +296,7 @@ async fn middleware(State(state): State<Arc<WebState>>, mut req: Request, next: 
     }
     let h = res.headers_mut();
     for c in set {
-        h.append(header::SET_COOKIE, c.header());
+        h.append(header::SET_COOKIE, c.header(state.config.cookie_path()));
     }
     h.insert("x-frame-options", HeaderValue::from_static("SAMEORIGIN"));
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
