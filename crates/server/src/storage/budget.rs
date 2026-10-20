@@ -154,9 +154,16 @@ pub fn trim(tenants_dir: &Path, max_bytes: u64, today: &str) -> rusqlite::Result
 }
 
 /// One pass: trim to the budget, then set the free-space state. `on_trim`
-/// runs after a pass that deleted files (the caller records the new
-/// cutoffs and drops cached state).
+/// runs after a pass that deleted files, before free space is read (the
+/// caller closes idle connections to the deleted files, whose open handles
+/// keep the space allocated, and records the new cutoffs). The ingest
+/// writer drops its own at its next transaction (DayWriter::begin).
 pub fn check(budget: &Budget, data_dir: &Path, tenants_dir: &Path, state: &State, on_trim: &dyn Fn(&Trimmed)) {
+    check_with(budget, data_dir, tenants_dir, state, on_trim, &free_bytes);
+}
+
+/// `check` with the free-space reading passed in (tests).
+fn check_with(budget: &Budget, data_dir: &Path, tenants_dir: &Path, state: &State, on_trim: &dyn Fn(&Trimmed), free_bytes: &dyn Fn(&Path) -> Option<u64>) {
     if budget.max_data_bytes > 0 {
         let today = &crate::time::utc_seconds_string(crate::time::now_micros() / 1_000_000)[..10];
         match trim(tenants_dir, budget.max_data_bytes, today) {
@@ -289,6 +296,70 @@ mod tests {
         assert_eq!(t.core_files, 8);
         assert_eq!(t.core_through, vec![("a".to_string(), "2026-10-13".to_string()), ("b".to_string(), "2026-10-13".to_string())]);
         assert!(t.used > 1, "still over: today's files are kept");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Deleted day files still open somewhere keep their disk blocks.
+    fn open_deleted(root: &Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .filter(|t| t.starts_with(root) && t.to_string_lossy().ends_with(" (deleted)"))
+            .count()
+    }
+
+    /// After a trim, every handle to the deleted files is closed before free
+    /// space is read: a dashboard reader idle in its pool, one checked out
+    /// during the trim (closed when it comes back), and the ingest writer's
+    /// cached day file. Each would otherwise keep a deleted file's blocks
+    /// allocated, and the floor would see no space come back.
+    #[test]
+    fn trimmed_files_are_closed_before_free_space_is_read() {
+        let root = tenants("handles");
+        let pools = crate::dashboard::pool::ReadPools::new(root.clone(), 2);
+        drop(pools.get("a").unwrap());
+        let busy = pools.get("a").unwrap();
+        let attached = |c: &Connection| c.query_row("SELECT count(*) FROM pragma_database_list", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(attached(&busy), 2 + 1 + 10, "main, temp, meta and ten day files");
+        let mut writer = crate::storage::writer::DayWriter::open(&root.join("a")).unwrap();
+        writer.begin().unwrap();
+        // Caches a day file that the trim deletes.
+        crate::ingest::writer::Target::route_at(&mut writer, "ingest_batches", "2026-10-10 12:00:00").unwrap();
+        writer.commit().unwrap();
+        let writer = std::sync::Mutex::new(writer);
+        let held_during_trim = std::cell::Cell::new(0);
+        let held_at_free = std::cell::Cell::new(usize::MAX);
+        let on_trim = |_: &Trimmed| {
+            held_during_trim.set(open_deleted(&root));
+            pools.release_deleted();
+            writer.lock().unwrap().drop_deleted();
+        };
+        let free = |_: &Path| {
+            held_at_free.set(open_deleted(&root));
+            Some(u64::MAX)
+        };
+        let budget = Budget { max_data_bytes: 1, min_free_bytes: 1 };
+        // Trims to today's files only ("today" is the real date, after them).
+        check_with(&budget, &root, &root, &State::default(), &on_trim, &free);
+        assert!(held_during_trim.get() > 0, "the readers and the writer held the deleted files");
+        // Only the reader still checked out holds them when space is read...
+        let busy_handles = held_at_free.get();
+        assert!(busy_handles > 0);
+        drop(busy);
+        // ...and it lets go when it comes back to the pool.
+        assert_eq!(open_deleted(&root), 0);
+        let r = pools.get("a").unwrap();
+        assert_eq!(attached(&r), 2 + 1, "a fresh reader over what is left: meta only");
+        drop(r);
+        // Without the busy reader, nothing is held when space is read.
+        for tier in [Tier::Core, Tier::Detail] {
+            let c = layout::open_or_create(&layout::day_path(&root.join("a"), tier, "2026-10-15")).unwrap();
+            c.execute_batch("CREATE TABLE pad (b BLOB); INSERT INTO pad VALUES (zeroblob(200000));").unwrap();
+        }
+        drop(pools.get("a").unwrap());
+        check_with(&budget, &root, &root, &State::default(), &on_trim, &free);
+        assert_eq!(held_at_free.get(), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 

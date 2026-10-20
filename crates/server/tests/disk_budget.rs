@@ -64,6 +64,17 @@ fn stop(mut child: Child) -> String {
     log
 }
 
+/// The server's open handles to deleted files under `root`: each keeps
+/// that file's space allocated.
+fn open_deleted(pid: u32, root: &Path) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .filter(|t| t.starts_with(root) && t.to_string_lossy().ends_with(" (deleted)"))
+        .count()
+}
+
 fn day(days_ago: i64) -> String {
     let now = railwatch_server::time::now_micros() / 1_000_000;
     railwatch_server::time::utc_seconds_string(now - days_ago * 86_400)[..10].to_string()
@@ -108,6 +119,7 @@ fn retention_catches_up_at_start() {
     let child = serve(&_root.0, port, &[]);
     wait_until("the start-up prune", || layout::days(&dir, Tier::Detail) == vec![day(2)]);
     assert_eq!(layout::days(&dir, Tier::Core), vec![day(10), day(2)]);
+    wait_until("the prune's release of deleted files", || open_deleted(child.id(), &_root.0) == 0);
     stop(child);
 }
 
@@ -126,6 +138,7 @@ fn over_max_data_bytes_at_start_trims_oldest_first_and_records_the_cutoff() {
     assert!(layout::days(&dir, Tier::Detail).is_empty());
     assert_eq!(layout::days(&dir, Tier::Core), vec![day(4), day(3), day(2), day(1)]);
     assert!(meta_path(&dir).is_file());
+    assert_eq!(open_deleted(child.id(), &_root.0), 0, "no handle keeps a trimmed file's space");
     let control = rusqlite::Connection::open(_root.0.join("control.sqlite3")).unwrap();
     let through: String = control.query_row("SELECT raw_pruned_through FROM environments", [], |r| r.get(0)).unwrap();
     assert_eq!(&through[..10], day(4), "raw rows before the end of the newest deleted day are refused");

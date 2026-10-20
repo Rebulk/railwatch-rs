@@ -1315,17 +1315,19 @@ fn serve() -> ExitCode {
         });
         railwatch_server::grouping::set_limits(cfg.new_issues);
         // Phase 2: rollups, grouping, drain, detectors, alerts, watchdog.
-        let jobs = railwatch_server::jobs::start_with(control.clone(), cfg.tenants_dir(), cfg.tiers);
-        // Disk budget (storage::budget): one pass now, before the first
-        // request, then every 10 s until shutdown.
-        let (stop_budget, budget_stopped) = std::sync::mpsc::channel::<()>();
-        let budget_thread = (!cfg.budget.is_off()).then(|| {
-            tracing::info!(max_data_bytes = cfg.budget.max_data_bytes, min_free_bytes = cfg.budget.min_free_bytes, "disk budget on");
-            let (c, work) = (control.clone(), jobs.background.work.clone());
-            let on_trim = move |t: &railwatch_server::storage::budget::Trimmed| railwatch_server::jobs::prune::after_trim(&c, &work, t);
-            railwatch_server::storage::budget::check(&cfg.budget, &cfg.data_dir, &cfg.tenants_dir(), &disk, &on_trim);
-            railwatch_server::storage::budget::spawn(cfg.budget, cfg.data_dir.clone(), cfg.tenants_dir(), disk.clone(), Box::new(on_trim), budget_stopped)
-        });
+        // Dashboard read pools, shared with the jobs: when retention or the
+        // disk budget deletes day files, every handle to them is closed so
+        // the space comes back (idle readers here, the ingest writers'
+        // cached files, the worker's own union readers).
+        let readers = railwatch_server::dashboard::pool::ReadPools::new(cfg.tenants_dir(), 4);
+        let release = {
+            let (readers, tenants) = (readers.clone(), tenants.clone());
+            move || {
+                readers.release_deleted();
+                tenants.release_deleted(Duration::from_secs(2));
+            }
+        };
+        let jobs = railwatch_server::jobs::start_with(control.clone(), cfg.tenants_dir(), cfg.tiers, Some(Box::new(release.clone())));
         if let Some(b) = cfg.backup.clone() {
             tracing::info!(endpoint = %b.s3.endpoint, bucket = %b.s3.bucket, every = b.interval_secs, "backups on");
             railwatch_server::storage::backup::spawn(b, cfg.data_dir.clone(), cfg.tenants_dir());
@@ -1335,12 +1337,34 @@ fn serve() -> ExitCode {
         let hub = web::cable::Hub::new();
         let followups_task = tokio::spawn(followups::run_with(control.clone(), followups_rx, Some(hub.clone()), Some(jobs.background.clone())));
         let web_state = match WebState::new(control, cfg.clone(), tenants.clone(), hub) {
-            Ok(s) => Arc::new(s),
+            Ok(mut s) => {
+                s.readers = readers;
+                Arc::new(s)
+            }
             Err(e) => {
                 tracing::error!(error = e, "cannot start the web app");
                 std::process::exit(1);
             }
         };
+        // Disk budget (storage::budget): one pass now, before the first
+        // request, then every 10 s until shutdown.
+        let (stop_budget, budget_stopped) = std::sync::mpsc::channel::<()>();
+        let budget_thread = (!cfg.budget.is_off()).then(|| {
+            tracing::info!(max_data_bytes = cfg.budget.max_data_bytes, min_free_bytes = cfg.budget.min_free_bytes, "disk budget on");
+            let (c, work, release) = (web_state.control.clone(), jobs.background.work.clone(), release.clone());
+            // Open handles keep deleted files' space allocated: they are all
+            // closed (the worker's within 5 s) before free space is read.
+            let on_trim = move |t: &railwatch_server::storage::budget::Trimmed| {
+                release();
+                let (done, closed) = std::sync::mpsc::channel();
+                if work.send(railwatch_server::jobs::TenantWork::Release(done)).is_ok() {
+                    let _ = closed.recv_timeout(Duration::from_secs(5));
+                }
+                railwatch_server::jobs::prune::after_trim(&c, &work, t);
+            };
+            railwatch_server::storage::budget::check(&cfg.budget, &cfg.data_dir, &cfg.tenants_dir(), &disk, &on_trim);
+            railwatch_server::storage::budget::spawn(cfg.budget, cfg.data_dir.clone(), cfg.tenants_dir(), disk.clone(), Box::new(on_trim), budget_stopped)
+        });
         let users: i64 = web_state.control.with(|c| c.query_row("SELECT count(*) FROM users", [], |r| r.get(0))).unwrap_or(0);
         if users == 0 {
             tracing::warn!("no users yet: run `railwatch setup` to create the admin");

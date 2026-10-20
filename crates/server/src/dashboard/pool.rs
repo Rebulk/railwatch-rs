@@ -78,15 +78,53 @@ impl std::ops::Deref for Reader {
 impl Drop for Reader {
     fn drop(&mut self) {
         if let Some(c) = self.conn.take() {
-            self.pool.idle.lock().unwrap().push(c);
+            // A reader busy while its day files were deleted (retention, the
+            // disk budget) is closed on return rather than kept idle: its
+            // handles would hold the deleted files' space until its next
+            // checkout. Checked under the idle lock, so it cannot slip past
+            // a concurrent `release_deleted`.
+            let mut idle = self.pool.idle.lock().unwrap();
+            if c.attaches_deleted() {
+                drop(idle);
+                drop(c);
+                *self.pool.open.lock().unwrap() -= 1;
+            } else {
+                idle.push(c);
+            }
             self.pool.ready.notify_one();
         }
+    }
+}
+
+impl Pooled {
+    fn attaches_deleted(&self) -> bool {
+        self.days.as_ref().is_some_and(|(_, attached)| attached.iter().any(|f| !f.exists()))
     }
 }
 
 impl ReadPools {
     pub fn new(dir: PathBuf, per_tenant: usize) -> ReadPools {
         ReadPools { dir, per_tenant: per_tenant.max(1), pools: Default::default() }
+    }
+
+    /// Closes idle union readers that attach a deleted day file (retention
+    /// or the disk budget just deleted it): an open handle keeps an unlinked
+    /// file's blocks allocated, and an idle reader would only re-attach on
+    /// its next checkout. Readers checked out now close on return (Drop).
+    pub fn release_deleted(&self) -> usize {
+        let pools: Vec<Arc<TenantPool>> = self.pools.lock().unwrap().values().cloned().collect();
+        let mut closed = 0;
+        for pool in pools {
+            let mut idle = pool.idle.lock().unwrap();
+            let (gone, kept): (Vec<Pooled>, Vec<Pooled>) = std::mem::take(&mut *idle).into_iter().partition(Pooled::attaches_deleted);
+            *idle = kept;
+            drop(idle);
+            *pool.open.lock().unwrap() -= gone.len();
+            closed += gone.len();
+            drop(gone);
+            pool.ready.notify_all();
+        }
+        closed
     }
 
     pub fn get(&self, slug: &str) -> rusqlite::Result<Reader> {

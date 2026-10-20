@@ -49,6 +49,9 @@ pub struct Worker {
     pub tiers: crate::storage::retention::Tiers,
     /// The accumulator's memory cap per tenant (MAX_BYTES; tests lower it).
     pub acc_max_bytes: usize,
+    /// After this thread's prune deleted day files: closes the rest of the
+    /// process's handles to them (the dashboard pools, the ingest writers).
+    pub on_release: Option<Box<dyn Fn() + Send>>,
     tenants: HashMap<i64, (String, Tenant)>,
 }
 
@@ -61,7 +64,7 @@ pub fn open_read(path: &std::path::Path) -> rusqlite::Result<Connection> {
 
 impl Worker {
     pub fn new(control: Arc<Control>, dir: PathBuf) -> Worker {
-        Worker { control, dir, tiers: Default::default(), acc_max_bytes: MAX_BYTES, tenants: HashMap::new() }
+        Worker { control, dir, tiers: Default::default(), acc_max_bytes: MAX_BYTES, on_release: None, tenants: HashMap::new() }
     }
 
     fn tenant(&mut self, env: i64, slug: &str) -> rusqlite::Result<&mut Tenant> {
@@ -100,6 +103,20 @@ impl Worker {
             crate::storage::reader::refresh(&t.read, dir, attached)?;
         }
         Ok(t)
+    }
+
+    /// Re-attaches every per-day tenant's union reader whose day files
+    /// changed: one still attaching a deleted file holds its space, and on a
+    /// quiet tenant `tenant()` (the only other refresh) may not run for
+    /// hours.
+    pub fn reattach(&mut self) {
+        for (env, (slug, t)) in self.tenants.iter_mut() {
+            if let Some((dir, attached)) = t.days.as_mut()
+                && let Err(e) = crate::storage::reader::refresh(&t.read, dir, attached)
+            {
+                tracing::error!(environment = env, tenant = slug, error = %e, "could not re-attach after day files were deleted");
+            }
+        }
     }
 
     /// Drops a tenant's connections (its files are about to be deleted or
@@ -165,9 +182,25 @@ impl Worker {
                 t.acc.clear();
                 t.users.clear();
                 match t.days.as_ref().map(|(d, _)| d.clone()) {
-                    Some(dir) => super::prune::prune_days(&control, &dir, &t.write, env, tiers).map(|_| ()),
+                    Some(dir) => {
+                        let p = super::prune::prune_days(&control, &dir, &t.write, env, tiers)?;
+                        // As after the disk budget: every handle to the
+                        // deleted files goes, or their space stays in use.
+                        if p.detail_files + p.core_files > 0 {
+                            self.reattach();
+                            if let Some(release) = &self.on_release {
+                                release();
+                            }
+                        }
+                        Ok(())
+                    }
                     None => super::prune::prune(&control, &t.write, env).map(|_| ()),
                 }
+            }
+            TenantWork::Release(done) => {
+                self.reattach();
+                let _ = done.send(());
+                Ok(())
             }
             TenantWork::Trimmed { env, slug } => {
                 // Exceptions went with the files: the kept affected-user
@@ -194,7 +227,14 @@ impl Worker {
             let conn = control.conn();
             grouping::group_with(&conn, &t.read, f.env_id, rows, None, &mut t.users)?;
         }
+        for (table, ids) in &f.rolled_ids {
+            if *table != "sessions" {
+                t.acc.ingest_except(&t.read, table, ids, &t.full_hours).map_err(e)?;
+            }
+        }
         if t.acc.bytes() > max_bytes {
+            // Checked after the batch is in, so a cold group load or a
+            // big batch never stays over the cap until the next batch.
             // The hours it holds are too big to keep in memory: they leave
             // the accumulator for good and are recomputed in full at each
             // flush while rows arrive (RollupJob, same output), until they
@@ -211,11 +251,6 @@ impl Worker {
             t.overflow_buckets.extend(hours.iter().copied());
             t.full_hours.extend(hours);
             t.acc.clear();
-        }
-        for (table, ids) in &f.rolled_ids {
-            if *table != "sessions" {
-                t.acc.ingest_except(&t.read, table, ids, &t.full_hours).map_err(e)?;
-            }
         }
         t.overflow_buckets.extend(f.rollup_buckets.iter().filter(|b| t.full_hours.contains(b)));
         t.session_buckets.extend(f.session_buckets.iter().copied());
@@ -253,6 +288,56 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open_deleted(root: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .filter(|t| t.starts_with(root) && t.to_string_lossy().ends_with(" (deleted)"))
+            .count()
+    }
+
+    /// Retention deletes day files under the worker's own union reader (and
+    /// the disk budget asks it to let go with Release). Both close every
+    /// handle to them, the reader's and, through on_release, the rest of the
+    /// process's, so the space comes back on a tenant that gets no more work.
+    #[test]
+    fn prune_and_release_close_the_union_readers_handles_to_deleted_files() {
+        let root = std::env::temp_dir().join(format!("rw-worker-release-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(root.join("telemetry")).unwrap();
+        let control = Arc::new(Control::open(&root.join("control.sqlite3")).unwrap());
+        let env = control.create("quiet", &format!("{:0>64}", 2), 30).unwrap();
+        let dir = root.join("telemetry").join("quiet");
+        crate::storage::layout::ensure(&dir).unwrap();
+        let day = |ago: i64| crate::time::utc_seconds_string(crate::time::now_micros() / 1_000_000 - ago * 86_400)[..10].to_string();
+        for ago in [40, 10, 1] {
+            for tier in [crate::storage::Tier::Core, crate::storage::Tier::Detail] {
+                crate::storage::layout::open_or_create(&crate::storage::layout::day_path(&dir, tier, &day(ago))).unwrap();
+            }
+        }
+        let released = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut w = Worker::new(control, root.join("telemetry"));
+        let r2 = released.clone();
+        w.on_release = Some(Box::new(move || {
+            r2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        // The worker's reader attaches all six day files.
+        w.handle_inner(TenantWork::Drain { env: env.id, slug: "quiet".into() }).unwrap();
+        // Retention: 40 days old goes (both tiers), 10 days old loses detail.
+        w.handle_inner(TenantWork::Prune { env: env.id, slug: "quiet".into() }).unwrap();
+        assert_eq!(crate::storage::layout::days(&dir, crate::storage::Tier::Detail), vec![day(1)]);
+        assert_eq!(open_deleted(&root), 0, "the worker re-attached after its prune");
+        assert_eq!(released.load(std::sync::atomic::Ordering::Relaxed), 1, "and had the rest of the process let go");
+        // The disk budget deletes a file the worker has attached.
+        crate::storage::retention::remove_for_test(&crate::storage::layout::day_path(&dir, crate::storage::Tier::Core, &day(10)));
+        assert!(open_deleted(&root) > 0);
+        let (done, rx) = std::sync::mpsc::channel();
+        w.handle_inner(TenantWork::Release(done)).unwrap();
+        rx.recv().unwrap();
+        assert_eq!(open_deleted(&root), 0, "Release re-attached a quiet tenant's reader");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// At its memory cap the accumulator lets go of the hour it holds; that
     /// hour is recomputed in full from then on, so the rollups are the same

@@ -82,6 +82,9 @@ pub enum TenantWork {
         env: i64,
         slug: String,
     },
+    /// Day files were deleted: re-attach the union readers
+    /// (Worker::reattach), then answer.
+    Release(std::sync::mpsc::Sender<()>),
     /// Runs on the worker with the tenant's (read, write) connections.
     With {
         env: i64,
@@ -99,6 +102,7 @@ impl TenantWork {
             TenantWork::Drain { .. } => "drain",
             TenantWork::Prune { .. } => "prune",
             TenantWork::Trimmed { .. } => "disk_budget",
+            TenantWork::Release(_) => "release_deleted",
             TenantWork::With { .. } => "detector",
         }
     }
@@ -111,10 +115,12 @@ pub struct Jobs {
 
 /// Starts the worker thread and returns the handle the follow-ups use.
 pub fn start(control: Arc<Control>, tenants_dir: PathBuf) -> Jobs {
-    start_with(control, tenants_dir, crate::storage::retention::Tiers::default())
+    start_with(control, tenants_dir, crate::storage::retention::Tiers::default(), None)
 }
 
-pub fn start_with(control: Arc<Control>, tenants_dir: PathBuf, tiers: crate::storage::retention::Tiers) -> Jobs {
+/// `on_release`: after a prune deleted day files, closes the process's other
+/// handles to them (worker.rs `on_release`).
+pub fn start_with(control: Arc<Control>, tenants_dir: PathBuf, tiers: crate::storage::retention::Tiers, on_release: Option<Box<dyn Fn() + Send>>) -> Jobs {
     let (tx, rx) = std::sync::mpsc::channel();
     let heartbeats = Arc::new(watchdog::Heartbeats::default());
     if let Err(e) = heartbeats.restore(&control.conn()) {
@@ -122,6 +128,7 @@ pub fn start_with(control: Arc<Control>, tenants_dir: PathBuf, tiers: crate::sto
     }
     let mut w = worker::Worker::new(control, tenants_dir);
     w.tiers = tiers;
+    w.on_release = on_release;
     let t = std::thread::Builder::new().name("rollups".into()).spawn(move || w.run(rx)).expect("spawn worker");
     Jobs { background: Background { heartbeats, work: tx }, threads: vec![t] }
 }

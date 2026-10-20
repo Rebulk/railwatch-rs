@@ -115,7 +115,13 @@ exemplar copy: the point is space); never today's files, meta or the control
 DB. Under the lock as above, every 10 s and at start. Deleted core days move
 `raw_pruned_through` to the end of the newest one, so the ingest floor
 rejects rows that would recreate them. `min_free_bytes` refuses ingest with
-503 + Retry-After while the filesystem is below it. Single-file environments
+503 + Retry-After while the filesystem is below it. After any deletion
+(retention or budget) every handle to the deleted files is closed, since an
+open handle keeps an unlinked file's space allocated: idle dashboard readers
+are dropped, a reader checked out at the time is dropped when it is
+returned, ingest writers drop cached day files, and the worker re-attaches
+its own union readers; the budget does this before it reads free space.
+Single-file environments
 count against the budget but are never trimmed (split them). Every deletion
 and every crossing is logged (docs/SELF-HOST.md, "Disk budget").
 
