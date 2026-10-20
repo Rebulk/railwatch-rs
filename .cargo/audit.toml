@@ -1,0 +1,8 @@
+[advisories]
+# RUSTSEC-2026-0381 (distrusted emSign intermediates in webpki-roots < 1.0.10)
+# matches webpki-roots 0.26.11 by version only. 0.26.11 is a semver-trick
+# shim that re-exports webpki-roots 1, locked at 1.0.10 (the fixed release),
+# so its roots are the fixed ones. It is pulled in by rustls-acme 0.15.4
+# (via async-web-client 0.6.3), the latest release of both. Remove this once
+# they depend on webpki-roots 1 directly.
+ignore = ["RUSTSEC-2026-0381"]
