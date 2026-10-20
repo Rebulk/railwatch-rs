@@ -1062,6 +1062,20 @@ fn doctor() -> ExitCode {
             } else {
                 println!("ok    {line}");
             }
+            if cfg.budget.min_free_bytes > 0 && free < cfg.budget.min_free_bytes {
+                ok = false;
+                println!("FAIL  under min_free_bytes ({}): ingest is refused (503) until space is freed", cfg.budget.min_free_bytes);
+            }
+        }
+    }
+    // Disk budget.
+    if cfg.budget.max_data_bytes > 0 {
+        let (used, _) = railwatch_server::storage::budget::usage(&cfg.tenants_dir());
+        let line = format!("telemetry: {:.1} GiB of max_data_bytes {:.1} GiB", used as f64 / 1073741824.0, cfg.budget.max_data_bytes as f64 / 1073741824.0);
+        if used > cfg.budget.max_data_bytes {
+            println!("warn  {line}: over; the server deletes the oldest day files");
+        } else {
+            println!("ok    {line}");
         }
     }
     // Control DB.
@@ -1288,6 +1302,7 @@ fn serve() -> ExitCode {
         }
         let (followups_tx, followups_rx) = followups::channel();
         let tenants = Tenants::new(cfg.tenants_dir(), Duration::from_secs(cfg.tenant_idle_seconds), followups_tx);
+        let disk = Arc::new(railwatch_server::storage::budget::State::default());
         let state = Arc::new(AppState {
             control: control.clone(),
             tenants: tenants.clone(),
@@ -1296,10 +1311,21 @@ fn serve() -> ExitCode {
             trust_proxy: cfg.trust_proxy,
             sourcemaps_dir: cfg.data_dir.join("sourcemaps"),
             cpu: Arc::new(tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(4, |n| n.get()))),
+            disk: disk.clone(),
         });
         railwatch_server::grouping::set_limits(cfg.new_issues);
         // Phase 2: rollups, grouping, drain, detectors, alerts, watchdog.
         let jobs = railwatch_server::jobs::start_with(control.clone(), cfg.tenants_dir(), cfg.tiers);
+        // Disk budget (storage::budget): one pass now, before the first
+        // request, then every 10 s until shutdown.
+        let (stop_budget, budget_stopped) = std::sync::mpsc::channel::<()>();
+        let budget_thread = (!cfg.budget.is_off()).then(|| {
+            tracing::info!(max_data_bytes = cfg.budget.max_data_bytes, min_free_bytes = cfg.budget.min_free_bytes, "disk budget on");
+            let (c, work) = (control.clone(), jobs.background.work.clone());
+            let on_trim = move |t: &railwatch_server::storage::budget::Trimmed| railwatch_server::jobs::prune::after_trim(&c, &work, t);
+            railwatch_server::storage::budget::check(&cfg.budget, &cfg.data_dir, &cfg.tenants_dir(), &disk, &on_trim);
+            railwatch_server::storage::budget::spawn(cfg.budget, cfg.data_dir.clone(), cfg.tenants_dir(), disk.clone(), Box::new(on_trim), budget_stopped)
+        });
         if let Some(b) = cfg.backup.clone() {
             tracing::info!(endpoint = %b.s3.endpoint, bucket = %b.s3.bucket, every = b.interval_secs, "backups on");
             railwatch_server::storage::backup::spawn(b, cfg.data_dir.clone(), cfg.tenants_dir());
@@ -1434,6 +1460,12 @@ fn serve() -> ExitCode {
         followups_task.await.ok();
         let _ = stop_jobs.send(true);
         scheduler.await.ok();
+        // Its trim hook holds a sender to the worker: stopped first, so the
+        // worker sees its channel close.
+        drop(stop_budget);
+        if let Some(t) = budget_thread {
+            tokio::task::spawn_blocking(move || drop(t.join())).await.ok();
+        }
         let railwatch_server::jobs::Jobs { background, threads } = jobs;
         drop(background);
         tokio::task::spawn_blocking(move || threads.into_iter().for_each(|t| drop(t.join()))).await.ok();

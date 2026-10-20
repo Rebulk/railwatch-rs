@@ -20,6 +20,7 @@
 //! committed batch advances them.
 
 pub mod backup;
+pub mod budget;
 pub mod exemplars;
 pub mod export;
 pub mod layout;

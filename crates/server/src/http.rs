@@ -6,7 +6,8 @@
 //! them (html entities escaped).
 //!
 //! Order per request, as in Rails: body limit (413) -> IP limit (429) ->
-//! route (404) -> authenticate (401) -> environment limit (429) -> action.
+//! route (404) -> authenticate (401) -> environment limit (429) -> action,
+//! with the disk floor (503, storage::budget) before any action that writes.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -48,6 +49,9 @@ pub struct AppState {
     /// in-flight request runs on the blocking pool at once and they all
     /// finish late together: p99 1.2 s at 32 in flight vs 0.13 s at 8.
     pub cpu: Arc<tokio::sync::Semaphore>,
+    /// The disk budget's state (storage::budget): under min_free_bytes,
+    /// writes are refused with 503.
+    pub disk: Arc<crate::storage::budget::State>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -75,6 +79,11 @@ fn internal_error() -> Response {
 
 fn busy() -> Response {
     with_retry_after(json(StatusCode::SERVICE_UNAVAILABLE, rhash! {"error" => "database busy", "retry_after" => 15i64}), 15)
+}
+
+/// Below min_free_bytes: the gem keeps the batch and retries later.
+fn disk_full() -> Response {
+    with_retry_after(json(StatusCode::SERVICE_UNAVAILABLE, rhash! {"error" => "disk almost full", "retry_after" => 60i64}), 60)
 }
 
 fn too_large() -> Response {
@@ -172,6 +181,9 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
 
     if state.env_limit.exceeded(&env.id) {
         return rate_limited();
+    }
+    if action != Action::Ping && state.disk.refuse_ingest() {
+        return disk_full();
     }
 
     // The body, capped while reading (a client may lie about its length or

@@ -29,6 +29,8 @@ struct Group {
     /// id -> (sort key, row)
     rows: HashMap<i64, (SortKey, RawRow)>,
     dirty: bool,
+    /// `row_bytes` of its rows.
+    bytes: usize,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -38,11 +40,24 @@ struct SortKey(Vec<u8>, i64, i64);
 pub struct Accumulator {
     groups: HashMap<Key, Group>,
     rows: usize,
+    bytes: usize,
 }
 
-/// Rows above which a tenant's accumulator gives up and falls back to the
-/// full recompute (bounds memory; logged).
-pub const MAX_ROWS: usize = 3_000_000;
+/// The most a tenant's accumulator may hold, by `row_bytes`. Over it, the
+/// hours it holds are recomputed in full instead (worker.rs). Rows cost
+/// ~650 bytes of RSS each, so this is ~200k rows (docs/PERF.md, "Bounded
+/// memory"); 3M rows, the former row cap, was ~2 GB.
+pub const MAX_BYTES: usize = 128 << 20;
+
+/// Heap a row holds here, roughly: the map entry, the row's values and
+/// their bytes, and the sort key's copy of occurred_at.
+fn row_bytes(key: &SortKey, row: &RawRow) -> usize {
+    std::mem::size_of::<(i64, (SortKey, RawRow))>()
+        + 16
+        + row.len() * std::mem::size_of::<crate::rollup::sqlval::Sql>()
+        + row.iter().map(|v| v.text().map_or(0, <[u8]>::len)).sum::<usize>()
+        + key.0.len()
+}
 
 fn hour_of(occurred_at: &[u8]) -> Option<i64> {
     let s = std::str::from_utf8(occurred_at).ok()?;
@@ -61,8 +76,19 @@ impl Accumulator {
         self.rows
     }
 
+    /// The rows' `row_bytes`.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// Folds in newly committed rows of `table` (by id).
     pub fn ingest(&mut self, read: &Connection, table: &str, ids: &[i64]) -> rusqlite::Result<()> {
+        self.ingest_except(read, table, ids, &HashSet::new())
+    }
+
+    /// `ingest`, leaving out rows of the hours in `skip` (recomputed in
+    /// full instead: worker.rs at MAX_BYTES).
+    pub fn ingest_except(&mut self, read: &Connection, table: &str, ids: &[i64], skip: &HashSet<i64>) -> rusqlite::Result<()> {
         for (si, source) in SOURCES.iter().enumerate() {
             if source.table.name() != table {
                 continue;
@@ -76,6 +102,9 @@ impl Accumulator {
                 for row in rows {
                     let Some(g) = row[1].text().map(<[u8]>::to_vec) else { continue };
                     let Some(bucket) = hour_of(row.last().unwrap().s()) else { continue };
+                    if skip.contains(&bucket) {
+                        continue;
+                    }
                     let key = (si, g, bucket);
                     if !self.groups.contains_key(&key) {
                         self.load_group(read, &key)?;
@@ -90,9 +119,18 @@ impl Accumulator {
     fn insert(&mut self, key: &Key, source: &Source, row: RawRow) {
         let g = self.groups.get_mut(key).expect("loaded");
         let id = row[0].to_i();
-        if g.rows.insert(id, (sort_key(source, &row), row)).is_none() {
-            self.rows += 1;
+        let sk = sort_key(source, &row);
+        let n = row_bytes(&sk, &row);
+        match g.rows.insert(id, (sk, row)) {
+            None => self.rows += 1,
+            Some((old_key, old)) => {
+                let o = row_bytes(&old_key, &old);
+                g.bytes -= o;
+                self.bytes -= o;
+            }
         }
+        g.bytes += n;
+        self.bytes += n;
         g.dirty = true;
     }
 
@@ -106,7 +144,7 @@ impl Accumulator {
             let mut st = read.prepare_cached(&sql)?;
             st.query_map(rusqlite::params![g, from, to], |r| row_values(r, source.width() + 1))?.collect::<rusqlite::Result<_>>()?
         };
-        self.groups.insert(key.clone(), Group { rows: HashMap::new(), dirty: true });
+        self.groups.insert(key.clone(), Group { rows: HashMap::new(), dirty: true, bytes: 0 });
         for row in rows {
             self.insert(key, source, row);
         }
@@ -134,20 +172,23 @@ impl Accumulator {
 
     /// Drops group-hours that ended before `before` (epoch seconds).
     pub fn evict_before(&mut self, before: i64) {
-        let mut dropped = 0;
+        let (mut rows, mut bytes) = (0, 0);
         self.groups.retain(|k, g| {
             let keep = k.2 + 3600 > before || g.dirty;
             if !keep {
-                dropped += g.rows.len();
+                rows += g.rows.len();
+                bytes += g.bytes;
             }
             keep
         });
-        self.rows -= dropped;
+        self.rows -= rows;
+        self.bytes -= bytes;
     }
 
     pub fn clear(&mut self) {
-        self.groups.clear();
+        self.groups = HashMap::new();
         self.rows = 0;
+        self.bytes = 0;
     }
 
     pub fn touched_buckets(&self) -> HashSet<i64> {

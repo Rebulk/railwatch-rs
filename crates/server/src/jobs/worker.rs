@@ -22,7 +22,7 @@ use super::TenantWork;
 use crate::control::Control;
 use crate::followups::{Followup, ROLLUP_FLUSH};
 use crate::grouping;
-use crate::rollup::incremental::{self, Accumulator, MAX_ROWS};
+use crate::rollup::incremental::{self, Accumulator, MAX_BYTES};
 use crate::rollup::{release_health_rollup_job, rollup_job};
 
 struct Tenant {
@@ -35,8 +35,11 @@ struct Tenant {
     acc: Accumulator,
     /// Hours whose sessions changed since the last flush.
     session_buckets: HashSet<i64>,
-    /// The accumulator overflowed: these hours need a full recompute.
+    /// Hours to recompute in full at the next flush.
     overflow_buckets: HashSet<i64>,
+    /// Hours the accumulator gave up on at its memory cap (MAX_BYTES):
+    /// their rows are not accumulated; each flush recomputes them.
+    full_hours: HashSet<i64>,
     users: grouping::AffectedUsers,
 }
 
@@ -44,6 +47,8 @@ pub struct Worker {
     pub control: Arc<Control>,
     pub dir: PathBuf,
     pub tiers: crate::storage::retention::Tiers,
+    /// The accumulator's memory cap per tenant (MAX_BYTES; tests lower it).
+    pub acc_max_bytes: usize,
     tenants: HashMap<i64, (String, Tenant)>,
 }
 
@@ -56,7 +61,7 @@ pub fn open_read(path: &std::path::Path) -> rusqlite::Result<Connection> {
 
 impl Worker {
     pub fn new(control: Arc<Control>, dir: PathBuf) -> Worker {
-        Worker { control, dir, tiers: Default::default(), tenants: HashMap::new() }
+        Worker { control, dir, tiers: Default::default(), acc_max_bytes: MAX_BYTES, tenants: HashMap::new() }
     }
 
     fn tenant(&mut self, env: i64, slug: &str) -> rusqlite::Result<&mut Tenant> {
@@ -84,6 +89,7 @@ impl Worker {
                         acc: Accumulator::default(),
                         session_buckets: HashSet::new(),
                         overflow_buckets: HashSet::new(),
+                        full_hours: HashSet::new(),
                         users: Default::default(),
                     },
                 ),
@@ -163,6 +169,12 @@ impl Worker {
                     None => super::prune::prune(&control, &t.write, env).map(|_| ()),
                 }
             }
+            TenantWork::Trimmed { env, slug } => {
+                // Exceptions went with the files: the kept affected-user
+                // sets would overcount, as after a prune.
+                self.tenant(env, &slug).map_err(e)?.users.clear();
+                Ok(())
+            }
             TenantWork::With { env, slug, f } => {
                 let t = self.tenant(env, &slug).map_err(e)?;
                 f(&t.read, &t.write);
@@ -174,6 +186,7 @@ impl Worker {
     fn committed(&mut self, f: Followup) -> Result<(), String> {
         let e = |e: rusqlite::Error| e.to_string();
         let control = self.control.clone();
+        let max_bytes = self.acc_max_bytes;
         let t = self.tenant(f.env_id, &f.slug).map_err(e)?;
         // Direct path: GroupExceptionsJob. Receipted: the drain, under claims.
         if !f.exception_ids.is_empty() && !f.receipted {
@@ -181,20 +194,30 @@ impl Worker {
             let conn = control.conn();
             grouping::group_with(&conn, &t.read, f.env_id, rows, None, &mut t.users)?;
         }
-        if t.acc.row_count() > MAX_ROWS {
-            tracing::warn!(tenant = f.slug, rows = t.acc.row_count(), "rollup accumulator full; falling back to full recompute");
-            t.overflow_buckets.extend(t.acc.touched_buckets());
-            t.overflow_buckets.extend(f.rollup_buckets.iter().copied());
+        if t.acc.bytes() > max_bytes {
+            // The hours it holds are too big to keep in memory: they leave
+            // the accumulator for good and are recomputed in full at each
+            // flush while rows arrive (RollupJob, same output), until they
+            // age out like any hour. Reloading them group by group instead
+            // would refill it with the same hour on the next batch.
+            let hours = t.acc.touched_buckets();
+            tracing::info!(
+                tenant = f.slug,
+                rows = t.acc.row_count(),
+                bytes = t.acc.bytes(),
+                hours = hours.len(),
+                "rollup accumulator at its memory cap; recomputing its hours in full"
+            );
+            t.overflow_buckets.extend(hours.iter().copied());
+            t.full_hours.extend(hours);
             t.acc.clear();
-        } else if t.overflow_buckets.is_empty() {
-            for (table, ids) in &f.rolled_ids {
-                if *table != "sessions" {
-                    t.acc.ingest(&t.read, table, ids).map_err(e)?;
-                }
-            }
-        } else {
-            t.overflow_buckets.extend(f.rollup_buckets.iter().copied());
         }
+        for (table, ids) in &f.rolled_ids {
+            if *table != "sessions" {
+                t.acc.ingest_except(&t.read, table, ids, &t.full_hours).map_err(e)?;
+            }
+        }
+        t.overflow_buckets.extend(f.rollup_buckets.iter().filter(|b| t.full_hours.contains(b)));
         t.session_buckets.extend(f.session_buckets.iter().copied());
         Ok(())
     }
@@ -212,7 +235,9 @@ impl Worker {
                     release_health_rollup_job::perform(&t.read, &t.write, b, i64::MIN)?;
                 }
                 // Hours older than the catch-up window leave memory.
-                t.acc.evict_before(now - now.rem_euclid(3600) - 3600);
+                let before = now - now.rem_euclid(3600) - 3600;
+                t.acc.evict_before(before);
+                t.full_hours.retain(|h| h + 3600 > before);
                 Ok(())
             })();
             if let Err(e) = r {
@@ -222,5 +247,74 @@ impl Worker {
         if !self.tenants.is_empty() {
             tracing::debug!(ms = started.elapsed().as_millis() as u64, "rollup flush");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// At its memory cap the accumulator lets go of the hour it holds; that
+    /// hour is recomputed in full from then on, so the rollups are the same
+    /// as if nothing had been capped, and the memory stays under the cap.
+    #[test]
+    fn at_the_memory_cap_the_hour_is_recomputed_in_full_with_the_same_rollups() {
+        let dir = std::env::temp_dir().join(format!("rw-acc-cap-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let control = Arc::new(Control::open(&dir.join("control.sqlite3")).unwrap());
+        let env = control.create("capped", &format!("{:0>64}", 1), 30).unwrap();
+        let path = dir.join("capped.sqlite3");
+        let t = crate::tenants::open_tenant(&path).unwrap();
+        let now = crate::time::now_micros() / 1_000_000;
+        let hour = now - now.rem_euclid(3600);
+        let mut w = Worker::new(control, dir.clone());
+        w.acc_max_bytes = 64 << 10;
+        let mut peak = 0;
+        for batch in 0..40 {
+            let mut ids = Vec::new();
+            for i in 0..25 {
+                t.execute(
+                    "INSERT INTO queries (occurred_at, duration, group_hash, sql) VALUES (?, ?, ?, 'SELECT 1')",
+                    rusqlite::params![crate::time::quoted_date_micros((hour + batch * 60 + i) * 1_000_000), (batch * 7 + i) % 500 + 1, format!("q{}", i % 6)],
+                )
+                .unwrap();
+                ids.push(t.last_insert_rowid());
+            }
+            let f = Followup {
+                env_id: env.id,
+                slug: "capped".into(),
+                accepted: ids.len() as i64,
+                committed_at_micros: now * 1_000_000,
+                rollup_buckets: vec![hour],
+                session_buckets: vec![],
+                exception_ids: vec![],
+                counts: vec![],
+                receipted: false,
+                rolled_ids: vec![("queries", ids)],
+                servers: vec![],
+            };
+            w.committed(f).unwrap();
+            let acc = &w.tenants[&env.id].1.acc;
+            peak = peak.max(acc.bytes());
+            if batch % 7 == 0 {
+                w.flush_all();
+            }
+        }
+        w.flush_all();
+        let tenant = &w.tenants[&env.id].1;
+        assert!(tenant.full_hours.contains(&hour), "the cap was reached");
+        assert_eq!(tenant.acc.row_count(), 0, "the capped hour is not accumulated again");
+        assert!(peak <= (64 << 10) + 25 * 1024, "held at most the cap plus one batch: {peak}");
+        let dump = |c: &Connection| -> Vec<Vec<rusqlite::types::Value>> {
+            let mut s = c
+                .prepare("SELECT record_type, group_hash, bucket, name, count, duration_sum, duration_max, p50, p95, p99, digest FROM rollups ORDER BY 1, 2, 3")
+                .unwrap();
+            s.query_map([], |r| (0..11).map(|i| r.get(i)).collect()).unwrap().map(Result::unwrap).collect()
+        };
+        let capped = dump(&t);
+        assert_eq!(capped.iter().map(|r| r[4].clone()).map(|v| if let rusqlite::types::Value::Integer(n) = v { n } else { 0 }).sum::<i64>(), 1000);
+        rollup_job::perform(&t, &t, hour, &mut rollup_job::Rng::PerGroup).unwrap();
+        assert_eq!(capped, dump(&t), "same rollups as a full recompute");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

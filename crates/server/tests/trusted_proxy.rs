@@ -87,6 +87,7 @@ async fn mounted_under_a_base_path_behind_a_trusted_proxy() {
         trust_proxy: false,
         sourcemaps_dir: dir.join("sourcemaps"),
         cpu: Arc::new(tokio::sync::Semaphore::new(2)),
+        disk: Default::default(),
     });
     let web_state = Arc::new(WebState::new(control.clone(), cfg.clone(), tenants, web::cable::Hub::new()).expect("web state"));
     // What every route sees of the header: proxy_auth::layer removes it.

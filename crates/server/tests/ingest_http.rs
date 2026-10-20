@@ -23,6 +23,7 @@ struct Server {
     dir: tempdir::Dir,
     control: Arc<Control>,
     token: String,
+    disk: Arc<railwatch_server::storage::budget::State>,
 }
 
 mod tempdir {
@@ -48,6 +49,8 @@ fn start(ip_limit: u64, env_limit: u64) -> Server {
     };
     let c2 = control.clone();
     let d2 = dir.clone();
+    let disk = Arc::new(railwatch_server::storage::budget::State::default());
+    let disk2 = disk.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         rt.block_on(async move {
@@ -61,13 +64,14 @@ fn start(ip_limit: u64, env_limit: u64) -> Server {
                 trust_proxy: true,
                 sourcemaps_dir: d2.join("sourcemaps"),
                 cpu: Arc::new(tokio::sync::Semaphore::new(4)),
+                disk: disk2,
             });
             tokio::spawn(followups::run(c2, rx));
             let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
             axum::serve(listener, http::router(state).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
         });
     });
-    Server { addr, dir: tempdir::Dir(dir), control, token }
+    Server { addr, dir: tempdir::Dir(dir), control, token, disk }
 }
 
 fn rand_suffix() -> u64 {
@@ -332,6 +336,33 @@ fn a_failing_batch_rolls_back_alone_when_coalesced() {
     assert_eq!(statuses.iter().filter(|s| **s == 200).count(), 18);
     assert_eq!(s.count("queries"), 18, "the failed batches' rows rolled back");
     assert_eq!(s.count("ingest_batches"), 18);
+}
+
+/// Under min_free_bytes (storage::budget) a batch is refused with 503 and
+/// Retry-After, so the gem keeps it and retries, and nothing is written;
+/// ping still answers. Once space is back the same batch goes in.
+#[test]
+fn under_the_disk_floor_ingest_answers_503_and_writes_nothing() {
+    let s = start(0, 0);
+    let body = gzip(&ndjson(&[fixture("log")]));
+    assert_eq!(s.post(&body, &[]).0, 200);
+    let free = railwatch_server::storage::budget::free_bytes(&s.dir.0).unwrap();
+    let low = railwatch_server::storage::budget::Budget { max_data_bytes: 0, min_free_bytes: free + (1 << 40) };
+    let telemetry = s.dir.0.join("telemetry");
+    railwatch_server::storage::budget::check(&low, &s.dir.0, &telemetry, &s.disk, &|_| {});
+    let (status, headers, ack) = s.post(&body, &[]);
+    assert_eq!(status, 503);
+    assert_eq!(ack, json!({"error": "disk almost full", "retry_after": 60}));
+    assert!(headers.contains(&("retry-after".into(), "60".into())));
+    assert_eq!(s.count("logs"), 1);
+    let ping = request(s.addr, "GET", "/ingest/ping", &[("Authorization", format!("Bearer {}", s.token))], b"");
+    assert_eq!(ping.0, 200);
+    // Unauthenticated requests still get 401 first.
+    assert_eq!(request(s.addr, "POST", "/ingest", &[], &body).0, 401);
+    let ok = railwatch_server::storage::budget::Budget { max_data_bytes: 0, min_free_bytes: 1 };
+    railwatch_server::storage::budget::check(&ok, &s.dir.0, &telemetry, &s.disk, &|_| {});
+    assert_eq!(s.post(&body, &[]).0, 200);
+    assert_eq!(s.count("logs"), 2);
 }
 
 #[test]

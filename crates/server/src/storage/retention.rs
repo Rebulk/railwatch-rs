@@ -118,7 +118,7 @@ pub fn prune(dir: &Path, meta: &Connection, tiers: Tiers, retention_days: i64, n
     Ok(out)
 }
 
-fn remove(path: &Path) -> u64 {
+pub(super) fn remove(path: &Path) -> u64 {
     let mut freed = 0;
     for suffix in ["", "-wal", "-shm"] {
         let p = std::path::PathBuf::from(format!("{}{suffix}", path.display()));

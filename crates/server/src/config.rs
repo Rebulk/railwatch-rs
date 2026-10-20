@@ -61,6 +61,9 @@ pub struct Config {
     pub enforce_quota: bool,
     /// Per-day tenants' retention tiers (storage::retention).
     pub tiers: crate::storage::retention::Tiers,
+    /// `max_data_bytes` and `min_free_bytes` (storage::budget); off (0) by
+    /// default.
+    pub budget: crate::storage::budget::Budget,
     /// S3-compatible backups (storage::backup); None = off (the default).
     pub backup: Option<crate::storage::backup::Settings>,
     /// `alert_delivery = "off"`: alerts still fire and are recorded, but
@@ -232,6 +235,32 @@ pub fn read_proxy_secret(path: &str) -> Result<Vec<u8>, String> {
     Ok(secret)
 }
 
+/// A byte count: digits with an optional K, M, G or T suffix (powers of
+/// 1024; `KB`, `KiB` and lower case too). Unset or 0 is 0 (off).
+pub fn parse_bytes(raw: &str) -> Option<u64> {
+    let s = raw.trim().to_ascii_uppercase();
+    let s = s.strip_suffix("IB").or_else(|| s.strip_suffix('B')).unwrap_or(&s);
+    let (digits, shift) = match s.char_indices().last() {
+        Some((i, 'K')) => (&s[..i], 10),
+        Some((i, 'M')) => (&s[..i], 20),
+        Some((i, 'G')) => (&s[..i], 30),
+        Some((i, 'T')) => (&s[..i], 40),
+        _ => (s, 0),
+    };
+    digits.trim().parse::<u64>().ok()?.checked_mul(1 << shift)
+}
+
+fn bytes(v: Option<String>, key: &str) -> Result<u64, String> {
+    v.map_or(Ok(0), |s| parse_bytes(&s).ok_or_else(|| format!("{key}: expected a size like 5G, 500M or 1073741824, got {s:?}")))
+}
+
+fn describe_bytes(n: u64) -> String {
+    match n {
+        0 => "(off)".into(),
+        n => format!("{n} ({:.1} GiB)", n as f64 / (1u64 << 30) as f64),
+    }
+}
+
 fn truthy(s: &str) -> bool {
     matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
@@ -306,6 +335,10 @@ impl Config {
         if tiers.detail_days < 1 || tiers.core_days_max < 1 {
             return Err("detail_retention_days and core_retention_days_max must be at least 1".into());
         }
+        let budget = crate::storage::budget::Budget {
+            max_data_bytes: bytes(get("max_data_bytes", &["RAILWATCH_MAX_DATA_BYTES"]), "max_data_bytes")?,
+            min_free_bytes: bytes(get("min_free_bytes", &["RAILWATCH_MIN_FREE_BYTES"]), "min_free_bytes")?,
+        };
         let backup = match (
             get("backup_s3_endpoint", &["RAILWATCH_BACKUP_S3_ENDPOINT"]),
             get("backup_s3_bucket", &["RAILWATCH_BACKUP_S3_BUCKET"]),
@@ -423,6 +456,7 @@ impl Config {
             tenant_idle_seconds,
             enforce_quota,
             tiers,
+            budget,
             backup,
             alert_delivery,
             tls,
@@ -559,6 +593,8 @@ impl Config {
             ("detail_retention_days".into(), self.tiers.detail_days.to_string(), src("detail_retention_days")),
             ("core_retention_days_max".into(), self.tiers.core_days_max.to_string(), src("core_retention_days_max")),
             ("exemplars_per_hour".into(), self.tiers.exemplars_per_hour.to_string(), src("exemplars_per_hour")),
+            ("max_data_bytes".into(), describe_bytes(self.budget.max_data_bytes), src("max_data_bytes")),
+            ("min_free_bytes".into(), describe_bytes(self.budget.min_free_bytes), src("min_free_bytes")),
             (
                 "backup".into(),
                 match &self.backup {
@@ -638,6 +674,19 @@ mod tests {
         c.trust_proxy = trust_proxy;
         c.tls = None;
         c
+    }
+
+    #[test]
+    fn sizes_take_binary_suffixes() {
+        assert_eq!(parse_bytes("0"), Some(0));
+        assert_eq!(parse_bytes("1073741824"), Some(1 << 30));
+        assert_eq!(parse_bytes("5G"), Some(5 << 30));
+        assert_eq!(parse_bytes(" 500m "), Some(500 << 20));
+        assert_eq!(parse_bytes("2GiB"), Some(2 << 30));
+        assert_eq!(parse_bytes("64KB"), Some(64 << 10));
+        for bad in ["", "G", "-1", "1.5G", "5X", "lots"] {
+            assert_eq!(parse_bytes(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

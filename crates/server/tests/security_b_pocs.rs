@@ -58,6 +58,7 @@ fn start() -> Server {
                 trust_proxy: false,
                 sourcemaps_dir: d2.join("sourcemaps"),
                 cpu: Arc::new(tokio::sync::Semaphore::new(4)),
+                disk: Default::default(),
             });
             tokio::spawn(followups::run(control, rx));
             let listener = tokio::net::TcpListener::from_std(l).unwrap();

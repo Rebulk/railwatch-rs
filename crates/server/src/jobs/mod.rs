@@ -13,7 +13,7 @@
 //! | silent_host_check 5 min     | silent_hosts (Kamal expected_servers)      |
 //! | scheduled_task_check 10 min | check_scheduled_tasks                      |
 //! | release_health_check 10 min | release_health_check                       |
-//! | prune_telemetry daily 3am   | prune per environment, 03:00 UTC           |
+//! | prune_telemetry daily 3am   | prune per environment, 03:00 UTC and at start |
 //! | auto_resolve_issues daily 4am | auto_resolve, 04:00 UTC                  |
 //! | quota_check 15 min          | quota_check                                |
 //! | weekly_digest every monday at 8am | weekly_digest::run_forever, 08:00 UTC Mondays |
@@ -77,6 +77,11 @@ pub enum TenantWork {
         env: i64,
         slug: String,
     },
+    /// The disk budget deleted core day files (exceptions with them).
+    Trimmed {
+        env: i64,
+        slug: String,
+    },
     /// Runs on the worker with the tenant's (read, write) connections.
     With {
         env: i64,
@@ -93,6 +98,7 @@ impl TenantWork {
             TenantWork::RecomputeSessions { .. } => "release_health_catchup",
             TenantWork::Drain { .. } => "drain",
             TenantWork::Prune { .. } => "prune",
+            TenantWork::Trimmed { .. } => "disk_budget",
             TenantWork::With { .. } => "detector",
         }
     }
@@ -330,11 +336,17 @@ pub async fn scheduler(control: Arc<Control>, bg: Background, tenants_dir: PathB
     }
     // weekly_digest: every monday at 8am (UTC).
     handles.push(tokio::spawn(weekly_digest::run_forever(control.clone(), tenants_dir, shutdown.clone())));
-    // Daily: prune at 03:00 UTC, auto-resolve at 04:00 UTC.
+    // Daily: prune at 03:00 UTC, auto-resolve at 04:00 UTC. Prune also runs
+    // once at start: a server that was not up at 03:00 (an app's dev box,
+    // a deploy at the wrong minute) would otherwise never prune. It is
+    // idempotent; on a pruned tenant it deletes nothing.
     {
         let (c, bg) = (control.clone(), bg.clone());
         let mut sd = shutdown.clone();
         handles.push(tokio::spawn(async move {
+            for e in environments(&c) {
+                let _ = bg.work.send(TenantWork::Prune { env: e.id, slug: e.slug });
+            }
             loop {
                 let now = time::now_micros() / 1_000_000;
                 let next = |hour: i64| {
