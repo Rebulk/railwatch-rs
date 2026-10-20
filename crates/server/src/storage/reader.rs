@@ -24,6 +24,18 @@ use super::layout::{self, Tier};
 /// Which files a reader has attached, to notice a new or deleted day.
 pub type Attached = Vec<PathBuf>;
 
+/// A union reader's page cache across all its attached files, in KiB, and
+/// the least any one file gets. Pages are read through mmap, so the cache
+/// barely matters for page time: on a 30-day tenant (62 files) the 261
+/// page cases took 3.2-3.4 s with 64 KiB per file and with 4 MB.
+const CACHE_KIB: i64 = 4_000;
+const MIN_FILE_CACHE_KIB: i64 = 64;
+
+/// Prepared statements a pooled union reader keeps. Each one is compiled
+/// over every file's branch of its views, so 256 of them held 31 MB per
+/// reader on a 30-day tenant; 64 cover the pages' hot statements.
+pub const STATEMENT_CACHE: usize = 64;
+
 pub fn open(dir: &Path) -> rusqlite::Result<(Connection, Attached)> {
     let conn = Connection::open_with_flags("file::memory:", OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -81,9 +93,13 @@ fn attach_all(conn: &Connection, dir: &Path) -> rusqlite::Result<Attached> {
         detail_aliases.push(format!("d{i}"));
         attached.push(p);
     }
-    // mmap per attached file, as the single-file reader does (pool.rs).
+    // mmap per attached file, as the single-file reader does (pool.rs). Each
+    // attached file has its own page cache, so the budget is split over
+    // them: 4 MB apiece was 62 MB per pooled reader on a 30-day tenant
+    // (docs/PERF.md, "Bounded memory").
+    let kib = (CACHE_KIB / (1 + core_aliases.len() + detail_aliases.len()) as i64).max(MIN_FILE_CACHE_KIB);
     for a in std::iter::once(&"m".to_string()).chain(&core_aliases).chain(&detail_aliases) {
-        conn.execute_batch(&format!("PRAGMA \"{a}\".mmap_size = 17179869184; PRAGMA \"{a}\".cache_size = -4000;"))?;
+        conn.execute_batch(&format!("PRAGMA \"{a}\".mmap_size = 17179869184; PRAGMA \"{a}\".cache_size = -{kib};"))?;
     }
     for table in tables() {
         let sources: Vec<&String> = match Tier::of(table) {

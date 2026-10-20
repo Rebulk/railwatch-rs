@@ -182,6 +182,7 @@ fn tenants(cfg: &Config) -> Tenants {
 }
 
 fn main() -> ExitCode {
+    railwatch_server::memory::configure();
     if let Err(e) = railwatch_server::config::load_env_file() {
         return fail(format!("RAILWATCH_ENV_FILE: {e}"));
     }

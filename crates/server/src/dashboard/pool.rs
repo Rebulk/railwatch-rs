@@ -41,7 +41,7 @@ fn open_pooled(tenants_dir: &Path, slug: &str) -> rusqlite::Result<Pooled> {
     match crate::storage::Layout::detect(tenants_dir, slug) {
         Some(crate::storage::Layout::Days(dir)) => {
             let (conn, attached) = crate::storage::reader::open(&dir)?;
-            conn.set_prepared_statement_cache_capacity(256);
+            conn.set_prepared_statement_cache_capacity(crate::storage::reader::STATEMENT_CACHE);
             Ok(Pooled { conn, days: Some((dir, attached)) })
         }
         _ => Ok(Pooled { conn: open_reader(&tenants_dir.join(format!("{slug}.sqlite3")))?, days: None }),
