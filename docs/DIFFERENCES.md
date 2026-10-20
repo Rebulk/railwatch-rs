@@ -401,9 +401,10 @@ Checked against railwatch-cloud @ 464f0fd in rw-baseline by:
    (tests/rollup_incremental.rs). Rails recomputes the whole hour per touched
    hour per minute. The full recompute stays as RollupCatchupJob (every
    5 min, current + previous hour) and for receipts committed before a
-   restart. Above 3M accumulated rows per tenant it falls back to full
-   recomputes (logged). Costs memory: one busy tenant at 10k ev/s holds
-   ~160 MB more RSS than Phase 1 (340 vs 180 MB).
+   restart. Above 128 MB of accumulated rows per tenant (~200k rows) it
+   lets go of the hours it holds and recomputes them in full at each flush
+   instead (same output; logged). Memory is bounded by that cap; before it,
+   the cap was 3M rows (~2 GB).
 3. **Reads on a read-only connection.** All background reads use a separate
    `SQLITE_OPEN_READ_ONLY` connection; under WAL they never take or wait for
    the writer's lock. Writes are RollupJob's (one IMMEDIATE transaction per
@@ -590,6 +591,12 @@ all of it (identical; 130/130).
     vs 26.4k/23.8k ev/s). `compare.py` accepts exactly these two
     sqlite_master rows. Not checked: a future gem migration that recreates
     either index.
+12. **A size budget and a free-space floor** (`max_data_bytes`,
+    `min_free_bytes`, off by default; storage/budget.rs). Rails bounds
+    telemetry by retention only. With the budget on, raw rows can go before
+    their retention ends (oldest day files first, logged), and under the
+    floor ingest answers 503 + Retry-After, which Rails never does for
+    disk space. Off, nothing changes.
 
 ## Process
 

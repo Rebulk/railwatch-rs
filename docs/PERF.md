@@ -224,6 +224,96 @@ wrong (both were checked by breaking them).
   acks 26/26, every table identical.
 - The workstation swapped 27 GB of zram throughout; major faults were checked per run (0-4).
 
+## Bounded memory and disk (branch bounded-disk-memory, from main 3a09c49)
+
+For a server on the monitored app's own box (the railwatch-server gem). A stress test of that
+setup found anonymous RSS of 1.3-1.8 GB under dashboard load, 0.95 GB still held when idle, a
+rollup accumulator that could reach ~3 GB, and disk bounded only by retention (time).
+
+### Method
+
+Tenant: `rw-load --spread-days 30` against main, 2.07M rows (1.18M queries, 291k logs, 292k
+cache events, 146k view renders, 149k executions) in 62 day files, 1.7 GB; retention 90 days
+and `DETAIL_RETENTION_DAYS=31` so nothing is pruned during a run. Load: 30 clients without
+keep-alive cycling 18 URLs for 60 s (10 slow `/api/v1` endpoints at 7d/30d, and the overview,
+requests, queries, `queries?q=widgets role:reading`, logs, logs FTS, cache and tenants pages
+through the trusted-proxy header), server on CPUs 8-15, clients on 0-5. RSS from
+/proc/PID/status, split by /proc/PID/smaps; per-connection SQLite memory from
+`sqlite3_db_status`. **The release binary is static musl** (bin/release); a glibc build of the
+same code holds much less (below), so memory was measured on musl builds made the way
+bin/release makes them.
+
+### What held the memory
+
+1. **musl's malloc kept SQLite's freed memory.** Bundled SQLite allocates through the C
+   library, not the Rust global allocator (mimalloc). On musl, 60 s after the load main held
+   1.0-1.3 GB anonymous, 0.9-1.1 GB of it in small unnamed mappings (musl's heap), 0.1 GB in
+   mimalloc's arena. The same code built for glibc held 0.3-0.37 GB. Now SQLite allocates
+   through mimalloc too (`SQLITE_CONFIG_MALLOC`, memory.rs).
+2. **mimalloc's purge delay.** This build's default is 1 s; anything freed and not reused
+   within it stays resident. Measured alternating 0 / 10 / 100 / 1000 ms twice on 45 s runs:
+   peak anonymous 323-357 / 408-421 / 483-495 / 690-713 MB, pages served 1371-1946 / 2514-2736
+   / 1505-2593 / 2459-2507. 0 cost ~25% throughput; 10 ms (mimalloc v3's documented default)
+   did not. Set to 10 ms at start unless `MIMALLOC_PURGE_DELAY` is set.
+3. **Each pooled union reader held ~98 MB** after the 261 page cases (`sqlite3_db_status`):
+   page cache 62 MB (4 MB per attached file x 62 files), prepared statements 31 MB (256 cached
+   statements, each compiled over every file's branch of its views), schema 4.6 MB. Pooled
+   readers per tenant: 4. Now the cache is one 4 MB budget split over the files (at least 64 KiB
+   each) and a union reader keeps 64 statements: ~15 MB per reader. Reads go through mmap, so
+   the cache barely matters: the 261 cases took 3.2-3.4 s at 64 KiB per file and at 4 MB.
+4. **The rollup accumulator** keeps ~650 bytes of RSS per row (measured: 300 MB after 450k
+   records at 7 batches/s on main) and capped at 3M rows (~2 GB). Now capped at 128 MB of
+   counted row bytes (`incremental::MAX_BYTES`, ~200k rows); past it, the hours it holds leave
+   it and are recomputed in full at each flush (RollupJob, same output) until they age out.
+
+### Results (musl release builds, 2 runs each, 30 clients, 60 s)
+
+| | main | branch |
+|---|---:|---:|
+| anonymous RSS at start | 13 MB | 44-46 MB |
+| anonymous RSS peak under load | 1,311-1,509 MB | **379-384 MB** |
+| anonymous RSS 60 s after | 1,005-1,267 MB | **260-273 MB** |
+| file-backed (mmap of day files) peak | 4.65 GB | 4.66-4.68 GB |
+| requests served in 60 s | 3,905-4,214 (46-100 were 429) | 3,400-3,426 (0 429) |
+
+Requests served swung 2x between identical runs on this shared box, so throughput was rerun
+alternating main / branch / branch with `MIMALLOC_PURGE_DELAY=1000`, 45 s each, twice:
+main 1,271 and 2,433 (peak anonymous 864, 1,102 MB), branch 2,469 and 2,383 (403, 314 MB),
+branch at 1 s purge 2,471 and 2,241 (657, 640 MB). No throughput cost seen; p50 355-650 /
+366-376 / 368-384 ms.
+
+File-backed RSS is the day files mapped read-only (mmap_size 16 GiB per file, as before): page
+cache the kernel can drop at any time, not process memory. The "0.95 GB anon idle" in the
+stress test was musl's heap, now gone. Targets: idle under 300 MB, met (260-273 MB); under 800
+MB with 30 clients on the slowest pages, met (379-384 MB).
+
+**Accumulator** (musl builds, fresh data dir, `rw-load` 2,000 batches = 1M records, all in
+the current hour, 4 clients, ~13 min): main peaked at 1,081 MB anonymous and held 1,110 MB
+idle 60 s later; the branch hit the cap once (316k rows, 134 MB counted), peaked at 244 MB and
+held 69 MB idle. The cost: once an hour is past the cap, each 5 s flush recomputes that hour in
+full (as main's 3M-row fallback did): 1,168 vs 1,284 ev/s in this saturated run (-9%, one run
+each), p50 1.37 vs 1.23 s. A busy hour of a real app (CRM: ~1,000 rows per minute) reaches the
+cap only well past ~200k rollup rows in two hours.
+
+### Identity and page timings
+
+`bench/storage/slow_pages.sh` on its 1.03M-row tenant (glibc builds, CPUs 4-7, 5 warm runs):
+main vs branch byte-identical, 383/383 in both layouts, every round. Sum of per-case medians,
+median of rounds: single 2,779 -> 2,762 ms (3 rounds), per-day 3,343 -> 3,243 ms (6 rounds,
+alternating which binary ran first). No case over 10% and 2 ms slower after 6 per-day rounds
+(after the first 3, five were, all in two rounds where the branch ran right after main; round
+sums swing 3.1-4.6 s on this box).
+
+### Disk
+
+`max_data_bytes` and `min_free_bytes` (storage/budget.rs, docs/SELF-HOST.md "Disk budget"),
+off by default. Prune also runs once at start. Tests: storage::budget (prune order across
+environments, never today or meta, the floor's refusals counted and reported),
+tests/ingest_http.rs (503 + Retry-After, nothing written, ping and 401 unaffected),
+tests/disk_budget.rs (the real binary: retention catch-up at start; over the budget at start,
+oldest detail days then core days, `raw_pruned_through` moved, logged, and a clean exit on
+SIGTERM).
+
 ## Proposals
 
 None of these is implemented.

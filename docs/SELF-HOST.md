@@ -131,6 +131,8 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `BACKUP_INTERVAL_SECONDS` | 300 | |
 | `DETAIL_RETENTION_DAYS` | 7 | queries, logs, spans, cache and view events |
 | `CORE_RETENTION_DAYS_MAX` | 90 | cap on an environment's retention |
+| `MAX_DATA_BYTES` | off | size budget for telemetry (`5G`, `500M`, bytes). Over it, the oldest day files are deleted, detail days before core days; never today's, rollups or the control DB. For a server sharing its disk with an app ([below](#disk-budget)) |
+| `MIN_FREE_BYTES` | off | below this much free space on the data dir's filesystem, ingest answers 503 + `Retry-After` (the gem keeps its buffer and retries) |
 | `RATE_LIMIT_IP`, `RATE_LIMIT_ENV` | 2400, 600 per minute | `0` disables |
 | `SILENCE_SECONDS` | 60 | quiet time before "app stopped reporting" |
 | `DEADMAN_URL` | | pinged every 30 s while healthy (healthchecks.io etc.) |
@@ -247,6 +249,32 @@ new one.
   path is too long for a socket (about 100 bytes). In those cases, and
   when the holder already has the address (same host and network), the
   second server waits for the lock as before.
+
+### Disk budget
+
+Retention bounds telemetry by time (7 days of detail, the account's
+retention of core), not size. On the app's own volume, a busy app can
+still fill it, and then the app fails too (sign-in, `db:prepare`). Two
+settings bound it; both are off unless set:
+
+- `MAX_DATA_BYTES=5G`: at start and every 10 s, while telemetry is over
+  this, the oldest day file is deleted: detail days (queries, logs,
+  cache, views, spans) of every environment first, then core days
+  (requests, jobs, exceptions). Today's files, the rollups (charts, issue
+  history) and the control DB are never deleted. Each pass that deletes
+  logs a warning with what went; an environment's lost core days move its
+  ingest floor, so late rows for them are rejected rather than recreating
+  the files. Still over with nothing older to delete (today alone is over
+  the budget) is logged as an error, once.
+- `MIN_FREE_BYTES=1G`: below this much free space on the data dir's
+  filesystem, `/ingest` answers 503 with `Retry-After: 60` (the gem keeps
+  the batch and retries) and nothing is written; the dashboard keeps
+  working. Logged once when it starts and once, with the number of
+  refused requests, when space is back. This covers what the budget
+  cannot: the app's own files filling the volume.
+
+`railwatch doctor` shows both. Size the budget below the volume's free
+space minus `MIN_FREE_BYTES`, so the budget acts first.
 
 ## Weekly digest
 
