@@ -38,6 +38,7 @@ pub mod http;
 pub mod import_rails;
 pub mod ingest;
 pub mod jobs;
+pub mod memory;
 pub mod rate_limit;
 pub mod release_signature;
 pub mod rjson;

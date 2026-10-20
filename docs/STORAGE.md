@@ -98,7 +98,8 @@ ingest_batches 2, no id twice; the retry answers `committed` (or
 | core | `core/<day>` | the account's `retention_days` (30), capped | `RAILWATCH_CORE_RETENTION_DAYS_MAX` (90) |
 | rollups, release_health | meta, DELETE | 13 months | (PruneTelemetryJob's) |
 
-Daily at 03:00 UTC, as PruneTelemetryJob. A day file goes once its whole
+Daily at 03:00 UTC, as PruneTelemetryJob, and once at start (a server that
+was down at 03:00 would otherwise never prune). A day file goes once its whole
 day is past the tier (deleting is `unlink`). Before a detail day goes, its
 **exemplars** are copied into that day's core file with their ids: per
 (kind, group_hash, hour), the `RAILWATCH_EXEMPLARS_PER_HOUR` (3) slowest
@@ -106,6 +107,23 @@ executions and every errored one (RollupJob's predicate: request status
 >= 500, command status != 0, job/task/channel outcome "failed"), with all
 their queries, cache events, view renders, logs (re-indexed) and spans. A
 marker in the core file's `ar_internal_metadata` makes the copy idempotent.
+
+**Size budget** (`storage/budget.rs`, off by default): `max_data_bytes`
+deletes whole day files past the budget, oldest detail day across all
+environments first, then the oldest core day with its detail day (no
+exemplar copy: the point is space); never today's files, meta or the control
+DB. Under the lock as above, every 10 s and at start. Deleted core days move
+`raw_pruned_through` to the end of the newest one, so the ingest floor
+rejects rows that would recreate them. `min_free_bytes` refuses ingest with
+503 + Retry-After while the filesystem is below it. After any deletion
+(retention or budget) every handle to the deleted files is closed, since an
+open handle keeps an unlinked file's space allocated: idle dashboard readers
+are dropped, a reader checked out at the time is dropped when it is
+returned, ingest writers drop cached day files, and the worker re-attaches
+its own union readers; the budget does this before it reads free space.
+Single-file environments
+count against the budget but are never trimmed (split them). Every deletion
+and every crossing is logged (docs/SELF-HOST.md, "Disk budget").
 
 ## Backups (decision 4)
 

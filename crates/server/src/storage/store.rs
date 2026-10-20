@@ -86,6 +86,13 @@ impl Store {
         }
     }
 
+    /// Closes cached files that no longer exist (DayWriter::drop_deleted).
+    pub fn drop_deleted(&mut self) {
+        if let Store::Days(w) = self {
+            w.drop_deleted();
+        }
+    }
+
     pub fn rollback(&mut self) {
         match self {
             Store::Single(c) => {

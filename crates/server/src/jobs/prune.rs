@@ -142,6 +142,34 @@ pub fn prune_days(
     Ok(p)
 }
 
+/// After the disk budget deleted core days (storage::budget): each
+/// environment's raw_pruned_through moves to the end of its newest deleted
+/// day, so ingest turns away rows for it instead of recreating the file,
+/// and the worker drops what it kept about the deleted exceptions.
+pub fn after_trim(control: &Control, work: &std::sync::mpsc::Sender<super::TenantWork>, t: &crate::storage::budget::Trimmed) {
+    for (slug, day) in &t.core_through {
+        let Some(start) = time::parse_db_time(&format!("{day} 00:00:00")) else { continue };
+        let through = time::quoted_date_micros(start + 86_400_000_000);
+        let r = {
+            let c = control.conn();
+            c.query_row("SELECT id FROM environments WHERE slug = ?", [slug], |r| r.get::<_, i64>(0)).and_then(|env| {
+                c.execute(
+                    "UPDATE environments SET raw_pruned_through = ?1 WHERE id = ?2 AND (raw_pruned_through IS NULL OR raw_pruned_through < ?1)",
+                    params![through, env],
+                )?;
+                Ok(env)
+            })
+        };
+        match r {
+            Ok(env) => {
+                let _ = work.send(super::TenantWork::Trimmed { env, slug: slug.clone() });
+            }
+            Err(e) => tracing::error!(tenant = slug, error = %e, "disk budget: could not record raw_pruned_through"),
+        }
+        tracing::warn!(tenant = slug, through = day, "disk budget: raw telemetry through this day is gone");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

@@ -184,6 +184,7 @@ impl DayWriter {
     pub fn begin(&mut self) -> rusqlite::Result<()> {
         self.meta.execute_batch("BEGIN IMMEDIATE")?;
         self.in_txn.clear();
+        self.drop_deleted();
         self.hwm = self.committed.clone();
         self.fallback_day = today();
         Ok(())
@@ -315,6 +316,15 @@ impl DayWriter {
         }
         self.files.sort_by_key(|f| std::cmp::Reverse(f.last_used));
         self.files.truncate(OPEN_FILES);
+    }
+
+    /// Closes cached day files that retention or the disk budget deleted:
+    /// an open handle keeps an unlinked file's blocks allocated. Runs at
+    /// every transaction and when asked (Tenants::release_deleted).
+    pub fn drop_deleted(&mut self) {
+        debug_assert!(self.in_txn.is_empty());
+        let dir = &self.dir;
+        self.files.retain(|f| layout::day_path(dir, f.tier, &f.day).exists());
     }
 
     /// Closes every day connection (before retention unlinks files).

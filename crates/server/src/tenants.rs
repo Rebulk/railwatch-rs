@@ -52,6 +52,10 @@ pub enum Job {
         delivery_id: String,
         reply: oneshot::Sender<Result<Option<StoredReceipt>, String>>,
     },
+    /// Close cached day files that were deleted (Tenants::release_deleted).
+    Release {
+        reply: std::sync::mpsc::Sender<()>,
+    },
 }
 
 #[derive(Clone)]
@@ -155,6 +159,26 @@ impl Tenants {
         (generation, tx)
     }
 
+    /// Has every running writer close its cached day files that were
+    /// deleted (retention, the disk budget), so their space comes back now
+    /// rather than at that writer's next batch. Waits up to `wait` in all;
+    /// a writer that is mid-batch answers after it (and drops them anyway
+    /// at its next transaction).
+    pub fn release_deleted(&self, wait: Duration) {
+        let senders: Vec<Sender<Job>> = self.inner.writers.lock().unwrap().values().map(|(_, tx)| tx.clone()).collect();
+        let deadline = Instant::now() + wait;
+        let replies: Vec<_> = senders
+            .into_iter()
+            .filter_map(|tx| {
+                let (reply, rx) = std::sync::mpsc::channel();
+                tx.send(Job::Release { reply }).ok().map(|_| rx)
+            })
+            .collect();
+        for rx in replies {
+            let _ = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+
     /// Graceful shutdown: close every channel, then wait for the writers to
     /// drain what was already queued.
     pub fn shutdown(&self) {
@@ -233,7 +257,7 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
 fn row_count(job: &Job) -> usize {
     match job {
         Job::Write { batch, .. } => batch.row_count().max(1),
-        Job::LookupReceipt { .. } => 0,
+        Job::LookupReceipt { .. } | Job::Release { .. } => 0,
     }
 }
 
@@ -244,6 +268,9 @@ fn fail(job: Job, message: String) {
         }
         Job::LookupReceipt { reply, .. } => {
             let _ = reply.send(Err(message));
+        }
+        Job::Release { reply } => {
+            let _ = reply.send(());
         }
     }
 }
@@ -258,6 +285,10 @@ fn process(env_id: i64, slug: &str, store: &mut Store, jobs: Vec<Job>, followups
         match job {
             Job::LookupReceipt { producer_id, delivery_id, reply } => {
                 let _ = reply.send(lookup_receipt(store.meta(), &producer_id, &delivery_id).map_err(|e| e.to_string()));
+            }
+            Job::Release { reply } => {
+                store.drop_deleted();
+                let _ = reply.send(());
             }
             w @ Job::Write { .. } => writes.push(w),
         }
@@ -275,7 +306,7 @@ fn process(env_id: i64, slug: &str, store: &mut Store, jobs: Vec<Job>, followups
                 Job::Write { reply, .. } => {
                     let _ = reply.send(Err(if busy { WriteError::Busy } else { WriteError::Internal(e.to_string()) }));
                 }
-                Job::LookupReceipt { .. } => unreachable!(),
+                Job::LookupReceipt { .. } | Job::Release { .. } => unreachable!(),
             }
         }
         return;
