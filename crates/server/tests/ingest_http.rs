@@ -49,13 +49,14 @@ fn start(ip_limit: u64, env_limit: u64) -> Server {
     };
     let c2 = control.clone();
     let d2 = dir.clone();
-    let disk = Arc::new(railwatch_server::storage::budget::State::default());
-    let disk2 = disk.clone();
+    let (disk_tx, disk_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         rt.block_on(async move {
             let (tx, rx) = followups::channel();
             let tenants = Tenants::new(d2.join("telemetry"), Duration::from_secs(60), tx);
+            let disk2 = tenants.disk();
+            disk_tx.send(disk2.clone()).unwrap();
             let state = Arc::new(AppState {
                 control: c2.clone(),
                 tenants,
@@ -71,6 +72,7 @@ fn start(ip_limit: u64, env_limit: u64) -> Server {
             axum::serve(listener, http::router(state).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
         });
     });
+    let disk = disk_rx.recv().unwrap();
     Server { addr, dir: tempdir::Dir(dir), control, token, disk }
 }
 
@@ -361,6 +363,32 @@ fn under_the_disk_floor_ingest_answers_503_and_writes_nothing() {
     assert_eq!(request(s.addr, "POST", "/ingest", &[], &body).0, 401);
     let ok = railwatch_server::storage::budget::Budget { max_data_bytes: 0, min_free_bytes: 1 };
     railwatch_server::storage::budget::check(&ok, &s.dir.0, &telemetry, &s.disk, &|_| {});
+    assert_eq!(s.post(&body, &[]).0, 200);
+    assert_eq!(s.count("logs"), 2);
+}
+
+/// Over max_data_bytes with only today's files left (nothing the budget may
+/// trim), a batch is refused like under the floor, with its own message,
+/// and nothing is written. Once a pass finds telemetry within the budget
+/// the same batch goes in.
+#[test]
+fn over_the_budget_with_only_today_left_ingest_answers_503_until_within() {
+    let s = start(0, 0);
+    let body = gzip(&ndjson(&[fixture("log")]));
+    assert_eq!(s.post(&body, &[]).0, 200);
+    let telemetry = s.dir.0.join("telemetry");
+    let (used, _) = railwatch_server::storage::budget::usage(&telemetry);
+    let over = railwatch_server::storage::budget::Budget { max_data_bytes: used / 2, min_free_bytes: 0 };
+    railwatch_server::storage::budget::check(&over, &s.dir.0, &telemetry, &s.disk, &|_| {});
+    let (status, headers, ack) = s.post(&body, &[]);
+    assert_eq!(status, 503);
+    assert_eq!(ack, json!({"error": "telemetry over max_data_bytes", "retry_after": 60}));
+    assert!(headers.contains(&("retry-after".into(), "60".into())));
+    assert_eq!(s.count("logs"), 1);
+    let ping = request(s.addr, "GET", "/ingest/ping", &[("Authorization", format!("Bearer {}", s.token))], b"");
+    assert_eq!(ping.0, 200);
+    let within = railwatch_server::storage::budget::Budget { max_data_bytes: used * 4, min_free_bytes: 0 };
+    railwatch_server::storage::budget::check(&within, &s.dir.0, &telemetry, &s.disk, &|_| {});
     assert_eq!(s.post(&body, &[]).0, 200);
     assert_eq!(s.count("logs"), 2);
 }

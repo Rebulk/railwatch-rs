@@ -81,17 +81,26 @@ fn attach_all(conn: &Connection, dir: &Path) -> rusqlite::Result<Attached> {
     let mut attached = vec![meta];
     let mut core_aliases = Vec::new();
     let mut detail_aliases = Vec::new();
+    // A day file deleted (retention, the disk budget) after it was listed
+    // fails to attach: it is skipped, as if listed a moment later.
+    let attach = |alias: &str, p: &Path| match conn.execute(&format!("ATTACH DATABASE ?1 AS {alias}"), [uri(p)]) {
+        Ok(_) => Ok(true),
+        Err(_) if !p.exists() => Ok(false),
+        Err(e) => Err(e),
+    };
     for (i, d) in core.iter().enumerate() {
         let p = layout::day_path(dir, Tier::Core, d);
-        conn.execute(&format!("ATTACH DATABASE ?1 AS c{i}"), [uri(&p)])?;
-        core_aliases.push(format!("c{i}"));
-        attached.push(p);
+        if attach(&format!("c{i}"), &p)? {
+            core_aliases.push(format!("c{i}"));
+            attached.push(p);
+        }
     }
     for (i, d) in detail.iter().enumerate() {
         let p = layout::day_path(dir, Tier::Detail, d);
-        conn.execute(&format!("ATTACH DATABASE ?1 AS d{i}"), [uri(&p)])?;
-        detail_aliases.push(format!("d{i}"));
-        attached.push(p);
+        if attach(&format!("d{i}"), &p)? {
+            detail_aliases.push(format!("d{i}"));
+            attached.push(p);
+        }
     }
     // mmap per attached file, as the single-file reader does (pool.rs). Each
     // attached file has its own page cache, so the budget is split over
@@ -432,6 +441,26 @@ mod tests {
         open_or_create(&day_path(&dir, Tier::Core, "2026-10-15")).unwrap();
         assert!(refresh(&conn, &dir, &mut attached).unwrap());
         assert_eq!(attached.len(), 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A day file the disk budget deletes between the directory listing and
+    /// its ATTACH is skipped, not an error: the worker re-attached on every
+    /// batch's follow-up, and failed while a burst was being trimmed.
+    #[test]
+    fn a_day_deleted_after_listing_is_skipped() {
+        let dir = std::env::temp_dir().join(format!("rw-reader-gone-{}", crate::control::base58(8)));
+        open_or_create(&meta_path(&dir)).unwrap();
+        for day in ["2026-10-13", "2026-10-14"] {
+            open_or_create(&day_path(&dir, Tier::Core, day)).unwrap();
+        }
+        // Listed, then gone: a name with no file behind it.
+        std::fs::remove_file(day_path(&dir, Tier::Core, "2026-10-13")).unwrap();
+        std::os::unix::fs::symlink(dir.join("gone"), day_path(&dir, Tier::Core, "2026-10-13")).unwrap();
+        let (conn, attached) = open(&dir).unwrap();
+        assert_eq!(attached, vec![meta_path(&dir), day_path(&dir, Tier::Core, "2026-10-14")]);
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM executions", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

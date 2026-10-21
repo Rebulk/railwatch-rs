@@ -72,6 +72,8 @@ struct Inner {
     generation: std::sync::atomic::AtomicU64,
     followups: Mutex<Option<FollowupSender>>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// The disk budget's estimate, which every commit adds to.
+    disk: Arc<crate::storage::budget::State>,
 }
 
 impl Tenants {
@@ -85,8 +87,15 @@ impl Tenants {
                 generation: Default::default(),
                 followups: Mutex::new(Some(followups)),
                 threads: Mutex::new(Vec::new()),
+                disk: Default::default(),
             }),
         }
+    }
+
+    /// The disk budget's state (storage::budget): the writers count what
+    /// they commit into it, ingest reads it.
+    pub fn disk(&self) -> Arc<crate::storage::budget::State> {
+        self.inner.disk.clone()
     }
 
     pub fn dir(&self) -> PathBuf {
@@ -144,7 +153,7 @@ impl Tenants {
         let handle = std::thread::Builder::new()
             .name(format!("writer-{slug}"))
             .spawn(move || {
-                run_writer(env_id, &slug, &dir, rx, inner.idle, &followups);
+                run_writer(env_id, &slug, &dir, rx, inner.idle, &followups, &inner.disk);
                 drop(followups);
                 // Unregister, unless a newer writer already took our place.
                 let mut writers = inner.writers.lock().unwrap();
@@ -217,7 +226,7 @@ pub fn open_tenant(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Duration, followups: &FollowupSender) {
+fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Duration, followups: &FollowupSender, disk: &crate::storage::budget::State) {
     let mut store = match Store::open(dir, slug) {
         Ok(c) => c,
         Err(e) => {
@@ -251,6 +260,7 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
             }
         }
         process(env_id, slug, &mut store, jobs, followups);
+        disk.wrote(store.take_written());
     }
 }
 

@@ -86,6 +86,14 @@ impl Store {
         }
     }
 
+    /// Bytes the commits since the last call wrote (budget::take_written).
+    pub fn take_written(&mut self) -> u64 {
+        match self {
+            Store::Single(c) => super::budget::take_written(c),
+            Store::Days(w) => w.take_written(),
+        }
+    }
+
     /// Closes cached files that no longer exist (DayWriter::drop_deleted).
     pub fn drop_deleted(&mut self) {
         if let Store::Days(w) = self {

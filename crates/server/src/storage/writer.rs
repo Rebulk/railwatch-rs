@@ -78,6 +78,8 @@ pub struct DayWriter {
     clock: u64,
     /// Day used for a row whose day column is missing (the batch's own day).
     fallback_day: String,
+    /// Bytes committed since take_written (budget::take_written).
+    written: u64,
 }
 
 /// What recovery undid.
@@ -103,6 +105,7 @@ impl DayWriter {
             in_batch: false,
             clock: 0,
             fallback_day: today(),
+            written: 0,
         };
         let r = w.recover()?;
         if r.rows > 0 {
@@ -229,6 +232,8 @@ impl DayWriter {
                 self.abort_after_partial_commit();
                 return Err(e);
             }
+            // Counted here: close_extra_files may drop this connection.
+            self.written += super::budget::take_written(&self.files[i - 1].conn);
             crash_point("after_day_commit");
         }
         crash_point("before_meta_commit");
@@ -244,6 +249,7 @@ impl DayWriter {
             self.abort_after_partial_commit();
             return Err(e);
         }
+        self.written += super::budget::take_written(&self.meta);
         self.committed = self.hwm.clone();
         self.in_txn.clear();
         crash_point("after_meta_commit");
@@ -285,13 +291,13 @@ impl DayWriter {
             && !self.in_txn.contains(&(i + 1))
             && !layout::day_path(&self.dir, tier, day).exists()
         {
-            self.files[i].conn = layout::open_or_create(&layout::day_path(&self.dir, tier, day))?;
+            self.files[i].conn = self.create(tier, day)?;
             self.files[i].seq.clear();
         }
         let i = match self.files.iter().position(|f| f.tier == tier && f.day == day) {
             Some(i) => i + 1,
             None => {
-                let conn = layout::open_or_create(&layout::day_path(&self.dir, tier, day))?;
+                let conn = self.create(tier, day)?;
                 self.files.push(DayFile { tier, day: day.to_string(), conn, seq: HashMap::new(), last_used: 0 });
                 self.files.len()
             }
@@ -307,6 +313,23 @@ impl DayWriter {
             self.in_txn.push(i);
         }
         Ok(i)
+    }
+
+    /// Bytes the commits since the last call wrote, for the disk budget.
+    pub fn take_written(&mut self) -> u64 {
+        std::mem::take(&mut self.written)
+    }
+
+    /// Opens a day file, creating it if needed. A new file's schema is
+    /// written by another connection, so its bytes are counted here.
+    fn create(&mut self, tier: Tier, day: &str) -> rusqlite::Result<Connection> {
+        let path = layout::day_path(&self.dir, tier, day);
+        let fresh = !path.exists();
+        let conn = layout::open_or_create(&path)?;
+        if fresh {
+            self.written += super::budget::file_bytes(&path);
+        }
+        Ok(conn)
     }
 
     /// Keeps the OPEN_FILES most recently used day connections.

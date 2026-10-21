@@ -18,12 +18,21 @@
 //!   budget that fits the disk never reaches the floor; the floor covers
 //!   what the budget cannot (the app itself filling the volume).
 //!
+//! A pass measures and trims every 10 s. Between passes the ingest writers
+//! add what they commit to a running estimate (`State::wrote`); once it is
+//! over the budget the pass is woken at once, and ingest waits for it
+//! (`State::admit`), so a burst overshoots by about one batch per request
+//! in flight rather than by 10 s of writes. Over the budget with nothing
+//! left to trim (only today's files), ingest answers 503 like the floor:
+//! accepting more would grow today's files until the floor stops it.
+//!
 //! Deleting telemetry early is data loss, so every pass that deletes says
 //! what it deleted, and crossing the floor or the budget is logged once
 //! each way.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use rusqlite::Connection;
 
@@ -42,6 +51,10 @@ impl Budget {
     }
 }
 
+/// How long an ingest request over the estimate waits for the pass it
+/// woke before it is refused.
+pub const TRIM_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// What the ingest path reads, written by the budget thread.
 #[derive(Debug, Default)]
 pub struct State {
@@ -51,17 +64,109 @@ pub struct State {
     over_budget: AtomicBool,
     /// Ingest requests refused while low (logged on recovery).
     refused: AtomicU64,
+    /// Ingest requests refused over max_data_bytes (logged by the pass).
+    refused_over: AtomicU64,
+    /// max_data_bytes as of the last pass (0: off).
+    max_data_bytes: AtomicU64,
+    /// Telemetry bytes the last pass measured...
+    measured: AtomicU64,
+    /// ...plus what the ingest writers committed since: the estimate.
+    written: AtomicU64,
+    /// Wakes the budget thread before its next tick, or stops it.
+    signal: Mutex<Signal>,
+    wake: Condvar,
+    /// Notified at the end of each pass's trim.
+    passed: tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct Signal {
+    woken: bool,
+    stopped: bool,
+}
+
+/// Why ingest is refused (503 + Retry-After).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Under min_free_bytes.
+    LowSpace,
+    /// Over max_data_bytes with nothing left to trim, or a trim that did
+    /// not finish within TRIM_WAIT.
+    OverBudget,
 }
 
 impl State {
-    /// Whether to refuse an ingest request; counts the refusal.
-    pub fn refuse_ingest(&self) -> bool {
-        let low = self.low_space.load(Ordering::Relaxed);
-        if low {
-            self.refused.fetch_add(1, Ordering::Relaxed);
+    /// Before an ingest write. Over max_data_bytes by the estimate, it
+    /// wakes the budget pass and waits up to TRIM_WAIT for it to trim; a
+    /// refusal is counted.
+    pub async fn admit(&self) -> Result<(), Refusal> {
+        let deadline = tokio::time::Instant::now() + TRIM_WAIT;
+        while self.over_estimate() && !self.over_budget.load(Ordering::Relaxed) {
+            // Notified by every pass that ends from here on, polled or not.
+            let passed = self.passed.notified();
+            self.wake();
+            if tokio::time::timeout_at(deadline, passed).await.is_err() {
+                break;
+            }
         }
-        low
+        if self.low_space.load(Ordering::Relaxed) {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return Err(Refusal::LowSpace);
+        }
+        if self.over_budget.load(Ordering::Relaxed) || self.over_estimate() {
+            self.refused_over.fetch_add(1, Ordering::Relaxed);
+            return Err(Refusal::OverBudget);
+        }
+        Ok(())
     }
+
+    /// The ingest writers, after each commit: `bytes` (see `take_written`)
+    /// count against max_data_bytes until the next pass measures. Over it,
+    /// the pass is woken now rather than at its next tick.
+    pub fn wrote(&self, bytes: u64) {
+        let max = self.max_data_bytes.load(Ordering::Relaxed);
+        if max == 0 || bytes == 0 {
+            return;
+        }
+        let written = self.written.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if self.measured.load(Ordering::Relaxed) + written > max {
+            self.wake();
+        }
+    }
+
+    fn over_estimate(&self) -> bool {
+        let max = self.max_data_bytes.load(Ordering::Relaxed);
+        max > 0 && self.measured.load(Ordering::Relaxed) + self.written.load(Ordering::Relaxed) > max
+    }
+
+    fn wake(&self) {
+        self.signal.lock().unwrap().woken = true;
+        self.wake.notify_one();
+    }
+
+    /// Stops the budget thread (`spawn`); join it after.
+    pub fn stop(&self) {
+        self.signal.lock().unwrap().stopped = true;
+        self.wake.notify_one();
+    }
+}
+
+/// At most how much `conn`'s files grew since the last call (as file_bytes
+/// counts them), from a counter SQLite keeps, so no stat per batch: each
+/// WAL frame written (page plus frame header) grows the WAL by at most its
+/// size and the main file, once checkpointed, by at most a page, so it
+/// counts twice. Erring high only wakes the pass early; the pass measures
+/// before it deletes anything.
+pub fn take_written(conn: &Connection) -> u64 {
+    let (mut pages, mut high) = (0, 0);
+    // SAFETY: the handle is live for `conn`'s lifetime; the out-params are
+    // plain ints; resetting the counter is all this does.
+    let rc = unsafe { rusqlite::ffi::sqlite3_db_status(conn.handle(), rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE, &mut pages, &mut high, 1) };
+    if rc != rusqlite::ffi::SQLITE_OK || pages <= 0 {
+        return 0;
+    }
+    let page: i64 = conn.prepare_cached("PRAGMA page_size").and_then(|mut q| q.query_row([], |r| r.get(0))).unwrap_or(4096);
+    2 * pages as u64 * (page as u64 + 24)
 }
 
 /// Free bytes for an unprivileged user on the filesystem holding `dir`.
@@ -86,8 +191,31 @@ pub struct Trimmed {
     pub used: u64,
 }
 
-fn file_bytes(path: &Path) -> u64 {
-    ["", "-wal", "-shm"].iter().map(|s| std::fs::metadata(format!("{}{s}", path.display())).map_or(0, |m| m.len())).sum()
+/// A database file with its -wal and -shm. With a live WAL, the main file
+/// counts at the size a checkpoint will grow it to: the WAL keeps its size
+/// after one, so the file and its WAL hold those pages twice.
+pub(super) fn file_bytes(path: &Path) -> u64 {
+    let len = |s: &str| std::fs::metadata(format!("{}{s}", path.display())).map_or(0, |m| m.len());
+    let (main, wal) = (len(""), len("-wal"));
+    let main = if wal > 0 { main.max(wal_db_bytes(path).unwrap_or(0)) } else { main };
+    main + wal + len("-shm")
+}
+
+/// The database size the WAL-index header (the first 48 bytes of -shm,
+/// stored twice, native byte order; sqlite.org/walformat.html) records:
+/// what the main file becomes once the WAL is checkpointed. None when the
+/// two copies differ (a writer is updating it) or it is not initialised.
+fn wal_db_bytes(path: &Path) -> Option<u64> {
+    let mut h = [0u8; 96];
+    std::io::Read::read_exact(&mut std::fs::File::open(format!("{}-shm", path.display())).ok()?, &mut h).ok()?;
+    if h[..48] != h[48..] || h[12] == 0 {
+        return None;
+    }
+    let page = match u16::from_ne_bytes([h[14], h[15]]) {
+        1 => 65536,
+        n => n as u64,
+    };
+    Some(u32::from_ne_bytes([h[20], h[21], h[22], h[23]]) as u64 * page)
 }
 
 /// Bytes under `tenants_dir`, and its per-day environments. A single-file
@@ -132,9 +260,15 @@ pub fn trim(tenants_dir: &Path, max_bytes: u64, today: &str) -> rusqlite::Result
             }
             let meta: Connection = crate::tenants::open_tenant(&layout::meta_path(dir))?;
             meta.execute_batch("BEGIN IMMEDIATE")?;
-            let mut freed = super::retention::remove(&layout::day_path(dir, Tier::Detail, &day));
+            // `used` counts files as file_bytes does, which can be more
+            // than their length today (a WAL not yet checkpointed).
+            let detail = layout::day_path(dir, Tier::Detail, &day);
+            let mut counted = file_bytes(&detail);
+            let mut freed = super::retention::remove(&detail);
             if tier == Tier::Core {
-                freed += super::retention::remove(&layout::day_path(dir, Tier::Core, &day));
+                let core = layout::day_path(dir, Tier::Core, &day);
+                counted += file_bytes(&core);
+                freed += super::retention::remove(&core);
                 let slug = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
                 match out.core_through.iter_mut().find(|(s, _)| *s == slug) {
                     Some(e) => e.1 = day.clone(),
@@ -146,7 +280,7 @@ pub fn trim(tenants_dir: &Path, max_bytes: u64, today: &str) -> rusqlite::Result
             }
             meta.execute_batch("COMMIT")?;
             out.bytes += freed;
-            used = used.saturating_sub(freed);
+            used = used.saturating_sub(counted.max(freed));
         }
     }
     out.used = used;
@@ -164,10 +298,21 @@ pub fn check(budget: &Budget, data_dir: &Path, tenants_dir: &Path, state: &State
 
 /// `check` with the free-space reading passed in (tests).
 fn check_with(budget: &Budget, data_dir: &Path, tenants_dir: &Path, state: &State, on_trim: &dyn Fn(&Trimmed), free_bytes: &dyn Fn(&Path) -> Option<u64>) {
+    state.max_data_bytes.store(budget.max_data_bytes, Ordering::Relaxed);
     if budget.max_data_bytes > 0 {
         let today = &crate::time::utc_seconds_string(crate::time::now_micros() / 1_000_000)[..10];
+        // Writes counted from here on may be in the measurement too: the
+        // estimate errs high.
+        let counted = state.written.load(Ordering::Relaxed);
         match trim(tenants_dir, budget.max_data_bytes, today) {
             Ok(t) => {
+                let over = t.used > budget.max_data_bytes;
+                state.measured.store(t.used, Ordering::Relaxed);
+                state.written.fetch_sub(counted, Ordering::Relaxed);
+                let was_over = state.over_budget.swap(over, Ordering::Relaxed);
+                // Ingest waiting on this pass goes on now; closing handles
+                // (on_trim) only matters to the floor.
+                state.passed.notify_waiters();
                 if t.detail_files + t.core_files > 0 {
                     tracing::warn!(
                         max_data_bytes = budget.max_data_bytes,
@@ -179,20 +324,35 @@ fn check_with(budget: &Budget, data_dir: &Path, tenants_dir: &Path, state: &Stat
                     );
                     on_trim(&t);
                 }
-                let over = t.used > budget.max_data_bytes;
-                if state.over_budget.swap(over, Ordering::Relaxed) != over {
-                    if over {
-                        tracing::error!(
+                if over && !was_over {
+                    tracing::error!(
+                        used = t.used,
+                        max_data_bytes = budget.max_data_bytes,
+                        "telemetry is still over max_data_bytes with no older day file left to delete (today's files, or a single-file environment): refusing ingest (503) until it is within max_data_bytes"
+                    );
+                } else if !over {
+                    let refused = state.refused_over.swap(0, Ordering::Relaxed);
+                    if was_over {
+                        tracing::warn!(
                             used = t.used,
                             max_data_bytes = budget.max_data_bytes,
-                            "telemetry is still over max_data_bytes with no older day file left to delete (today's files, or a single-file environment)"
+                            refused,
+                            "telemetry is within max_data_bytes again: accepting ingest again"
                         );
-                    } else {
-                        tracing::info!(used = t.used, max_data_bytes = budget.max_data_bytes, "telemetry is within max_data_bytes again");
+                    } else if refused > 0 {
+                        tracing::warn!(
+                            used = t.used,
+                            max_data_bytes = budget.max_data_bytes,
+                            refused,
+                            "refused ingest (503) over max_data_bytes: the trim took longer than the requests wait for it"
+                        );
                     }
                 }
             }
-            Err(e) => tracing::error!(error = %e, "disk budget: could not delete day files"),
+            Err(e) => {
+                state.passed.notify_waiters();
+                tracing::error!(error = %e, "disk budget: could not delete day files");
+            }
         }
     }
     if budget.min_free_bytes > 0 {
@@ -221,24 +381,31 @@ fn check_with(budget: &Budget, data_dir: &Path, tenants_dir: &Path, state: &Stat
     }
 }
 
-/// How often the budget thread checks.
+/// How often the budget thread checks when nothing wakes it.
 pub const EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The budget thread (only started when a knob is set). It runs until
-/// `stop`'s sender is dropped; join it before the work `on_trim` sends to
-/// is shut down (its closure holds a sender).
+/// The budget thread (only started when a knob is set): a pass every
+/// EVERY, and one at once when ingest crosses the estimate. It runs until
+/// `State::stop`; join it before the work `on_trim` sends to is shut down
+/// (its closure holds a sender).
 pub fn spawn(
     budget: Budget,
     data_dir: PathBuf,
     tenants_dir: PathBuf,
     state: std::sync::Arc<State>,
     on_trim: Box<dyn Fn(&Trimmed) + Send>,
-    stop: std::sync::mpsc::Receiver<()>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("disk-budget".into())
         .spawn(move || {
-            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(EVERY) {
+            loop {
+                let signal = state.signal.lock().unwrap();
+                let (mut signal, _) = state.wake.wait_timeout_while(signal, EVERY, |s| !s.woken && !s.stopped).unwrap();
+                if signal.stopped {
+                    return;
+                }
+                signal.woken = false;
+                drop(signal);
                 check(&budget, &data_dir, &tenants_dir, &state, &*on_trim);
             }
         })
@@ -373,6 +540,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn admit(state: &State) -> Result<(), Refusal> {
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(state.admit())
+    }
+
+    fn today() -> String {
+        crate::time::utc_seconds_string(crate::time::now_micros() / 1_000_000)[..10].to_string()
+    }
+
     #[test]
     fn under_the_free_space_floor_ingest_is_refused_until_it_recovers() {
         let root = tenants("floor");
@@ -380,12 +555,90 @@ mod tests {
         let free = free_bytes(&root).unwrap();
         let floor = Budget { max_data_bytes: 0, min_free_bytes: free + (1 << 40) };
         check(&floor, &root, &root, &state, &|_| {});
-        assert!(state.refuse_ingest());
-        assert!(state.refuse_ingest());
+        assert_eq!(admit(&state), Err(Refusal::LowSpace));
+        assert_eq!(admit(&state), Err(Refusal::LowSpace));
         assert_eq!(state.refused.load(Ordering::Relaxed), 2);
         check(&Budget { max_data_bytes: 0, min_free_bytes: 1 }, &root, &root, &state, &|_| {});
-        assert!(!state.refuse_ingest());
+        assert_eq!(admit(&state), Ok(()));
         assert_eq!(state.refused.load(Ordering::Relaxed), 0, "reported and reset on recovery");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a commit wrote is counted from SQLite's own page counter: at
+    /// least what the file grew by as the budget measures it, and a
+    /// checkpoint (which grows the main file by pages the WAL holds) adds
+    /// nothing.
+    #[test]
+    fn take_written_counts_the_wal_frames_a_commit_wrote() {
+        let root = tenants("written");
+        let path = day_path(&root.join("a"), Tier::Core, "2026-10-20");
+        let c = open_or_create(&path).unwrap();
+        let before = file_bytes(&path);
+        let _ = take_written(&c);
+        c.execute_batch("CREATE TABLE more (b BLOB); INSERT INTO more VALUES (zeroblob(1000000));").unwrap();
+        let wrote = take_written(&c);
+        let grew = file_bytes(&path) - before;
+        assert!(wrote >= grew && wrote <= grew + grew / 10, "wrote {wrote}, the files grew {grew} (WAL and main file to be)");
+        assert_eq!(take_written(&c), 0, "reset by each call");
+        // The main file grows at the checkpoint; it was counted already.
+        let main = std::fs::metadata(&path).unwrap().len();
+        c.execute_batch("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > main + 900_000, "the checkpoint grew the main file");
+        assert_eq!(file_bytes(&path) - before, grew, "and file_bytes had counted it");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Writes past the budget wake the pass at once (not at its 10 s tick),
+    /// and the request over the estimate waits for it rather than writing.
+    #[test]
+    fn crossing_the_budget_wakes_the_pass_and_ingest_waits_for_its_trim() {
+        let root = tenants("wake");
+        let (total, _) = usage(&root);
+        let state = std::sync::Arc::new(State::default());
+        let budget = Budget { max_data_bytes: total, min_free_bytes: 0 };
+        check(&budget, &root, &root, &state, &|_| {});
+        assert_eq!(admit(&state), Ok(()), "within: no wait");
+        let thread = spawn(budget, root.clone(), root.clone(), state.clone(), Box::new(|_| {}));
+        // Today's file grows by ~2 day files, which the writer reports.
+        let c = open_or_create(&day_path(&root.join("a"), Tier::Core, &today())).unwrap();
+        let _ = take_written(&c);
+        c.execute_batch("CREATE TABLE pad (b BLOB); INSERT INTO pad VALUES (zeroblob(400000));").unwrap();
+        let started = std::time::Instant::now();
+        state.wrote(take_written(&c));
+        assert_eq!(admit(&state), Ok(()), "the pass trimmed old days back under the budget");
+        assert!(started.elapsed() < TRIM_WAIT, "woken, not the 10 s tick: {:?}", started.elapsed());
+        assert!(left(&root, "a", Tier::Detail).len() < 5, "old detail days went");
+        assert_eq!(state.written.load(Ordering::Relaxed), 0, "re-synced by the measurement");
+        state.stop();
+        thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Only today's files left and still over: ingest answers 503 (it would
+    /// otherwise grow today's files until the floor stops it), until a pass
+    /// finds telemetry within the budget again.
+    #[test]
+    fn over_budget_with_only_today_left_ingest_is_refused_until_within() {
+        let root = std::env::temp_dir().join(format!("rw-budget-today-{}", crate::control::base58(8)));
+        let dir = root.join("a");
+        open_or_create(&meta_path(&dir)).unwrap();
+        for tier in [Tier::Core, Tier::Detail] {
+            let c = open_or_create(&day_path(&dir, tier, &today())).unwrap();
+            c.execute_batch("CREATE TABLE pad (b BLOB); INSERT INTO pad VALUES (zeroblob(200000)); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        let (total, _) = usage(&root);
+        let state = State::default();
+        check(&Budget { max_data_bytes: total / 2, min_free_bytes: 0 }, &root, &root, &state, &|_| {});
+        assert_eq!(left(&root, "a", Tier::Core), vec![today()], "today's files are never trimmed");
+        let waited = std::time::Instant::now();
+        assert_eq!(admit(&state), Err(Refusal::OverBudget));
+        assert!(waited.elapsed() < TRIM_WAIT / 2, "nothing to trim: refused without waiting");
+        assert_eq!(admit(&state), Err(Refusal::OverBudget));
+        assert_eq!(state.refused_over.load(Ordering::Relaxed), 2);
+        // Within again (here a larger budget; in practice the next day).
+        check(&Budget { max_data_bytes: total * 2, min_free_bytes: 0 }, &root, &root, &state, &|_| {});
+        assert_eq!(admit(&state), Ok(()));
+        assert_eq!(state.refused_over.load(Ordering::Relaxed), 0, "reported and reset on recovery");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

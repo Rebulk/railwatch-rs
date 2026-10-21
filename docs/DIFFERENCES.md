@@ -595,8 +595,9 @@ all of it (identical; 130/130).
     `min_free_bytes`, off by default; storage/budget.rs). Rails bounds
     telemetry by retention only. With the budget on, raw rows can go before
     their retention ends (oldest day files first, logged), and under the
-    floor ingest answers 503 + Retry-After, which Rails never does for
-    disk space. Off, nothing changes.
+    floor, or over the budget with only today's files left, ingest answers
+    503 + Retry-After, which Rails never does for disk space. Off, nothing
+    changes.
 
 ## Process
 

@@ -1302,7 +1302,7 @@ fn serve() -> ExitCode {
         }
         let (followups_tx, followups_rx) = followups::channel();
         let tenants = Tenants::new(cfg.tenants_dir(), Duration::from_secs(cfg.tenant_idle_seconds), followups_tx);
-        let disk = Arc::new(railwatch_server::storage::budget::State::default());
+        let disk = tenants.disk();
         let state = Arc::new(AppState {
             control: control.clone(),
             tenants: tenants.clone(),
@@ -1347,8 +1347,8 @@ fn serve() -> ExitCode {
             }
         };
         // Disk budget (storage::budget): one pass now, before the first
-        // request, then every 10 s until shutdown.
-        let (stop_budget, budget_stopped) = std::sync::mpsc::channel::<()>();
+        // request, then every 10 s, or at once when ingest crosses
+        // max_data_bytes, until shutdown.
         let budget_thread = (!cfg.budget.is_off()).then(|| {
             tracing::info!(max_data_bytes = cfg.budget.max_data_bytes, min_free_bytes = cfg.budget.min_free_bytes, "disk budget on");
             let (c, work, release) = (web_state.control.clone(), jobs.background.work.clone(), release.clone());
@@ -1363,7 +1363,7 @@ fn serve() -> ExitCode {
                 railwatch_server::jobs::prune::after_trim(&c, &work, t);
             };
             railwatch_server::storage::budget::check(&cfg.budget, &cfg.data_dir, &cfg.tenants_dir(), &disk, &on_trim);
-            railwatch_server::storage::budget::spawn(cfg.budget, cfg.data_dir.clone(), cfg.tenants_dir(), disk.clone(), Box::new(on_trim), budget_stopped)
+            railwatch_server::storage::budget::spawn(cfg.budget, cfg.data_dir.clone(), cfg.tenants_dir(), disk.clone(), Box::new(on_trim))
         });
         let users: i64 = web_state.control.with(|c| c.query_row("SELECT count(*) FROM users", [], |r| r.get(0))).unwrap_or(0);
         if users == 0 {
@@ -1486,7 +1486,7 @@ fn serve() -> ExitCode {
         scheduler.await.ok();
         // Its trim hook holds a sender to the worker: stopped first, so the
         // worker sees its channel close.
-        drop(stop_budget);
+        disk.stop();
         if let Some(t) = budget_thread {
             tokio::task::spawn_blocking(move || drop(t.join())).await.ok();
         }
