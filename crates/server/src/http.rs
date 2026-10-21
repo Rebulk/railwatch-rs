@@ -49,7 +49,8 @@ pub struct AppState {
     /// in-flight request runs on the blocking pool at once and they all
     /// finish late together: p99 1.2 s at 32 in flight vs 0.13 s at 8.
     pub cpu: Arc<tokio::sync::Semaphore>,
-    /// The disk budget's state (storage::budget): under min_free_bytes,
+    /// The disk budget's state (storage::budget, `Tenants::disk`): under
+    /// min_free_bytes, or over max_data_bytes with nothing left to trim,
     /// writes are refused with 503.
     pub disk: Arc<crate::storage::budget::State>,
 }
@@ -81,9 +82,14 @@ fn busy() -> Response {
     with_retry_after(json(StatusCode::SERVICE_UNAVAILABLE, rhash! {"error" => "database busy", "retry_after" => 15i64}), 15)
 }
 
-/// Below min_free_bytes: the gem keeps the batch and retries later.
-fn disk_full() -> Response {
-    with_retry_after(json(StatusCode::SERVICE_UNAVAILABLE, rhash! {"error" => "disk almost full", "retry_after" => 60i64}), 60)
+/// Below min_free_bytes, or over max_data_bytes: the gem keeps the batch
+/// and retries later.
+fn disk_refused(why: crate::storage::budget::Refusal) -> Response {
+    let error = match why {
+        crate::storage::budget::Refusal::LowSpace => "disk almost full",
+        crate::storage::budget::Refusal::OverBudget => "telemetry over max_data_bytes",
+    };
+    with_retry_after(json(StatusCode::SERVICE_UNAVAILABLE, rhash! {"error" => error, "retry_after" => 60i64}), 60)
 }
 
 fn too_large() -> Response {
@@ -182,8 +188,10 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
     if state.env_limit.exceeded(&env.id) {
         return rate_limited();
     }
-    if action != Action::Ping && state.disk.refuse_ingest() {
-        return disk_full();
+    if action != Action::Ping
+        && let Err(why) = state.disk.admit().await
+    {
+        return disk_refused(why);
     }
 
     // The body, capped while reading (a client may lie about its length or

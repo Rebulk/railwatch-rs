@@ -146,3 +146,97 @@ fn over_max_data_bytes_at_start_trims_oldest_first_and_records_the_cutoff() {
     assert!(log.contains("telemetry over max_data_bytes: deleted the oldest day files"), "{log}");
     assert!(log.contains("raw telemetry through this day is gone"), "{log}");
 }
+
+/// POST /ingest with a gzipped NDJSON body; the status.
+fn post(port: u16, token: &str, body: &[u8]) -> u16 {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let head = format!(
+        "POST /ingest HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/x-ndjson\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    s.write_all(head.as_bytes()).unwrap();
+    s.write_all(body).unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    out.split(' ').nth(1).unwrap().parse().unwrap()
+}
+
+/// `n` log records stamped now, ~1 KB each, gzipped.
+fn logs(n: usize) -> Vec<u8> {
+    let all: serde_json::Value = serde_json::from_str(include_str!("fixtures/wire_fixtures.json")).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+    let mut body = Vec::new();
+    for i in 0..n {
+        let mut r = all["log"].clone();
+        r["timestamp"] = serde_json::json!(now);
+        r["message"] = serde_json::json!(format!("{i} {}", railwatch_server::control::new_token().repeat(20)));
+        body.extend_from_slice(serde_json::to_string(&r).unwrap().as_bytes());
+        body.push(b'\n');
+    }
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut e, &body).unwrap();
+    e.finish().unwrap()
+}
+
+/// A burst into today's files: the writers' running estimate wakes the
+/// budget pass as soon as it crosses max_data_bytes, so telemetry never
+/// gets more than about one batch per request in flight over it (it used
+/// to grow for up to 10 s, to 2.3x a 60M budget). Then, with only today's
+/// files left over the budget, ingest answers 503; it would otherwise grow
+/// them until the free-space floor stopped it.
+#[test]
+fn a_burst_stays_within_the_budget_plus_one_batch_per_sender() {
+    let (_root, _dir) = data_dir("burst", &[6, 5, 4, 3, 2, 1]);
+    let token = String::from_utf8(
+        Command::new(BIN).args(["env", "create", "burst"]).env("RAILWATCH_DATA_DIR", &_root.0).env_remove("RAILWATCH_CONFIG").output().unwrap().stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let telemetry = _root.0.join("telemetry");
+    let usage = || railwatch_server::storage::budget::usage(&telemetry).0;
+    let old = usage();
+    // Room for today's new files and a few batches before the burst.
+    let max = old + 4_000_000;
+    let port = free_port();
+    let child = serve(&_root.0, port, &[("RAILWATCH_MAX_DATA_BYTES", &max.to_string())]);
+    wait_until("the server", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+    // Today's files exist; then one batch's bytes.
+    let body = logs(100);
+    assert_eq!(post(port, &token, &body), 200);
+    let before = usage();
+    assert_eq!(post(port, &token, &body), 200);
+    let batch = usage() - before;
+    assert!(batch > 50_000, "one batch wrote {batch} bytes");
+
+    const SENDERS: u64 = 4;
+    let peak = std::sync::atomic::AtomicU64::new(0);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let statuses = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                peak.fetch_max(usage(), std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let senders: Vec<_> = (0..SENDERS).map(|_| s.spawn(|| (0..25).map(|_| post(port, &token, &body)).collect::<Vec<_>>())).collect();
+        for h in senders {
+            statuses.lock().unwrap().extend(h.join().unwrap());
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let statuses = statuses.into_inner().unwrap();
+    let (ok, refused) = (statuses.iter().filter(|s| **s == 200).count(), statuses.iter().filter(|s| **s == 503).count());
+    assert_eq!(ok + refused, statuses.len(), "only 200 or 503: {statuses:?}");
+    // 100 batches is ~3x the room the old days free: some went in and
+    // the rest were refused once only today's files were left.
+    assert!(ok > 0 && refused > 0, "{ok} accepted, {refused} refused");
+    let peak = peak.into_inner();
+    assert!(peak <= max + SENDERS * batch, "peak {peak} over max {max} + {SENDERS} x {batch}");
+    assert!(layout::days(&_dir, Tier::Detail).len() <= 1, "old detail days were trimmed for the burst");
+    let log = stop(child);
+    assert!(log.contains("telemetry over max_data_bytes: deleted the oldest day files"), "{log}");
+    assert_eq!(log.matches("still over max_data_bytes with no older day file left to delete").count(), 1, "logged once: {log}");
+}

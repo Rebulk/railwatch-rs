@@ -314,6 +314,19 @@ tests/disk_budget.rs (the real binary: retention catch-up at start; over the bud
 oldest detail days then core days, `raw_pruned_through` moved, logged, and a clean exit on
 SIGTERM).
 
+Under a burst: ingest adds what each commit wrote to a running estimate and wakes the pass as
+soon as it crosses the budget (it used to wait up to 10 s). Repro from the resilience report
+(N1): 200 MB tmpfs volume, `MAX_DATA_BYTES=60M MIN_FREE_BYTES=40M`, `rw-load --concurrency 2
+--rate 9 --duration 120 --spread-days 10`, telemetry sampled every 0.5 s (budget 62.9 MB): peak 149
+MB on main fcce07b, 61.5-63.3 MB with the estimate (3 runs). Followed by 150 s more into today's
+files: main grew to 164 MB until the floor refused ingest at 41 MB free; with the estimate ingest
+answered 503 over the budget (logged once) and the volume kept 141 MB free. Tests: storage::budget (the counter against the file
+growth it stands for, a wake that trims within TRIM_WAIT, 503 over the budget with only today
+left and back to 200 when within), tests/ingest_http.rs (that 503 over HTTP),
+tests/disk_budget.rs (the real binary: four senders in a burst stay within the budget plus one
+batch each, then 503, logged once), storage::reader (a day file deleted between listing and ATTACH
+is skipped: trims now run during bursts, and the worker's re-attach failed on them).
+
 ## Proposals
 
 None of these is implemented.

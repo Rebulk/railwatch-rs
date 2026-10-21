@@ -112,7 +112,17 @@ marker in the core file's `ar_internal_metadata` makes the copy idempotent.
 deletes whole day files past the budget, oldest detail day across all
 environments first, then the oldest core day with its detail day (no
 exemplar copy: the point is space); never today's files, meta or the control
-DB. Under the lock as above, every 10 s and at start. Deleted core days move
+DB. Under the lock as above, every 10 s and at start, and at once when
+ingest crosses the budget: each ingest writer adds what it commits (SQLite's
+count of WAL frames written, doubled for the checkpoint that later grows the
+main file) to a running estimate that every pass resets to what it measured,
+and a request over the estimate wakes the pass and waits up to 1 s for it,
+so a burst overshoots by about one batch per request in flight. A WAL not
+yet checkpointed counts the main file at the size its `-shm` header says it
+will reach. Over the budget with only today's files left, ingest answers 503
++ Retry-After (`"telemetry over max_data_bytes"`) until a pass finds it
+within; accepting more would grow today's files until the floor stops it.
+Deleted core days move
 `raw_pruned_through` to the end of the newest one, so the ingest floor
 rejects rows that would recreate them. `min_free_bytes` refuses ingest with
 503 + Retry-After while the filesystem is below it. After any deletion

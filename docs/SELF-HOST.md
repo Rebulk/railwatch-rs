@@ -131,7 +131,7 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `BACKUP_INTERVAL_SECONDS` | 300 | |
 | `DETAIL_RETENTION_DAYS` | 7 | queries, logs, spans, cache and view events |
 | `CORE_RETENTION_DAYS_MAX` | 90 | cap on an environment's retention |
-| `MAX_DATA_BYTES` | off | size budget for telemetry (`5G`, `500M`, bytes). Over it, the oldest day files are deleted, detail days before core days; never today's, rollups or the control DB. For a server sharing its disk with an app ([below](#disk-budget)) |
+| `MAX_DATA_BYTES` | off | size budget for telemetry (`5G`, `500M`, bytes). Over it, the oldest day files are deleted, detail days before core days; never today's, rollups or the control DB. Still over with only today's files left, ingest answers 503 + `Retry-After`. For a server sharing its disk with an app ([below](#disk-budget)) |
 | `MIN_FREE_BYTES` | off | below this much free space on the data dir's filesystem, ingest answers 503 + `Retry-After` (the gem keeps its buffer and retries) |
 | `RATE_LIMIT_IP`, `RATE_LIMIT_ENV` | 2400, 600 per minute | `0` disables |
 | `SILENCE_SECONDS` | 60 | quiet time before "app stopped reporting" |
@@ -257,15 +257,22 @@ retention of core), not size. On the app's own volume, a busy app can
 still fill it, and then the app fails too (sign-in, `db:prepare`). Two
 settings bound it; both are off unless set:
 
-- `MAX_DATA_BYTES=5G`: at start and every 10 s, while telemetry is over
-  this, the oldest day file is deleted: detail days (queries, logs,
-  cache, views, spans) of every environment first, then core days
-  (requests, jobs, exceptions). Today's files, the rollups (charts, issue
-  history) and the control DB are never deleted. Each pass that deletes
-  logs a warning with what went; an environment's lost core days move its
-  ingest floor, so late rows for them are rejected rather than recreating
-  the files. Still over with nothing older to delete (today alone is over
-  the budget) is logged as an error, once.
+- `MAX_DATA_BYTES=5G`: at start, every 10 s, and as soon as ingest
+  crosses it, while telemetry is over this, the oldest day file is
+  deleted: detail days (queries, logs, cache, views, spans) of every
+  environment first, then core days (requests, jobs, exceptions). Today's
+  files, the rollups (charts, issue history) and the control DB are never
+  deleted. Ingest counts what it writes, so a burst goes over by about one
+  batch per sender, not by 10 s of writes. Each pass that deletes logs a
+  warning with what went; an environment's lost core days move its ingest
+  floor, so late rows for them are rejected rather than recreating the
+  files. Still over with nothing older to delete (today alone is over the
+  budget), `/ingest` answers 503 with `Retry-After: 60` and
+  `"telemetry over max_data_bytes"` until telemetry is within it again
+  (usually after midnight UTC, when today's files become yesterday's).
+  Logged as an error once when it starts and once, with the number of
+  refused requests, when it ends. Size the budget for at least a day of
+  telemetry.
 - `MIN_FREE_BYTES=1G`: below this much free space on the data dir's
   filesystem, `/ingest` answers 503 with `Retry-After: 60` (the gem keeps
   the batch and retries) and nothing is written; the dashboard keeps
