@@ -120,8 +120,8 @@ and a request over the estimate wakes the pass and waits up to 1 s for it,
 so a burst overshoots by about one batch per request in flight. A WAL not
 yet checkpointed counts the main file at the size its `-shm` header says it
 will reach. Over the budget with only today's files left, ingest answers 503
-+ Retry-After (`"telemetry over max_data_bytes"`) until a pass finds it
-within; accepting more would grow today's files until the floor stops it.
+with `Retry-After: 60` and the JSON error `"telemetry over max_data_bytes"`
+until a pass finds it within; accepting more would grow today's files until the floor stops it.
 Deleted core days move
 `raw_pruned_through` to the end of the newest one, so the ingest floor
 rejects rows that would recreate them. `min_free_bytes` refuses ingest with
