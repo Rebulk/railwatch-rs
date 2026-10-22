@@ -1,7 +1,9 @@
+import { fileURLToPath } from "node:url"
+
 import react from "@vitejs/plugin-react"
 import { defineConfig } from "vitest/config"
 
-const frontendDir = new URL("./app/frontend", import.meta.url).pathname
+const frontendDir = fileURLToPath(new URL("./app/frontend", import.meta.url))
 
 // Formatted times in the tests are UTC; the workers inherit this.
 process.env.TZ = "UTC"

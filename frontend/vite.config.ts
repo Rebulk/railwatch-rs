@@ -2,11 +2,13 @@
 // SSR. The Rust server embeds dist/ and serves URL /vite/<file> from
 // dist/<file>, with dist/.vite/manifest.json mapping each entrypoint to its
 // hashed file.
+import { fileURLToPath } from "node:url"
+
 import tailwindcss from "@tailwindcss/vite"
 import react from "@vitejs/plugin-react"
 import { defineConfig } from "vite"
 
-const frontendDir = new URL("./app/frontend", import.meta.url).pathname
+const frontendDir = fileURLToPath(new URL("./app/frontend", import.meta.url))
 
 export default defineConfig({
   // Relative, so chunk imports and CSS font URLs resolve against the file
