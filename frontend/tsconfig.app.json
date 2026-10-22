@@ -26,13 +26,9 @@
     /* Aliases */
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./app/frontend/*", "./tmp/railwatch-frontend/*"],
-      "~/*": ["./app/frontend/*", "./tmp/railwatch-frontend/*"]
+      "@/*": ["./app/frontend/*"],
+      "~/*": ["./app/frontend/*"]
     }
   },
-  "include": ["app/frontend/**/*", "tmp/railwatch-frontend/**/*"],
-  "exclude": [
-    "tmp/railwatch-frontend/**/*.test.ts",
-    "tmp/railwatch-frontend/**/*.test.tsx"
-  ]
+  "include": ["app/frontend/**/*"]
 }

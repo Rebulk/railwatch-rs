@@ -243,12 +243,9 @@ cloud-only page driven in a real browser.
     symlink, not copied. Tables the control DB lacks are reported, not
     imported (today: issues, issue_activities).
 13. **Frontend build.** Plain Vite instead of rails-vite-plugin, assets under
-    `/vite/`. One change to cloud's `frontend.config.ts`: the bare-import
-    redirect applies to gem files only. Cloud's version also redirects bare
-    imports from inside node_modules to the entrypoint, where Node's lookup
-    walks above the checkout; a stray `node_modules` in a parent directory changed the
-    built chart chunk depending on where the build ran. With the change the
-    build is byte-identical across directories.
+    `/vite/`. The dashboard source is this repository's own
+    (`frontend/app/frontend`, taken from the gem's 0.9.4 `app/frontend`), one
+    root: no `frontend.config.ts` two-roots resolver, no gem to unpack.
 14. **Security headers on pages** are a fixed subset (X-Frame-Options,
     nosniff, Referrer-Policy, a CSP without script-src). Rails' report-only
     CSP with nonces is not reproduced.
