@@ -1,53 +1,24 @@
 #!/usr/bin/env bash
 # Builds the dashboard frontend into frontend/dist (embedded by the Rust
-# server), then the release binary.
-#
-# The frontend has two roots, like railwatch-cloud: frontend/app/frontend
-# (cloud-only pages) and frontend/tmp/railwatch-frontend (the railwatch gem's
-# app/frontend, extracted here from the pinned .gem). See
-# frontend/frontend.config.ts.
+# server), then the release binary. The source is frontend/app/frontend.
 #
 # URL /vite/<file> is served from frontend/dist/<file>; the entrypoints are
 # looked up in frontend/dist/.vite/manifest.json.
 set -euo pipefail
 
-GEM_VERSION=0.9.3
-GEM_SHA256=a559e1e585867b87da6447a169fe69bf4571e95330d7427bd66f7d7ffd5e57e0
 NODE=node@22.23.2
 PNPM=pnpm@10.30.3
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 frontend="$root/frontend"
-gem_cache="$frontend/tmp/gems"
-gem_file="$gem_cache/railwatch-$GEM_VERSION.gem"
 
 # mise pins the versions locally; CI (setup-node + corepack) has them on PATH.
 if command -v mise > /dev/null; then run() { mise exec "$NODE" "$PNPM" -- "$@"; }; else run() { "$@"; }; fi
 
-# 1. The gem's frontend source, from the pinned and checksummed .gem.
-mkdir -p "$gem_cache"
-if [ ! -f "$gem_file" ] || ! echo "$GEM_SHA256  $gem_file" | sha256sum -c --status; then
-  fetch_dir="$(mktemp -d)"
-  trap 'rm -rf "$fetch_dir"' EXIT
-  (cd "$fetch_dir" && gem fetch railwatch -v "$GEM_VERSION" --platform ruby >/dev/null)
-  mv "$fetch_dir/railwatch-$GEM_VERSION.gem" "$gem_file"
-fi
-if ! echo "$GEM_SHA256  $gem_file" | sha256sum -c --status; then
-  echo "bin/build: $gem_file does not match sha256 $GEM_SHA256" >&2
-  rm -f "$gem_file"
-  exit 1
-fi
-
-extract_dir="$(mktemp -d "$frontend/tmp/extract.XXXXXX")"
-tar -xOf "$gem_file" data.tar.gz | tar -xz -C "$extract_dir" app/frontend
-rm -rf "$frontend/tmp/railwatch-frontend"
-mv "$extract_dir/app/frontend" "$frontend/tmp/railwatch-frontend"
-rm -rf "$extract_dir"
-
-# 2. Vite build.
+# 1. Vite build.
 (cd "$frontend" && run pnpm install --frozen-lockfile && run pnpm exec vite build)
 
-# 3. Precompressed siblings for the server to pick by Accept-Encoding.
+# 2. Precompressed siblings for the server to pick by Accept-Encoding.
 # -n keeps names and timestamps out of the gzip header, so output is stable.
 find "$frontend/dist" -type f -size +1024c \
   \( -name '*.js' -o -name '*.css' -o -name '*.svg' -o -name '*.json' \
@@ -58,7 +29,7 @@ find "$frontend/dist" -type f -size +1024c \
     brotli -q 11 -k -f "$file"
   done
 
-# 4. The server binary, which embeds frontend/dist.
+# 3. The server binary, which embeds frontend/dist.
 if [ "${SKIP_CARGO:-}" != 1 ]; then
   (cd "$root" && cargo build --release -p railwatch-server)
 fi

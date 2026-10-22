@@ -1,12 +1,14 @@
-// railwatch-rs builds the same dashboard railwatch-cloud does (two roots, see
-// frontend.config.ts), but with plain Vite: no rails-vite-plugin, no SSR. The
-// Rust server embeds dist/ and serves URL /vite/<file> from dist/<file>, with
-// dist/.vite/manifest.json mapping each entrypoint to its hashed file.
+// railwatch-rs builds the dashboard with plain Vite: no rails-vite-plugin, no
+// SSR. The Rust server embeds dist/ and serves URL /vite/<file> from
+// dist/<file>, with dist/.vite/manifest.json mapping each entrypoint to its
+// hashed file.
+import { fileURLToPath } from "node:url"
+
 import tailwindcss from "@tailwindcss/vite"
 import react from "@vitejs/plugin-react"
 import { defineConfig } from "vite"
 
-import { gemFrontend, twoRoots } from "./frontend.config"
+const frontendDir = fileURLToPath(new URL("./app/frontend", import.meta.url))
 
 export default defineConfig({
   // Relative, so chunk imports and CSS font URLs resolve against the file
@@ -14,15 +16,12 @@ export default defineConfig({
   // (RAILWATCH_BASE_PATH). The server still serves dist/ at /vite/.
   base: "./",
   // icon.png and icon.svg land at dist/ root.
-  publicDir: "tmp/railwatch-frontend/public",
-  server: { fs: { allow: [".", gemFrontend] } },
+  publicDir: "app/frontend/public",
   resolve: {
-    alias: [
-      // routes/index.js is the gem's (cloud's copy is identical). twoRoots()
-      // only tries index.ts/index.tsx, and the rails-vite-plugin `@` alias
-      // that found cloud's copy is not used here.
-      { find: /^@\/routes$/, replacement: `${gemFrontend}/routes/index.js` },
-    ],
+    alias: {
+      "@": frontendDir,
+      "~": frontendDir,
+    },
   },
   build: {
     outDir: "dist",
@@ -37,7 +36,6 @@ export default defineConfig({
     },
   },
   plugins: [
-    twoRoots(),
     react({
       babel: {
         plugins: ["babel-plugin-react-compiler"],

@@ -8,13 +8,13 @@
 #
 # Sections:
 #   1. code ported into this repository (named in each file's SPDX header);
-#   2. the railwatch gem, whose app/frontend is built into the dashboard;
+#   2. the fonts in frontend/app/frontend/fonts, copied into frontend/dist;
 #   3. the npm packages Vite bundles into frontend/dist (production deps);
 #   4. every Rust crate linked into the binary on the release targets
 #      (cargo-about, about.toml), C libraries they compile in included.
 #
 # Needs: cargo-about (cargo install --locked --features cli cargo-about),
-# frontend/node_modules (bin/build), the gem's .gem in frontend/tmp/gems.
+# frontend/node_modules (bin/build).
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,8 +24,6 @@ trap 'rm -rf "$tmp"' EXIT
 
 command -v cargo-about > /dev/null || { echo "bin/third-party-licenses: needs cargo-about (cargo install --locked --features cli cargo-about)" >&2; exit 1; }
 [ -d "$root/frontend/node_modules" ] || { echo "bin/third-party-licenses: frontend/node_modules is missing (bin/build)" >&2; exit 1; }
-gem_file=$(ls "$root"/frontend/tmp/gems/railwatch-*.gem 2> /dev/null | head -1)
-[ -n "$gem_file" ] || { echo "bin/third-party-licenses: the railwatch .gem is missing (bin/build fetches it)" >&2; exit 1; }
 
 # 4. Rust crates. {{{ }}}: the texts are plain text, not HTML.
 cat > "$tmp/crates.hbs" <<'EOF'
@@ -42,12 +40,10 @@ EOF
 
 # 3. npm packages bundled into the frontend: each with its own license file.
 (cd "$root/frontend" && pnpm licenses list --prod --json) > "$tmp/npm.json"
-# 2. the gem's MIT-LICENSE, straight from the pinned .gem.
-tar -xOf "$gem_file" data.tar.gz | tar -xzO MIT-LICENSE > "$tmp/gem-license.txt"
 
-python3 -I - "$root" "$tmp" "$(basename "$gem_file" .gem)" > "$tmp/out" <<'PY'
+python3 -I - "$root" "$tmp" > "$tmp/out" <<'PY'
 import json, pathlib, sys
-root, tmp, gem = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+root, tmp = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 rule = "=" * 80
 def section(title):
     print(f"\n{rule}\n{title}\n{rule}")
@@ -118,9 +114,11 @@ print(mit)
 print("\ncrates/server/src/jobs/schedule.rs: fugit 1.11's schedule grammar (\"fugit\").\n  Copyright (c) 2017-2024 John Mettraux. MIT:\n")
 print(mit)
 
-section(f"2. The railwatch gem ({gem}): app/frontend is built into the dashboard")
-print()
-print((tmp / "gem-license.txt").read_text().rstrip())
+section("2. Fonts bundled into the dashboard (frontend/dist)")
+fonts = root / "frontend/app/frontend/fonts"
+for title, notice in [("Commit Mono (CommitMono-*.woff2), OFL-1.1", "CommitMono-OFL.txt"), ("Roboto (Roboto-*.woff2), Apache-2.0", "Roboto-LICENSE.txt")]:
+    print(f"\n--------------------------------------------------------------------------------\n{title}\n")
+    print((fonts / notice).read_text().rstrip())
 
 section("3. npm packages bundled into the dashboard (frontend/dist)")
 npm = json.loads((tmp / "npm.json").read_text())

@@ -8,8 +8,7 @@ Security problems go through [SECURITY.md](SECURITY.md), not public issues.
 
 You need Rust 1.99.1 (CI's pinned toolchain; `rust-version` is the floor),
 Node 22 + pnpm 10 (versions pinned in `bin/build`; `mise` picks them up if
-installed), Ruby (bin/build unpacks the railwatch gem's frontend from its
-pinned, checksummed `.gem`) and `brotli`.
+installed) and `brotli`.
 
 ```sh
 bin/build                  # frontend into frontend/dist, then target/release/railwatch with it embedded
@@ -22,6 +21,7 @@ What CI runs (`.github/workflows/ci.yml`); a PR needs all of it green:
 
 ```sh
 SKIP_CARGO=1 bin/build
+(cd frontend && pnpm check && pnpm test)   # tsc, vitest
 cargo fmt --check          # rustfmt.toml: 160 columns
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked

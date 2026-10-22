@@ -12,7 +12,7 @@ gem's embedded store and the hosted platform without conversion.
 
 - `crates/server` - the server (`railwatch` binary: ingest, dashboard, alerts, MCP, `/api/v1`)
 - `crates/load`   - `rw-load`, a load generator that speaks the gem's wire protocol
-- `frontend/`     - the dashboard (the gem's React pages plus the server's own), embedded at build time
+- `frontend/`     - the dashboard (React + Inertia), embedded at build time
 - `bench/`        - differential harnesses against the Rails implementation, install proofs, benchmarks
 - `research/`     - measured experiments behind the storage and restart designs
 - `docs/`         - [SELF-HOST.md](docs/SELF-HOST.md) (install, config, backups, releases),
