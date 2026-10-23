@@ -1086,7 +1086,7 @@ pub fn broadcasts_index(conn: &Connection, ctx: &PageContext, _control: &dyn Con
         "recent" => recent.iter().map(|b| crate::obj! {
             "id" => ji(b.i("id")), "kind" => js(b.s("kind")), "stream" => js(b.s("stream")), "channel" => js(b.s("channel")), "action" => js(b.s("action")),
             "bytes" => ji(b.i("bytes")), "failed" => b.attr("broadcasts", "failed"), "duration" => dur(b, 3), "occurred_at" => jt(b.t("occurred_at")),
-            "execution_id" => js(b.s("execution_id")), "execution_preview" => js(b.s("execution_preview")),
+            "execution_id" => js(b.s("execution_id")), "execution_source" => js(b.s("execution_source")), "execution_preview" => js(b.s("execution_preview")),
         }).collect::<Vec<_>>(),
     })
 }
@@ -1409,6 +1409,27 @@ mod like_tests {
         assert_eq!(l["recent"].as_array().unwrap().iter().map(|x| x["model"].clone()).collect::<Vec<_>>(), ["gpt_4"]);
         let l = page(llm_calls_index, "attachments:100%");
         assert_eq!(l["recent"].as_array().unwrap().iter().map(|x| x["attachment_types"].clone()).collect::<Vec<_>>(), ["100%png"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recent broadcast carries its parent's kind, so the page can link a
+    /// job's broadcast to the job rather than to the request route.
+    #[test]
+    fn recent_broadcasts_carry_the_execution_source() {
+        let dir = std::env::temp_dir().join(format!("rw-broadcasts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = crate::tenants::open_tenant(&dir.join("t.sqlite3")).unwrap();
+        let now = 1_792_000_000_000_000;
+        t.execute(
+            "INSERT INTO broadcasts (occurred_at, kind, stream, duration, group_hash, execution_source, execution_id) VALUES (?, 'broadcast', 'widgets', 1000, 'g', 'job', 'e1')",
+            rusqlite::params![qt(now - 60_000_000)],
+        )
+        .unwrap();
+        let ctx = PageContext::new(1, now, Default::default(), crate::dashboard::CursorKey(b"k".to_vec()));
+        let b = broadcasts_index(&t, &ctx, &StaticControl::default()).unwrap();
+        assert_eq!(b["recent"][0]["execution_source"], "job");
+        assert_eq!(b["recent"][0]["execution_id"], "e1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

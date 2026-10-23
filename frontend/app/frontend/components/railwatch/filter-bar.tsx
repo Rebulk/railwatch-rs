@@ -72,7 +72,11 @@ export function FilterBar({
     setOpen(false)
   }
 
-  const commit = () => onChange(draft)
+  // Enter then blur, or a focus that only passes through, would otherwise
+  // re-run the same visit.
+  const commit = () => {
+    if (draft !== value) onChange(draft)
+  }
 
   return (
     <div className="flex flex-wrap items-center gap-2">

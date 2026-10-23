@@ -27,15 +27,19 @@ interface Props {
 }
 
 export default function Requests(p: Props) {
-  const { environment, window } = usePage<SharedProps>().props
+  const { environment, window, range } = usePage<SharedProps>().props
   const { percentile } = usePercentile()
   const a = environment!.application_id
   const e = environment!.id
+  const timeParams =
+    window === "custom"
+      ? { from: range?.from, to: range?.to }
+      : { window: window }
 
   const visit = (params: Record<string, string | undefined>) =>
     router.visit(
       R.applicationEnvironmentRequestsPath(a, e, {
-        window,
+        ...timeParams,
         sort: p.sort,
         dir: p.dir,
         q: p.q || undefined,
@@ -51,7 +55,7 @@ export default function Requests(p: Props) {
     })
 
   const routeHref = (x: GroupRow) =>
-    R.routeApplicationEnvironmentRequestsPath(a, e, x.group_hash, { window })
+    R.routeApplicationEnvironmentRequestsPath(a, e, x.group_hash, timeParams)
 
   return (
     <EnvLayout title="Requests">

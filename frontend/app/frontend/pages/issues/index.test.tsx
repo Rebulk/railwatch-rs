@@ -96,3 +96,29 @@ describe("issue action shortcuts", () => {
     expect(router.patch).not.toHaveBeenCalled()
   })
 })
+
+describe("bulk selection", () => {
+  function selectIssue() {
+    render(<Issues issues={[issue]} filters={{}} counts={{}} members={[]} />)
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select APP-7" }))
+    expect(screen.getByText("1 selected")).toBeInTheDocument()
+  }
+
+  it("is cleared when a filter changes, so bulk actions cannot reach issues no longer listed", () => {
+    selectIssue()
+    fireEvent.click(screen.getByRole("button", { name: /Resolved/ }))
+    expect(router.visit).toHaveBeenCalledWith(
+      R.issuesPath({ status: "resolved" }),
+      { preserveState: true },
+    )
+    expect(screen.queryByText("1 selected")).not.toBeInTheDocument()
+  })
+
+  it("is cleared when a search is submitted", () => {
+    selectIssue()
+    const search = screen.getByPlaceholderText("Search or source:browser")
+    fireEvent.change(search, { target: { value: "timeout" } })
+    fireEvent.submit(search)
+    expect(screen.queryByText("1 selected")).not.toBeInTheDocument()
+  })
+})

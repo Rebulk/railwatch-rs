@@ -104,6 +104,12 @@ beforeEach(async () => {
   vi.resetModules()
   vi.useFakeTimers()
   vi.setSystemTime(new Date("2026-09-03T12:00:00.000Z"))
+  // jsdom keeps sessionStorage for the whole file, so without a reset only
+  // the first test would see the session-open beacon. Every test starts in a
+  // tab whose session is already open; the open beacon has its own test.
+  sessionStorage.clear()
+  sessionStorage.setItem("railwatch.session", "0123456789abcdef")
+  sessionStorage.setItem("railwatch.session.at", String(Date.now()))
   handlers = {}
   on.mockClear()
 
@@ -192,14 +198,33 @@ function ownStack(file = "/assets/index-Bq1.js") {
   return `Error: boom\n    at IssueRow (${file}:41:2210)`
 }
 
+describe("startRailwatch session", () => {
+  // Release health needs the session to exist before its first beat, so a
+  // tab's first start sends one visit-less beacon that opens it.
+  it("opens a new tab's session with one visit-less beacon", async () => {
+    sessionStorage.clear()
+    vi.resetModules()
+    const module = await import("@/lib/railwatch")
+    module.startRailwatch()
+
+    expect(sendBeacon).toHaveBeenCalledTimes(1)
+    const body = blobBody(sendBeacon.mock.calls[0][1]) as Body & {
+      session?: { id: string; duration_ms?: number }
+    }
+    expect(body.visits).toEqual([])
+    expect(body.session?.id).toBe(sessionStorage.getItem("railwatch.session"))
+    expect(body.session).not.toHaveProperty("duration_ms")
+  })
+
+  it("does not reopen a session an earlier page in the tab opened", () => {
+    expect(sendBeacon).not.toHaveBeenCalled()
+  })
+})
+
 describe("startRailwatch batching", () => {
-  // Starting the client opens the tab's session with one visit-less beacon
-  // (release health needs the session to exist before its first beat), so
-  // "nothing flushed yet" means exactly that one call and no visits in it.
   it("does not flush a queued visit before the 5s timer or the 20-visit threshold", () => {
     completeVisit("/dashboard")
-    expect(sendBeacon).toHaveBeenCalledTimes(1)
-    expect(blobBody(sendBeacon.mock.calls[0][1]).visits).toEqual([])
+    expect(sendBeacon).not.toHaveBeenCalled()
   })
 
   it("flushes automatically once the 5s timer elapses", () => {

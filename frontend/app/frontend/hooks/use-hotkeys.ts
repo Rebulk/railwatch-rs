@@ -1,12 +1,15 @@
 import { useEffect, useRef } from "react"
 
+import { ignorePageShortcut } from "@/lib/keyboard"
+
 type HotkeyMap = Record<string, () => void>
 
 const CHORD_TIMEOUT_MS = 800
 
 // Tiny keyboard shortcut hook supporting single keys ("?") and two-key
-// chords ("g d") without pulling in a dependency. Ignores keystrokes while
-// focus is in a form field, and while a modifier key is held.
+// chords ("g d") without pulling in a dependency. Yields to the same
+// keystrokes every page shortcut does (ignorePageShortcut), except Shift,
+// which "?" needs.
 export function useHotkeys(map: HotkeyMap) {
   const mapRef = useRef(map)
   useEffect(() => {
@@ -18,16 +21,7 @@ export function useHotkeys(map: HotkeyMap) {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement
-      if (
-        target.tagName === "INPUT" ||
-        target.tagName === "TEXTAREA" ||
-        target.tagName === "SELECT" ||
-        target.isContentEditable
-      ) {
-        return
-      }
-      if (event.metaKey || event.ctrlKey || event.altKey) return
+      if (ignorePageShortcut(event, { allowShift: true })) return
 
       if (pending.current) {
         const combo = `${pending.current} ${event.key}`
