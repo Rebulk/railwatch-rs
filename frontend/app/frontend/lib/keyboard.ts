@@ -1,5 +1,9 @@
 // Page shortcuts must yield to browser shortcuts, IME input, and controls.
-export function ignorePageShortcut(event: KeyboardEvent) {
+// `allowShift` is for shortcuts typed with Shift, like "?".
+export function ignorePageShortcut(
+  event: KeyboardEvent,
+  { allowShift = false }: { allowShift?: boolean } = {},
+) {
   return (
     event.defaultPrevented ||
     event.isComposing ||
@@ -7,7 +11,7 @@ export function ignorePageShortcut(event: KeyboardEvent) {
     event.metaKey ||
     event.ctrlKey ||
     event.altKey ||
-    event.shiftKey ||
+    (!allowShift && event.shiftKey) ||
     (event.target instanceof Element &&
       Boolean(
         event.target.closest(
