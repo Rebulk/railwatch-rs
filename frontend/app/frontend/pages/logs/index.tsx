@@ -11,6 +11,7 @@ import { SavedViewsMenu } from "@/components/railwatch/saved-views"
 import { Segmented, SegmentedItem } from "@/components/railwatch/segmented"
 import { LevelBadge } from "@/components/railwatch/status-badge"
 import EnvLayout from "@/layouts/env-layout"
+import { executionPath } from "@/lib/execution-path"
 import { parseFilter, serializeFilter } from "@/lib/filter"
 import { count, when } from "@/lib/format"
 import { cn } from "@/lib/utils"
@@ -255,19 +256,19 @@ export default function Logs(p: Props) {
             key: "in",
             hideOnMobile: true,
             header: "In",
-            cell: (l) =>
-              l.execution_id ? (
-                <Link
-                  className="font-mono text-xs hover:underline"
-                  href={R.applicationEnvironmentRequestPath(
-                    a,
-                    e,
-                    l.execution_id,
-                  )}
-                >
+            cell: (l) => {
+              const href = executionPath({
+                applicationId: a,
+                environmentId: e,
+                source: l.execution_source,
+                executionId: l.execution_id,
+              })
+              return href ? (
+                <Link className="font-mono text-xs hover:underline" href={href}>
                   {l.execution_preview}
                 </Link>
-              ) : null,
+              ) : null
+            },
           },
           {
             key: "t",
