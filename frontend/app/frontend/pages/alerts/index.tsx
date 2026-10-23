@@ -97,24 +97,26 @@ export default function AlertsIndex(p: Props) {
             const isOpen = expanded === a.id
             return (
               <div key={a.id} className="p-3">
-                <button
-                  type="button"
-                  className="flex w-full flex-wrap items-center gap-3 text-left text-sm"
-                  onClick={() => setExpanded(isOpen ? null : a.id)}
-                >
-                  {isOpen ? (
-                    <ChevronDown className="text-muted-foreground size-4 shrink-0" />
-                  ) : (
-                    <ChevronRight className="text-muted-foreground size-4 shrink-0" />
-                  )}
-                  <span className="font-mono text-xs">{a.event}</span>
-                  <span className="text-muted-foreground text-xs">
-                    {a.integration.name} ({a.integration.kind})
-                  </span>
+                <div className="flex w-full flex-wrap items-center gap-3 text-sm">
+                  <button
+                    type="button"
+                    aria-expanded={isOpen}
+                    className="flex items-center gap-3 text-left"
+                    onClick={() => setExpanded(isOpen ? null : a.id)}
+                  >
+                    {isOpen ? (
+                      <ChevronDown className="text-muted-foreground size-4 shrink-0" />
+                    ) : (
+                      <ChevronRight className="text-muted-foreground size-4 shrink-0" />
+                    )}
+                    <span className="font-mono text-xs">{a.event}</span>
+                    <span className="text-muted-foreground text-xs">
+                      {a.integration.name} ({a.integration.kind})
+                    </span>
+                  </button>
                   {a.issue && (
                     <Link
                       href={R.issuePath(a.issue.id)}
-                      onClick={(e) => e.stopPropagation()}
                       className="text-xs hover:underline"
                     >
                       <span className="font-mono font-semibold">
@@ -143,16 +145,13 @@ export default function AlertsIndex(p: Props) {
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          retry(a.id)
-                        }}
+                        onClick={() => retry(a.id)}
                       >
                         Retry
                       </Button>
                     )}
                   </span>
-                </button>
+                </div>
                 {isOpen && (
                   <div className="mt-3 space-y-2 pl-7">
                     {a.error && (
