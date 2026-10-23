@@ -38,10 +38,14 @@ export default function Issues(p: Props) {
   const [highlightedId, setHighlightedId] = useState<number | null>(null)
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const status = p.filters.status ?? "open"
-  const apply = (patch: Record<string, string | undefined>) =>
+  // A filter change swaps the listed issues, so the selection goes with it:
+  // bulk actions must only touch issues the user can see.
+  const apply = (patch: Record<string, string | undefined>) => {
+    setSelected(new Set())
     router.visit(R.issuesPath({ ...p.filters, ...patch }), {
       preserveState: true,
     })
+  }
 
   // j/k/Enter/o/Esc row navigation lives in useRowNav, wired in via
   // DataTable's keyboardNav prop below. r/i/a act on whichever row that
