@@ -86,6 +86,7 @@ export default function Visits(p: Props) {
     router.visit(
       R.applicationEnvironmentVisitsPath(a, e, {
         window,
+        q: p.q || undefined,
         sort: field,
         dir: p.sort === field && p.dir === "desc" ? "asc" : "desc",
       }),
