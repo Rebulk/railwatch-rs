@@ -6,8 +6,8 @@ import { EmptyState } from "@/components/railwatch/empty-state"
 import { PageHeader } from "@/components/railwatch/page-header"
 import { Badge } from "@/components/ui/badge"
 import EnvLayout from "@/layouts/env-layout"
+import { executionPath } from "@/lib/execution-path"
 import { bytes, count, ms, when } from "@/lib/format"
-import * as R from "@/routes"
 import type { SharedProps } from "@/types"
 
 interface Stream {
@@ -29,6 +29,7 @@ interface Recent {
   duration: number
   occurred_at: string
   execution_id: string | null
+  execution_source: string | null
   execution_preview: string | null
 }
 interface Props {
@@ -41,9 +42,12 @@ export default function Broadcasts(p: Props) {
   const a = environment!.application_id
   const e = environment!.id
   const recentHref = (r: Recent) =>
-    r.execution_id
-      ? R.applicationEnvironmentRequestPath(a, e, r.execution_id)
-      : null
+    executionPath({
+      applicationId: a,
+      environmentId: e,
+      source: r.execution_source,
+      executionId: r.execution_id,
+    })
   return (
     <EnvLayout title="Broadcasts">
       <PageHeader
