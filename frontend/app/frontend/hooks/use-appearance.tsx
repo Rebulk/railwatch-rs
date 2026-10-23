@@ -56,11 +56,11 @@ export function useAppearance() {
     applyTheme(mode)
   }, [])
 
+  // The system-theme listener belongs to initializeTheme for the life of the
+  // page; it reads the saved appearance on every change, so this hook never
+  // adds or removes it.
   useEffect(() => {
     applyTheme(appearance)
-
-    return () =>
-      mediaQuery()?.removeEventListener("change", handleSystemThemeChange)
   }, [appearance])
 
   return { appearance, updateAppearance } as const
