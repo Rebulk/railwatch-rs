@@ -147,24 +147,13 @@ async fn scope(cx: &Ctx, app: i64, env: i64) -> Result<Scoped, Response> {
 /// port (custom ranges, Ruby Time.zone.parse); this covers the presets and
 /// is replaced by `dashboard::shared_props(&ctx)` at the merge.
 pub fn window_props(p: &Params, now: i64) -> Value {
-    const PRESETS: [(&str, i64); 5] = [("1h", 3600), ("6h", 21_600), ("24h", 86_400), ("7d", 604_800), ("30d", 2_592_000)];
-    const STEPS: [(&str, i64); 6] = [("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600), ("6h", 21_600), ("1d", 86_400)];
-    let key = p.s("window");
-    let (key, span) = PRESETS.iter().find(|(k, _)| *k == key).copied().unwrap_or(("24h", 86_400));
-    let from = now - span * 1_000_000;
-    let offered: Vec<&str> = STEPS.iter().filter(|(_, s)| (2..=400).contains(&(span / s))).map(|(k, _)| *k).collect();
-    let default = if span <= 7200 {
-        "1m"
-    } else if span <= 43_200 {
-        "5m"
-    } else if span <= 604_800 {
-        "1h"
-    } else {
-        "6h"
-    };
-    let requested = p.s("step");
-    let step = if offered.contains(&requested.as_str()) { requested } else { default.to_string() };
-    json!({"window": key, "range": {"from": crate::time::iso8601_6(from), "to": crate::time::iso8601_6(now)}, "step": step, "steps": offered})
+    // The same window and step the page's data uses (dashboard::PageContext),
+    // so a custom ?from=&to= range is what the frontend is told, not 24h.
+    let opt = |k: &str| Some(p.s(k)).filter(|v| !v.is_empty());
+    let (window, from, to, step) = (opt("window"), opt("from"), opt("to"), opt("step"));
+    let w = crate::dashboard::window::Window::parse(window.as_deref(), from.as_deref(), to.as_deref(), now);
+    let step = crate::dashboard::window::step_key(w.from, w.to, step.as_deref());
+    json!({"window": w.key, "range": w.to_h(), "step": step, "steps": crate::dashboard::window::steps_for(w.from, w.to)})
 }
 
 /// SavedView.props_for(environment, user).
@@ -495,6 +484,18 @@ mod tests {
         let d = window_props(&Params::default(), 1_791_900_000_000_000);
         assert_eq!((d["window"].as_str(), d["step"].as_str()), (Some("24h"), Some("1h")));
         assert_eq!(d["steps"], json!(["5m", "15m", "1h", "6h"]));
+    }
+
+    /// A custom range is reported as itself, as the data uses it, so the
+    /// frontend keeps it on navigation instead of falling back to 24h.
+    #[test]
+    fn a_custom_range_is_reported_as_custom() {
+        let p = Params::from_query(Some("from=2026-10-01T00:00:00Z&to=2026-10-03T00:00:00Z"));
+        let w = window_props(&p, 1_791_900_000_000_000);
+        assert_eq!(w["window"], "custom");
+        assert_eq!(w["range"]["from"], "2026-10-01T00:00:00.000000Z");
+        assert_eq!(w["range"]["to"], "2026-10-03T00:00:00.000000Z");
+        assert_eq!(w["step"], "1h");
     }
 
     #[test]
