@@ -300,6 +300,22 @@ impl Server {
     }
 }
 
+/// Reads a `Connection: close` response to EOF. A server that closes with
+/// bytes still unread (or the kernel's RST racing the FIN) can surface as
+/// ConnectionReset after the whole response arrived; that is not a failure.
+fn read_response(s: &mut TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) => return buf,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && buf.windows(4).any(|w| w == b"\r\n\r\n") => return buf,
+            Err(e) => panic!("reading the response: {e}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Res {
     status: u16,
@@ -340,8 +356,7 @@ impl Browser {
             head.push_str(&format!("Content-Type: application/x-www-form-urlencoded\r\nOrigin: http://{hostport}\r\n"));
         }
         s.write_all(format!("{head}\r\n{body}").as_bytes()).unwrap();
-        let mut buf = Vec::new();
-        s.read_to_end(&mut buf).unwrap();
+        let buf = read_response(&mut s);
         let split = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let head = String::from_utf8_lossy(&buf[..split]).to_string();
         let status = head.split(' ').nth(1).unwrap().parse().unwrap();
@@ -650,8 +665,7 @@ fn reauthentication_for_google_users() {
         let body = "confirmation=Owner%40Example.com";
         let x = b.jar.get("XSRF-TOKEN").cloned().unwrap();
         s.write_all(format!("DELETE /users HTTP/1.1\r\nHost: {rest}\r\nConnection: close\r\nCookie: {}\r\nX-XSRF-TOKEN: {x}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}", cookies.join("; "), body.len()).as_bytes()).unwrap();
-        let mut buf = String::new();
-        s.read_to_string(&mut buf).unwrap();
+        let buf = String::from_utf8_lossy(&read_response(&mut s)).into_owned();
         buf.lines().find_map(|l| l.to_ascii_lowercase().starts_with("location:").then(|| l[9..].trim().to_string())).unwrap_or_default()
     };
     assert_eq!(delete_user(&mut b), "/settings/profile", "stale sign-in: refused");
