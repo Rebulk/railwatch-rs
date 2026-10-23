@@ -1,5 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
+import { useState } from "react"
 import { describe, expect, it, vi } from "vitest"
 
 import type { FilterField } from "@/components/railwatch/filter-bar"
@@ -41,6 +42,46 @@ describe("FilterBar typing", () => {
     await user.type(input, "status:200{Enter}")
 
     expect(onChange).toHaveBeenCalledWith("status:200")
+  })
+
+  it("does not visit again when the input loses focus after Enter", async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    // The page passes the committed query back as `value` once its visit
+    // lands, as every FilterBar caller does.
+    function Page() {
+      const [value, setValue] = useState("")
+      return (
+        <FilterBar
+          value={value}
+          fields={fields}
+          onChange={(q) => {
+            onChange(q)
+            setValue(q)
+          }}
+        />
+      )
+    }
+    render(<Page />)
+
+    const input = screen.getByPlaceholderText("Filter...")
+    await user.type(input, "status:200{Enter}")
+    await user.tab()
+
+    expect(onChange).toHaveBeenCalledExactlyOnceWith("status:200")
+  })
+
+  it("does not visit when focus only passes through the input", async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    render(
+      <FilterBar value="status:500" fields={fields} onChange={onChange} />,
+    )
+
+    await user.click(screen.getByPlaceholderText("Filter..."))
+    await user.tab()
+
+    expect(onChange).not.toHaveBeenCalled()
   })
 })
 
