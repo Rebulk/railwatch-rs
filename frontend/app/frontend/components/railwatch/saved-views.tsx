@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useClipboard } from "@/hooks/use-clipboard"
 import { cn } from "@/lib/utils"
 import * as R from "@/routes"
 import type { SavedView, SharedProps } from "@/types"
@@ -66,6 +67,7 @@ export function SavedViewsMenu({ page }: { page: string }) {
   const [pinned, setPinned] = useState(true)
   const [shared, setShared] = useState(true)
   const [copied, setCopied] = useState(false)
+  const [, copy] = useClipboard()
   const a = environment!.application_id
   const e = environment!.id
   const views = allViews.filter((v) => v.page === page)
@@ -97,9 +99,11 @@ export function SavedViewsMenu({ page }: { page: string }) {
   }
 
   const copyLink = () => {
-    void navigator.clipboard?.writeText(globalThis.location.href)
-    setCopied(true)
-    globalThis.setTimeout(() => setCopied(false), 1500)
+    void copy(globalThis.location.href).then((ok) => {
+      if (!ok) return
+      setCopied(true)
+      globalThis.setTimeout(() => setCopied(false), 1500)
+    })
   }
 
   return (

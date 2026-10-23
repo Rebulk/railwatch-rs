@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen } from "@testing-library/react"
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SavedViewsMenu } from "@/components/railwatch/saved-views"
 import {
@@ -183,5 +183,57 @@ describe("SavedViewsMenu save dialog", () => {
     fireEvent.click(screen.getByText("Save current view…"))
 
     expect(screen.getByText("Save view")).toBeDisabled()
+  })
+})
+
+describe("SavedViewsMenu copy link", () => {
+  // The button swaps its link icon for a check once the link is copied.
+  const copyButton = () => screen.getByLabelText("Copy link to this view")
+  const showsCopied = () =>
+    copyButton().querySelector(".lucide-check") !== null
+
+  function stubClipboard(clipboard: Partial<Clipboard> | undefined) {
+    Object.defineProperty(navigator, "clipboard", {
+      value: clipboard,
+      configurable: true,
+    })
+  }
+
+  afterEach(() => {
+    stubClipboard(undefined)
+    vi.restoreAllMocks()
+  })
+
+  it("shows copied once the link is on the clipboard", async () => {
+    const writeText = vi.fn(() => Promise.resolve())
+    stubClipboard({ writeText })
+    render(<SavedViewsMenu page="logs" />)
+
+    await act(async () => fireEvent.click(copyButton()))
+
+    expect(writeText).toHaveBeenCalledWith(globalThis.location.href)
+    expect(showsCopied()).toBe(true)
+  })
+
+  it("does not show copied when the page has no clipboard", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined)
+    stubClipboard(undefined)
+    render(<SavedViewsMenu page="logs" />)
+
+    await act(async () => fireEvent.click(copyButton()))
+
+    expect(showsCopied()).toBe(false)
+  })
+
+  it("does not show copied when the browser refuses the write", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined)
+    stubClipboard({
+      writeText: () => Promise.reject(new DOMException("denied")),
+    })
+    render(<SavedViewsMenu page="logs" />)
+
+    await act(async () => fireEvent.click(copyButton()))
+
+    expect(showsCopied()).toBe(false)
   })
 })
