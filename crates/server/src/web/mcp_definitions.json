@@ -524,6 +524,79 @@
       }
     },
     {
+      "name": "web_vitals",
+      "description": "Browser page-load performance from the browser client, as the Visits page shows it: p75 Core Web Vitals (LCP, INP and TTFB in milliseconds, CLS as a unitless score) each rated good, needs-improvement or poor against web.dev's thresholds (returned in thresholds), with its sample count; every Inertia component (page) with visit count, errors and client-measured visit duration p50/p95/p99/max in milliseconds plus its own p75 vitals; and the same vitals per release deployed in the window, to tell whether a deploy made pages slower. Vitals come from initial page loads only; a metric is absent when no visit measured it.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug, exactly as returned by list_applications."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          },
+          "component": {
+            "type": "string",
+            "description": "Inertia component name exactly as returned in components[].component, e.g. orders/index. Optional; narrows vitals and releases to that page."
+          },
+          "sort": {
+            "type": "string",
+            "enum": [
+              "count",
+              "p50",
+              "p95",
+              "p99",
+              "errors",
+              "avg",
+              "max",
+              "lcp",
+              "cls",
+              "inp",
+              "ttfb"
+            ],
+            "description": "Order components by visit count (default), a visit-duration statistic, or a vital's p75 (lcp, cls, inp, ttfb), worst first."
+          },
+          "dir": {
+            "type": "string",
+            "enum": [
+              "desc",
+              "asc"
+            ],
+            "description": "desc (default) puts the highest value first; asc the lowest."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Components to return, 1-100. Defaults to 20."
+          }
+        },
+        "required": [
+          "application_slug",
+          "environment"
+        ]
+      }
+    },
+    {
       "name": "recent_deploys",
       "description": "The 20 most recent deploys of an environment, newest first, with the deploy identifier, git ref, name, timestamp, and link.",
       "inputSchema": {

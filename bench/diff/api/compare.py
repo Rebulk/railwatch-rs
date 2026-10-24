@@ -35,6 +35,8 @@ EXPECTED_DIFF = {
     "write.deploy.repost": "a re-posted deploy keeps its deployed_at (old Rails: reset to now)",
     "after_writes.deploys": "the re-posted deploy keeps its deployed_at, so its place in the list",
     "after_writes.releases": "the re-posted deploy keeps its deployed_at, so its place in the timeline",
+    "series.no_type": "Rust-only: series also takes type=visit, so the 422 lists it",
+    "series.bad_type": "Rust-only: series also takes type=visit, so the 422 lists it",
 }
 verbose = "--verbose" in sys.argv
 

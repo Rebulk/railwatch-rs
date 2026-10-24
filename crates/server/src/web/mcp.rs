@@ -137,7 +137,7 @@ pub fn discovery(base: &str) -> Value {
     let d = definitions();
     json!({
         "name": SERVER_NAME, "version": SERVER_VERSION, "protocolVersion": PROTOCOL_VERSION,
-        "description": "Railwatch Cloud monitoring for Rails: applications, issues, requests, queries, profiles, logs, deploys, and release health.",
+        "description": "Railwatch Cloud monitoring for Rails: applications, issues, requests, queries, profiles, logs, deploys, release health, and browser web vitals.",
         "transport": "streamable-http", "endpoint": format!("{base}/mcp"),
         "authentication": {"type": "http-bearer", "header": "Authorization",
                            "description": "Per-user API & MCP token, generated at Settings -> Profile (\"API & MCP tokens\"). Needs the mcp and read scopes; the write tools also need write.",
@@ -454,6 +454,7 @@ impl Mcp<'_> {
             "search_logs" => self.search_logs(&a),
             "search_telemetry" => self.search_telemetry(&a).map(|v| v.to_string()),
             "release_health" => self.release_health(&a),
+            "web_vitals" => self.web_vitals(&a),
             "recent_deploys" => self.recent_deploys(&a),
             "list_alerts" => self.list_alerts(&a),
             "update_issue" => self.update_issue(&a),
@@ -1411,6 +1412,56 @@ impl Mcp<'_> {
             Ok(out)
         })?;
         Ok(Value::Array(rows).to_string())
+    }
+
+    /// The visits page's numbers: p75 web vitals for the window (or one
+    /// component), the components with their visit timings and vitals, and
+    /// the vitals of each release deployed in the window.
+    fn web_vitals(&self, a: &Args) -> R<String> {
+        let Some(env) = self.resolve_environment(a)? else { return not_found("environment") };
+        let (from, to) = self.window(a);
+        let limit = clamp(a.get("limit"), 20, 100)?;
+        let sort = a.presence("sort").unwrap_or_else(|| "count".into());
+        let component = a.presence("component");
+        let deploys: Vec<(String, Option<String>, String)> = self.env.control.with(|c| {
+            c.prepare(
+                "SELECT deploy, ref, deployed_at FROM deploys WHERE environment_id = ?1 AND deployed_at BETWEEN ?2 AND ?3 ORDER BY deployed_at DESC LIMIT 50",
+            )?
+            .query_map(params![env.id, qt(from), qt(to)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect()
+        })?;
+        self.with_telemetry(&env, |conn| {
+            let samples = crate::dashboard::pages::vital_samples(conn, from, to)?;
+            let components =
+                crate::dashboard::pages::visit_components(conn, from, to, &samples, Some(&sort), a.presence("dir").as_deref(), component.as_deref())?;
+            let samples = match &component {
+                Some(c) => samples.of_component(c),
+                None => samples,
+            };
+            let names: Vec<String> = deploys.iter().map(|d| d.0.clone()).collect();
+            let releases: Vec<Value> = deploys
+                .iter()
+                .zip(crate::dashboard::pages::vitals_by_deploy(&samples, &names))
+                .map(|((deploy, ref_, at), vitals)| {
+                    crate::obj! {
+                        "deploy" => deploy.clone(), "ref" => ref_.clone().map_or(Value::Null, Value::from), "deployed_at" => db_time_s(Some(at.clone())),
+                        "vitals" => Value::Object(vitals),
+                    }
+                })
+                .collect();
+            let v = crate::obj! {
+                "window" => json!({"from": time_s(Some(from)), "to": time_s(Some(to))}),
+                "component" => component.clone().map_or(Value::Null, Value::from),
+                "vitals" => Value::Object(samples.summary()), "thresholds" => crate::dashboard::pages::vital_thresholds(),
+                "components" => components.into_iter().take(limit as usize).map(|r| crate::obj! {
+                    "component" => r["name"].clone(), "group_hash" => r["group_hash"].clone(), "visits" => r["count"].clone(), "errors" => r["errors"].clone(),
+                    "avg_ms" => r["avg"].clone(), "p50_ms" => r["p50"].clone(), "p95_ms" => r["p95"].clone(), "p99_ms" => r["p99"].clone(),
+                    "max_ms" => r["max"].clone(), "vitals" => r["vitals"].clone(),
+                }).collect::<Vec<_>>(),
+                "releases" => releases,
+            };
+            Ok(v.to_string())
+        })
     }
 
     fn recent_deploys(&self, a: &Args) -> R<String> {
