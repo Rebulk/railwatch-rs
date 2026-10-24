@@ -1266,6 +1266,121 @@ fn p75(mut values: Vec<Sql>) -> Value {
     }
 }
 
+/// One visit that measured a vital: its component, its deploy, the value.
+pub struct VitalSample {
+    pub component: String,
+    pub deploy: Option<String>,
+    value: Sql,
+}
+
+/// The window's web-vital samples, per metric (VITALS order), newest first
+/// and at most MAX_VITAL_SAMPLES each. The visits page, the MCP
+/// web_vitals tool and /api/v1 .../visits all read these, so their
+/// numbers agree.
+pub struct VitalSamples(Vec<(&'static str, Vec<VitalSample>)>);
+
+pub fn vital_samples(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<VitalSamples> {
+    let mut out = vec![];
+    for (m, _, _) in VITALS {
+        let rows = db::query(
+            conn,
+            &format!(
+                "SELECT \"visits\".\"component\", \"visits\".\"deploy\", \"visits\".\"{m}\" FROM \"visits\" WHERE \"visits\".\"occurred_at\" BETWEEN ?1 AND ?2 \
+                 AND \"visits\".\"{m}\" IS NOT NULL ORDER BY \"visits\".\"occurred_at\" DESC LIMIT {MAX_VITAL_SAMPLES}"
+            ),
+            rusqlite::params![qt(from), qt(to)],
+        )?;
+        let samples = rows
+            .iter()
+            .map(|r| VitalSample { component: r.s("component").unwrap_or("").to_string(), deploy: r.s("deploy").map(str::to_string), value: r.at(2).clone() })
+            .collect();
+        out.push((m, samples));
+    }
+    Ok(VitalSamples(out))
+}
+
+impl VitalSamples {
+    /// `{metric => {value, rating, samples}}` for every metric with samples:
+    /// the p75, rated against web.dev's good / poor thresholds.
+    pub fn summary(&self) -> Map<String, Value> {
+        summarize_vitals(self.0.iter().map(|(m, samples)| (*m, samples.iter().map(|s| s.value.clone()).collect())))
+    }
+
+    /// `summary` per `key` (a component, a deploy), in one pass. Samples
+    /// whose key is None are left out.
+    pub fn summary_by(&self, key: impl Fn(&VitalSample) -> Option<&str>) -> HashMap<String, Map<String, Value>> {
+        let mut by: HashMap<String, Vec<(&'static str, Vec<Sql>)>> = HashMap::new();
+        for (m, samples) in &self.0 {
+            for s in samples {
+                let Some(k) = key(s) else { continue };
+                let metrics = by.entry(k.to_string()).or_insert_with(|| VITALS.iter().map(|(m, _, _)| (*m, vec![])).collect());
+                metrics.iter_mut().find(|(x, _)| x == m).unwrap().1.push(s.value.clone());
+            }
+        }
+        by.into_iter().map(|(k, metrics)| (k, summarize_vitals(metrics.into_iter()))).collect()
+    }
+
+    /// Only the samples of one component.
+    pub fn of_component(self, component: &str) -> VitalSamples {
+        VitalSamples(self.0.into_iter().map(|(m, samples)| (m, samples.into_iter().filter(|s| s.component == component).collect())).collect())
+    }
+}
+
+fn summarize_vitals(metrics: impl Iterator<Item = (&'static str, Vec<Sql>)>) -> Map<String, Value> {
+    let mut vitals = Map::new();
+    for (m, vals) in metrics {
+        if vals.is_empty() {
+            continue;
+        }
+        let n = vals.len();
+        let v = p75(vals);
+        vitals.insert(m.into(), crate::obj! { "value" => v.clone(), "rating" => rating(m, v.as_f64().unwrap_or(0.0)), "samples" => n });
+    }
+    vitals
+}
+
+/// The good / poor thresholds the ratings use, for API and MCP readers.
+pub fn vital_thresholds() -> Value {
+    Value::Object(
+        VITALS
+            .iter()
+            .map(|(m, good, poor)| {
+                let unit = if *m == "cls" { "score" } else { "ms" };
+                ((*m).to_string(), crate::obj! { "good" => jf(*good), "poor" => jf(*poor), "unit" => unit })
+            })
+            .collect(),
+    )
+}
+
+/// The visits page's components (`grouped("visit", 100)`, so visit count,
+/// errors and duration percentiles in ms) with each one's `vitals`. A
+/// `sort` of a vital orders by its p75, worst first unless `dir` is asc,
+/// components without that vital last; any other sort is `grouped`'s.
+pub fn visit_components(conn: &Connection, from: i64, to: i64, samples: &VitalSamples, sort: Option<&str>, dir: Option<&str>) -> rusqlite::Result<Vec<Value>> {
+    let by = samples.summary_by(|s| Some(&s.component));
+    let vital = sort.filter(|s| VITALS.iter().any(|(m, _, _)| m == s));
+    let rows: Vec<Value> = aggregations::grouped(conn, "visit", from, to, 100, if vital.is_some() { None } else { sort }, dir)?
+        .into_iter()
+        .map(|mut row| {
+            let v = by.get(row["name"].as_str().unwrap_or("")).cloned().unwrap_or_default();
+            db::merge_into(&mut row, "vitals", Value::Object(v));
+            row
+        })
+        .collect();
+    let Some(m) = vital else { return Ok(rows) };
+    let sign = if dir == Some("asc") { 1.0 } else { -1.0 };
+    let (mut with, without): (Vec<Value>, Vec<Value>) = rows.into_iter().partition(|r| r["vitals"].get(m).is_some());
+    with = rb::sort_by_num(with, |r| rb::Num::F(sign * r["vitals"][m]["value"].as_f64().unwrap_or(0.0)));
+    with.extend(without);
+    Ok(with)
+}
+
+/// The vitals of each deploy's visits, for the deploys given.
+pub fn vitals_by_deploy(samples: &VitalSamples, deploys: &[String]) -> Vec<Map<String, Value>> {
+    let by = samples.summary_by(|s| s.deploy.as_deref());
+    deploys.iter().map(|d| by.get(d).cloned().unwrap_or_default()).collect()
+}
+
 pub fn visits_index(conn: &Connection, ctx: &PageContext, _control: &dyn ControlData) -> R {
     let (from, to) = ctx.range();
     let p = filter_query::parse(ctx.param("q"));
@@ -1274,51 +1389,20 @@ pub fn visits_index(conn: &Connection, ctx: &PageContext, _control: &dyn Control
         rc.eq("visits", "component", s(cmp));
     }
     let rows = select(conn, "visits", "\"visits\".*", &rc, &super::recent("visits"), Some(200))?;
-    let samples = |metric: &str, cols: &str| {
-        db::query(
-            conn,
-            &format!(
-                "SELECT {cols} FROM \"visits\" WHERE \"visits\".\"occurred_at\" BETWEEN ?1 AND ?2 AND \"visits\".\"{metric}\" IS NOT NULL \
-                 ORDER BY \"visits\".\"occurred_at\" DESC LIMIT {MAX_VITAL_SAMPLES}"
-            ),
-            rusqlite::params![qt(from), qt(to)],
-        )
-    };
-    let mut vitals = Map::new();
-    for (m, _, _) in VITALS {
-        let vals: Vec<Sql> = samples(m, &format!("\"visits\".\"{m}\""))?.iter().map(|r| r.at(0).clone()).collect();
-        if vals.is_empty() {
-            continue;
-        }
-        let n = vals.len();
-        let v = p75(vals);
-        vitals.insert(m.into(), crate::obj! { "value" => v.clone(), "rating" => rating(m, v.as_f64().unwrap_or(0.0)), "samples" => n });
-    }
-    let mut comp_vitals: Vec<(&str, HashMap<String, Value>)> = vec![];
-    for m in ["lcp", "inp"] {
-        let mut order: Vec<String> = vec![];
-        let mut by: HashMap<String, Vec<Sql>> = HashMap::new();
-        for r in samples(m, &format!("\"visits\".\"component\", \"visits\".\"{m}\""))? {
-            let k = r.s("component").unwrap_or("").to_string();
-            if !by.contains_key(&k) {
-                order.push(k.clone());
-            }
-            by.entry(k).or_default().push(r.at(1).clone());
-        }
-        comp_vitals.push((m, by.into_iter().map(|(k, v)| (k, p75(v))).collect()));
-    }
+    let samples = vital_samples(conn, from, to)?;
+    let by_component = samples.summary_by(|s| Some(&s.component));
     let components: Vec<Value> = grouped(conn, ctx, "visit", 100, true)?
         .into_iter()
         .map(|mut row| {
-            let name = row["name"].as_str().unwrap_or("").to_string();
-            for (m, map) in &comp_vitals {
-                db::merge_into(&mut row, m, map.get(&name).cloned().unwrap_or(Value::Null));
+            let v = by_component.get(row["name"].as_str().unwrap_or(""));
+            for m in ["lcp", "inp"] {
+                db::merge_into(&mut row, m, v.and_then(|v| v.get(m)).map_or(Value::Null, |x| x["value"].clone()));
             }
             row
         })
         .collect();
     Ok(crate::obj! {
-        "components" => components, "series" => series(conn, ctx, "visit", None)?, "vitals" => Value::Object(vitals),
+        "components" => components, "series" => series(conn, ctx, "visit", None)?, "vitals" => Value::Object(samples.summary()),
         "sort" => sort_param(ctx, "count"), "dir" => dir_param(ctx), "q" => ctx.param_s("q"),
         "recent" => rows.iter().map(|v| crate::obj! {
             "id" => ji(v.i("id")), "component" => js(v.s("component")), "url" => js(v.s("url")), "method" => js(v.s("method")), "duration" => dur(v, 1),
