@@ -1227,12 +1227,9 @@ impl Api<'_> {
         })?;
         let (components, vitals, releases) = self.telemetry(e, |conn| {
             let samples = pages::vital_samples(conn, from, to)?;
-            let mut components = pages::visit_components(conn, from, to, &samples, sort.as_deref(), dir.as_deref())?;
+            let components = pages::visit_components(conn, from, to, &samples, sort.as_deref(), dir.as_deref(), component.as_deref())?;
             let samples = match &component {
-                Some(c) => {
-                    components.retain(|r| r["name"].as_str() == Some(c.as_str()));
-                    samples.of_component(c)
-                }
+                Some(c) => samples.of_component(c),
                 None => samples,
             };
             let names: Vec<String> = deploys.iter().map(|d| d.0.clone()).collect();
@@ -1981,6 +1978,50 @@ mod tests {
         let (status, v) = super::super::mcp::call(&env, NOW, Some(&format!("Bearer {}", f.tokens["full"])), &Bytes::from(body.to_string()));
         assert_eq!(status, StatusCode::OK);
         serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{v}"))).unwrap()
+    }
+
+    /// More than 100 components: a rarely visited one ranks past the
+    /// 100-row cap by visit count, yet a component filter finds it and a
+    /// worst-LCP sort puts it first.
+    #[test]
+    fn web_vitals_filter_and_sort_see_past_the_hundredth_component() {
+        let f = fixture("vitals-many");
+        let slug: String = f.c.with(|x| x.query_row("SELECT slug FROM environments WHERE id = ?", [f.env], |r| r.get(0))).unwrap();
+        let conn = crate::tenants::open_tenant(&f.dir.join("telemetry").join(format!("{slug}.sqlite3"))).unwrap();
+        let at = qt(NOW - 2 * 3600 * 1_000_000);
+        let insert = |c: &str, lcp: i64| {
+            conn.execute(
+                "INSERT INTO visits (component, group_hash, url, method, duration, status, occurred_at, lcp, inp, cls, ttfb)
+                 VALUES (?1, substr(hex(?1) || '00000000000000000000000000000000', 1, 32), '/x', 'GET', 500000, 'success', ?2, ?3, 100, 0.01, 100)",
+                params![c, at, lcp],
+            )
+            .unwrap();
+        };
+        // 120 busy components (3 visits each, good LCP) and one rare page
+        // (1 visit, terrible LCP) that ranks last by visit count.
+        for i in 0..120 {
+            for _ in 0..3 {
+                insert(&format!("busy/{i:03}"), 1000);
+            }
+        }
+        insert("rare/slow", 9000);
+        for h in crate::rollup::rollup_job::hours_with_rows(&conn).unwrap() {
+            crate::rollup::rollup_job::perform(&conn, &conn, h, &mut crate::rollup::rollup_job::Rng::PerGroup).unwrap();
+        }
+
+        let mcp = mcp_tool(&f, "web_vitals", json!({"application_slug": "shop", "environment": "production", "window": "24h", "sort": "lcp"}));
+        let names: Vec<&str> = mcp["components"].as_array().unwrap().iter().map(|c| c["component"].as_str().unwrap()).collect();
+        assert_eq!(names.first(), Some(&"rare/slow"), "worst LCP first, though 121st by visits");
+        assert_eq!(names.len(), 20, "the tool's default limit");
+
+        let one = mcp_tool(&f, "web_vitals", json!({"application_slug": "shop", "environment": "production", "window": "24h", "component": "rare/slow"}));
+        let rows = one["components"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{one}");
+        assert_eq!(rows[0]["vitals"]["lcp"]["value"], 9000);
+
+        let (s, api) = get(&f, &format!("/api/v1/applications/{}/environments/{}/visits?window=24h&component=rare%2Fslow", f.app, f.env), "full");
+        assert_eq!(s, 200, "{api}");
+        assert_eq!(api["data"].as_array().map(Vec::len), Some(1), "{api}");
     }
 
     #[test]

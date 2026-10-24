@@ -1356,22 +1356,37 @@ pub fn vital_thresholds() -> Value {
 /// errors and duration percentiles in ms) with each one's `vitals`. A
 /// `sort` of a vital orders by its p75, worst first unless `dir` is asc,
 /// components without that vital last; any other sort is `grouped`'s.
-pub fn visit_components(conn: &Connection, from: i64, to: i64, samples: &VitalSamples, sort: Option<&str>, dir: Option<&str>) -> rusqlite::Result<Vec<Value>> {
+/// `component` keeps only that one. Both filter and vital sort look at
+/// every component before the 100-row cap, so neither misses one ranked
+/// past it by visit count.
+pub fn visit_components(
+    conn: &Connection,
+    from: i64,
+    to: i64,
+    samples: &VitalSamples,
+    sort: Option<&str>,
+    dir: Option<&str>,
+    component: Option<&str>,
+) -> rusqlite::Result<Vec<Value>> {
+    const LIMIT: usize = 100;
     let by = samples.summary_by(|s| Some(&s.component));
     let vital = sort.filter(|s| VITALS.iter().any(|(m, _, _)| m == s));
-    let rows: Vec<Value> = aggregations::grouped(conn, "visit", from, to, 100, if vital.is_some() { None } else { sort }, dir)?
+    let limit = if vital.is_some() || component.is_some() { usize::MAX } else { LIMIT };
+    let rows: Vec<Value> = aggregations::grouped(conn, "visit", from, to, limit, if vital.is_some() { None } else { sort }, dir)?
         .into_iter()
+        .filter(|row| component.is_none_or(|c| row["name"].as_str() == Some(c)))
         .map(|mut row| {
             let v = by.get(row["name"].as_str().unwrap_or("")).cloned().unwrap_or_default();
             db::merge_into(&mut row, "vitals", Value::Object(v));
             row
         })
         .collect();
-    let Some(m) = vital else { return Ok(rows) };
+    let Some(m) = vital else { return Ok(rows.into_iter().take(LIMIT).collect()) };
     let sign = if dir == Some("asc") { 1.0 } else { -1.0 };
     let (mut with, without): (Vec<Value>, Vec<Value>) = rows.into_iter().partition(|r| r["vitals"].get(m).is_some());
     with = rb::sort_by_num(with, |r| rb::Num::F(sign * r["vitals"][m]["value"].as_f64().unwrap_or(0.0)));
     with.extend(without);
+    with.truncate(LIMIT);
     Ok(with)
 }
 

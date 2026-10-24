@@ -1432,12 +1432,10 @@ impl Mcp<'_> {
         })?;
         self.with_telemetry(&env, |conn| {
             let samples = crate::dashboard::pages::vital_samples(conn, from, to)?;
-            let mut components = crate::dashboard::pages::visit_components(conn, from, to, &samples, Some(&sort), a.presence("dir").as_deref())?;
+            let components =
+                crate::dashboard::pages::visit_components(conn, from, to, &samples, Some(&sort), a.presence("dir").as_deref(), component.as_deref())?;
             let samples = match &component {
-                Some(c) => {
-                    components.retain(|r| r["name"].as_str() == Some(c.as_str()));
-                    samples.of_component(c)
-                }
+                Some(c) => samples.of_component(c),
                 None => samples,
             };
             let names: Vec<String> = deploys.iter().map(|d| d.0.clone()).collect();
