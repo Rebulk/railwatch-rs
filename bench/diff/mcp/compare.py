@@ -75,6 +75,8 @@ EXPECTED_DIFF = {
     "tools/call.params_array": "params not an object: 200 -32602 Invalid params (old Rails: -32603)",
     "initialize.params_string": "params not an object: 200 -32602 Invalid params (old Rails: ignored)",
     "tools/list.params_number": "params not an object: 200 -32602 Invalid params (old Rails: ignored)",
+    "tools/list": "Rust-only web_vitals tool (Rails has no web vitals tool)",
+    "tools/list.read_only": "Rust-only web_vitals tool (Rails has no web vitals tool)",
 }
 
 same = expected = 0
