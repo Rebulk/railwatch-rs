@@ -345,7 +345,7 @@ fn backup_now() -> ExitCode {
     let cfg = config();
     let Some(b) = backup_settings(&cfg) else { return ExitCode::from(2) };
     let started = std::time::Instant::now();
-    match railwatch_server::storage::backup::run_pass(&b.s3, &cfg.data_dir, &cfg.tenants_dir(), railwatch_server::time::now_micros()) {
+    match railwatch_server::storage::backup::run_pass(&b.s3, &cfg.data_dir, &cfg.tenants_dir(), railwatch_server::time::now_micros(), &mut Default::default()) {
         Ok(p) => {
             railwatch_server::storage::backup::record_ok(&cfg.data_dir);
             println!(
