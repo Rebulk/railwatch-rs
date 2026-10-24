@@ -10,6 +10,10 @@
 //! tenants/<slug>.sqlite3.zst            a single-file (Rails layout) tenant, every pass
 //! ```
 //!
+//! A meta, control or single-file snapshot is skipped when the database has
+//! not changed since the last upload (`unchanged`: the file's and its WAL's
+//! size and mtime): an idle environment's meta was re-uploaded every pass.
+//!
 //! Snapshots use the SQLite online backup API into a temporary file, so a
 //! snapshot is a consistent database even while ingest writes; it is then
 //! zstd-compressed (level 3, research/IMPROVEMENTS.md 2(i): ~8x) and PUT.
@@ -33,6 +37,8 @@ use super::s3::S3;
 #[derive(Debug, Default)]
 pub struct Pass {
     pub snapshots: usize,
+    /// Snapshots skipped because the database had not changed.
+    pub unchanged: usize,
     pub day_files: usize,
     pub skipped: usize,
     pub bytes_raw: u64,
@@ -122,6 +128,38 @@ fn free_bytes(dir: &Path) -> Option<u64> {
 }
 
 /// Snapshots `src` and uploads it compressed as `key`.
+/// What a database looks like on disk: the main file's and its WAL's length
+/// and mtime. Every commit changes the WAL (or, after a checkpoint, the main
+/// file), so an equal stamp means nothing was written since.
+fn stamp(src: &Path) -> Option<String> {
+    let one = |p: &Path| {
+        std::fs::metadata(p).ok().map(|m| (m.len(), m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos())))
+    };
+    let wal = src.with_file_name(format!("{}-wal", src.file_name()?.to_string_lossy()));
+    Some(format!("{:?} {:?}", one(src)?, one(&wal)))
+}
+
+/// Uploads `src` unless it is unchanged since this process last uploaded it.
+fn upload_if_changed(s3: &S3, src: &Path, key: &str, scratch: &Path, pass: &mut Pass, last: &mut Uploaded) -> Result<(), String> {
+    let before = stamp(src);
+    if before.is_some() && last.get(key) == before.as_ref() {
+        pass.unchanged += 1;
+        return Ok(());
+    }
+    upload_snapshot(s3, src, key, scratch, pass)?;
+    // The stamp from before the snapshot: a write during it changes the
+    // stamp, so the next pass uploads again rather than missing it.
+    match before {
+        Some(s) => last.insert(key.to_string(), s),
+        None => last.remove(key),
+    };
+    Ok(())
+}
+
+/// The stamp of each object as last uploaded, per process (a restart
+/// uploads everything once).
+pub type Uploaded = std::collections::HashMap<String, String>;
+
 fn upload_snapshot(s3: &S3, src: &Path, key: &str, scratch: &Path, pass: &mut Pass) -> Result<(), String> {
     let tmp = scratch.join("snapshot.sqlite3");
     snapshot(src, &tmp).map_err(|e| format!("snapshot {}: {e}", src.display()))?;
@@ -140,20 +178,20 @@ pub fn closed(day: &str, now_micros: i64) -> bool {
 }
 
 /// One backup pass over the whole data directory.
-pub fn run_pass(s3: &S3, data_dir: &Path, tenants_dir: &Path, now_micros: i64) -> Result<Pass, String> {
+pub fn run_pass(s3: &S3, data_dir: &Path, tenants_dir: &Path, now_micros: i64, last: &mut Uploaded) -> Result<Pass, String> {
     let mut pass = Pass::default();
     let scratch = data_dir.join("backup-tmp");
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
     let control = data_dir.join("control.sqlite3");
     if control.is_file() {
-        upload_snapshot(s3, &control, "control/latest.sqlite3.zst", &scratch, &mut pass)?;
+        upload_if_changed(s3, &control, "control/latest.sqlite3.zst", &scratch, &mut pass, last)?;
     }
     let mut existing: Option<std::collections::HashSet<String>> = None;
     for entry in std::fs::read_dir(tenants_dir).map_err(|e| e.to_string())?.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         if path.is_dir() && layout::meta_path(&path).is_file() {
-            upload_snapshot(s3, &layout::meta_path(&path), &format!("tenants/{name}/meta.sqlite3.zst"), &scratch, &mut pass)?;
+            upload_if_changed(s3, &layout::meta_path(&path), &format!("tenants/{name}/meta.sqlite3.zst"), &scratch, &mut pass, last)?;
             let known = match &existing {
                 Some(k) => k,
                 None => existing.insert(s3.list("tenants/")?.into_iter().collect()),
@@ -179,7 +217,7 @@ pub fn run_pass(s3: &S3, data_dir: &Path, tenants_dir: &Path, now_micros: i64) -
         } else if let Some(slug) = name.strip_suffix(".sqlite3")
             && path.is_file()
         {
-            upload_snapshot(s3, &path, &format!("tenants/{slug}.sqlite3.zst"), &scratch, &mut pass)?;
+            upload_if_changed(s3, &path, &format!("tenants/{slug}.sqlite3.zst"), &scratch, &mut pass, last)?;
         }
     }
     let _ = std::fs::remove_dir_all(&scratch);
@@ -270,13 +308,15 @@ pub fn spawn(settings: Settings, data_dir: PathBuf, tenants_dir: PathBuf) -> std
     std::thread::Builder::new()
         .name("backup".into())
         .spawn(move || {
+            let mut last = Uploaded::new();
             loop {
                 let started = std::time::Instant::now();
-                match run_pass(&settings.s3, &data_dir, &tenants_dir, crate::time::now_micros()) {
+                match run_pass(&settings.s3, &data_dir, &tenants_dir, crate::time::now_micros(), &mut last) {
                     Ok(p) => {
                         record_ok(&data_dir);
                         tracing::info!(
                             snapshots = p.snapshots,
+                            unchanged = p.unchanged,
                             day_files = p.day_files,
                             skipped = p.skipped,
                             raw = p.bytes_raw,
@@ -296,6 +336,32 @@ pub fn spawn(settings: Settings, data_dir: PathBuf, tenants_dir: PathBuf) -> std
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stamp that lets a pass skip an unchanged database must change on
+    /// every commit, WAL-mode included, or a backup would silently miss data.
+    #[test]
+    fn a_commit_changes_the_stamp_and_nothing_else_does() {
+        let dir = std::env::temp_dir().join(format!("rw-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("meta.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t (x INTEGER);").unwrap();
+        let first = stamp(&path).unwrap();
+        assert_eq!(stamp(&path).unwrap(), first, "no write, same stamp");
+        let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let _: i64 = reader.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(stamp(&path).unwrap(), first, "a read does not change it");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        let after_insert = stamp(&path).unwrap();
+        assert_ne!(after_insert, first, "a commit into the WAL changes it");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        assert_ne!(stamp(&path).unwrap(), after_insert, "a checkpoint into the main file changes it");
+        assert!(stamp(&dir.join("missing.sqlite3")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A small object that inflates past the cap is refused and leaves no
     /// partial file behind; one under the cap restores whole.
