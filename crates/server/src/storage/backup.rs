@@ -11,8 +11,8 @@
 //! ```
 //!
 //! A meta, control or single-file snapshot is skipped when the database has
-//! not changed since the last upload (`unchanged`: the file's and its WAL's
-//! size and mtime): an idle environment's meta was re-uploaded every pass.
+//! had no commit since the last upload (`unchanged`, by `PRAGMA
+//! data_version`): an idle environment's meta was re-uploaded every pass.
 //!
 //! Snapshots use the SQLite online backup API into a temporary file, so a
 //! snapshot is a consistent database even while ingest writes; it is then
@@ -128,37 +128,44 @@ fn free_bytes(dir: &Path) -> Option<u64> {
 }
 
 /// Snapshots `src` and uploads it compressed as `key`.
-/// What a database looks like on disk: the main file's and its WAL's length
-/// and mtime. Every commit changes the WAL (or, after a checkpoint, the main
-/// file), so an equal stamp means nothing was written since.
-fn stamp(src: &Path) -> Option<String> {
-    let one = |p: &Path| {
-        std::fs::metadata(p).ok().map(|m| (m.len(), m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos())))
-    };
-    let wal = src.with_file_name(format!("{}-wal", src.file_name()?.to_string_lossy()));
-    Some(format!("{:?} {:?}", one(src)?, one(&wal)))
+/// Is `src` unchanged since this process last uploaded it? Each key keeps a
+/// read-only connection to its database, and SQLite's `PRAGMA data_version`
+/// on it changes whenever any other connection commits, WAL reuse after a
+/// checkpoint included, so nothing written since the last upload is skipped.
+struct Watch {
+    conn: Connection,
+    uploaded_at: i64,
+}
+
+fn data_version(conn: &Connection) -> Option<i64> {
+    conn.query_row("PRAGMA data_version", [], |r| r.get(0)).ok()
 }
 
 /// Uploads `src` unless it is unchanged since this process last uploaded it.
 fn upload_if_changed(s3: &S3, src: &Path, key: &str, scratch: &Path, pass: &mut Pass, last: &mut Uploaded) -> Result<(), String> {
-    let before = stamp(src);
-    if before.is_some() && last.get(key) == before.as_ref() {
+    if let Some(w) = last.0.get(key)
+        && data_version(&w.conn) == Some(w.uploaded_at)
+    {
         pass.unchanged += 1;
         return Ok(());
     }
+    // Read before the snapshot: a commit during it moves data_version past
+    // this, so the next pass uploads again rather than missing it.
+    let watch = Connection::open_with_flags(src, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .ok()
+        .and_then(|conn| data_version(&conn).map(|uploaded_at| Watch { conn, uploaded_at }));
     upload_snapshot(s3, src, key, scratch, pass)?;
-    // The stamp from before the snapshot: a write during it changes the
-    // stamp, so the next pass uploads again rather than missing it.
-    match before {
-        Some(s) => last.insert(key.to_string(), s),
-        None => last.remove(key),
+    match watch {
+        Some(w) => last.0.insert(key.to_string(), w),
+        None => last.0.remove(key),
     };
     Ok(())
 }
 
-/// The stamp of each object as last uploaded, per process (a restart
-/// uploads everything once).
-pub type Uploaded = std::collections::HashMap<String, String>;
+/// What each object was as last uploaded, per process (a restart uploads
+/// everything once).
+#[derive(Default)]
+pub struct Uploaded(std::collections::HashMap<String, Watch>);
 
 fn upload_snapshot(s3: &S3, src: &Path, key: &str, scratch: &Path, pass: &mut Pass) -> Result<(), String> {
     let tmp = scratch.join("snapshot.sqlite3");
@@ -308,7 +315,7 @@ pub fn spawn(settings: Settings, data_dir: PathBuf, tenants_dir: PathBuf) -> std
     std::thread::Builder::new()
         .name("backup".into())
         .spawn(move || {
-            let mut last = Uploaded::new();
+            let mut last = Uploaded::default();
             loop {
                 let started = std::time::Instant::now();
                 match run_pass(&settings.s3, &data_dir, &tenants_dir, crate::time::now_micros(), &mut last) {
@@ -337,29 +344,29 @@ pub fn spawn(settings: Settings, data_dir: PathBuf, tenants_dir: PathBuf) -> std
 mod tests {
     use super::*;
 
-    /// The stamp that lets a pass skip an unchanged database must change on
-    /// every commit, WAL-mode included, or a backup would silently miss data.
+    /// What lets a pass skip an unchanged database must move on every commit
+    /// from another connection, WAL reuse after a checkpoint included, or a
+    /// backup would silently miss data; reads must not move it.
     #[test]
-    fn a_commit_changes_the_stamp_and_nothing_else_does() {
-        let dir = std::env::temp_dir().join(format!("rw-stamp-{}", std::process::id()));
+    fn every_commit_moves_data_version_and_reads_do_not() {
+        let dir = std::env::temp_dir().join(format!("rw-dv-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("meta.sqlite3");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t (x INTEGER);").unwrap();
-        let first = stamp(&path).unwrap();
-        assert_eq!(stamp(&path).unwrap(), first, "no write, same stamp");
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (0);").unwrap();
+        let watch = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let first = data_version(&watch).unwrap();
         let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let _: i64 = reader.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
-        assert_eq!(stamp(&path).unwrap(), first, "a read does not change it");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
-        let after_insert = stamp(&path).unwrap();
-        assert_ne!(after_insert, first, "a commit into the WAL changes it");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
-        assert_ne!(stamp(&path).unwrap(), after_insert, "a checkpoint into the main file changes it");
-        assert!(stamp(&dir.join("missing.sqlite3")).is_none());
+        assert_eq!(data_version(&watch), Some(first), "a read does not move it");
+        writer.execute("UPDATE t SET x = 1", []).unwrap();
+        let second = data_version(&watch).unwrap();
+        assert_ne!(second, first, "a commit moves it");
+        // Same-size rewrite into a WAL reset by a checkpoint, at once: the
+        // case a size+mtime stamp could miss.
+        writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); UPDATE t SET x = 1;").unwrap();
+        assert_ne!(data_version(&watch), Some(second), "a commit after a checkpoint moves it too");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
