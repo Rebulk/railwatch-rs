@@ -41,7 +41,7 @@ use crate::rate_limit::FixedWindow;
 const MAX_PER_PAGE: i64 = 200;
 /// `rate_limit to: 600, within: 1.minute, by: -> { current_user.id }`
 pub const RATE_LIMIT: u64 = 600;
-const SERIES_TYPES: [&str; 3] = ["request", "job_attempt", "query"];
+const SERIES_TYPES: [&str; 4] = ["request", "job_attempt", "query", "visit"];
 
 pub fn rate_limit() -> FixedWindow<(&'static str, i64)> {
     FixedWindow::new(RATE_LIMIT)
@@ -127,6 +127,7 @@ enum Action {
     Tenants,
     Spans,
     Series,
+    Visits,
     Issues,
     Issue,
     UpdateIssue,
@@ -155,6 +156,7 @@ impl Action {
             Tenants => "api/v1/environments/tenants",
             Spans => "api/v1/environments/spans",
             Series => "api/v1/environments/series",
+            Visits => "api/v1/environments/visits",
             Issues | Issue | UpdateIssue => "api/v1/issues",
             CreateComment => "api/v1/issue_comments",
         }
@@ -179,6 +181,7 @@ impl Action {
                 | Tenants
                 | Spans
                 | Series
+                | Visits
         )
     }
 }
@@ -243,6 +246,7 @@ fn route(method: &Method, path: &str) -> Option<Routed> {
                 (["tenants"], true, _) => (Tenants, p(&base)),
                 (["spans"], true, _) => (Spans, p(&base)),
                 (["series"], true, _) => (Series, p(&base)),
+                (["visits"], true, _) => (Visits, p(&base)),
                 _ => return None,
             }
         }
@@ -481,6 +485,7 @@ fn run(env: &Env, limit: &FixedWindow<(&'static str, i64)>, now: i64, action: Ac
         Tenants => api.tenants(e()),
         Spans => api.spans(e()),
         Series => api.series(e()),
+        Visits => api.visits(e()),
         Issues => api.issues(),
         Issue => api.issue(),
         UpdateIssue => api.update_issue(),
@@ -1207,6 +1212,48 @@ impl Api<'_> {
         ok(crate::obj! { "data" => points })
     }
 
+    /// The visits page's components and web vitals (p75 per metric, rated),
+    /// plus the vitals of each deploy in the window.
+    fn visits(&self, e: &Scoped) -> R<Rendered> {
+        let (from, to) = self.window().range();
+        let (sort, dir, component) = (self.params.opt("sort"), self.params.opt("dir"), self.params.presence("component"));
+        let deploys: Vec<(String, Option<String>, Option<String>, String)> = self.control(|c| {
+            c.prepare(
+                "SELECT deploy, ref, name, deployed_at FROM deploys WHERE deploys.environment_id = ? AND deploys.deployed_at BETWEEN ? AND ? \
+                 ORDER BY deploys.deployed_at DESC LIMIT 50",
+            )?
+            .query_map(params![e.id, qt(from), qt(to)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect()
+        })?;
+        let (components, vitals, releases) = self.telemetry(e, |conn| {
+            let samples = pages::vital_samples(conn, from, to)?;
+            let mut components = pages::visit_components(conn, from, to, &samples, sort.as_deref(), dir.as_deref())?;
+            let samples = match &component {
+                Some(c) => {
+                    components.retain(|r| r["name"].as_str() == Some(c.as_str()));
+                    samples.of_component(c)
+                }
+                None => samples,
+            };
+            let names: Vec<String> = deploys.iter().map(|d| d.0.clone()).collect();
+            let releases: Vec<Value> = deploys
+                .iter()
+                .zip(pages::vitals_by_deploy(&samples, &names))
+                .map(|((deploy, ref_, name, at), vitals)| {
+                    crate::obj! {
+                        "deploy" => deploy.clone(), "ref" => js(ref_.as_deref()), "name" => js(name.as_deref()), "deployed_at" => db_time(Some(at)),
+                        "vitals" => Value::Object(vitals),
+                    }
+                })
+                .collect();
+            Ok((components, samples.summary(), releases))
+        })?;
+        let (items, meta) = self.paginate(components)?;
+        ok(crate::obj! {
+            "vitals" => Value::Object(vitals), "thresholds" => pages::vital_thresholds(), "data" => items, "meta" => meta, "releases" => releases,
+        })
+    }
+
     // -- issues ------------------------------------------------------------------
 
     /// `Issue.where(application_id: accessible_applications.select(:id))`
@@ -1852,7 +1899,7 @@ mod tests {
     fn series_validates_type_and_step_and_the_rate_limit_is_per_user_and_controller() {
         let f = fixture("series");
         let base = format!("/api/v1/applications/{}/environments/{}/series", f.app, f.env);
-        assert_eq!(get(&f, &base, "full"), (422, json!({"error": "type must be one of request, job_attempt, query"})));
+        assert_eq!(get(&f, &base, "full"), (422, json!({"error": "type must be one of request, job_attempt, query, visit"})));
         assert_eq!(
             get(&f, &format!("{base}?type=request&step=1d"), "full"),
             (422, json!({"error": "step must be one of 5m, 15m, 1h, 6h for this window"})),
@@ -1871,6 +1918,146 @@ mod tests {
         let third = hit("/api/v1/me");
         assert_eq!((third.status.as_u16(), third.body.as_slice()), (429, br#"{"error":"rate limit exceeded"}"#.as_slice()));
         assert_eq!(hit("/api/v1/accounts").status, 200, "each controller has its own counter");
+    }
+
+    /// Seeds initial-load visits with vitals (and navigations without) into
+    /// the environment's tenant, rolls them up, and inserts deploys d1, d2.
+    fn seed_visits(f: &Fixture) {
+        let slug: String = f.c.with(|x| x.query_row("SELECT slug FROM environments WHERE id = ?", [f.env], |r| r.get(0))).unwrap();
+        let conn = crate::tenants::open_tenant(&f.dir.join("telemetry").join(format!("{slug}.sqlite3"))).unwrap();
+        let at = qt(NOW - 2 * 3600 * 1_000_000);
+        // (component, lcp, inp, cls, ttfb, deploy, duration ms)
+        let loads: [(&str, i64, i64, f64, i64, &str, i64); 6] = [
+            ("orders/index", 1000, 100, 0.05, 200, "d1", 900),
+            ("orders/index", 2000, 150, 0.05, 300, "d2", 1100),
+            ("orders/index", 3000, 300, 0.3, 400, "d2", 1500),
+            ("orders/index", 5000, 600, 0.3, 900, "d2", 2600),
+            ("home/show", 1200, 80, 0.01, 100, "d1", 700),
+            ("home/show", 1500, 90, 0.02, 150, "d1", 800),
+        ];
+        for (c, lcp, inp, cls, ttfb, deploy, d) in loads {
+            conn.execute(
+                "INSERT INTO visits (component, group_hash, url, method, duration, status, occurred_at, deploy, lcp, inp, cls, ttfb)
+                 VALUES (?1, substr(hex(?1) || '00000000000000000000000000000000', 1, 32), '/x', 'GET', ?2, 'success', ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![c, d * 1000, at, deploy, lcp, inp, cls, ttfb],
+            )
+            .unwrap();
+        }
+        for d in [120, 340] {
+            conn.execute(
+                "INSERT INTO visits (component, group_hash, url, method, duration, status, occurred_at, deploy)
+                 VALUES ('orders/index', substr(hex('orders/index') || '00000000000000000000000000000000', 1, 32), '/x', 'GET', ?1, 'success', ?2, 'd2')",
+                params![d * 1000, at],
+            )
+            .unwrap();
+        }
+        for h in crate::rollup::rollup_job::hours_with_rows(&conn).unwrap() {
+            crate::rollup::rollup_job::perform(&conn, &conn, h, &mut crate::rollup::rollup_job::Rng::PerGroup).unwrap();
+        }
+        for (deploy, hours_ago) in [("d1", 5), ("d2", 3)] {
+            f.c.with(|x| {
+                x.execute(
+                    "INSERT INTO deploys (environment_id, deploy, ref, deployed_at, created_at, updated_at) VALUES (?1, ?2, ?2, ?3, ?3, ?3)",
+                    params![f.env, deploy, qt(NOW - hours_ago * 3600 * 1_000_000)],
+                )
+            })
+            .unwrap();
+        }
+    }
+
+    /// The visits page's props for the fixture's environment at NOW.
+    fn visits_page(f: &Fixture, params: &[(&str, &str)]) -> Value {
+        let slug: String = f.c.with(|x| x.query_row("SELECT slug FROM environments WHERE id = ?", [f.env], |r| r.get(0))).unwrap();
+        let control = f.c.with(|c| super::super::dashboard_bridge::DbControl::load(c, f.env)).unwrap();
+        let p: crate::dashboard::Params = params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let ctx = crate::dashboard::PageContext::new(f.env, NOW, p, f.key.clone());
+        let env = Env { control: &f.c, tenants: &f.tenants, readers: &f.readers, cursor_key: &f.key };
+        with_tenant(&env, &slug, |conn| pages::visits_index(conn, &ctx, &control).map_err(|_| rusqlite::Error::InvalidQuery)).unwrap()
+    }
+
+    fn mcp_tool(f: &Fixture, name: &str, args: Value) -> Value {
+        let env = Env { control: &f.c, tenants: &f.tenants, readers: &f.readers, cursor_key: &f.key };
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}});
+        let (status, v) = super::super::mcp::call(&env, NOW, Some(&format!("Bearer {}", f.tokens["full"])), &Bytes::from(body.to_string()));
+        assert_eq!(status, StatusCode::OK);
+        serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{v}"))).unwrap()
+    }
+
+    #[test]
+    fn web_vitals_match_the_visits_page_in_the_api_and_mcp() {
+        let f = fixture("vitals");
+        seed_visits(&f);
+        let page = visits_page(&f, &[("window", "24h")]);
+        let (s, api) = get(&f, &format!("/api/v1/applications/{}/environments/{}/visits?window=24h", f.app, f.env), "full");
+        assert_eq!(s, 200, "{api}");
+        let mcp = mcp_tool(&f, "web_vitals", json!({"application_slug": "shop", "environment": "production", "window": "24h"}));
+
+        // The p75 over the six initial loads (index ceil(6 * 0.75) - 1 = 4 of
+        // the sorted values), rated with web.dev's thresholds.
+        let expected = json!({
+            "lcp": {"value": 3000, "rating": "needs-improvement", "samples": 6},
+            "cls": {"value": 0.3, "rating": "poor", "samples": 6},
+            "inp": {"value": 300, "rating": "needs-improvement", "samples": 6},
+            "ttfb": {"value": 400, "rating": "good", "samples": 6},
+        });
+        assert_eq!(page["vitals"].to_string(), expected.to_string(), "the page itself");
+        assert_eq!(api["vitals"].to_string(), page["vitals"].to_string(), "the API reports the page's vitals");
+        assert_eq!(mcp["vitals"].to_string(), page["vitals"].to_string(), "MCP reports the page's vitals");
+        assert_eq!(api["thresholds"]["lcp"].to_string(), r#"{"good":2500.0,"poor":4000.0,"unit":"ms"}"#);
+
+        // Components: the page's visit counts, duration p95 and per-component LCP/INP p75.
+        let row = |name: &str, count: &Value, p95: &Value, lcp: &Value, inp: &Value| json!([name, count, p95, lcp, inp]).to_string();
+        let page_rows: Vec<String> =
+            page["components"].as_array().unwrap().iter().map(|c| row(c["name"].as_str().unwrap(), &c["count"], &c["p95"], &c["lcp"], &c["inp"])).collect();
+        let api_rows: Vec<String> = api["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| row(c["name"].as_str().unwrap(), &c["count"], &c["p95"], &c["vitals"]["lcp"]["value"], &c["vitals"]["inp"]["value"]))
+            .collect();
+        let mcp_rows: Vec<String> = mcp["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| row(c["component"].as_str().unwrap(), &c["visits"], &c["p95_ms"], &c["vitals"]["lcp"]["value"], &c["vitals"]["inp"]["value"]))
+            .collect();
+        assert_eq!(page_rows.len(), 2);
+        assert!(page_rows[0].starts_with(r#"["orders/index",6,"#) && page_rows[0].ends_with(",3000,300]"), "{page_rows:?}");
+        assert!(page_rows[1].starts_with(r#"["home/show",2,"#) && page_rows[1].ends_with(",1500,90]"), "{page_rows:?}");
+        assert_eq!(api_rows, page_rows, "API components are the page's");
+        assert_eq!(mcp_rows, page_rows, "MCP components are the page's");
+        assert_eq!(api["meta"], json!({"page": 1, "per_page": 25, "total": 2}));
+
+        // Per release: d2 shipped the slow orders loads.
+        let releases: Vec<(String, Value)> =
+            mcp["releases"].as_array().unwrap().iter().map(|r| (r["deploy"].as_str().unwrap().to_string(), r["vitals"]["lcp"].clone())).collect();
+        assert_eq!(
+            json!(releases).to_string(),
+            json!([["d2", {"value": 5000, "rating": "poor", "samples": 3}], ["d1", {"value": 1500, "rating": "good", "samples": 3}]]).to_string()
+        );
+        let api_deploys: Vec<&str> = api["releases"].as_array().unwrap().iter().map(|r| r["deploy"].as_str().unwrap()).collect();
+        assert_eq!(api_deploys, ["d2", "d1"]);
+        assert_eq!(api["releases"][0]["vitals"].to_string(), mcp["releases"][0]["vitals"].to_string());
+        assert_eq!(api["releases"][1]["vitals"].to_string(), mcp["releases"][1]["vitals"].to_string());
+
+        // The worst pages first: sort by a vital's p75.
+        let by_lcp = mcp_tool(&f, "web_vitals", json!({"application_slug": "shop", "environment": "production", "sort": "lcp", "dir": "asc"}));
+        let names: Vec<&str> = by_lcp["components"].as_array().unwrap().iter().map(|c| c["component"].as_str().unwrap()).collect();
+        assert_eq!(names, ["home/show", "orders/index"]);
+        let (_, api_by_inp) = get(&f, &format!("/api/v1/applications/{}/environments/{}/visits?sort=inp", f.app, f.env), "full");
+        assert_eq!(api_by_inp["data"][0]["name"], "orders/index");
+
+        // One component: its vitals are the page's component row, its releases only its loads.
+        let orders = mcp_tool(&f, "web_vitals", json!({"application_slug": "shop", "environment": "production", "component": "orders/index"}));
+        assert_eq!(orders["components"].as_array().unwrap().len(), 1);
+        assert_eq!(orders["vitals"]["lcp"]["value"], page["components"][0]["lcp"]);
+        assert_eq!(orders["vitals"]["lcp"]["samples"], 4);
+        assert_eq!(orders["releases"][1]["vitals"]["lcp"].to_string(), r#"{"value":1000,"rating":"good","samples":1}"#);
+
+        // The visit series is the page's chart.
+        let (s, series) = get(&f, &format!("/api/v1/applications/{}/environments/{}/series?type=visit&window=24h", f.app, f.env), "full");
+        assert_eq!(s, 200);
+        assert_eq!(series["data"].to_string(), page["series"].to_string(), "the page's visit chart");
     }
 
     #[test]

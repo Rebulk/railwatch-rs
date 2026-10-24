@@ -785,7 +785,7 @@ responses compared value for value with key order (a tool's text is parsed
 first, so a difference points inside it). **154/154 identical** since the
 detection port (was 152/154; 1 below). 84/84 identical on the
 1.9M-row tenant (`perf.sh`). The write cases' `issue_activities`
-and `comments` match row for row (kind, user, data). Cases: all 17 tools
+and `comments` match row for row (kind, user, data). Cases: all 17 Rails tools
 (windows, filters, cursors, by-name/by-hash/by-id identifiers), the 3
 prompts with and without optional arguments, resources list/read
 (applications, both summary URI forms, docs incl. case-folded names),
@@ -832,6 +832,17 @@ AmbiguousIdentifier (the baseline has one account; the SQL is Rails'
    own protocol (behind a TLS proxy both say https).
 6. **Body size**: a POST over 4 MiB is refused with 413 `{"error": "body too
    large"}` before parsing; Rails reads any size.
+
+7. **Rust-only tool `web_vitals`** (2026-10-24): the Visits page's numbers
+   for an assistant. p75 LCP/CLS/INP/TTFB with rating and sample count
+   (`visits_index`'s `vitals`), web.dev's `thresholds`, the components with
+   visit count, errors, duration p50/p95/p99/max in ms and their own vitals,
+   and the vitals of each release deployed in the window; `component`
+   narrows to one page, `sort` takes a vital (worst p75 first). It reads
+   the same samples as the page (`pages::vital_samples`, the newest
+   `MAX_VITAL_SAMPLES` per metric), so the numbers are the page's
+   (`web_vitals_match_the_visits_page_in_the_api_and_mcp`). Rails has no
+   such tool, so the diff's `tools/list` cases are EXPECTED.
 
 # Detectors diff (`bench/diff/detectors/`, 2026-10-15)
 
@@ -971,6 +982,17 @@ presence, then followed on each side).
    `update!` calls do: `{"priority":"urgent","assignee_id":<outsider>}`
    saves the priority and then answers 404 (diffed:
    `write.update.priority_then_bad_assignee`).
+
+7. **Rust-only endpoint `GET .../environments/:id/visits`** (2026-10-24):
+   `{vitals, thresholds, data, meta, releases}`: the Visits page's
+   `vitals`, web.dev's thresholds, its components (`grouped("visit")`
+   rows, durations in ms, each with `vitals`) paginated like requests, and
+   each deploy in the window with its vitals. Takes `window`, `sort`
+   (`grouped`'s fields or `lcp`/`cls`/`inp`/`ttfb`, by p75), `dir`,
+   `component`, `page`, `per_page`. `series` also takes `type=visit` (the
+   page's chart), so its 422 lists four types (`series.no_type` and
+   `series.bad_type` are EXPECTED against Rails). Tested against the page's
+   props in `web_vitals_match_the_visits_page_in_the_api_and_mcp`.
 
 ## Rails bugs fixed on both sides (2026-10-16)
 
