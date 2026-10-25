@@ -23,10 +23,10 @@ window.ResizeObserver ??= ResizeObserverStub
 // Saved method is explicitly called with its original receiver below.
 // eslint-disable-next-line @typescript-eslint/unbound-method
 const matches = Element.prototype.matches
-Element.prototype.matches = function (selector: string) {
+Element.prototype.matches = function (this: Element, selector: string) {
   if (selector === ":modal" || selector === ":fullscreen") return false
   return matches.call(this, selector)
-}
+} as typeof Element.prototype.matches
 
 // cmdk scrolls the selected item into view; jsdom doesn't implement layout.
 if (!window.HTMLElement.prototype.scrollIntoView) {
