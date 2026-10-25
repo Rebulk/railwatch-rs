@@ -11,6 +11,10 @@
 //!
 //! Every result is the text `JSON.generate` writes, so times inside tool
 //! results are `Time#to_s` ("2026-10-15 02:20:00 UTC"), not `as_json`.
+//! The results are shaped for an agent, not Rails' (mcp_summary.rs):
+//! get_execution and last_execution lead with a summary and page their
+//! timeline, get_issue collapses framework frames, records carry a
+//! dashboard `url`, and every result is capped.
 //! `call` is synchronous and takes `now`: the server runs it on the
 //! blocking pool, the diff harness (bin/mcp_dump.rs) at a frozen instant.
 
@@ -27,6 +31,7 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde_json::{Map, Value, json};
 
 use super::WebState;
+use super::mcp_summary;
 use crate::control::Control;
 use crate::dashboard::cursor_page::{self, CursorKey, Order};
 use crate::dashboard::db::{self, Rec, jf, qt};
@@ -124,10 +129,13 @@ async fn show(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Respons
 }
 
 /// The request's own scheme and host, as `mcp_url`/`settings_profile_url`
-/// would build them: the configured url's scheme with the Host header.
+/// would build them: the configured url's scheme with the Host header. Behind
+/// a trusted proxy, X-Forwarded-Proto names the scheme: the railwatch-server
+/// gem runs the server on plain http and serves its app over https.
 fn base_url(state: &WebState, headers: &HeaderMap) -> String {
     let configured = state.config.url.trim_end_matches('/');
-    let scheme = configured.split_once("://").map_or("http", |(s, _)| s);
+    let forwarded = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()).filter(|p| state.config.trust_proxy && matches!(*p, "http" | "https"));
+    let scheme = forwarded.unwrap_or_else(|| configured.split_once("://").map_or("http", |(s, _)| s));
     let base_path = &state.config.base_path;
     match headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
         Some(host) => format!("{scheme}://{host}{base_path}"),
@@ -177,13 +185,14 @@ async fn create(State(state): State<Arc<WebState>>, req: Request) -> Response {
         Ok(p) => p,
         Err(refused) => return json_body(StatusCode::FORBIDDEN, &refused),
     };
+    let base = base_url(&state, &parts.headers);
     let Ok(bytes) = axum::body::to_bytes(body, 4 << 20).await else {
         return json_body(StatusCode::PAYLOAD_TOO_LARGE, &json!({"error": "body too large"}));
     };
     let s = state.clone();
     let (status, v) = tokio::task::spawn_blocking(move || {
         let env = Env { control: &s.control, tenants: &s.tenants, readers: &s.readers, cursor_key: &s.cursor_key };
-        call_as(&env, crate::time::now_micros(), auth.as_deref(), proxied.as_ref(), &bytes)
+        call_as(&env, &base, crate::time::now_micros(), auth.as_deref(), proxied.as_ref(), &bytes)
     })
     .await
     .unwrap_or_else(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": format!("mcp task failed: {e}")})));
@@ -360,14 +369,20 @@ impl Token {
 
 /// Authenticates, parses and dispatches one POST. Returns the status and
 /// body; a `Value::Null` body is Rails' HTML 500 page (an exception the
-/// controller does not rescue).
+/// controller does not rescue). Dashboard links in the results are paths.
 pub fn call(env: &Env, now: i64, authorization: Option<&str>, body: &Bytes) -> (StatusCode, Value) {
-    call_as(env, now, authorization, None, body)
+    call_at(env, "", now, authorization, body)
 }
 
-/// `call`, for a request that may carry the trusted proxy's verified claims
-/// instead of a token (Token::from_request).
-pub fn call_as(env: &Env, now: i64, authorization: Option<&str>, proxied: Option<&super::proxy_auth::Claims>, body: &Bytes) -> (StatusCode, Value) {
+/// `call`, with every record's dashboard `url` starting at `base`: the
+/// public scheme, host and base path ("https://railwatch.example.com").
+pub fn call_at(env: &Env, base: &str, now: i64, authorization: Option<&str>, body: &Bytes) -> (StatusCode, Value) {
+    call_as(env, base, now, authorization, None, body)
+}
+
+/// `call_at`, for a request that may carry the trusted proxy's verified
+/// claims instead of a token (Token::from_request).
+pub fn call_as(env: &Env, base: &str, now: i64, authorization: Option<&str>, proxied: Option<&super::proxy_auth::Claims>, body: &Bytes) -> (StatusCode, Value) {
     let token = match Token::from_request(env.control, authorization, proxied, now) {
         Ok(t) => t,
         Err(e) => {
@@ -389,7 +404,7 @@ pub fn call_as(env: &Env, now: i64, authorization: Option<&str>, proxied: Option
     if !payload.is_object() {
         return (StatusCode::BAD_REQUEST, json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "Invalid Request"}}));
     }
-    let mcp = Mcp { env, now, token };
+    let mcp = Mcp { env, now, token, base: base.trim_end_matches('/').to_string() };
     match mcp.dispatch_rpc(&payload) {
         Some(v) => (StatusCode::OK, v),
         None => (StatusCode::INTERNAL_SERVER_ERROR, Value::Null),
@@ -442,6 +457,8 @@ struct Mcp<'a> {
     env: &'a Env<'a>,
     now: i64,
     token: Token,
+    /// What dashboard links start with ("" for paths).
+    base: String,
 }
 
 fn success(id: &Value, result: Value) -> Value {
@@ -540,6 +557,7 @@ impl Mcp<'_> {
             "explain_query" => self.explain_query(&a),
             "list_tenants" => self.list_tenants(&a),
             "get_execution" => self.get_execution(&a),
+            "last_execution" => self.last_execution(&a),
             "search_logs" => self.search_logs(&a),
             "search_telemetry" => self.search_telemetry(&a).map(|v| v.to_string()),
             "release_health" => self.release_health(&a),
@@ -551,7 +569,7 @@ impl Mcp<'_> {
             _ => unreachable!("known tool"),
         };
         match result {
-            Ok(text) => success(id, json!({"content": [{"type": "text", "text": text}]})),
+            Ok(text) => success(id, json!({"content": [{"type": "text", "text": mcp_summary::cap(text, mcp_summary::MAX_RESULT_BYTES, narrow_hint(name_s))}]})),
             Err(Fail::Invalid(m)) => error(id, -32602, &m),
             Err(Fail::Internal(e)) => {
                 tracing::error!(tool = name_s, error = %e, "mcp tool failed");
@@ -753,9 +771,11 @@ impl Mcp<'_> {
         })?)
     }
 
-    fn environments_of(&self, app: i64) -> R<Vec<(String, String)>> {
+    fn environments_of(&self, app: i64) -> R<Vec<(String, String, i64)>> {
         Ok(self.env.control.with(|c| {
-            c.prepare("SELECT name, slug FROM environments WHERE application_id = ? ORDER BY id")?.query_map([app], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+            c.prepare("SELECT name, slug, id FROM environments WHERE application_id = ? ORDER BY id")?
+                .query_map([app], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect()
         })?)
     }
 
@@ -764,14 +784,15 @@ impl Mcp<'_> {
     }
 
     /// resolve_application: slug, narrowed by account_slug / application_id;
-    /// two matches is AmbiguousIdentifier.
+    /// two matches is AmbiguousIdentifier. With neither slug nor id, the one
+    /// application the token can see (in account_slug, when given): an
+    /// embedded server has exactly one, and an agent should not have to look
+    /// it up first.
     fn resolve_application(&self, a: &Args) -> R<Option<App>> {
         let slug = a.s("application_slug");
         let app_id = a.get("application_id");
         let slug_blank = crate::rjson::ruby::blank(slug.as_bytes());
-        if slug_blank && !present(app_id) {
-            return Ok(None);
-        }
+        let defaulting = slug_blank && !present(app_id);
         if present(app_id) && !positive_integer(app_id) {
             return Ok(None);
         }
@@ -798,6 +819,9 @@ impl Mcp<'_> {
                 .collect()
         })?;
         if matches.len() > 1 {
+            if defaulting {
+                return Ok(None);
+            }
             return Err(Fail::Invalid(format!(
                 "Application slug {} exists in more than one of your accounts; pass account_slug alongside it, or pass application_id",
                 ruby_inspect(&slug)
@@ -806,26 +830,35 @@ impl Mcp<'_> {
         Ok(matches.pop())
     }
 
-    /// resolve_environment: by name, then by slug, within the application.
+    /// resolve_environment: by name, then by slug, within the application;
+    /// with no environment given, the application's only one.
     fn resolve_environment(&self, a: &Args) -> R<Option<EnvRow>> {
         let Some(app) = self.resolve_application(a)? else { return Ok(None) };
         let wanted = a.s("environment");
+        let row = |r: &rusqlite::Row<'_>| {
+            Ok(EnvRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                slug: r.get(2)?,
+                application_id: app.id,
+                app_slug: app.slug.clone(),
+                account_slug: app.account_slug.clone(),
+                last_seen_at: r.get(3)?,
+            })
+        };
         Ok(self.env.control.with(|c| {
+            if !a.present("environment") {
+                let mut only: Vec<EnvRow> = c
+                    .prepare("SELECT id, name, slug, last_seen_at FROM environments WHERE application_id = ? LIMIT 2")?
+                    .query_map([app.id], row)?
+                    .collect::<rusqlite::Result<_>>()?;
+                return Ok(if only.len() == 1 { only.pop() } else { None });
+            }
             let find = |col: &str| {
                 c.query_row(
                     &format!("SELECT id, name, slug, last_seen_at FROM environments WHERE application_id = ? AND {col} = ? LIMIT 1"),
                     params![app.id, wanted],
-                    |r| {
-                        Ok(EnvRow {
-                            id: r.get(0)?,
-                            name: r.get(1)?,
-                            slug: r.get(2)?,
-                            application_id: app.id,
-                            app_slug: app.slug.clone(),
-                            account_slug: app.account_slug.clone(),
-                            last_seen_at: r.get(3)?,
-                        })
-                    },
+                    row,
                 )
                 .optional()
             };
@@ -834,6 +867,57 @@ impl Mcp<'_> {
                 None => find("slug"),
             }
         })?)
+    }
+
+    /// The "environment not found" result, saying what to pass instead and
+    /// listing what this token can see.
+    fn no_environment(&self, a: &Args) -> R<String> {
+        Ok(self.no_environment_value(a)?.to_string())
+    }
+
+    fn no_environment_value(&self, a: &Args) -> R<Value> {
+        let apps = self.accessible_applications()?;
+        let mut available = vec![];
+        for app in apps.iter().take(20) {
+            let envs: Vec<String> = self.environments_of(app.id)?.into_iter().map(|(n, _, _)| n).collect();
+            available.push(json!({"application_slug": app.slug, "account_slug": app.account_slug, "application_id": app.id, "environments": envs}));
+        }
+        let hint = match self.resolve_application(a)? {
+            None if apps.is_empty() => "This token can see no application. Create one in the dashboard, or use a token of a member of its account.".to_string(),
+            None if !Self::application_identity_given(a) => {
+                "This token can see more than one application: pass application_slug (and environment) from available.".to_string()
+            }
+            None => "No application by that name for this token: pass an application_slug from available.".to_string(),
+            Some(app) => {
+                let envs: Vec<String> = self.environments_of(app.id)?.into_iter().map(|(n, _, _)| n).collect();
+                if a.present("environment") {
+                    format!("{} has no environment {}: pass one of {}.", app.slug, ruby_inspect(&a.s("environment")), envs.join(", "))
+                } else {
+                    format!("{} has more than one environment: pass environment, one of {}.", app.slug, envs.join(", "))
+                }
+            }
+        };
+        Ok(json!({"error": "environment not found", "hint": hint, "available": available}))
+    }
+
+    /// A dashboard link: the public base URL (or nothing, for paths) and a
+    /// path as the dashboard's router has it.
+    fn url(&self, path: &str) -> Value {
+        Value::String(format!("{}{path}", self.base))
+    }
+
+    /// models::execution_row with Time#to_s times and the dashboard link.
+    fn execution_row(&self, env: &EnvRow, r: &Rec) -> Value {
+        let mut v = row_times(models::execution_row(r), &["occurred_at"]);
+        db::merge_into(&mut v, "url", self.execution_url(env, r.s("kind"), r.s("execution_id")));
+        v
+    }
+
+    fn execution_url(&self, env: &EnvRow, kind: Option<&str>, execution_id: Option<&str>) -> Value {
+        match execution_id {
+            Some(eid) if !eid.is_empty() && kind != Some("browser") => self.url(&execution_path(env.application_id, env.id, kind, eid)),
+            _ => Value::Null,
+        }
     }
 
     /// `environment.with_telemetry { ... }` over the tenant's read connection
@@ -884,6 +968,14 @@ pub(crate) fn issue_exception_occurrences(conn: &Connection, group_hash: &str, s
     )?;
     Ok((first, last))
 }
+
+/// What get_profile and the execution summary say when there is no profile.
+pub(super) const PROFILE_SETUP: &str = "To capture profiles, the app needs the vernier (Ruby 3.2+) or stackprof gem and RAILWATCH_PROFILE_SAMPLE_RATE (a fraction of executions to profile), or RAILWATCH_PROFILE_SLOW_MS together with RAILWATCH_TAIL_SAMPLE_SLOW_MS (profile the slow ones).";
+
+/// list_issues' sort: impact, with the last bind as now.
+const IMPACT_SQL: &str = "(i.occurrences * 1.0 / (1 + MAX(0, julianday(?) - julianday(i.last_seen_at))))";
+
+const ISSUE_NOT_FOUND_HINT: &str = "Pass key as list_issues returns it (e.g. SHOP-12, or its canonical_key account_slug/application_id/SHOP-12), or issue_id. list_issues with status open, resolved or ignored finds it.";
 
 fn not_found(what: &str) -> R<String> {
     Ok(json!({"error": format!("{what} not found")}).to_string())
@@ -1090,7 +1182,7 @@ impl Mcp<'_> {
             out.push(crate::obj! {
                 "slug" => app.slug.clone(), "name" => app.name.clone(), "account" => app.account_slug.clone(),
                 "application_id" => app.id, "application_slug" => app.slug.clone(), "account_slug" => app.account_slug.clone(),
-                "environments" => envs.into_iter().map(|(n, s)| json!({"name": n, "slug": s})).collect::<Vec<_>>(),
+                "environments" => envs.into_iter().map(|(n, s, id)| json!({"name": n, "slug": s, "url": self.url(&format!("/apps/{}/envs/{id}", app.id))})).collect::<Vec<_>>(),
             });
         }
         Ok(Value::Array(out).to_string())
@@ -1110,20 +1202,78 @@ impl Mcp<'_> {
         }
         sql.push_str(" AND i.status = ?");
         binds.push(a.presence("status").unwrap_or_else(|| "open".into()).into());
-        sql.push_str(&format!(" ORDER BY i.last_seen_at DESC LIMIT {}", clamp(a.get("limit"), 20, 100)?));
+        let impact = match a.presence("sort").as_deref() {
+            None | Some("recent") => false,
+            Some("impact") => true,
+            Some(_) => return Ok(json!({"error": "sort must be recent or impact"}).to_string()),
+        };
+        if impact {
+            // Occurrences, discounted by the days since the issue was last
+            // seen: 30 today outranks 30 a week ago and 3 an hour ago.
+            sql.push_str(&format!(" ORDER BY {IMPACT_SQL} DESC, i.affected_users DESC, i.last_seen_at DESC"));
+            binds.push(qt(self.now).into());
+        } else {
+            sql.push_str(" ORDER BY i.last_seen_at DESC");
+        }
+        sql.push_str(&format!(" LIMIT {}", clamp(a.get("limit"), 20, 100)?));
         let rows = self.query_issues(&sql, binds)?;
-        Ok(Value::Array(rows.iter().map(IssueRow::json).collect()).to_string())
+        let now_days = self.now as f64 / 86_400_000_000.0;
+        Ok(Value::Array(
+            rows.iter()
+                .map(|i| {
+                    let mut v = self.issue_json(i);
+                    if impact {
+                        let last = i.last_seen_at.as_deref().and_then(crate::time::parse_db_time).map_or(now_days, |t| t as f64 / 86_400_000_000.0);
+                        db::merge_into(&mut v, "impact", jf(rb::round(i.occurrences as f64 / (1.0 + (now_days - last).max(0.0)), 2)));
+                    }
+                    v
+                })
+                .collect(),
+        )
+        .to_string())
     }
 
     fn get_issue(&self, a: &Args) -> R<String> {
-        let Some(issue) = self.resolve_issue(a)? else { return Ok(json!({"error": "issue not found"}).to_string()) };
-        let mut v = issue.json();
+        let Some(issue) = self.resolve_issue(a)? else { return Ok(json!({"error": "issue not found", "hint": ISSUE_NOT_FOUND_HINT}).to_string()) };
+        let mut v = self.issue_json(&issue);
         db::merge_into(&mut v, "sample", issue.sample_json());
         db::merge_into(&mut v, "detection", self.detection(&issue)?);
-        let (sample, last) = self.exception_occurrences(&issue)?;
+        let (mut sample, mut last) = self.exception_occurrences(&issue)?;
+        let all_frames = a.s("frames") == "all";
+        let env = issue.env_row();
+        for o in [&mut sample, &mut last] {
+            if let Value::Object(m) = o {
+                if !all_frames && let Some(frames) = m.get("frames") {
+                    let collapsed = mcp_summary::collapse_frames(frames);
+                    m.insert("frames".into(), collapsed);
+                }
+                let url = self.execution_url(&env, m.get("execution_source").and_then(Value::as_str), m.get("execution_id").and_then(Value::as_str));
+                m.insert("execution_url".into(), url);
+            }
+        }
+        // Often the sample is the latest occurrence: print it once.
+        if sample.is_object() && sample.get("id") == last.get("id") {
+            last = json!({"id": sample["id"], "same_as": "sample_occurrence"});
+        }
+        if issue.kind == "exception" && sample.is_null() && last.is_null() {
+            db::merge_into(
+                &mut v,
+                "note",
+                Value::from(
+                    "This issue's occurrences are past the environment's retention: frames and context are gone. Its title, culprit and counts are all that is left.",
+                ),
+            );
+        }
         db::merge_into(&mut v, "sample_occurrence", sample);
         db::merge_into(&mut v, "last_occurrence", last);
         Ok(v.to_string())
+    }
+
+    /// issue_json with the issue's dashboard link.
+    fn issue_json(&self, issue: &IssueRow) -> Value {
+        let mut v = issue.json();
+        db::merge_into(&mut v, "url", self.url(&format!("/issues/{}", issue.id)));
+        v
     }
 
     /// IssueDetectionPresenter#as_json, its Times (representative records'
@@ -1158,41 +1308,63 @@ impl Mcp<'_> {
     }
 
     fn list_slow_routes(&self, a: &Args) -> R<String> {
-        let Some(env) = self.resolve_environment(a)? else { return not_found("environment") };
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
+        let sort = a.presence("sort").unwrap_or_else(|| "total".into());
+        if !["total", "avg", "p95"].contains(&sort.as_str()) {
+            return Ok(json!({"error": "sort must be total, avg, or p95"}).to_string());
+        }
         let (from, to) = self.window(a);
         let rows = self.with_telemetry(&env, |conn| {
             Ok(db::query(
                 conn,
-                "SELECT \"rollups\".\"group_hash\", \"rollups\".\"name\", SUM(count), SUM(error_count), MAX(p95) FROM \"rollups\" \
+                "SELECT \"rollups\".\"group_hash\", \"rollups\".\"name\", SUM(count), SUM(error_count), MAX(p95), SUM(duration_sum) FROM \"rollups\" \
                  WHERE \"rollups\".\"record_type\" = 'request' AND \"rollups\".\"bucket\" BETWEEN ?1 AND ?2 GROUP BY \"rollups\".\"group_hash\", \"rollups\".\"name\"",
                 params![qt(rb::beginning_of_hour(from)), qt(to)],
             )?)
         })?;
+        let num = |v: &rusqlite::types::Value| match v {
+            rusqlite::types::Value::Integer(i) => *i as f64,
+            rusqlite::types::Value::Real(f) => *f,
+            _ => 0.0,
+        };
+        let window = a.presence("window").filter(|w| Window::preset(Some(w), self.now).key == *w);
         let rows: Vec<(f64, Value)> = rows
             .iter()
             .map(|r| {
-                let p95 = match r.at(4) {
-                    rusqlite::types::Value::Integer(i) => *i as f64,
-                    rusqlite::types::Value::Real(f) => *f,
-                    _ => 0.0,
+                let count = num(r.at(2));
+                let p95_ms = rb::round(num(r.at(4)) / 1000.0, 2);
+                let total_ms = rb::round(num(r.at(5)) / 1000.0, 1);
+                let avg_ms = if count > 0.0 { rb::round(num(r.at(5)) / count / 1000.0, 2) } else { 0.0 };
+                let key = match sort.as_str() {
+                    "avg" => avg_ms,
+                    "p95" => p95_ms,
+                    _ => total_ms,
                 };
-                let p95_ms = rb::round(p95 / 1000.0, 2);
+                let url = match (r.at(0), &window) {
+                    (rusqlite::types::Value::Text(g), Some(w)) => {
+                        self.url(&format!("/apps/{}/envs/{}/requests/routes/{}?window={w}", env.application_id, env.id, segment(g)))
+                    }
+                    (rusqlite::types::Value::Text(g), None) => {
+                        self.url(&format!("/apps/{}/envs/{}/requests/routes/{}", env.application_id, env.id, segment(g)))
+                    }
+                    _ => Value::Null,
+                };
                 (
-                    p95_ms,
+                    key,
                     crate::obj! {
                         "route" => db::raw_json(r.at(1)), "group_hash" => db::raw_json(r.at(0)), "count" => db::raw_json(r.at(2)),
-                        "errors" => db::raw_json(r.at(3)), "p95_ms" => jf(p95_ms),
+                        "errors" => db::raw_json(r.at(3)), "total_ms" => jf(total_ms), "avg_ms" => jf(avg_ms), "p95_ms" => jf(p95_ms),
+                        "url" => url,
                     },
                 )
             })
             .collect();
-        // sort_by { -p95_ms } (Float keys: MRI's introsort), first(20)
-        let sorted = rb::sort_by_num(rows, |(p, _)| rb::Num::F(-p));
+        let sorted = rb::sort_by_num(rows, |(k, _)| rb::Num::F(-k));
         Ok(Value::Array(sorted.into_iter().take(20).map(|(_, v)| v).collect()).to_string())
     }
 
     fn get_route(&self, a: &Args) -> R<String> {
-        let Some(env) = self.resolve_environment(a)? else { return not_found("environment") };
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
         let (from, to) = self.window(a);
         let route = a.s("route");
         let given = a.presence("group_hash");
@@ -1239,10 +1411,11 @@ impl Mcp<'_> {
             let ids: Vec<String> = requests.iter().filter_map(|r| r.s("execution_id").map(str::to_string)).collect();
             let slowest: Vec<Value> = max_by_n(&requests, 10, |r| r.i("duration").unwrap_or(0))
                 .into_iter()
-                .map(|r| row_times(models::execution_row(r), &["occurred_at"]))
+                .map(|r| self.execution_row(&env, r))
                 .collect();
             let v = crate::obj! {
                 "route" => name, "group_hash" => group_hash.clone(),
+                "url" => self.url(&format!("/apps/{}/envs/{}/requests/routes/{}", env.application_id, env.id, segment(&group_hash))),
                 "window" => json!({"from": time_s(Some(from)), "to": time_s(Some(to))}),
                 "count" => summary.count, "errors" => summary.errors, "client_errors" => summary.client_errors,
                 "avg_ms" => ms(Some(summary.avg)), "p50_ms" => ms(Some(summary.p50)), "p95_ms" => ms(Some(summary.p95)),
@@ -1256,7 +1429,7 @@ impl Mcp<'_> {
     }
 
     fn get_profile(&self, a: &Args) -> R<String> {
-        let Some(env) = self.resolve_environment(a)? else { return not_found("environment") };
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
         let limit = clamp(a.get("limit"), 25, 100)?;
         self.with_telemetry(&env, |conn| {
             let profile = if a.present("profile_id") {
@@ -1274,7 +1447,16 @@ impl Mcp<'_> {
             } else {
                 db::query_one(conn, "SELECT \"profiles\".* FROM \"profiles\" ORDER BY \"profiles\".\"occurred_at\" DESC LIMIT 1", [])?
             };
-            let Some(p) = profile else { return not_found("profile") };
+            let Some(p) = profile else {
+                let hint = if a.present("execution_id") {
+                    "No profile was captured for this execution."
+                } else if a.present("profile_id") {
+                    "No profile with that id; profile ids come from get_execution's timeline (type profile)."
+                } else {
+                    "This environment has no profiles."
+                };
+                return Ok(json!({"error": "profile not found", "hint": format!("{hint} {PROFILE_SETUP}")}).to_string());
+            };
             let (collapsed, truncated) = match crate::dashboard::execution_presenter::collapsed_capped(
                 p.blob("stacks").unwrap_or(&[]),
                 crate::dashboard::execution_presenter::MAX_COLLAPSED_BYTES,
@@ -1288,13 +1470,15 @@ impl Mcp<'_> {
                 "samples" => p.i("samples"), "execution_id" => p.s("execution_id"), "execution" => p.s("execution_preview"),
                 "occurred_at" => time_s(p.t("occurred_at")), "deploy" => p.s("deploy"), "server" => p.s("server"), "truncated" => truncated,
                 "frames" => hot_frames(&collapsed, limit as usize),
+                "url" => self.url(&format!("/apps/{}/envs/{}/profiles/{}", env.application_id, env.id, p.i("id").unwrap_or(0))),
+                "execution_url" => self.execution_url(&env, p.s("execution_source"), p.s("execution_id")),
             };
             Ok(v.to_string())
         })
     }
 
     fn search_requests(&self, a: &Args) -> R<String> {
-        let Some(env) = self.resolve_environment(a)? else { return not_found("environment") };
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
         let (from, to) = self.window(a);
         let q = a.get("q");
         let q = if q.is_null() { None } else { Some(to_s(q)) };
@@ -1346,12 +1530,12 @@ impl Mcp<'_> {
                 &format!("SELECT \"executions\".* FROM {from_sql} WHERE {} ORDER BY \"executions\".\"occurred_at\" DESC LIMIT {limit}", all.sql()),
                 params_from_iter(all.binds.iter()),
             )?;
-            Ok(Value::Array(rows.iter().map(|r| row_times(models::execution_row(r), &["occurred_at"])).collect()).to_string())
+            Ok(Value::Array(rows.iter().map(|r| self.execution_row(&env, r)).collect()).to_string())
         })
     }
 
     fn explain_query(&self, a: &Args) -> R<String> {
-        let Some(env) = self.resolve_environment(a)? else { return not_found("environment") };
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
         let (from, to) = self.window(a);
         let group_hash = a.s("group_hash");
         self.with_telemetry(&env, |conn| {
@@ -1368,52 +1552,158 @@ impl Mcp<'_> {
                 Some(e) => Some(e.clone()),
                 None => db::query_one(conn, &format!("{base} ORDER BY \"queries\".\"occurred_at\" DESC LIMIT 1"), params![group_hash, qt(from), qt(to)])?,
             };
-            let Some(n) = newest else { return not_found("query group") };
-            let v = crate::obj! {
+            let Some(n) = newest else {
+                return Ok(json!({"error": "query group not found",
+                    "hint": "No query with this group_hash in the window. Take group_hash from get_route's slow_queries or n_plus_ones, or search_telemetry resource queries; pass a longer window (7d, 30d) for older ones."}).to_string());
+            };
+            let mut v = crate::obj! {
                 "group_hash" => group_hash.clone(), "sql" => n.s("resolved_sql").unwrap_or(""), "source" => n.s("source"),
                 "connection" => n.s("connection"), "duration_ms" => n.i("duration").map_or(Value::Null, |d| jf(rb::round(d as f64 / 1000.0, 3))),
                 "occurred_at" => time_s(n.t("occurred_at")), "execution_id" => n.s("execution_id"),
                 "execution" => n.s("execution_preview"),
                 "explain" => explained.as_ref().map_or(Value::Null, |e| crate::dashboard::db::js(e.s("explain"))),
+                "url" => self.url(&format!("/apps/{}/envs/{}/queries/{}", env.application_id, env.id, segment(&group_hash))),
+                "execution_url" => self.execution_url(&env, n.s("execution_source"), n.s("execution_id")),
             };
+            if explained.is_none() {
+                db::merge_into(
+                    &mut v,
+                    "hint",
+                    Value::from("No stored plan for this query in the window. Plans are captured only when the app sets RAILWATCH_CAPTURE_QUERY_EXPLAIN=true, and only for SELECTs slower than RAILWATCH_EXPLAIN_THRESHOLD_MS (100 by default). Or run EXPLAIN on sql yourself."),
+                );
+            }
             Ok(v.to_string())
         })
     }
 
     fn list_tenants(&self, a: &Args) -> R<String> {
-        let Some(env) = self.resolve_environment(a)? else { return not_found("environment") };
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
         let (from, to) = self.window(a);
         let q = a.get("q");
         let q = if q.is_null() { None } else { Some(to_s(q)) };
         self.with_telemetry(&env, |conn| {
             let rows = crate::dashboard::tenant::index(conn, from, to, q.as_deref(), None, None)?;
-            Ok(Value::Array(rows.into_iter().map(|r| row_times(r, &["last_seen_at"])).collect()).to_string())
+            Ok(Value::Array(
+                rows.into_iter()
+                    .map(|r| {
+                        let mut r = row_times(r, &["last_seen_at"]);
+                        if let Some(t) = r.get("tenant").and_then(Value::as_str) {
+                            let url = self.url(&format!("/apps/{}/envs/{}/tenants/{}", env.application_id, env.id, segment(t)));
+                            db::merge_into(&mut r, "url", url);
+                        }
+                        r
+                    })
+                    .collect(),
+            )
+            .to_string())
         })
     }
 
     fn get_execution(&self, a: &Args) -> R<String> {
-        let Some(env) = self.resolve_environment(a)? else { return not_found("environment") };
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
         let eid = a.s("execution_id");
+        if !a.present("execution_id") {
+            return Ok(json!({"error": "execution_id is required", "hint": "Take one from search_requests, get_route's slowest_requests, an issue's sample_occurrence, or call last_execution for the newest request or job."}).to_string());
+        }
         self.with_telemetry(&env, |conn| {
             let Some(exe) = db::query_one(conn, "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"execution_id\" = ?1 LIMIT 1", [&eid])?
             else {
-                return not_found("execution");
+                return Ok(json!({"error": "execution not found", "hint": "Executions are kept for the environment's retention period, and only sampled-in ones are stored. Search recent ones with search_requests, or call last_execution."}).to_string());
             };
-            let start = exe.t("occurred_at").unwrap_or(0);
-            let mut v = crate::obj! {
-                "kind" => exe.s("kind"), "name" => exe.s("name"),
-                "duration_ms" => jf(exe.i("duration").unwrap_or(0) as f64 / 1000.0),
-                "status" => exe.i("status"), "outcome" => exe.s("outcome"), "occurred_at" => time_s(Some(start)),
-                "timeline" => execution_timeline(conn, &eid, start)?,
-            };
-            // The gem's per-execution buffer kept the earliest child records
-            // and dropped the rest: say so, or the timeline reads as complete.
-            if let Some(dropped) = exe.json("detail").get("dropped_records").filter(|d| d.as_i64().is_some_and(|n| n > 0)) {
-                db::merge_into(&mut v, "dropped_records", dropped.clone());
-                db::merge_into(&mut v, "dropped_bytes", exe.json("detail").get("dropped_bytes").cloned().unwrap_or(Value::Null));
-            }
-            Ok(v.to_string())
+            Ok(self.execution_detail(conn, &env, &exe, a)?.to_string())
         })
+    }
+
+    /// The newest execution, optionally of one kind and matching a path or
+    /// route, in get_execution's shape.
+    fn last_execution(&self, a: &Args) -> R<String> {
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
+        let kind = a.presence("kind").unwrap_or_else(|| "any".into());
+        let kinds: &[&str] = match kind.as_str() {
+            "request" => &["request"],
+            "job" => &["job_attempt"],
+            "any" => &["request", "job_attempt", "scheduled_task", "command", "channel_action"],
+            _ => return Ok(json!({"error": "kind must be request, job, or any"}).to_string()),
+        };
+        let path = a.presence("path");
+        self.with_telemetry(&env, |conn| {
+            // A path that matches nothing would walk every execution: look
+            // back a day at most (the dev loop wants the request just made;
+            // search_requests reaches further).
+            let since = path.as_ref().map(|_| qt(self.now - 24 * 3_600_000_000));
+            let Some(exe) = newest_execution(conn, kinds, path.as_deref(), since.as_deref())? else {
+                let what = match &path {
+                    Some(p) => format!("no {} matching {} in the last 24 hours", if kind == "job" { "job" } else { "request or job" }, ruby_inspect(p)),
+                    None => "no executions".into(),
+                };
+                return Ok(json!({"error": format!("{what} in {}/{}", env.app_slug, env.name),
+                    "hint": "Make the request (or run the job) again and retry: the app ships records every RAILWATCH_FLUSH_INTERVAL seconds (2 by default). Nothing arrives when RAILWATCH_TOKEN/RAILWATCH_INGEST_URL point elsewhere, when RAILWATCH_REQUEST_SAMPLE_RATE / RAILWATCH_JOB_SAMPLE_RATE sample it out, or when its path is in ignored_request_paths."}).to_string());
+            };
+            Ok(self.execution_detail(conn, &env, &exe, a)?.to_string())
+        })
+    }
+
+    /// get_execution's result: what ran, the summary of where its time went,
+    /// and one page of the timeline.
+    fn execution_detail(&self, conn: &Connection, env: &EnvRow, exe: &Rec, a: &Args) -> R<Value> {
+        let eid = exe.s("execution_id").unwrap_or("").to_string();
+        let start = exe.t("occurred_at").unwrap_or(0);
+        let duration_ms = exe.i("duration").unwrap_or(0) as f64 / 1000.0;
+        let entries = execution_timeline(conn, &eid, start)?;
+        let n_plus_ones: Vec<mcp_summary::NPlusOne> = db::query(
+            conn,
+            "SELECT \"n_plus_ones\".* FROM \"n_plus_ones\" WHERE \"n_plus_ones\".\"execution_id\" = ?1 ORDER BY \"n_plus_ones\".\"id\"",
+            [&eid],
+        )?
+        .iter()
+        .map(|r| mcp_summary::NPlusOne {
+            group_hash: r.s("group_hash").map(str::to_string),
+            sql: r.s("sql").unwrap_or("").to_string(),
+            source: r.s("source").map(str::to_string),
+            count: r.i("count").unwrap_or(0),
+        })
+        .collect();
+        let warnings: Vec<Value> = db::query(
+            conn,
+            "SELECT \"logs\".* FROM \"logs\" WHERE \"logs\".\"execution_id\" = ?1 AND \"logs\".\"level\" IN ('warn', 'error', 'fatal') ORDER BY \"logs\".\"occurred_at\" LIMIT 5",
+            [&eid],
+        )?
+        .iter()
+        .map(|r| crate::obj! { "level" => r.s("level"), "message" => rb::first_chars(r.s("message").unwrap_or(""), 300), "source" => r.s("source") })
+        .collect();
+        let detail = exe.json("detail");
+        let dropped = detail.get("dropped_records").and_then(Value::as_i64).filter(|n| *n > 0);
+        let has_profile = entries.iter().any(|e| e.kind == "profile") || exe.i("profile_id").is_some();
+        let summary = mcp_summary::execution_summary(&mcp_summary::Facts {
+            duration_ms,
+            entries: &entries,
+            n_plus_ones: &n_plus_ones,
+            warnings,
+            dropped_records: dropped,
+            has_profile,
+        });
+
+        let kind = exe.s("kind");
+        let mut v = crate::obj! {
+            "execution_id" => eid.clone(), "kind" => kind, "name" => exe.s("name"),
+            "duration_ms" => jf(duration_ms),
+            "status" => exe.i("status"), "outcome" => exe.s("outcome"), "occurred_at" => time_s(Some(start)),
+            "url" => self.execution_url(env, kind, Some(&eid)),
+        };
+        if let Some(path) = detail.get("path").filter(|p| p.is_string()) {
+            db::merge_into(&mut v, "path", path.clone());
+        }
+        // The gem's per-execution buffer kept the earliest child records
+        // and dropped the rest: say so, or the timeline reads as complete.
+        if dropped.is_some() {
+            db::merge_into(&mut v, "dropped_records", detail["dropped_records"].clone());
+            db::merge_into(&mut v, "dropped_bytes", detail.get("dropped_bytes").cloned().unwrap_or(Value::Null));
+        }
+        db::merge_into(&mut v, "summary", summary);
+        let (timeline, page) = timeline_page(&entries, a)?;
+        db::merge_into(&mut v, "timeline", timeline);
+        db::merge_into(&mut v, "timeline_page", page);
+        Ok(v)
     }
 
     fn search_logs(&self, a: &Args) -> R<String> {
@@ -1440,7 +1730,7 @@ impl Mcp<'_> {
         if !TELEMETRY_RESOURCES.contains(&resource.as_str()) {
             return Ok(json!({"error": "resource must be jobs, exceptions, logs, or queries"}));
         }
-        let Some(env) = self.resolve_environment(a)? else { return Ok(json!({"error": "environment not found"})) };
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment_value(a) };
         let (from, to) = self.window(a);
         let q = a.get("q");
         let q_s = if q.is_null() { None } else { Some(to_s(q)) };
@@ -1477,13 +1767,28 @@ impl Mcp<'_> {
                 "logs" => models::log_row(r),
                 _ => models::query_row(r),
             };
-            let data: Vec<Value> = page.rows.iter().map(|r| row_times(row(r), &["occurred_at"])).collect();
+            let data: Vec<Value> = page
+                .rows
+                .iter()
+                .map(|r| {
+                    let mut v = row_times(row(r), &["occurred_at"]);
+                    let url = match resource.as_str() {
+                        "jobs" => self.execution_url(&env, r.s("kind"), r.s("execution_id")),
+                        "queries" => {
+                            r.s("group_hash").map_or(Value::Null, |g| self.url(&format!("/apps/{}/envs/{}/queries/{}", env.application_id, env.id, segment(g))))
+                        }
+                        _ => self.execution_url(&env, r.s("execution_source"), r.s("execution_id")),
+                    };
+                    db::merge_into(&mut v, "url", url);
+                    v
+                })
+                .collect();
             Ok(json!({"data": data, "meta": page.meta}))
         })
     }
 
     fn release_health(&self, a: &Args) -> R<String> {
-        let Some(env) = self.resolve_environment(a)? else { return not_found("environment") };
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
         let (from, to) = self.window(a);
         let deploys: Vec<(String, Option<String>, String)> = self.env.control.with(|c| {
             c.prepare(
@@ -1502,6 +1807,7 @@ impl Mcp<'_> {
                 db::merge_into(&mut v, "ref", ref_.clone().map_or(Value::Null, Value::from));
                 db::merge_into(&mut v, "deployed_at", db_time_s(Some(at.clone())));
                 db::merge_into(&mut v, "adoption", jf(share));
+                db::merge_into(&mut v, "url", self.url(&format!("/apps/{}/envs/{}/releases/{}", env.application_id, env.id, segment(deploy))));
                 out.push(v);
             }
             Ok(out)
@@ -1513,7 +1819,7 @@ impl Mcp<'_> {
     /// component), the components with their visit timings and vitals, and
     /// the vitals of each release deployed in the window.
     fn web_vitals(&self, a: &Args) -> R<String> {
-        let Some(env) = self.resolve_environment(a)? else { return not_found("environment") };
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
         let (from, to) = self.window(a);
         let limit = clamp(a.get("limit"), 20, 100)?;
         let sort = a.presence("sort").unwrap_or_else(|| "count".into());
@@ -1563,13 +1869,14 @@ impl Mcp<'_> {
     }
 
     fn recent_deploys(&self, a: &Args) -> R<String> {
-        let Some(env) = self.resolve_environment(a)? else { return not_found("environment") };
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
         let rows: Vec<Value> = self.env.control.with(|c| {
-            c.prepare("SELECT deploy, ref, name, deployed_at, url FROM deploys WHERE environment_id = ?1 ORDER BY deployed_at DESC LIMIT 20")?
+            c.prepare("SELECT deploy, ref, name, deployed_at, url, id FROM deploys WHERE environment_id = ?1 ORDER BY deployed_at DESC LIMIT 20")?
                 .query_map([env.id], |r| {
                     Ok(crate::obj! {
                         "deploy" => r.get::<_, String>(0)?, "ref" => r.get::<_, Option<String>>(1)?, "name" => r.get::<_, Option<String>>(2)?,
                         "deployed_at" => db_time_s(r.get(3)?), "url" => r.get::<_, Option<String>>(4)?,
+                        "dashboard_url" => self.url(&format!("/apps/{}/envs/{}/deploys/{}", env.application_id, env.id, r.get::<_, i64>(5)?)),
                     })
                 })?
                 .collect()
@@ -1629,7 +1936,7 @@ impl Mcp<'_> {
                 Some(iid) => self.query_issues(&format!("{ISSUE_SELECT} WHERE i.id = ?"), vec![iid.into()])?.pop().map_or(Value::Null, |i| {
                     crate::obj! {
                         "key" => i.key.clone(), "canonical_key" => i.canonical_key(), "issue_id" => i.id,
-                        "title" => i.title.clone(), "environment" => i.environment_name.clone(),
+                        "title" => i.title.clone(), "environment" => i.environment_name.clone(), "url" => self.url(&format!("/issues/{}", i.id)),
                     }
                 }),
                 None => Value::Null,
@@ -1645,7 +1952,7 @@ impl Mcp<'_> {
     /// update_issue: every write attributed to the token's user, with an
     /// "agent" activity listing what the client asked to change.
     fn update_issue(&self, a: &Args) -> R<String> {
-        let Some(found) = self.resolve_issue(a)? else { return Ok(json!({"error": "issue not found"}).to_string()) };
+        let Some(found) = self.resolve_issue(a)? else { return Ok(json!({"error": "issue not found", "hint": ISSUE_NOT_FOUND_HINT}).to_string()) };
         let user = self.user_name()?;
         let actor = crate::grouping::issue::Actor { user_id: self.token.user_id, name: &user };
         let id = found.id;
@@ -1705,11 +2012,11 @@ impl Mcp<'_> {
         });
         result?;
         let issue = self.query_issues(&format!("{ISSUE_SELECT} WHERE i.id = ?"), vec![id.into()])?.pop().ok_or(Fail::Unrescued)?;
-        Ok(issue.json().to_string())
+        Ok(self.issue_json(&issue).to_string())
     }
 
     fn add_comment(&self, a: &Args) -> R<String> {
-        let Some(found) = self.resolve_issue(a)? else { return Ok(json!({"error": "issue not found"}).to_string()) };
+        let Some(found) = self.resolve_issue(a)? else { return Ok(json!({"error": "issue not found", "hint": ISSUE_NOT_FOUND_HINT}).to_string()) };
         let body = a.s("body");
         if crate::rjson::ruby::blank(body.as_bytes()) {
             // validates :body, presence: true -> RecordInvalid
@@ -2062,8 +2369,9 @@ fn split_semicolons(s: &str) -> Vec<&str> {
     v
 }
 
-/// Execution#timeline: every child's timeline_entry, sorted by offset.
-fn execution_timeline(conn: &Connection, eid: &str, start: i64) -> rusqlite::Result<Value> {
+/// Execution#timeline: every child's timeline_entry, sorted by offset, with
+/// what the summary reads besides each row's JSON.
+fn execution_timeline(conn: &Connection, eid: &str, start: i64) -> rusqlite::Result<Vec<mcp_summary::Entry>> {
     // CHILDREN in declaration order; label per model's timeline_label.
     const CHILDREN: [(&str, &str); 16] = [
         ("queries", "query"),
@@ -2083,7 +2391,7 @@ fn execution_timeline(conn: &Connection, eid: &str, start: i64) -> rusqlite::Res
         ("attachments", "attachment"),
         ("llm_calls", "llm_call"),
     ];
-    let mut entries: Vec<(f64, Value)> = vec![];
+    let mut entries: Vec<(f64, mcp_summary::Entry)> = vec![];
     for (table, singular) in CHILDREN {
         let select = if table == "queries" {
             "queries.*, COALESCE(NULLIF(queries.sql, ''), (SELECT query_shapes.sql FROM query_shapes WHERE query_shapes.group_hash = queries.group_hash), '') AS resolved_sql".to_string()
@@ -2120,19 +2428,139 @@ fn execution_timeline(conn: &Connection, eid: &str, start: i64) -> rusqlite::Res
                 }
             };
             let offset = rb::round(rb::time_sub(r.t("occurred_at").unwrap_or(0), start) * 1000.0, 3);
-            let duration = if has_duration { r.i("duration").map_or(Value::Null, |d| jf(d as f64 / 1000.0)) } else { Value::Null };
-            let source = if has_source { crate::dashboard::db::js(r.s("source")) } else { Value::Null };
+            let duration = if has_duration { r.i("duration").map(|d| d as f64 / 1000.0) } else { None };
+            let source = if has_source { r.s("source").map(str::to_string) } else { None };
+            let row = crate::obj! {
+                "type" => singular, "id" => r.i("id"), "offset" => jf(offset), "duration" => duration.map_or(Value::Null, jf),
+                "label" => label, "stage" => r.s("execution_stage"), "source" => source.clone(),
+            };
             entries.push((
                 offset,
-                crate::obj! {
-                    "type" => singular, "id" => r.i("id"), "offset" => jf(offset), "duration" => duration,
-                    "label" => label, "stage" => r.s("execution_stage"), "source" => source,
+                mcp_summary::Entry {
+                    kind: singular,
+                    offset,
+                    duration,
+                    group_hash: r.s("group_hash").map(str::to_string),
+                    sql: (table == "queries").then(|| r.s("resolved_sql").unwrap_or("").to_string()),
+                    source,
+                    row,
                 },
             ));
         }
     }
     let sorted = rb::sort_by_num(entries, |(o, _)| rb::Num::F(*o));
-    Ok(Value::Array(sorted.into_iter().map(|(_, v)| v).collect()))
+    Ok(sorted.into_iter().map(|(_, e)| e).collect())
+}
+
+/// Timeline rows per page by default, and at most.
+const TIMELINE_PAGE: i64 = 25;
+const TIMELINE_PAGE_MAX: i64 = 200;
+
+/// One page of the timeline (`timeline_offset`, `timeline_limit`, and
+/// `timeline_type` to keep one record type), and where the next one starts.
+fn timeline_page(entries: &[mcp_summary::Entry], a: &Args) -> R<(Value, Value)> {
+    let offset = to_i(a.get("timeline_offset"))?.max(0) as usize;
+    let limit = clamp(a.get("timeline_limit"), TIMELINE_PAGE, TIMELINE_PAGE_MAX)? as usize;
+    let wanted = a.presence("timeline_type");
+    let matching: Vec<&mcp_summary::Entry> = entries.iter().filter(|e| wanted.as_deref().is_none_or(|t| e.kind == t)).collect();
+    let rows: Vec<Value> = matching.iter().skip(offset).take(limit).map(|e| e.row.clone()).collect();
+    let next = offset + rows.len();
+    let more = next < matching.len();
+    let mut page = crate::obj! {
+        "offset" => offset, "returned" => rows.len(), "total" => matching.len(),
+        "next_offset" => if more { Value::from(next) } else { Value::Null },
+    };
+    if let Some(t) = &wanted {
+        db::merge_into(&mut page, "type", Value::from(t.clone()));
+    }
+    if more {
+        db::merge_into(
+            &mut page,
+            "hint",
+            Value::from(format!(
+                "{} more rows. Pass timeline_offset: {next} for the next page (timeline_limit up to {TIMELINE_PAGE_MAX}), or timeline_type (query, transaction, view_render, log, ...) for one kind of record. summary already lists the slowest rows and the repeated queries.",
+                matching.len() - next
+            )),
+        );
+    }
+    Ok((Value::Array(rows), page))
+}
+
+/// The newest execution of `kinds` whose path, route or name contains
+/// `path`, at or after `since` when given. One lookup per kind, so each walks
+/// the (kind, occurred_at) index backwards and stops at its first match.
+fn newest_execution(conn: &Connection, kinds: &[&str], path: Option<&str>, since: Option<&str>) -> rusqlite::Result<Option<Rec>> {
+    let mut best: Option<Rec> = None;
+    for kind in kinds {
+        let mut sql = String::from("SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"kind\" = ?");
+        let mut binds: Vec<rusqlite::types::Value> = vec![kind.to_string().into()];
+        if let Some(since) = since {
+            sql.push_str(" AND \"executions\".\"occurred_at\" >= ?");
+            binds.push(since.to_string().into());
+        }
+        if let Some(p) = path {
+            let like = format!("%{}%", p.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            sql.push_str(
+                " AND (\"executions\".\"name\" LIKE ? ESCAPE '\\' OR \"executions\".\"route\" LIKE ? ESCAPE '\\' \
+                 OR json_extract(\"executions\".\"detail\", '$.path') LIKE ? ESCAPE '\\')",
+            );
+            binds.extend([like.clone().into(), like.clone().into(), like.into()]);
+        }
+        sql.push_str(" ORDER BY \"executions\".\"occurred_at\" DESC, \"executions\".\"id\" DESC LIMIT 1");
+        if let Some(r) = db::query_one(conn, &sql, params_from_iter(binds))?
+            && best.as_ref().is_none_or(|b| r.t("occurred_at") > b.t("occurred_at"))
+        {
+            best = Some(r);
+        }
+    }
+    Ok(best)
+}
+
+/// The dashboard page of one execution, as the frontend's executionPath
+/// builds it.
+fn execution_path(app: i64, env: i64, kind: Option<&str>, execution_id: &str) -> String {
+    let section = match kind {
+        Some("request") => "requests",
+        Some("job" | "job_attempt") => "jobs",
+        Some("scheduled_task") => "scheduled_tasks",
+        Some("command") => "commands",
+        _ => "executions",
+    };
+    format!("/apps/{app}/envs/{env}/{section}/{}", segment(execution_id))
+}
+
+/// A path segment, percent-encoded (tenant names and deploy versions are
+/// whatever the app sent).
+fn segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// What to do when a tool's result is over the cap.
+fn narrow_hint(tool: &str) -> &'static str {
+    match tool {
+        "get_execution" | "last_execution" => {
+            "Read summary first. Page the timeline with timeline_offset/timeline_limit, or keep one record type with timeline_type."
+        }
+        "get_issue" => {
+            "Frames are collapsed unless frames: \"all\" was passed; omit it. Read the in-app frames, then get_execution on the occurrence's execution_id."
+        }
+        "search_telemetry" | "search_logs" => {
+            "Pass a smaller limit, a narrower window, or more filters in q (e.g. level:error, source:app/models/order.rb). meta.next_cursor pages on."
+        }
+        "search_requests" => "Pass a smaller limit or a narrower q (route:, status:, min_ms:) or window.",
+        "web_vitals" => "Pass a smaller limit, or component to read one component.",
+        "release_health" => "Pass a narrower window.",
+        "get_route" => "Pass a narrower window.",
+        "get_profile" => "Pass a smaller limit.",
+        _ => "Pass a smaller limit or a narrower window.",
+    }
 }
 
 fn has_column(table: &str, col: &str) -> bool {
@@ -2167,7 +2595,7 @@ impl Mcp<'_> {
         for app in self.accessible_applications()? {
             let mut envs = self.environments_of(app.id)?;
             envs.sort_by(|a, b| a.0.cmp(&b.0));
-            for (env, _) in envs {
+            for (env, _, _) in envs {
                 list.push(json!({"uri": format!("railwatch://applications/{}/{}/environments/{env}/summary", app.account_slug, app.slug),
                     "name": format!("{} / {env} summary", app.name),
                     "description": "Request and job volume, p95, error rate, open issues, and last-seen time over the last 24 hours.",
@@ -2372,5 +2800,507 @@ mod tests {
         assert_eq!(post(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":null}"#).1["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(post(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).0, StatusCode::OK);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Agent-facing behaviour, over a seeded environment -------------------
+
+    const NOW: i64 = 1_792_000_000_000_000;
+
+    struct Seeded {
+        dir: std::path::PathBuf,
+        c: Control,
+        tenants: crate::tenants::Tenants,
+        readers: crate::dashboard::pool::ReadPools,
+        key: CursorKey,
+        token: String,
+        app: i64,
+        env: i64,
+        slug: String,
+    }
+
+    impl Drop for Seeded {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    use crate::control::{Control, create_account, create_environment, insert_application, insert_user, issue_api_token, test_password};
+
+    /// One account, one application ("shop"), one environment, and a token
+    /// that sees only them: what an embedded server looks like.
+    fn seeded(name: &str) -> Seeded {
+        let dir = std::env::temp_dir().join(format!("rw-mcp-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("telemetry")).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let ada = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
+        let account = c.tx(|tx| create_account(tx, "Acme", ada)).unwrap();
+        let app = c.tx(|tx| insert_application(tx, account, "Shop", "shop", "SHOP", None, "main")).unwrap();
+        let (env, _) = c.tx(|tx| create_environment(tx, app, "development")).unwrap();
+        let slug: String = c.with(|x| x.query_row("SELECT slug FROM environments WHERE id = ?", [env], |r| r.get(0))).unwrap();
+        let scopes: Vec<String> = ["mcp", "read", "write"].iter().map(|s| s.to_string()).collect();
+        let (_, token) = c.tx(|tx| issue_api_token(tx, ada, "t", &scopes, None, None, None)).unwrap();
+        let (followups, _rx) = crate::followups::channel();
+        let tenants = crate::tenants::Tenants::new(dir.join("telemetry"), std::time::Duration::from_secs(60), followups);
+        let readers = crate::dashboard::pool::ReadPools::new(dir.join("telemetry"), 1);
+        Seeded { dir, c, tenants, readers, key: CursorKey(b"k".to_vec()), token, app, env, slug }
+    }
+
+    impl Seeded {
+        fn tenant(&self) -> Connection {
+            crate::tenants::open_tenant(&self.dir.join("telemetry").join(format!("{}.sqlite3", self.slug))).unwrap()
+        }
+
+        fn rpc(&self, base: &str, body: Value) -> Value {
+            let env = Env { control: &self.c, tenants: &self.tenants, readers: &self.readers, cursor_key: &self.key };
+            let (status, v) = call_at(&env, base, NOW, Some(&format!("Bearer {}", self.token)), &Bytes::from(body.to_string()));
+            assert_eq!(status, StatusCode::OK, "{v}");
+            v
+        }
+
+        /// A tool's result text, as the client gets it.
+        fn text(&self, name: &str, args: Value) -> String {
+            let v = self.rpc(
+                "https://rw.example.com/railwatch",
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}),
+            );
+            v["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{name}: {v}")).to_string()
+        }
+
+        fn tool(&self, name: &str, args: Value) -> Value {
+            serde_json::from_str(&self.text(name, args)).unwrap()
+        }
+    }
+
+    /// An execution shaped like the production invoicing request: 3.67 s,
+    /// twelve commits holding most of it, 826 queries in 77 shapes (one run
+    /// 60 times from one line), an N+1 on it, and a warning.
+    fn seed_invoicing(conn: &Connection, eid: &str, at: i64) {
+        let t = |ms: f64| qt(at + (ms * 1000.0) as i64);
+        conn.execute(
+            "INSERT INTO executions (execution_id, kind, name, route, group_hash, status, occurred_at, duration, detail)
+             VALUES (?1, 'request', 'GET /:org_slug/invoicing(.:format)', '/:org_slug/invoicing(.:format)', 'route_invoicing', 200, ?2, 3669559, ?3)",
+            params![eid, qt(at), json!({"path": "/acme/invoicing"}).to_string()],
+        )
+        .unwrap();
+        let mut offset = 200.0;
+        for i in 0..12 {
+            let d = if i < 5 { 400.0 } else { 120.0 };
+            conn.execute(
+                "INSERT INTO transactions (execution_id, occurred_at, duration, outcome) VALUES (?1, ?2, ?3, 'commit')",
+                params![eid, t(offset), (d * 1000.0) as i64],
+            )
+            .unwrap();
+            offset += d + 5.0;
+        }
+        let q = |n: usize, sql: &str, group: &str, source: &str, start: f64| {
+            for k in 0..n {
+                conn.execute(
+                    "INSERT INTO queries (execution_id, occurred_at, duration, sql, group_hash, source) VALUES (?1, ?2, 100, ?3, ?4, ?5)",
+                    params![eid, t(start + k as f64 * 2.0), sql, group, source],
+                )
+                .unwrap();
+            }
+        };
+        q(
+            60,
+            "SELECT \"car_invoices\".* FROM \"car_invoices\" WHERE \"car_invoices\".\"customer_id\" = ?",
+            "g_invoices",
+            "app/services/billing/customer_documents.rb:511",
+            210.0,
+        );
+        for shape in 0..76 {
+            let n = if shape < 70 { 10 } else { 11 };
+            q(
+                n,
+                &format!("SELECT \"t{shape}\".* FROM \"t{shape}\" WHERE \"t{shape}\".\"id\" = ?"),
+                &format!("g{shape:02}"),
+                &format!("app/models/m{shape}.rb:{shape}"),
+                300.0 + shape as f64 * 40.0,
+            );
+        }
+        conn.execute(
+            "INSERT INTO n_plus_ones (execution_id, occurred_at, count, sql, group_hash, source) VALUES (?1, ?2, 5, ?3, 'g_invoices', 'app/services/billing/customer_documents.rb:511')",
+            params![eid, t(220.0), "SELECT \"car_invoices\".* FROM \"car_invoices\" WHERE \"car_invoices\".\"customer_id\" = ?"],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO logs (execution_id, occurred_at, level, message) VALUES (?1, ?2, 'warn', 'slow invoice sync')", params![eid, t(3000.0)])
+            .unwrap();
+        conn.execute("INSERT INTO logs (execution_id, occurred_at, level, message) VALUES (?1, ?2, 'info', 'Completed 200 OK')", params![eid, t(3660.0)])
+            .unwrap();
+    }
+
+    #[test]
+    fn get_execution_leads_with_where_the_time_went() {
+        let f = seeded("summary");
+        seed_invoicing(&f.tenant(), "e-invoicing", NOW - 60_000_000);
+        // No application or environment: the token sees one of each.
+        let v = f.tool("get_execution", json!({"execution_id": "e-invoicing"}));
+        let s = &v["summary"];
+        assert_eq!(s["counts"]["query"], 826);
+        assert_eq!(s["counts"]["transaction"], 12);
+        assert_eq!(s["distinct_query_shapes"], 77);
+        assert_eq!(s["time_ms"]["sql"].as_f64(), Some(82.6));
+        assert_eq!(s["time_ms"]["transactions"].as_f64(), Some(2840.0));
+        assert!(s["time_ms"]["untracked"].as_f64().unwrap() > 700.0, "{}", s["time_ms"]);
+
+        let top = &s["repeated_queries"][0];
+        assert_eq!(top["count"], 60);
+        assert_eq!(top["source"], "app/services/billing/customer_documents.rb:511");
+        assert_eq!(top["total_ms"].as_f64(), Some(6.0));
+        assert_eq!(s["n_plus_ones"][0]["repeats"], 60);
+        assert_eq!(s["n_plus_ones"][0]["fix"], "Customer.includes(:car_invoices)");
+        assert_eq!(s["slowest"][0]["type"], "transaction");
+        assert_eq!(s["slowest"][0]["duration"].as_f64(), Some(400.0));
+        assert_eq!(s["warnings"], json!([{"level": "warn", "message": "slow invoice sync", "source": null}]));
+        let notes = s["notes"].to_string();
+        assert!(notes.contains("12 database transaction(s)") && notes.contains("RAILWATCH_PROFILE_SLOW_MS"), "{notes}");
+
+        // The timeline is one page, with the way to the rest.
+        assert_eq!(v["timeline"].as_array().unwrap().len(), 25);
+        assert_eq!(v["timeline_page"]["total"], 840);
+        assert_eq!(v["timeline_page"]["next_offset"], 25);
+        assert!(v["timeline_page"]["hint"].as_str().unwrap().contains("timeline_offset: 25"));
+        assert_eq!(v["path"], "/acme/invoicing");
+        assert_eq!(v["url"], format!("https://rw.example.com/railwatch/apps/{}/envs/{}/requests/e-invoicing", f.app, f.env));
+        // The production response for this request was 224 KB.
+        let bytes = f.text("get_execution", json!({"execution_id": "e-invoicing"})).len();
+        assert!(bytes < 20_000, "{bytes} bytes");
+
+        // Paging reaches every row, in offset order, and filters by type.
+        let mut seen = 0;
+        let mut offset = 0;
+        let mut last_offset = f64::MIN;
+        while let Some(o) = Some(offset) {
+            let p = f.tool("get_execution", json!({"execution_id": "e-invoicing", "timeline_offset": o, "timeline_limit": 200}));
+            for r in p["timeline"].as_array().unwrap() {
+                let at = r["offset"].as_f64().unwrap();
+                assert!(at >= last_offset);
+                last_offset = at;
+                seen += 1;
+            }
+            match p["timeline_page"]["next_offset"].as_u64() {
+                Some(n) => offset = n,
+                None => break,
+            }
+        }
+        assert_eq!(seen, 840);
+        let tx = f.tool("get_execution", json!({"execution_id": "e-invoicing", "timeline_type": "transaction"}));
+        assert_eq!((tx["timeline"].as_array().unwrap().len(), tx["timeline_page"]["total"].as_u64()), (12, Some(12)));
+        assert!(tx["timeline_page"]["next_offset"].is_null() && tx["timeline_page"].get("hint").is_none());
+    }
+
+    #[test]
+    fn last_execution_finds_the_newest_by_path_and_kind() {
+        let f = seeded("last");
+        let conn = f.tenant();
+        let empty = f.tool("last_execution", json!({}));
+        assert!(empty["error"].as_str().unwrap().starts_with("no executions in shop/development"), "{empty}");
+        assert!(empty["hint"].as_str().unwrap().contains("RAILWATCH_FLUSH_INTERVAL"));
+
+        seed_invoicing(&conn, "e-old-invoicing", NOW - 3_600_000_000);
+        let insert = |eid: &str, kind: &str, name: &str, path: Option<&str>, ago_s: i64| {
+            let detail = path.map_or_else(|| "{}".to_string(), |p| json!({"path": p}).to_string());
+            conn.execute(
+                "INSERT INTO executions (execution_id, kind, name, occurred_at, duration, detail) VALUES (?1, ?2, ?3, ?4, 5000, ?5)",
+                params![eid, kind, name, qt(NOW - ago_s * 1_000_000), detail],
+            )
+            .unwrap();
+        };
+        insert("e-checkout", "request", "POST /checkout", Some("/checkout"), 30);
+        insert("e-job", "job_attempt", "InvoiceSyncJob", None, 20);
+        insert("e-home", "request", "GET /", Some("/"), 10);
+
+        assert_eq!(f.tool("last_execution", json!({}))["execution_id"], "e-home");
+        assert_eq!(f.tool("last_execution", json!({"kind": "job"}))["execution_id"], "e-job");
+        assert_eq!(f.tool("last_execution", json!({"kind": "request", "path": "/checkout"}))["execution_id"], "e-checkout");
+        // A path matches the request path as well as the route pattern.
+        let inv = f.tool("last_execution", json!({"path": "/acme/invoicing"}));
+        assert_eq!(inv["execution_id"], "e-old-invoicing");
+        assert_eq!(inv["summary"]["n_plus_ones"][0]["source"], "app/services/billing/customer_documents.rb:511", "the dev loop's answer in one call");
+        assert_eq!(
+            f.tool("last_execution", json!({"path": "InvoiceSync"}))["url"],
+            format!("https://rw.example.com/railwatch/apps/{}/envs/{}/jobs/e-job", f.app, f.env)
+        );
+        // LIKE wildcards in the path are literal.
+        assert!(
+            f.tool("last_execution", json!({"path": "/c%t"}))["error"].as_str().unwrap().contains("no request or job matching \"/c%t\" in the last 24 hours")
+        );
+        assert_eq!(f.tool("last_execution", json!({"kind": "mail"}))["error"], "kind must be request, job, or any");
+    }
+
+    #[test]
+    fn application_and_environment_default_only_when_unambiguous() {
+        let f = seeded("defaults");
+        f.tenant()
+            .execute(
+                "INSERT INTO executions (execution_id, kind, name, occurred_at, duration) VALUES ('e1', 'request', 'GET /', ?1, 1000)",
+                [qt(NOW - 1_000_000)],
+            )
+            .unwrap();
+        // Passing them still works, by name or by slug.
+        assert_eq!(f.tool("get_execution", json!({"application_slug": "shop", "environment": "development", "execution_id": "e1"}))["name"], "GET /");
+        assert_eq!(f.tool("get_execution", json!({"application_slug": "shop", "environment": f.slug, "execution_id": "e1"}))["name"], "GET /");
+        let wrong = f.tool("get_execution", json!({"environment": "staging", "execution_id": "e1"}));
+        assert_eq!(wrong["error"], "environment not found");
+        assert_eq!(wrong["hint"], "shop has no environment \"staging\": pass one of development.");
+        assert_eq!(wrong["available"][0]["environments"], json!(["development"]));
+
+        // A second environment: environment is required again; the app is not.
+        f.c.tx(|tx| create_environment(tx, f.app, "production")).unwrap();
+        let two = f.tool("search_requests", json!({}));
+        assert_eq!(two["hint"], "shop has more than one environment: pass environment, one of development, production.");
+        assert_eq!(f.tool("search_requests", json!({"environment": "development"}))[0]["execution_id"], "e1");
+
+        // A second application: the slug is required.
+        let account: i64 = f.c.with(|x| x.query_row("SELECT account_id FROM applications WHERE id = ?", [f.app], |r| r.get(0))).unwrap();
+        f.c.tx(|tx| insert_application(tx, account, "Admin", "admin", "ADM", None, "main")).unwrap();
+        let apps = f.tool("search_requests", json!({"environment": "development"}));
+        assert!(apps["hint"].as_str().unwrap().starts_with("This token can see more than one application"), "{apps}");
+        assert_eq!(apps["available"].as_array().unwrap().len(), 2);
+        assert_eq!(f.tool("search_requests", json!({"application_slug": "shop", "environment": "development"}))[0]["execution_id"], "e1");
+    }
+
+    /// An exception issue whose sample is its latest occurrence, raised
+    /// through 45 framework frames.
+    fn seed_exception_issue(f: &Seeded) -> i64 {
+        let mut frames = vec![
+            json!({"file": "/usr/local/bundle/ruby/3.4.0/gems/cloudflare-email-0.4.2/lib/cloudflare/email/client.rb", "line": 163, "function": "Cloudflare::Email::Client#request", "in_app": false}),
+            json!({"file": "app/services/outbound_email/cloudflare_feedback_consumer.rb", "line": 41, "function": "poll", "in_app": true, "code": {"41": "count = @client.poll(batch_size: 1) do |event|"}}),
+            json!({"file": "app/jobs/outbound_email_feedback_job.rb", "line": 9, "function": "perform", "in_app": true}),
+        ];
+        for i in 0..45 {
+            let gem = ["activejob-8.1.4", "activesupport-8.1.4", "solid_queue-1.7.0"][i % 3];
+            frames
+                .push(json!({"file": format!("/usr/local/bundle/ruby/3.4.0/gems/{gem}/lib/x{i}.rb"), "line": i, "function": format!("f{i}"), "in_app": false}));
+        }
+        let conn = f.tenant();
+        conn.execute(
+            "INSERT INTO executions (execution_id, kind, name, occurred_at, duration) VALUES ('e-job', 'job_attempt', 'OutboundEmailFeedbackJob', ?1, 1000)",
+            [qt(NOW - 3_600_000_000)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO exceptions (id, class_name, message, occurred_at, group_hash, frames, execution_id, execution_source)
+             VALUES (55, 'Cloudflare::Email::NetworkError', 'provider response could not be read', ?1, 'gx', ?2, 'e-job', 'job')",
+            params![qt(NOW - 3_600_000_000), Value::Array(frames).to_string()],
+        )
+        .unwrap();
+        f.c.with(|x| {
+            x.execute(
+                "INSERT INTO issues (application_id, environment_id, number, title, kind, status, group_hash, occurrences, affected_users,
+                   first_seen_at, last_seen_at, created_at, updated_at, sample)
+                 VALUES (?1, ?2, 79, 'Cloudflare::Email::NetworkError', 'exception', 'open', 'gx', 3, 0, ?3, ?3, ?3, ?3, ?4)",
+                params![f.app, f.env, qt(NOW - 3_600_000_000), json!({"exception_id": 55, "execution_id": "e-job"}).to_string()],
+            )?;
+            Ok(x.last_insert_rowid())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn get_issue_prints_one_occurrence_and_collapses_framework_frames() {
+        let f = seeded("issue");
+        let id = seed_exception_issue(&f);
+        let v = f.tool("get_issue", json!({"key": "SHOP-79"}));
+        assert_eq!(v["url"], format!("https://rw.example.com/railwatch/issues/{id}"));
+        let o = &v["sample_occurrence"];
+        assert_eq!(o["id"], 55);
+        assert_eq!(o["execution_url"], format!("https://rw.example.com/railwatch/apps/{}/envs/{}/jobs/e-job", f.app, f.env));
+        assert_eq!(v["last_occurrence"], json!({"id": 55, "same_as": "sample_occurrence"}));
+        let frames = o["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 4, "{frames:?}");
+        assert_eq!(frames[0]["function"], "Cloudflare::Email::Client#request", "the raising frame stays");
+        assert_eq!(frames[1]["code"]["41"], "count = @client.poll(batch_size: 1) do |event|", "in-app frames keep their code");
+        assert_eq!(frames[3], json!({"omitted_frames": 45, "gems": ["activejob", "activesupport", "solid_queue"]}));
+        // frames: all is the stored backtrace.
+        let all = f.tool("get_issue", json!({"key": "SHOP-79", "frames": "all"}));
+        assert_eq!(all["sample_occurrence"]["frames"].as_array().unwrap().len(), 48);
+        // A newer occurrence is printed too.
+        f.tenant()
+            .execute(
+                "INSERT INTO exceptions (id, class_name, message, occurred_at, group_hash, frames) VALUES (56, 'X', 'y', ?1, 'gx', '[]')",
+                [qt(NOW - 60_000_000)],
+            )
+            .unwrap();
+        let two = f.tool("get_issue", json!({"key": "SHOP-79"}));
+        assert_eq!((two["sample_occurrence"]["id"].as_i64(), two["last_occurrence"]["id"].as_i64()), (Some(55), Some(56)));
+        assert!(two["last_occurrence"].get("same_as").is_none());
+        let missing = f.tool("get_issue", json!({"key": "SHOP-999"}));
+        assert!(missing["hint"].as_str().unwrap().contains("list_issues"));
+    }
+
+    #[test]
+    fn list_slow_routes_ranks_by_total_time_unless_asked() {
+        let f = seeded("routes");
+        let conn = f.tenant();
+        let bucket = qt(rb::beginning_of_hour(NOW - 3_600_000_000));
+        // Hit 4 times at 3 s; hit 28,000 times at 40 ms.
+        for (g, name, count, sum, p95) in [("rare", "GET /reports", 4, 12_000_000i64, 3_500_000), ("hot", "POST /ingest", 28_000, 1_120_000_000, 90_000)] {
+            conn.execute(
+                "INSERT INTO rollups (record_type, group_hash, name, bucket, count, duration_sum, p95) VALUES ('request', ?1, ?2, ?3, ?4, ?5, ?6)",
+                params![g, name, bucket, count, sum, p95],
+            )
+            .unwrap();
+        }
+        let by_total = f.tool("list_slow_routes", json!({}));
+        assert_eq!(by_total[0]["route"], "POST /ingest");
+        assert_eq!((by_total[0]["total_ms"].as_f64(), by_total[0]["avg_ms"].as_f64()), (Some(1_120_000.0), Some(40.0)));
+        assert_eq!(by_total[0]["url"], format!("https://rw.example.com/railwatch/apps/{}/envs/{}/requests/routes/hot", f.app, f.env));
+        assert_eq!(f.tool("list_slow_routes", json!({"sort": "avg"}))[0]["route"], "GET /reports");
+        assert_eq!(
+            f.tool("list_slow_routes", json!({"sort": "p95", "window": "7d"}))[0]["url"].as_str().map(|u| u.ends_with("/routes/rare?window=7d")),
+            Some(true)
+        );
+        assert_eq!(f.tool("list_slow_routes", json!({"sort": "count"}))["error"], "sort must be total, avg, or p95");
+    }
+
+    #[test]
+    fn list_issues_sort_impact_weighs_occurrences_by_recency() {
+        let f = seeded("impact");
+        let issue = |n: i64, occurrences: i64, days_ago: i64| {
+            let at = qt(NOW - days_ago * 86_400_000_000);
+            f.c.with(|x| {
+                x.execute(
+                    "INSERT INTO issues (application_id, environment_id, number, title, kind, status, group_hash, occurrences, affected_users,
+                       first_seen_at, last_seen_at, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'E' || ?3, 'exception', 'open', 'g' || ?3, ?4, 0, ?5, ?5, ?5, ?5)",
+                    params![f.app, f.env, n, occurrences, at],
+                )
+            })
+            .unwrap();
+        };
+        issue(1, 1, 0); // a one-off, just now
+        issue(2, 300, 0); // frequent and current
+        issue(3, 400, 30); // frequent a month ago
+        issue(4, 20, 1); // steady
+        let keys = |v: Value| v.as_array().unwrap().iter().map(|i| i["key"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        // Default: newest first, as before.
+        assert_eq!(keys(f.tool("list_issues", json!({})))[..2], ["SHOP-1", "SHOP-2"]);
+        let impact = f.tool("list_issues", json!({"sort": "impact"}));
+        assert_eq!(keys(impact.clone()), ["SHOP-2", "SHOP-3", "SHOP-4", "SHOP-1"]);
+        assert_eq!(impact[0]["impact"].as_f64(), Some(300.0));
+        assert_eq!(impact[1]["impact"].as_f64(), Some(12.9));
+        assert_eq!(f.tool("list_issues", json!({"sort": "loud"}))["error"], "sort must be recent or impact");
+    }
+
+    #[test]
+    fn missing_profiles_and_plans_name_the_setting() {
+        let f = seeded("hints");
+        let p = f.tool("get_profile", json!({"execution_id": "nope"}));
+        assert_eq!(p["error"], "profile not found");
+        let hint = p["hint"].as_str().unwrap();
+        assert!(hint.contains("RAILWATCH_PROFILE_SAMPLE_RATE") && hint.contains("RAILWATCH_PROFILE_SLOW_MS") && hint.contains("vernier"), "{hint}");
+        f.tenant()
+            .execute(
+                "INSERT INTO queries (occurred_at, duration, sql, group_hash, source) VALUES (?1, 250000, 'SELECT 1', 'gq', 'app/x.rb:1')",
+                [qt(NOW - 60_000_000)],
+            )
+            .unwrap();
+        let q = f.tool("explain_query", json!({"group_hash": "gq"}));
+        assert!(q["explain"].is_null() && q["hint"].as_str().unwrap().contains("RAILWATCH_CAPTURE_QUERY_EXPLAIN"), "{q}");
+        assert_eq!(q["url"], format!("https://rw.example.com/railwatch/apps/{}/envs/{}/queries/gq", f.app, f.env));
+    }
+
+    #[test]
+    fn urls_are_paths_without_a_base_and_encode_what_the_app_sent() {
+        let f = seeded("paths");
+        f.tenant()
+            .execute(
+                "INSERT INTO executions (execution_id, kind, name, occurred_at, duration) VALUES ('a b/c', 'command', 'rake x', ?1, 1)",
+                [qt(NOW - 1_000_000)],
+            )
+            .unwrap();
+        let v = f.rpc("", json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "last_execution", "arguments": {}}}));
+        let v: Value = serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["url"], format!("/apps/{}/envs/{}/commands/a%20b%2Fc", f.app, f.env));
+        let apps = f.tool("list_applications", json!({}));
+        assert_eq!(apps[0]["environments"][0]["url"], format!("https://rw.example.com/railwatch/apps/{}/envs/{}", f.app, f.env));
+    }
+
+    /// No tool's result is bigger than the cap, however much data the
+    /// environment holds: each one is called on an environment seeded past
+    /// it, and must still return valid JSON.
+    #[test]
+    fn no_tool_result_exceeds_the_cap() {
+        let f = seeded("cap");
+        let id = seed_exception_issue(&f);
+        let conn = f.tenant();
+        conn.execute_batch("BEGIN").unwrap();
+        // One huge execution: 5,000 queries with long SQL and 2 KB logs.
+        conn.execute(
+            "INSERT INTO executions (execution_id, kind, name, group_hash, status, occurred_at, duration) VALUES ('big', 'request', 'GET /big', 'gbig', 200, ?1, 9000000)",
+            [qt(NOW - 60_000_000)],
+        )
+        .unwrap();
+        for i in 0..5_000 {
+            let sql = format!("SELECT {} FROM wide_{i}", "col, ".repeat(80));
+            conn.execute(
+                "INSERT INTO queries (execution_id, occurred_at, duration, sql, group_hash, source) VALUES ('big', ?1, ?2, ?3, ?4, 'app/x.rb:1')",
+                params![qt(NOW - 60_000_000 + i), 1000 + i, sql, format!("g{i}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO logs (execution_id, occurred_at, level, message) VALUES ('big', ?1, 'error', ?2)",
+                params![qt(NOW - 60_000_000 + i), "x".repeat(2_000)],
+            )
+            .unwrap();
+        }
+        // Many requests, routes and tenants.
+        for i in 0..300i64 {
+            conn.execute(
+                "INSERT INTO executions (execution_id, kind, name, group_hash, status, occurred_at, duration, app_tenant, method)
+                 VALUES (?1, 'request', ?2, ?3, 200, ?4, 5000, ?5, 'GET')",
+                params![
+                    format!("r{i}"),
+                    format!("GET /{}", "p".repeat(200 + i as usize)),
+                    format!("gr{i}"),
+                    qt(NOW - 120_000_000 - i),
+                    format!("tenant-{i}-{}", "t".repeat(200))
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        for h in crate::rollup::rollup_job::hours_with_rows(&conn).unwrap() {
+            crate::rollup::rollup_job::perform(&conn, &conn, h, &mut crate::rollup::rollup_job::Rng::PerGroup).unwrap();
+        }
+
+        let generous: Map<String, Value> = [
+            ("execution_id", json!("big")),
+            ("timeline_limit", json!(200)),
+            ("limit", json!(200)),
+            ("q", json!("")),
+            ("resource", json!("logs")),
+            ("route", json!("GET /big")),
+            ("group_hash", json!("g1")),
+            ("key", json!("SHOP-79")),
+            ("issue_id", json!(id)),
+            ("frames", json!("all")),
+            ("window", json!("30d")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let mut over = vec![];
+        for t in &definitions().tools {
+            let name = t["name"].as_str().unwrap();
+            if Mcp::write_tool(name) {
+                continue;
+            }
+            // Every argument the tool takes, at its most generous.
+            let args: Map<String, Value> =
+                t["inputSchema"]["properties"].as_object().unwrap().keys().filter_map(|k| generous.get(k).map(|v| (k.clone(), v.clone()))).collect();
+            let text = f.text(name, Value::Object(args));
+            serde_json::from_str::<Value>(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            if text.len() > mcp_summary::MAX_RESULT_BYTES {
+                over.push((name, text.len()));
+            }
+        }
+        assert!(over.is_empty(), "over the cap: {over:?}");
+        // The cap really was needed, and its marker says how to narrow.
+        let logs = f.tool("search_logs", json!({"q": "", "limit": 200}));
+        assert!(logs["truncated"]["omitted_rows"].is_object(), "{}", logs["truncated"]);
+        assert!(logs["truncated"]["hint"].as_str().unwrap().contains("smaller limit"));
     }
 }

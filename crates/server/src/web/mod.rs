@@ -24,6 +24,7 @@ pub mod integrations;
 pub mod issues;
 pub mod mailer;
 pub mod mcp;
+mod mcp_summary;
 pub mod params;
 pub mod proxy_auth;
 pub mod session;
