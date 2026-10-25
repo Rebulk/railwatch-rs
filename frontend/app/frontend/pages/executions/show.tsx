@@ -66,6 +66,7 @@ interface Attachment {
   occurred_at: string
 }
 interface Props {
+  recorded_children: number | null
   execution: Execution
   timeline: TimelineEntry[]
   exceptions: ExceptionDetail[]
@@ -211,7 +212,7 @@ function markdownReport(p: Props, x: Execution) {
   if (dropped) {
     lines.push("")
     lines.push(
-      `> ${truncationNotice(p.timeline.length, dropped, droppedBytes(x))}`,
+      `> ${truncationNotice(p.recorded_children ?? p.timeline.length, dropped, droppedBytes(x))}`,
     )
   }
   if (p.exceptions.length > 0) {
@@ -391,7 +392,7 @@ export default function ExecutionShow(p: Props) {
           <AlertTriangle className="text-warning mt-0.5 size-4 shrink-0" />
           <span>
             {truncationNotice(
-              p.timeline.length,
+              p.recorded_children ?? p.timeline.length,
               droppedRecords(x),
               droppedBytes(x),
             )}
