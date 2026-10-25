@@ -345,7 +345,7 @@
     },
     {
       "name": "get_execution",
-      "description": "One execution (request, job attempt, scheduled task run, command, or Action Cable channel action) with its full child timeline: every query, cache read, log line, outgoing request, view render, and exception, each with an offset in milliseconds from the start of the execution.",
+      "description": "One execution (request, job attempt, scheduled task run, command, or Action Cable channel action) with its full child timeline: every query, cache read, log line, outgoing request, view render, and exception, each with an offset in milliseconds from the start of the execution. When the app's per-execution buffer overflowed, dropped_records and dropped_bytes say how many child records after the earliest ones are missing from the timeline.",
       "inputSchema": {
         "type": "object",
         "properties": {

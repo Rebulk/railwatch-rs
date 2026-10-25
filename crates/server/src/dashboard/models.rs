@@ -21,7 +21,12 @@ pub fn execution_row(r: &Rec) -> Value {
     let extra = match kind {
         "request" => crate::obj! {
             "method" => js(r.s("method")), "inertia_component" => js(r.s("inertia_component")),
-            "queries" => r.json("counters").get("queries").cloned().unwrap_or(Value::Null),
+            // The gem sends only the counters that fired: no "queries" key is
+            // a request that ran none. A row with no counters at all is still nil.
+            "queries" => match r.json("counters") {
+                Value::Object(c) => c.get("queries").cloned().unwrap_or(Value::from(0)),
+                _ => Value::Null,
+            },
         },
         "job_attempt" => crate::obj! {
             "queue" => js(r.s("queue")), "attempt" => ji(r.i("attempt")), "job_id" => js(r.s("job_id")),
@@ -157,4 +162,25 @@ pub fn rows_with_identity(conn: &Connection, rows: &[Rec]) -> rusqlite::Result<V
             )
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_with_counters(counters: Option<&str>) -> Rec {
+        let conn = Connection::open_in_memory().unwrap();
+        db::query(&conn, "SELECT 'request' AS kind, ?1 AS counters", [counters]).unwrap().remove(0)
+    }
+
+    // railwatch 1.2 leaves zero counters off the wire, so a request that ran
+    // no queries arrives as {"view_renders":1}. The requests list, MCP's
+    // search_requests and get_route, and the API all read this row.
+    #[test]
+    fn a_request_whose_counters_omit_queries_ran_none() {
+        assert_eq!(execution_row(&request_with_counters(Some(r#"{"view_renders":1}"#)))["queries"], 0);
+        assert_eq!(execution_row(&request_with_counters(Some("{}")))["queries"], 0);
+        assert_eq!(execution_row(&request_with_counters(Some(r#"{"queries":3}"#)))["queries"], 3);
+        assert_eq!(execution_row(&request_with_counters(None))["queries"], Value::Null);
+    }
 }
