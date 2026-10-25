@@ -25,6 +25,40 @@ fn children(conn: &Connection, table: &str, select: &str, eid: &str, order: &str
     db::query(conn, &sql, [eid])
 }
 
+/// Every table whose rows are an execution's child records: what the gem's
+/// per-execution buffer holds, so what its dropped_records is counted against.
+const CHILD_TABLES: [&str; 19] = [
+    "attachments",
+    "broadcasts",
+    "cache_events",
+    "deprecations",
+    "enqueued_jobs",
+    "exceptions",
+    "llm_calls",
+    "logs",
+    "mails",
+    "n_plus_ones",
+    "notifications",
+    "outgoing_requests",
+    "profiles",
+    "queries",
+    "spans",
+    "storage_ops",
+    "transactions",
+    "view_renders",
+    "visits",
+];
+
+/// How many child records the execution kept, across every child table.
+/// Only asked for a truncated execution (the notice's "X of Y recorded").
+fn recorded_children(conn: &Connection, eid: &str) -> rusqlite::Result<i64> {
+    let mut n = 0;
+    for t in CHILD_TABLES {
+        n += conn.query_row(&format!("SELECT COUNT(*) FROM \"{t}\" WHERE \"{t}\".\"execution_id\" = ?1"), [eid], |r| r.get::<_, i64>(0))?;
+    }
+    Ok(n)
+}
+
 pub fn props(conn: &Connection, exe: &Rec, ctx: &PageContext, control: &dyn ControlData) -> rusqlite::Result<Value> {
     let eid = exe.s("execution_id").unwrap_or("").to_string();
     let start = exe.t("occurred_at").unwrap_or(0);
@@ -64,6 +98,13 @@ pub fn props(conn: &Connection, exe: &Rec, ctx: &PageContext, control: &dyn Cont
         "trace_id" => js(exe.s("trace_id")), "allocations" => ji(exe.i("allocations")), "peak_memory" => ji(exe.i("peak_memory")),
         "exception_preview" => js(exe.s("exception_preview")), "profiled" => profile.is_some(),
         "stages" => Value::Object(stages), "counters" => exe.json("counters"), "detail" => exe.json("detail"),
+    };
+    // Exact, not the timeline's length: the timeline leaves some child
+    // kinds out (n+1s, deprecations, visits), and the gem's cap counts all.
+    let recorded_children = if exe.json("detail").get("dropped_records").and_then(Value::as_i64).unwrap_or(0) > 0 {
+        Value::from(recorded_children(conn, &eid)?)
+    } else {
+        Value::Null
     };
 
     let timeline = timeline(conn, &eid, start, &exceptions, &attachments)?;
@@ -186,6 +227,7 @@ pub fn props(conn: &Connection, exe: &Rec, ctx: &PageContext, control: &dyn Cont
 
     Ok(crate::obj! {
         "execution" => base,
+        "recorded_children" => recorded_children,
         "timeline" => timeline,
         "exceptions" => exceptions.iter().map(exception_row).collect::<Vec<_>>(),
         "logs" => logs, "queries" => queries, "spans" => spans, "profile" => profile_card,
@@ -478,4 +520,45 @@ pub fn collapsed_capped(stacks: &[u8], limit: usize) -> Result<(String, bool), S
         }
     }
     String::from_utf8(out).map(|s| (s, truncated)).map_err(|_| "decompressed content is not valid UTF-8".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dashboard::control::StaticControl;
+
+    /// The truncation notice's "X of Y" counts every kept child record, not
+    /// just the ones the timeline draws: n+1s, deprecations and visits are
+    /// in the gem's per-execution buffer too.
+    #[test]
+    fn a_truncated_execution_reports_every_kept_child() {
+        let dir = std::env::temp_dir().join(format!("rw-trunc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = crate::tenants::open_tenant(&dir.join("t.sqlite3")).unwrap();
+        let now = 1_792_000_000_000_000;
+        let at = crate::time::iso8601_6(now - 60_000_000);
+        let insert_exec = |eid: &str, detail: &str| {
+            t.execute(
+                "INSERT INTO executions (execution_id, kind, name, occurred_at, duration, detail) VALUES (?1, 'request', 'GET /x', ?2, 1000, ?3)",
+                rusqlite::params![eid, at, detail],
+            )
+            .unwrap();
+        };
+        insert_exec("e1", r#"{"dropped_records":21,"dropped_bytes":55977}"#);
+        insert_exec("e2", "{}");
+        for _ in 0..2 {
+            t.execute("INSERT INTO queries (execution_id, occurred_at, duration, sql, group_hash) VALUES ('e1', ?1, 1000, 'SELECT 1', 'g')", [&at]).unwrap();
+        }
+        t.execute("INSERT INTO n_plus_ones (execution_id, occurred_at, group_hash, sql, count) VALUES ('e1', ?1, 'n', 'SELECT 1', 5)", [&at]).unwrap();
+        t.execute("INSERT INTO deprecations (execution_id, occurred_at, message, group_hash) VALUES ('e1', ?1, 'old', 'd')", [&at]).unwrap();
+        let ctx = PageContext::new(1, now, Default::default(), crate::dashboard::CursorKey(b"k".to_vec()));
+        let exe = |eid: &str| db::query(&t, "SELECT * FROM executions WHERE execution_id = ?1", [eid]).unwrap().remove(0);
+
+        let truncated = props(&t, &exe("e1"), &ctx, &StaticControl::default()).unwrap();
+        assert_eq!(truncated["recorded_children"], 4, "2 queries + 1 n+1 + 1 deprecation");
+        let whole = props(&t, &exe("e2"), &ctx, &StaticControl::default()).unwrap();
+        assert_eq!(whole["recorded_children"], Value::Null, "not counted unless something was dropped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
