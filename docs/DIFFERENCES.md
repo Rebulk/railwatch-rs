@@ -606,9 +606,18 @@ all of it (identical; 130/130).
     after Rails' own, so Rails opens the file with 0 pending migrations, its
     `Visit` model gains four readable attributes, and its mapper writes
     NULL there. A visit record without the fields maps to exactly Rails' row
-    (mapper_vs_ruby is unchanged). Rolling back to an older release leaves
-    the columns in place: it reads and writes the files unchanged, since
-    nothing older names them and the widths still agree.
+    (mapper_vs_ruby is unchanged).
+
+    **Rolling back past this release is roll-forward-only once a day rolls
+    over.** The older release keeps reading the widened files, but it creates
+    each new day file with its own narrower schema, and its reader's views are
+    the same `SELECT *` union: from the first new day file onward, every
+    per-day environment that already holds a widened file fails to read until
+    the widths agree again. Roll forward (the startup sweep widens the narrow
+    files before any reader attaches), or, to stay on the older release, drop
+    the four columns from every widened file
+    (`ALTER TABLE visits DROP COLUMN redirect_ms` and the other three) with
+    the server stopped. Single-file tenants are unaffected either way.
 
 ## Process
 

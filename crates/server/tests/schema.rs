@@ -123,3 +123,42 @@ fn startup_widens_every_day_file_so_the_union_reader_still_reads_old_days() {
     let n: i64 = reader.query_row("SELECT count(*) FROM visits WHERE redirect_ms IS NULL", [], |r| r.get(0)).unwrap();
     assert_eq!(n, 1, "the old day's visit reads through the union, NULL in the new column");
 }
+
+/// A fresh install has no tenants directory yet: that is nothing to do, not
+/// an error that would hide a real failure.
+#[test]
+fn startup_sweep_treats_a_missing_tenants_directory_as_a_fresh_install() {
+    let scratch = Scratch::new("missing");
+    assert_eq!(railwatch_server::tenants::add_missing_columns_everywhere(&scratch.0.join("telemetry")), 0);
+}
+
+/// The layout has only regular files and directories. A symlink to a
+/// tenant file, a tenant directory or a day file outside `tenants_dir` is
+/// skipped, never widened; the regular files beside it still are.
+#[cfg(unix)]
+#[test]
+fn startup_sweep_does_not_follow_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let outside = Scratch::new("outside");
+    old_tenant(&outside.0.join("elsewhere.sqlite3"));
+    let elsewhere_dir = outside.0.join("elsewhere-production");
+    std::fs::create_dir_all(elsewhere_dir.join(Tier::Core.dir())).unwrap();
+    old_tenant(&meta_path(&elsewhere_dir));
+    old_tenant(&outside.0.join("day.sqlite3"));
+
+    let tenants = Scratch::new("symlinks");
+    old_tenant(&tenants.0.join("shop-production.sqlite3"));
+    symlink(outside.0.join("elsewhere.sqlite3"), tenants.0.join("linked-production.sqlite3")).unwrap();
+    symlink(&elsewhere_dir, tenants.0.join("linked-days")).unwrap();
+    let dir = tenants.0.join("days-production");
+    std::fs::create_dir_all(dir.join(Tier::Core.dir())).unwrap();
+    old_tenant(&meta_path(&dir));
+    symlink(outside.0.join("day.sqlite3"), day_path(&dir, Tier::Core, "2026-10-13")).unwrap();
+
+    assert_eq!(railwatch_server::tenants::add_missing_columns_everywhere(&tenants.0), 2, "the single file and the per-day meta");
+    for skipped in [outside.0.join("elsewhere.sqlite3"), meta_path(&elsewhere_dir), outside.0.join("day.sqlite3")] {
+        let cols = visit_columns(&rusqlite::Connection::open(&skipped).unwrap());
+        assert!(!cols.iter().any(|c| c == "redirect_ms"), "{} was reached through a symlink", skipped.display());
+    }
+}

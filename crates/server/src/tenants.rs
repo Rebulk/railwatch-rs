@@ -232,17 +232,21 @@ pub fn open_tenant(path: &Path) -> rusqlite::Result<Connection> {
 /// per-day directory) gets the schema::ADDED_COLUMNS it lacks. Runs once at
 /// startup, before any reader attaches: a union reader's views read every
 /// day file, and one file short a column fails every page of that
-/// environment. Returns the files changed; a file it cannot open is
-/// reported and skipped (its environment's pages fail until it is fixed,
-/// the rest are unaffected).
+/// environment. Returns the files changed.
+///
+/// A missing `tenants_dir` is a fresh install. Any other failure (a
+/// directory or entry it cannot read, a file it cannot open) is logged and
+/// skipped, so that environment's pages fail until it is fixed while the
+/// rest are unaffected; it is never silently passed over. Only regular files
+/// and directories are followed: the layout (storage/layout.rs) has no
+/// symlinks, and following one could widen a file outside `tenants_dir`.
 pub fn add_missing_columns_everywhere(tenants_dir: &Path) -> usize {
     let mut files = Vec::new();
-    for e in std::fs::read_dir(tenants_dir).into_iter().flatten().flatten() {
-        let path = e.path();
-        if path.is_dir() && crate::storage::layout::meta_path(&path).is_file() {
-            files.extend(crate::storage::layout::all_files(&path));
-        } else if path.extension().is_some_and(|x| x == "sqlite3") {
-            files.push(path);
+    for (path, kind) in regular_entries(tenants_dir) {
+        match kind {
+            Kind::Dir => per_day_files(&path, &mut files),
+            Kind::File if path.extension().is_some_and(|x| x == "sqlite3") => files.push(path),
+            Kind::File => {}
         }
     }
     let mut changed = 0;
@@ -258,6 +262,69 @@ pub fn add_missing_columns_everywhere(tenants_dir: &Path) -> usize {
         }
     }
     changed
+}
+
+enum Kind {
+    File,
+    Dir,
+}
+
+/// The regular files and directories directly in `dir`, by `DirEntry::file_type`
+/// (which does not follow symlinks). A missing `dir` is empty; every other
+/// error is logged.
+fn regular_entries(dir: &Path) -> Vec<(PathBuf, Kind)> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::error!(dir = %dir.display(), error = %e, "cannot list tenant files for the new telemetry columns");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::error!(dir = %dir.display(), error = %e, "cannot read a tenant directory entry");
+                continue;
+            }
+        };
+        match entry.file_type() {
+            Ok(t) if t.is_file() => out.push((entry.path(), Kind::File)),
+            Ok(t) if t.is_dir() => out.push((entry.path(), Kind::Dir)),
+            Ok(_) => tracing::warn!(path = %entry.path().display(), "not a regular file or directory: skipped"),
+            Err(e) => tracing::error!(path = %entry.path().display(), error = %e, "cannot read a tenant entry's type"),
+        }
+    }
+    out
+}
+
+/// A per-day tenant directory's meta file and day files, as
+/// storage::layout::all_files lists them, but through regular_entries.
+fn per_day_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let meta = crate::storage::layout::meta_path(dir);
+    match std::fs::symlink_metadata(&meta) {
+        Ok(m) if m.file_type().is_file() => files.push(meta),
+        // Not a per-day tenant (no meta file), or meta is not a regular file.
+        Ok(_) => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::error!(file = %meta.display(), error = %e, "cannot read a tenant's meta file");
+            return;
+        }
+    }
+    for tier in [crate::storage::layout::Tier::Core, crate::storage::layout::Tier::Detail] {
+        let mut days: Vec<PathBuf> = regular_entries(&dir.join(tier.dir()))
+            .into_iter()
+            .filter_map(|(path, kind)| {
+                let day = path.file_name()?.to_str()?.strip_suffix(".sqlite3")?;
+                (matches!(kind, Kind::File) && day.len() == 10 && crate::storage::layout::day_of(day) == Some(day)).then_some(path)
+            })
+            .collect();
+        days.sort();
+        files.extend(days);
+    }
 }
 
 fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Duration, followups: &FollowupSender, disk: &crate::storage::budget::State) {
