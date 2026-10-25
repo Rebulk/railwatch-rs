@@ -280,6 +280,72 @@ async fn mounted_under_a_base_path_behind_a_trusted_proxy() {
         .unwrap();
     assert_eq!(role, "member", "the proxy's role wins on every request");
 
+    // MCP and the API: the signed header is a credential there too, for the
+    // same user, so an agent behind the proxy needs no pasted token.
+    let rpc = |auth: Option<String>, origin: Option<&str>, body: serde_json::Value| {
+        let mut r = http.post(format!("{base}/railwatch/mcp")).header("content-type", "application/json").body(body.to_string());
+        if let Some(a) = auth {
+            r = r.header(proxy_auth::HEADER, a);
+        }
+        if let Some(o) = origin {
+            r = r.header("origin", o);
+        }
+        r.send()
+    };
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let r = rpc(Some(signed("agent@example.com", "member")), None, list.clone()).await.unwrap();
+    assert_eq!(r.status(), 200, "tools/list with the proxy's header, no token");
+    let tools: serde_json::Value = r.json().await.unwrap();
+    let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"get_execution") && names.contains(&"add_comment"), "read and write tools, as in the dashboard: {names:?}");
+    let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_applications", "arguments": {}}});
+    let r: serde_json::Value = rpc(Some(signed("agent@example.com", "member")), None, call).await.unwrap().json().await.unwrap();
+    let apps = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(apps.contains("\"shop\""), "the proxied user sees the proxy's account: {apps}");
+    let agent: i64 = control.with(|c| c.query_row("SELECT count(*) FROM users WHERE email = 'agent@example.com'", [], |r| r.get(0))).unwrap();
+    assert_eq!(agent, 1, "the agent is a user like any proxied visitor");
+    assert_eq!(rpc(None, None, list.clone()).await.unwrap().status(), 401, "no header, no token: still 401");
+    let forged =
+        proxy_auth::sign(b"not-the-secret-not-the-secret-not-the-se", &json!({"email": "eve@example.com", "name": "Eve", "role": "admin", "exp": now() + 60}));
+    assert_eq!(rpc(Some(forged), None, list.clone()).await.unwrap().status(), 401, "a forged header is refused on MCP too");
+    // Another site's page, through a browser that passes the app's gate:
+    // refused, since these routes take no CSRF token.
+    let r = rpc(Some(signed("agent@example.com", "member")), Some("https://evil.example"), list.clone()).await.unwrap();
+    assert_eq!(r.status(), 403, "cross-origin MCP through the proxy");
+    // A token, when one is sent, is the only credential looked at.
+    let r = http
+        .post(format!("{base}/railwatch/mcp"))
+        .header(proxy_auth::HEADER, signed("agent@example.com", "member"))
+        .bearer_auth("rwp_not_a_token")
+        .body(list.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401, "a bad token is not rescued by the proxy's header");
+    let api = |path: &str, auth: Option<String>, origin: Option<&str>| {
+        let mut r = http.get(format!("{base}{path}"));
+        if let Some(a) = auth {
+            r = r.header(proxy_auth::HEADER, a);
+        }
+        if let Some(o) = origin {
+            r = r.header("origin", o);
+        }
+        r.send()
+    };
+    let me = api("/railwatch/api/v1/me", Some(signed("agent@example.com", "member")), None).await.unwrap();
+    assert_eq!(me.status(), 200, "/api/v1 with the proxy's header");
+    let me: serde_json::Value = me.json().await.unwrap();
+    assert_eq!(me["user"]["email"], "agent@example.com");
+    assert_eq!(me["token"]["name"], proxy_auth::SESSION_AGENT);
+    assert_eq!(api("/railwatch/api/v1/me", None, None).await.unwrap().status(), 401);
+    assert_eq!(api("/railwatch/api/v1/me", Some(signed("agent@example.com", "member")), Some("https://evil.example")).await.unwrap().status(), 403);
+    // Proxy auth off: the header grants nothing on MCP or the API either.
+    let off_rpc =
+        http.post(format!("http://{off_addr}/railwatch/mcp")).header(proxy_auth::HEADER, signed("agent@example.com", "member")).body(list.to_string());
+    assert_eq!(off_rpc.send().await.unwrap().status(), 401, "off: MCP ignores the header");
+    let off_me = http.get(format!("http://{off_addr}/railwatch/api/v1/me")).header(proxy_auth::HEADER, signed("agent@example.com", "member"));
+    assert_eq!(off_me.send().await.unwrap().status(), 401, "off: the API ignores the header");
+
     unsafe {
         std::env::remove_var("RAILWATCH_BASE_PATH");
         std::env::remove_var("RAILWATCH_TRUSTED_PROXY_SECRET_FILE");

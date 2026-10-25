@@ -209,6 +209,19 @@ The security model:
 - **CSRF still applies**: a state-changing request needs the Origin check
   and the session's token, which the browser gets and sends through the
   proxy like any cookie.
+- **MCP and the API**: a valid header is also a credential on
+  `/railwatch/mcp` and `/railwatch/api/v1`, for the same user, so an AI
+  agent behind the proxy needs no pasted token. It gets what that user has
+  in the dashboard: every read tool, plus the issue writes (`update_issue`,
+  `add_comment`, attributed to the user and "agent"), in the first account
+  only. These routes take no CSRF token, so a proxied request the browser
+  marks as coming from another site (`Origin` not the `Host`, or
+  `Sec-Fetch-Site: cross-site`) is refused with 403; agents send no
+  `Origin`. An `Authorization` header, when the request has one, is the
+  only credential looked at: a bad token is 401 whatever else it carries.
+  Which requests the proxy signs is the proxy's choice: the
+  railwatch-server gem signs these two routes only in development, for a
+  request from the same machine, unless the app opts in.
 - **Replay**: there is no nonce. A header captured in transit can be
   replayed until its `exp`, at most 300 s (60 s from the gem), the same
   exposure as the session cookie that travels with it. Keep the hop between
