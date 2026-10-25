@@ -503,10 +503,25 @@ fn execution(rec: &Value) -> R<(&'static str, Attrs)> {
             "request_size",
             "response_size",
             "gc_time",
+            "dropped_records",
+            "dropped_bytes",
         ],
-        "command" => &["context", "gc_time", "interactive"],
-        "channel_action" => &["channel", "context", "gc_time"],
-        _ => &["job_id", "provider_job_id", "attempt_id", "adapter", "priority", "db_runtime", "arguments_preview", "context", "gc_time", "schedule"],
+        "command" => &["context", "gc_time", "interactive", "dropped_records", "dropped_bytes"],
+        "channel_action" => &["channel", "context", "gc_time", "dropped_records", "dropped_bytes"],
+        _ => &[
+            "job_id",
+            "provider_job_id",
+            "attempt_id",
+            "adapter",
+            "priority",
+            "db_runtime",
+            "arguments_preview",
+            "context",
+            "gc_time",
+            "schedule",
+            "dropped_records",
+            "dropped_bytes",
+        ],
     };
     let mut attrs = envelope(rec)?;
     let inertia = rec.get("inertia");
@@ -899,5 +914,23 @@ mod tests {
         assert_eq!(ts(253402300800.5), "10000-01-01 00:00:00.500000");
         assert_eq!(timestamp_string(&Value::Str(b"0x10".to_vec())).unwrap(), "1970-01-01 00:00:16.000000");
         assert_eq!(timestamp_string(&Value::Bool(true)).unwrap_err(), MapError::new("TypeError", "can't convert true into Float"));
+    }
+
+    // railwatch 1.2 puts dropped_records/dropped_bytes on a parent whose
+    // tree outgrew the gem's per-execution buffer. They live in detail,
+    // where the execution page and MCP get_execution read them.
+    #[test]
+    fn a_truncated_parent_keeps_its_dropped_counts_in_detail() {
+        for t in ["request", "job_attempt", "scheduled_task", "command", "channel_action"] {
+            let rec =
+                rjson::parse(format!(r#"{{"v":1,"t":"{t}","timestamp":1767225600.0,"duration":1,"dropped_records":21,"dropped_bytes":55977}}"#).as_bytes())
+                    .unwrap();
+            let mapped = row_for(&rec, &mut vec![]).unwrap().unwrap();
+            let detail = mapped.row.iter().find(|(k, _)| *k == "detail").map(|(_, v)| v.clone());
+            let Some(Bind::Text(detail)) = detail else { panic!("{t}: no detail") };
+            let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+            assert_eq!(detail["dropped_records"], 21, "{t}");
+            assert_eq!(detail["dropped_bytes"], 55977, "{t}");
+        }
     }
 }

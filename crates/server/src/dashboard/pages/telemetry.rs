@@ -86,12 +86,26 @@ pub fn queries_index(conn: &Connection, ctx: &PageContext, _control: &dyn Contro
 }
 
 pub fn n_plus_ones(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<Value> {
-    let rows = db::query(
+    let binds = [s(&qt(from)), s(&qt(to))];
+    // Per day file and combined (the MAX of each file's MAX is the MAX); keys
+    // come back in GROUP BY order as on one file.
+    let per_file = crate::storage::reader::aggregate(
         conn,
-        "SELECT \"n_plus_ones\".\"group_hash\", COUNT(*), MAX(sql), MAX(source), MAX(count) FROM \"n_plus_ones\" \
+        "n_plus_ones",
+        "SELECT \"n_plus_ones\".\"group_hash\" AS group_hash, COUNT(*) AS n, MAX(sql) AS sql, MAX(source) AS source, MAX(count) AS most FROM {t} \
          WHERE \"n_plus_ones\".\"occurred_at\" BETWEEN ?1 AND ?2 GROUP BY \"n_plus_ones\".\"group_hash\"",
-        rusqlite::params![qt(from), qt(to)],
+        "SELECT group_hash, SUM(n), MAX(sql), MAX(source), MAX(most) FROM {u} GROUP BY group_hash",
+        &binds,
     )?;
+    let rows = match per_file {
+        Some(rows) => rows,
+        None => db::query(
+            conn,
+            "SELECT \"n_plus_ones\".\"group_hash\", COUNT(*), MAX(sql), MAX(source), MAX(count) FROM \"n_plus_ones\" \
+             WHERE \"n_plus_ones\".\"occurred_at\" BETWEEN ?1 AND ?2 GROUP BY \"n_plus_ones\".\"group_hash\"",
+            rusqlite::params_from_iter(binds.iter()),
+        )?,
+    };
     let rows = rb::sort_by_num(rows, |r| Num::I(-i(r.at(1))));
     Ok(Value::Array(
         rows.iter()
@@ -1540,8 +1554,9 @@ mod per_day_tests {
 
     /// The per-file rewrites (cursor pages, FTS paired per file, the summed
     /// aggregates) give the single file's props: four log levels, two queues
-    /// with real latencies, three users, rows on five days, a text filter, a
-    /// cursor page and the slowest-queries page.
+    /// with real latencies, three users in two tenants, n+1s, rows on five
+    /// days, a text filter, a cursor page and the slowest-queries page, under
+    /// 24h, which holds today's rows whole (the hinted edge file).
     #[test]
     fn per_day_pages_equal_the_single_file() {
         let dir = std::env::temp_dir().join(format!("rw-perday-{}", crate::control::base58(8)));
@@ -1556,17 +1571,26 @@ mod per_day_tests {
                 id += 1;
                 let at = format!("{day} 0{i}:00:00.{id:06}");
                 let msg = if i % 2 == 0 { format!("Completed {id}") } else { format!("Started {id}") };
-                t.execute("INSERT INTO logs (id, level, message, occurred_at) VALUES (?, ?, ?, ?)", rusqlite::params![id, level, msg, at]).unwrap();
+                t.execute(
+                    "INSERT INTO logs (id, level, message, occurred_at, app_tenant) VALUES (?, ?, ?, ?, ?)",
+                    rusqlite::params![id, level, msg, at, [Some("acme"), None, Some("bolt")][id as usize % 3]],
+                )
+                .unwrap();
                 t.execute(
                     "INSERT INTO queries (id, sql, name, duration, occurred_at, adapter, group_hash) VALUES (?, 'SELECT 1', 'Widget Load', ?, ?, 'sqlite', 'g')",
                     rusqlite::params![id, (id * 7919) % 50, at],
                 )
                 .unwrap();
+                t.execute(
+                    "INSERT INTO n_plus_ones (id, sql, source, count, occurred_at, group_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![id, format!("SELECT {id}"), format!("app/x.rb:{}", 40 - id), id % 7 + 2, at, ["n1", "n2"][id as usize % 2]],
+                )
+                .unwrap();
                 // Jobs on two queues with odd latencies (AVG over files must be
                 // exact) and requests from three users, some failing.
                 t.execute(
-                    "INSERT INTO executions (id, execution_id, kind, name, occurred_at, duration, queue, queue_latency, outcome, status, user_ref, group_hash) \
-                     VALUES (?1, ?2, ?3, 'X', ?4, 1000, ?5, ?6, ?7, ?8, ?9, 'g')",
+                    "INSERT INTO executions (id, execution_id, kind, name, occurred_at, duration, queue, queue_latency, outcome, status, user_ref, group_hash, app_tenant) \
+                     VALUES (?1, ?2, ?3, 'X', ?4, ?10, ?5, ?6, ?7, ?8, ?9, 'g', ?11)",
                     rusqlite::params![
                         id,
                         format!("e{id}"),
@@ -1576,7 +1600,9 @@ mod per_day_tests {
                         if i == 2 { None } else { Some(id * 37 + 1) },
                         if i == 4 { "failed" } else { "ok" },
                         if i == 3 { 503 } else { 200 },
-                        ["ada", "bob", "cy"][id as usize % 3],
+                        ["ada", "bob", "cy"][(id / 6) as usize % 3],
+                        1000 + (id * id * 7919) % 99_991,
+                        [Some("acme"), Some("acme"), None, Some("bolt")][(id / 6) as usize % 4],
                     ],
                 )
                 .unwrap();
@@ -1600,6 +1626,9 @@ mod per_day_tests {
             vec![("window", "7d"), ("q", "widget"), ("limit", "2")],
             vec![("window", "7d"), ("q", "adapter:sqlite"), ("limit", "3")],
             vec![("window", "7d"), ("q", "adapter:mysql")],
+            vec![("window", "1h")],
+            vec![("window", "30d"), ("q", "ac")],
+            vec![("window", "7d"), ("sort", "p95"), ("dir", "asc")],
         ] {
             let c = ctx(&params);
             let a = logs_index(&single, &c, &StaticControl::default()).unwrap();
@@ -1608,12 +1637,18 @@ mod per_day_tests {
             let a = queries_index(&single, &c, &StaticControl::default()).unwrap();
             let b = queries_index(&days, &c, &StaticControl::default()).unwrap();
             assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap(), "queries {params:?}");
-            for page in [crate::dashboard::pages::jobs_index as fn(&Connection, &PageContext, &dyn ControlData) -> R, people_index, profiles_index] {
+            for page in
+                [crate::dashboard::pages::jobs_index as fn(&Connection, &PageContext, &dyn ControlData) -> R, people_index, profiles_index, tenants_index]
+            {
                 let a = page(&single, &c, &StaticControl::default()).unwrap();
                 let b = page(&days, &c, &StaticControl::default()).unwrap();
                 assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap(), "{params:?}");
             }
         }
+        let tenants = tenants_index(&days, &ctx(&[("window", "7d")]), &StaticControl::default()).unwrap();
+        assert_eq!(tenants["tenants"].as_array().unwrap().len(), 2, "{tenants}");
+        let npo = n_plus_ones(&days, now - 7 * 86_400_000_000, now).unwrap();
+        assert_eq!(npo.as_array().unwrap().len(), 2, "{npo}");
         let queues = crate::dashboard::pages::queue_stats(&days, now - 7 * 86_400_000_000, now).unwrap();
         assert_eq!(queues.as_array().unwrap().len(), 2, "{queues}");
         let counts = logs_index(&days, &ctx(&[("window", "7d")]), &StaticControl::default()).unwrap()["counts"].clone();

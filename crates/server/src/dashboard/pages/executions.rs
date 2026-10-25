@@ -377,12 +377,15 @@ pub fn traces_show(conn: &Connection, ctx: &PageContext, _control: &dyn ControlD
 
 /// `requests.between(..).where.not(user_ref: nil).group(:user_ref)` with
 /// its count, errors and last seen, sorted by user_ref (the GROUP BY's
-/// order). Per day file and combined on a per-day tenant.
+/// order). Per day file and combined on a per-day tenant, on the covering
+/// idx_executions_people in the window's files (people@7d 111 -> 20 ms of
+/// SQL: the kind+occurred_at range read every request row from the table).
 pub fn active_people(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<Vec<db::Rec>> {
     let binds = [s("request"), s(&qt(from)), s(&qt(to))];
-    let per_file = crate::storage::reader::aggregate(
+    let per_file = crate::storage::reader::aggregate_hinted(
         conn,
         "executions",
+        Some(crate::storage::reader::Hint { window: (from, to), inside: "idx_executions_people", outside: "index_executions_on_kind_and_occurred_at" }),
         "SELECT \"executions\".\"user_ref\" AS user_ref, COUNT(*) AS n, SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END) AS errors, MAX(occurred_at) AS last \
          FROM {t} WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 AND \"executions\".\"user_ref\" IS NOT NULL \
          GROUP BY \"executions\".\"user_ref\"",

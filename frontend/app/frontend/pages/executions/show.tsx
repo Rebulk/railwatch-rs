@@ -1,5 +1,5 @@
 import { Link, usePage } from "@inertiajs/react"
-import { Check, ClipboardCopy, Copy } from "lucide-react"
+import { AlertTriangle, Check, ClipboardCopy, Copy } from "lucide-react"
 import { useState } from "react"
 
 import { DataTable } from "@/components/railwatch/data-table"
@@ -20,6 +20,7 @@ import { useClipboard } from "@/hooks/use-clipboard"
 import EnvLayout from "@/layouts/env-layout"
 import { executionPath } from "@/lib/execution-path"
 import { bytes, count, ms, when } from "@/lib/format"
+import { truncationNotice } from "@/lib/truncation"
 import * as R from "@/routes"
 import type { ExceptionDetail, SharedProps, TimelineEntry } from "@/types"
 
@@ -65,6 +66,7 @@ interface Attachment {
   occurred_at: string
 }
 interface Props {
+  recorded_children: number | null
   execution: Execution
   timeline: TimelineEntry[]
   exceptions: ExceptionDetail[]
@@ -182,6 +184,17 @@ function parseContext(v: unknown): unknown {
   }
 }
 
+// The gem puts these on the parent only when its buffer overflowed;
+// ingest keeps them in detail.
+function droppedRecords(x: Execution): number {
+  return Number(x.detail.dropped_records ?? 0)
+}
+
+function droppedBytes(x: Execution): number | null {
+  const b = x.detail.dropped_bytes
+  return typeof b === "number" ? b : null
+}
+
 function markdownReport(p: Props, x: Execution) {
   const lines: string[] = []
   lines.push(`# ${x.name}`)
@@ -195,6 +208,13 @@ function markdownReport(p: Props, x: Execution) {
   lines.push("")
   lines.push("## Counters")
   for (const [k, v] of Object.entries(x.counters)) lines.push(`- ${k}: ${v}`)
+  const dropped = droppedRecords(x)
+  if (dropped) {
+    lines.push("")
+    lines.push(
+      `> ${truncationNotice(p.recorded_children ?? p.timeline.length, dropped, droppedBytes(x))}`,
+    )
+  }
   if (p.exceptions.length > 0) {
     lines.push("")
     lines.push("## Exceptions")
@@ -364,6 +384,21 @@ export default function ExecutionShow(p: Props) {
           }
         />
       </StatStrip>
+      {droppedRecords(x) > 0 && (
+        <p
+          role="status"
+          className="border-warning/40 bg-warning/10 flex items-start gap-2 rounded-md border px-3 py-2 text-sm"
+        >
+          <AlertTriangle className="text-warning mt-0.5 size-4 shrink-0" />
+          <span>
+            {truncationNotice(
+              p.recorded_children ?? p.timeline.length,
+              droppedRecords(x),
+              droppedBytes(x),
+            )}
+          </span>
+        </p>
+      )}
       {p.trace.length > 1 && (
         <Card>
           <CardHeader>

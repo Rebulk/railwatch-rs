@@ -56,12 +56,14 @@ these fields, from `Railwatch.build_parent` in `lib/railwatch.rb`:
 |---|---|
 | `duration` | Wall time in microseconds, execution start to finish. |
 | `stages` | Hash of stage name → microseconds spent in it (e.g. `{"middleware_before" => 120, "action" => 4300, "render" => 900}`). |
-| `counters` | Hash of child-record counts for this execution — `queries`, `cached_queries`, `exceptions`, `logs`, `cache_events`, `jobs_enqueued`, `mail`, `broadcasts`, `notifications`, `outgoing_requests`, `storage_ops`, `view_renders`, `transactions`, `hydrated_models`, `lazy_loads`, `deprecations`, `spans` (`Execution::COUNTERS`). Counted even when the execution is sampled out, so aggregate rates don't depend on the sample rate. |
+| `counters` | Hash of child-record counts for this execution — `queries`, `cached_queries`, `exceptions`, `logs`, `cache_events`, `jobs_enqueued`, `mail`, `broadcasts`, `notifications`, `outgoing_requests`, `storage_ops`, `view_renders`, `transactions`, `hydrated_models`, `lazy_loads`, `deprecations`, `spans` (`Execution::COUNTERS`). Counted even when the execution is sampled out, so aggregate rates don't depend on the sample rate. Only the counters that fired are sent: a counter missing from the hash is zero, and readers must treat it that way. |
 | `peak_memory` | RSS in bytes, sampled at most once per second process-wide (`Execution.sampled_memory`) — cheap enough to read but not per-execution-accurate to the microsecond. |
 | `allocations` | Objects allocated during the execution (`GC.stat(:total_allocated_objects)` delta). |
 | `gc_time` | GC time in the execution's window, when the Ruby build exposes `GC.stat(:time)`. |
 | `exception_preview` | First unhandled exception's `"Class: message"`, truncated to 255 chars, or nil. |
 | `context` | Serialized `Railwatch.context(...)` key/values active for this execution, parameter-filtered like request params. `"_railwatch_truncated": true` when it did not fit in 64KB. |
+| `dropped_records` | Child records this execution's tree lost to `execution_buffer_bytes` (or `Execution::MAX_RECORDS`): the earliest records are kept and everything after the first overflow is counted here instead of built. Present only when non-zero, and only on a tree that shipped. View renders past `max_view_renders_per_execution` are capped, not dropped, and not counted here. |
+| `dropped_bytes` | Estimated in-memory weight of those dropped records (records refused after the overflow are weighed at the buffer's mean). Present alongside `dropped_records`. |
 
 A sampled-out execution still ships its parent record if it raised an
 unhandled exception. See `Railwatch.finish_execution`. Sampling controls
