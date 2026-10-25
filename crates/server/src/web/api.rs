@@ -474,6 +474,11 @@ fn run(
     if matches!(action, Action::CreateDeploy | Action::UpdateIssue | Action::CreateComment) && !token.allows("write") {
         return Err(Halt::Json(StatusCode::FORBIDDEN, json!({"error": "insufficient_scope"})));
     }
+    // Deploys are recorded by a deploy hook with its own token, never from
+    // the dashboard, so the proxy's user does not get them with `write`.
+    if action == Action::CreateDeploy && token.is_proxied() {
+        return Err(Halt::Json(StatusCode::FORBIDDEN, json!({"error": "insufficient_scope"})));
+    }
     let params = match params {
         Ok(p) => p,
         Err(()) if action == Action::Me => Params { map: Map::new() },

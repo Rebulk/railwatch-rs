@@ -322,6 +322,16 @@ async fn mounted_under_a_base_path_behind_a_trusted_proxy() {
         .await
         .unwrap();
     assert_eq!(r.status(), 401, "a bad token is not rescued by the proxy's header");
+    // Nor is an Authorization header that is not even ASCII.
+    let r = http
+        .post(format!("{base}/railwatch/mcp"))
+        .header(proxy_auth::HEADER, signed("agent@example.com", "member"))
+        .header("authorization", reqwest::header::HeaderValue::from_bytes(b"Bearer \xff").unwrap())
+        .body(list.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401, "an unreadable Authorization is a bad token, not a fall back to the proxy");
     let api = |path: &str, auth: Option<String>, origin: Option<&str>| {
         let mut r = http.get(format!("{base}{path}"));
         if let Some(a) = auth {
@@ -338,6 +348,16 @@ async fn mounted_under_a_base_path_behind_a_trusted_proxy() {
     assert_eq!(me["user"]["email"], "agent@example.com");
     assert_eq!(me["token"]["name"], proxy_auth::SESSION_AGENT);
     assert_eq!(api("/railwatch/api/v1/me", None, None).await.unwrap().status(), 401);
+    // Writes are the dashboard's (issues, comments); a deploy is not one.
+    let deploy = http
+        .post(format!("{base}/railwatch/api/v1/applications/{app_id}/environments/{env_id}/deploys"))
+        .header(proxy_auth::HEADER, signed("agent@example.com", "admin"))
+        .header("content-type", "application/json")
+        .body(json!({"sha": "abc1234"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deploy.status(), 403, "the proxy's user cannot record deploys");
     assert_eq!(api("/railwatch/api/v1/me", Some(signed("agent@example.com", "member")), Some("https://evil.example")).await.unwrap().status(), 403);
     // Proxy auth off: the header grants nothing on MCP or the API either.
     let off_rpc =

@@ -214,11 +214,13 @@ The security model:
   agent behind the proxy needs no pasted token. It gets what that user has
   in the dashboard: every read tool, plus the issue writes (`update_issue`,
   `add_comment`, attributed to the user and "agent"), in the first account
-  only. These routes take no CSRF token, so a proxied request the browser
+  only. Recording a deploy (`POST .../deploys`) is not among them: that is
+  the deploy hook's, with a token. These routes take no CSRF token, so a proxied request the browser
   marks as coming from another site (`Origin` not the `Host`, or
   `Sec-Fetch-Site: cross-site`) is refused with 403; agents send no
-  `Origin`. An `Authorization` header, when the request has one, is the
-  only credential looked at: a bad token is 401 whatever else it carries.
+  `Origin`. Otherwise an `Authorization` header, when the request has
+  one (readable or not), is the only credential looked at: a bad token is
+  401, not a fall back to the header.
   Which requests the proxy signs is the proxy's choice: the
   railwatch-server gem signs these two routes only in development, for a
   request from the same machine, unless the app opts in.

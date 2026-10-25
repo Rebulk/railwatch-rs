@@ -245,7 +245,17 @@ impl Token {
             tracing::warn!(path = parts.uri.path(), "trusted proxy: cross-origin MCP/API request refused");
             return Err(json!({"error": "cross_origin"}));
         }
+        // Any Authorization header, readable or not, is the credential: one
+        // that is not ASCII is a bad token (401), not a fall back to the proxy.
+        if parts.headers.contains_key(header::AUTHORIZATION) {
+            return Ok(None);
+        }
         Ok(Some(claims.clone()))
+    }
+
+    /// Whether this is a trusted-proxy identity rather than a token row.
+    pub fn is_proxied(&self) -> bool {
+        self.id == PROXIED_TOKEN_ID
     }
 
     /// The request's identity on /mcp and /api/v1: an Authorization header,
@@ -266,8 +276,9 @@ impl Token {
 
     /// A token for a user the trusted proxy names: the user and session
     /// proxy_auth::resolve gives the dashboard, with what that user can do
-    /// in the dashboard (read, and write issues and comments), limited to
-    /// the account the proxy fronts. Not a row: nothing to revoke or record.
+    /// in the dashboard (read, and write issues and comments; not deploys,
+    /// which api::run refuses it), limited to the account the proxy fronts.
+    /// Not a row: nothing to revoke or record.
     pub fn from_proxied(control: &Control, claims: &super::proxy_auth::Claims) -> rusqlite::Result<Option<Token>> {
         let resolved = control.tx(|tx| {
             let (_, user) = super::proxy_auth::resolve(tx, claims)?;
@@ -296,7 +307,7 @@ impl Token {
 
     /// ApiToken#record_use!: last_used_at at most every five minutes.
     pub fn record_use(&self, control: &Control, now: i64) {
-        if self.id == PROXIED_TOKEN_ID {
+        if self.is_proxied() {
             return;
         }
         if self.last_used_at.is_none_or(|t| t <= now - LAST_USED_WRITE_INTERVAL) {
