@@ -271,7 +271,7 @@ pub fn add_missing_columns_everywhere(tenants_dir: &Path) -> usize {
     // until it is widened, and nothing else widens an old day file. So a
     // file that failed (typically a lock held past busy_timeout) gets more
     // tries before the server takes traffic.
-    for attempt in 1..=STARTUP_WIDEN_RETRIES {
+    for _ in 0..STARTUP_WIDEN_RETRIES {
         if failed.is_empty() {
             break;
         }
@@ -280,19 +280,53 @@ pub fn add_missing_columns_everywhere(tenants_dir: &Path) -> usize {
         for path in failed {
             match widen(&path) {
                 Ok(n) => changed += usize::from(n > 0),
-                Err(e) if attempt == STARTUP_WIDEN_RETRIES => {
-                    tracing::error!(file = %path.display(), error = %e, "cannot add the new telemetry columns; that environment's visits fail to read until it is fixed (restart to retry)");
-                }
                 Err(_) => still.push(path),
             }
         }
         failed = still;
     }
+    // Still narrow: start serving anyway (other environments must not wait
+    // on one locked file) and keep trying in the background, so the
+    // environment's visits pages come back on their own once the lock clears.
+    if !failed.is_empty() {
+        for path in &failed {
+            tracing::error!(file = %path.display(), "cannot add the new telemetry columns; that environment's visits fail to read until a background retry succeeds");
+        }
+        let _ = std::thread::Builder::new().name("widen-retry".into()).spawn(|| widen_until_done(failed, BACKGROUND_WIDEN_EVERY));
+    }
     changed
 }
 
-/// Further passes over files the startup sweep could not widen.
+/// Further passes over files the startup sweep could not widen, before the
+/// server starts serving.
 const STARTUP_WIDEN_RETRIES: u32 = 3;
+/// How often a file still narrow after startup is tried again.
+const BACKGROUND_WIDEN_EVERY: Duration = Duration::from_secs(30);
+
+/// Widens every file in `paths`, trying the ones that fail again every
+/// `every`, until none is left. A file that disappears (retention, the disk
+/// budget) is dropped, not retried.
+pub fn widen_until_done(mut paths: Vec<PathBuf>, every: Duration) {
+    while !paths.is_empty() {
+        std::thread::sleep(every);
+        paths.retain(|path| {
+            if !path.exists() {
+                return false;
+            }
+            let result = Connection::open(path).and_then(|c| {
+                schema::configure(&c)?;
+                schema::add_missing_columns(&c)
+            });
+            match result {
+                Ok(_) => {
+                    tracing::info!(file = %path.display(), "added the new telemetry columns");
+                    false
+                }
+                Err(_) => true,
+            }
+        });
+    }
+}
 
 enum Kind {
     File,
@@ -345,7 +379,21 @@ fn per_day_files(dir: &Path, files: &mut Vec<PathBuf>) {
         }
     }
     for tier in [crate::storage::layout::Tier::Core, crate::storage::layout::Tier::Detail] {
-        let mut days: Vec<PathBuf> = regular_entries(&dir.join(tier.dir()))
+        let tier_dir = dir.join(tier.dir());
+        // read_dir follows a symlinked tier directory, so check it first.
+        match std::fs::symlink_metadata(&tier_dir) {
+            Ok(m) if m.file_type().is_dir() => {}
+            Ok(_) => {
+                tracing::warn!(path = %tier_dir.display(), "not a regular directory: skipped");
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::error!(path = %tier_dir.display(), error = %e, "cannot read a tenant's tier directory");
+                continue;
+            }
+        }
+        let mut days: Vec<PathBuf> = regular_entries(&tier_dir)
             .into_iter()
             .filter_map(|(path, kind)| {
                 let day = path.file_name()?.to_str()?.strip_suffix(".sqlite3")?;

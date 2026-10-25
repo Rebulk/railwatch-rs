@@ -613,9 +613,10 @@ all of it (identical; 130/130).
     under railwatch-cloud; add the four to its expected columns first.
 
     A file the startup sweep cannot widen (another process holding its write
-    lock past busy_timeout) is retried three more times a second apart, then
-    logged as an error; its environment's visits pages fail until a restart
-    widens it. A writer that cannot open its tenant answers what is queued
+    lock past busy_timeout) is retried three more times a second apart; if it
+    is still narrow the server starts anyway, logs an error, and a background
+    thread retries it every 30 seconds until it is widened. Until then that
+    environment's visits pages fail; the rest of the server is unaffected. A writer that cannot open its tenant answers what is queued
     and exits, so the next job opens the file again.
 
     **Rolling back past this release is roll-forward-only once a day rolls

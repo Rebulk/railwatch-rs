@@ -155,9 +155,14 @@ fn startup_sweep_does_not_follow_symlinks() {
     std::fs::create_dir_all(dir.join(Tier::Core.dir())).unwrap();
     old_tenant(&meta_path(&dir));
     symlink(outside.0.join("day.sqlite3"), day_path(&dir, Tier::Core, "2026-10-13")).unwrap();
+    // A whole tier directory symlinked out of the tenant.
+    let outside_tier = outside.0.join("detail");
+    std::fs::create_dir_all(&outside_tier).unwrap();
+    old_tenant(&outside_tier.join("2026-10-13.sqlite3"));
+    symlink(&outside_tier, dir.join(Tier::Detail.dir())).unwrap();
 
     assert_eq!(railwatch_server::tenants::add_missing_columns_everywhere(&tenants.0), 2, "the single file and the per-day meta");
-    for skipped in [outside.0.join("elsewhere.sqlite3"), meta_path(&elsewhere_dir), outside.0.join("day.sqlite3")] {
+    for skipped in [outside.0.join("elsewhere.sqlite3"), meta_path(&elsewhere_dir), outside.0.join("day.sqlite3"), outside_tier.join("2026-10-13.sqlite3")] {
         let cols = visit_columns(&rusqlite::Connection::open(&skipped).unwrap());
         assert!(!cols.iter().any(|c| c == "redirect_ms"), "{} was reached through a symlink", skipped.display());
     }
@@ -191,4 +196,35 @@ fn a_tenant_that_failed_to_open_is_retried_by_the_next_job() {
     drop(blocker);
     assert!(matches!(lookup(), Ok(None)), "the lock cleared: the tenant opens and answers");
     tenants.shutdown();
+}
+
+/// A file still locked after the startup retries is not forgotten: the
+/// background retry widens it once the lock clears, so its environment's
+/// union reader reads visits again without a restart.
+#[test]
+fn a_file_still_locked_after_startup_is_widened_once_the_lock_clears() {
+    let tenants = Scratch::new("background");
+    let dir = tenants.0.join("shop-production");
+    std::fs::create_dir_all(dir.join(Tier::Core.dir())).unwrap();
+    old_tenant(&meta_path(&dir));
+    let day = day_path(&dir, Tier::Core, "2026-10-13");
+    old_tenant(&day);
+    let blocker = rusqlite::Connection::open(&day).unwrap();
+    blocker.execute_batch("PRAGMA journal_mode = WAL; BEGIN IMMEDIATE;").unwrap();
+
+    let retry = {
+        let day = day.clone();
+        std::thread::spawn(move || railwatch_server::tenants::widen_until_done(vec![day], std::time::Duration::from_millis(200)))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    retry.join().unwrap();
+
+    railwatch_server::tenants::add_missing_columns_everywhere(&tenants.0);
+    let reader = railwatch_server::dashboard::pool::open_tenant_reader(&tenants.0, "shop-production").unwrap();
+    let n: i64 = reader.query_row("SELECT count(*) FROM visits WHERE redirect_ms IS NULL", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1, "the once-locked day reads through the union");
+    let cols = visit_columns(&rusqlite::Connection::open(&day).unwrap());
+    assert!(cols.iter().any(|c| c == "redirect_ms"), "widened by the background retry");
 }
