@@ -27,6 +27,14 @@ updates:
       npm-major:
         patterns: ["*"]
         update-types: [major]
+    # Each needs its own migration, not a bump: Inertia 3 changes the
+    # protocol the server's inertia.rs speaks, and plugin-react 6 drops the
+    # `babel` option the React compiler is configured through.
+    ignore:
+      - dependency-name: "@inertiajs/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@vitejs/plugin-react"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
