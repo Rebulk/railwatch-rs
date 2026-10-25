@@ -606,7 +606,17 @@ all of it (identical; 130/130).
     after Rails' own, so Rails opens the file with 0 pending migrations, its
     `Visit` model gains four readable attributes, and its mapper writes
     NULL there. A visit record without the fields maps to exactly Rails' row
-    (mapper_vs_ruby is unchanged).
+    (mapper_vs_ruby is unchanged). Rails' exact-schema restore check
+    (`Operations::RestoredSchema`, run by RestoreVerificationJob, which is
+    not ported here, #13 under Jobs) DOES reject these files: it reports the
+    four as unexpected columns. That check only matters for a file moved back
+    under railwatch-cloud; add the four to its expected columns first.
+
+    A file the startup sweep cannot widen (another process holding its write
+    lock past busy_timeout) is retried three more times a second apart, then
+    logged as an error; its environment's visits pages fail until a restart
+    widens it. A writer that cannot open its tenant answers what is queued
+    and exits, so the next job opens the file again.
 
     **Rolling back past this release is roll-forward-only once a day rolls
     over.** The older release keeps reading the widened files, but it creates

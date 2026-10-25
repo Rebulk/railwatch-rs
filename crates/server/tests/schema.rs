@@ -162,3 +162,33 @@ fn startup_sweep_does_not_follow_symlinks() {
         assert!(!cols.iter().any(|c| c == "redirect_ms"), "{} was reached through a symlink", skipped.display());
     }
 }
+
+/// A writer that cannot open its tenant (here: another process holds the
+/// write lock past busy_timeout while the new columns would be added) must
+/// not refuse that tenant forever: once the lock clears, the next job opens
+/// the file again.
+#[test]
+fn a_tenant_that_failed_to_open_is_retried_by_the_next_job() {
+    use railwatch_server::tenants::{Job, Tenants};
+
+    let tenants_dir = Scratch::new("retry");
+    let path = tenants_dir.0.join("shop-production.sqlite3");
+    old_tenant(&path);
+    let blocker = rusqlite::Connection::open(&path).unwrap();
+    blocker.execute_batch("PRAGMA journal_mode = WAL; BEGIN IMMEDIATE;").unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let (followups, _rx) = railwatch_server::followups::channel();
+    let tenants = Tenants::new(tenants_dir.0.clone(), std::time::Duration::from_secs(60), followups);
+    let lookup = || {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tenants.send(1, "shop-production", Job::LookupReceipt { producer_id: "p".into(), delivery_id: "d".into(), reply });
+        runtime.block_on(rx).unwrap()
+    };
+
+    assert!(lookup().is_err(), "refused while the lock is held");
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    assert!(matches!(lookup(), Ok(None)), "the lock cleared: the tenant opens and answers");
+    tenants.shutdown();
+}

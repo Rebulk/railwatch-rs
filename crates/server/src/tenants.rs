@@ -249,20 +249,50 @@ pub fn add_missing_columns_everywhere(tenants_dir: &Path) -> usize {
             Kind::File => {}
         }
     }
-    let mut changed = 0;
-    for path in files {
-        let result = Connection::open(&path).and_then(|c| {
+    let widen = |path: &Path| {
+        Connection::open(path).and_then(|c| {
             schema::configure(&c)?;
             schema::add_missing_columns(&c)
-        });
-        match result {
+        })
+    };
+    let mut changed = 0;
+    let mut failed = Vec::new();
+    for path in files {
+        match widen(&path) {
             Ok(0) => {}
             Ok(_) => changed += 1,
-            Err(e) => tracing::error!(file = %path.display(), error = %e, "cannot add the new telemetry columns"),
+            Err(e) => {
+                tracing::warn!(file = %path.display(), error = %e, "cannot add the new telemetry columns yet; retrying");
+                failed.push(path);
+            }
         }
+    }
+    // A per-day file left narrow fails every visits page of its environment
+    // until it is widened, and nothing else widens an old day file. So a
+    // file that failed (typically a lock held past busy_timeout) gets more
+    // tries before the server takes traffic.
+    for attempt in 1..=STARTUP_WIDEN_RETRIES {
+        if failed.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let mut still = Vec::new();
+        for path in failed {
+            match widen(&path) {
+                Ok(n) => changed += usize::from(n > 0),
+                Err(e) if attempt == STARTUP_WIDEN_RETRIES => {
+                    tracing::error!(file = %path.display(), error = %e, "cannot add the new telemetry columns; that environment's visits fail to read until it is fixed (restart to retry)");
+                }
+                Err(_) => still.push(path),
+            }
+        }
+        failed = still;
     }
     changed
 }
+
+/// Further passes over files the startup sweep could not widen.
+const STARTUP_WIDEN_RETRIES: u32 = 3;
 
 enum Kind {
     File,
@@ -332,8 +362,13 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
         Ok(c) => c,
         Err(e) => {
             tracing::error!(tenant = slug, error = %e, "cannot open tenant file");
-            // Answer everything that arrives until the senders go away.
-            for job in rx.iter() {
+            // Answer what is already queued, then exit: the spawn wrapper
+            // unregisters this writer, so the next job starts a new one that
+            // opens the file again. Answering until the senders went away
+            // never ended (the registry holds a sender), so one transient
+            // failure (a lock held past busy_timeout while the new columns
+            // were added) refused that tenant's ingest until a restart.
+            while let Ok(job) = rx.try_recv() {
                 fail(job, format!("cannot open tenant: {e}"));
             }
             return;
