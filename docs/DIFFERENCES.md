@@ -595,6 +595,20 @@ all of it (identical; 130/130).
     floor, or over the budget with only today's files left, ingest answers
     503 + Retry-After, which Rails never does for disk space. Off, nothing
     changes.
+13. **`visits` has four more columns** (`schema::ADDED_COLUMNS`:
+    `redirect_ms`, `redirect_count`, `connect_ms`, `server_ms`, nullable
+    integers): the initial load's TTFB split into phases, which gem 1.2's
+    browser client sends and the Rails cloud does not store. Unlike #11 this
+    alters existing files: `ALTER TABLE ... ADD COLUMN` on every tenant file
+    when the server starts (and on any file `open_tenant` opens), because
+    the per-day union reader's `SELECT *` views refuse files of different
+    widths (tests/schema.rs shows the failure). The columns are appended
+    after Rails' own, so Rails opens the file with 0 pending migrations, its
+    `Visit` model gains four readable attributes, and its mapper writes
+    NULL there. A visit record without the fields maps to exactly Rails' row
+    (mapper_vs_ruby is unchanged). Rolling back to an older release leaves
+    the columns in place: it reads and writes the files unchanged, since
+    nothing older names them and the widths still agree.
 
 ## Process
 

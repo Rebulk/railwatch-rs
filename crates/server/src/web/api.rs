@@ -1226,29 +1226,32 @@ impl Api<'_> {
             .query_map(params![e.id, qt(from), qt(to)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect()
         })?;
-        let (components, vitals, releases) = self.telemetry(e, |conn| {
+        let (components, vitals, ttfb_phases, releases) = self.telemetry(e, |conn| {
             let samples = pages::vital_samples(conn, from, to)?;
-            let components = pages::visit_components(conn, from, to, &samples, sort.as_deref(), dir.as_deref(), component.as_deref())?;
-            let samples = match &component {
-                Some(c) => samples.of_component(c),
-                None => samples,
+            let phases = pages::ttfb_phases(conn, from, to)?;
+            let components = pages::visit_components(conn, from, to, &samples, &phases, sort.as_deref(), dir.as_deref(), component.as_deref())?;
+            let (samples, phases) = match &component {
+                Some(c) => (samples.of_component(c), phases.of_component(c)),
+                None => (samples, phases),
             };
             let names: Vec<String> = deploys.iter().map(|d| d.0.clone()).collect();
             let releases: Vec<Value> = deploys
                 .iter()
                 .zip(pages::vitals_by_deploy(&samples, &names))
-                .map(|((deploy, ref_, name, at), vitals)| {
+                .zip(pages::ttfb_phases_by_deploy(&phases, &names))
+                .map(|(((deploy, ref_, name, at), vitals), ttfb_phases)| {
                     crate::obj! {
                         "deploy" => deploy.clone(), "ref" => js(ref_.as_deref()), "name" => js(name.as_deref()), "deployed_at" => db_time(Some(at)),
-                        "vitals" => Value::Object(vitals),
+                        "vitals" => Value::Object(vitals), "ttfb_phases" => Value::Object(ttfb_phases),
                     }
                 })
                 .collect();
-            Ok((components, samples.summary(), releases))
+            Ok((components, samples.summary(), phases.summary(), releases))
         })?;
         let (items, meta) = self.paginate(components)?;
         ok(crate::obj! {
-            "vitals" => Value::Object(vitals), "thresholds" => pages::vital_thresholds(), "data" => items, "meta" => meta, "releases" => releases,
+            "vitals" => Value::Object(vitals), "thresholds" => pages::vital_thresholds(), "ttfb_phases" => Value::Object(ttfb_phases),
+            "data" => items, "meta" => meta, "releases" => releases,
         })
     }
 
@@ -2122,6 +2125,93 @@ mod tests {
         let (s, series) = get(&f, &format!("/api/v1/applications/{}/environments/{}/series?type=visit&window=24h", f.app, f.env), "full");
         assert_eq!(s, 200);
         assert_eq!(series["data"].to_string(), page["series"].to_string(), "the page's visit chart");
+
+        // No load in this fixture split its TTFB (a gem before 1.2).
+        assert_eq!(page["ttfb_phases"], json!({}));
+        assert_eq!(mcp["ttfb_phases"], json!({}));
+    }
+
+    /// Initial loads that split their TTFB (gem 1.2+): a slow first byte that
+    /// is all redirects shows as redirect time, the same on the page, the API
+    /// and MCP, overall, per component and per release. A load whose browser
+    /// hid a cross-origin chain (no count) still counts its redirect time,
+    /// and only the counted ones make up `redirected_at_least`.
+    #[test]
+    fn ttfb_phases_show_redirect_time_on_the_page_the_api_and_mcp() {
+        let f = fixture("phases");
+        let slug: String = f.c.with(|x| x.query_row("SELECT slug FROM environments WHERE id = ?", [f.env], |r| r.get(0))).unwrap();
+        let conn = crate::tenants::open_tenant(&f.dir.join("telemetry").join(format!("{slug}.sqlite3"))).unwrap();
+        let at = qt(NOW - 2 * 3600 * 1_000_000);
+        // (component, deploy, ttfb, redirect_ms, redirect_count, connect_ms, server_ms)
+        type Load<'a> = (&'a str, &'a str, i64, i64, Option<i64>, i64, i64);
+        let loads: [Load; 5] = [
+            ("auth/sign_in", "d2", 1300, 1180, Some(2), 20, 100), // / -> /sign_in, same origin
+            ("auth/sign_in", "d2", 1250, 1130, None, 20, 100),    // the old host first: cross-origin, hidden
+            ("auth/sign_in", "d2", 1400, 1200, None, 60, 140),    // hidden too
+            ("auth/sign_in", "d1", 140, 3, None, 30, 107),        // typed /sign_in: no redirect
+            ("orders/index", "d1", 160, 2, None, 40, 118),
+        ];
+        for (c, deploy, ttfb, redirect_ms, redirect_count, connect_ms, server_ms) in loads {
+            conn.execute(
+                "INSERT INTO visits (component, group_hash, url, method, duration, status, occurred_at, deploy, ttfb, redirect_ms, redirect_count, connect_ms, server_ms)
+                 VALUES (?1, substr(hex(?1) || '00000000000000000000000000000000', 1, 32), '/x', 'GET', 900000, 'success', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![c, at, deploy, ttfb, redirect_ms, redirect_count, connect_ms, server_ms],
+            )
+            .unwrap();
+        }
+        // A load from a gem without phases: no sample.
+        conn.execute(
+            "INSERT INTO visits (component, group_hash, url, method, duration, status, occurred_at, deploy, ttfb)
+             VALUES ('orders/index', substr(hex('orders/index') || '00000000000000000000000000000000', 1, 32), '/x', 'GET', 900000, 'success', ?1, 'd1', 2000)",
+            [&at],
+        )
+        .unwrap();
+        for h in crate::rollup::rollup_job::hours_with_rows(&conn).unwrap() {
+            crate::rollup::rollup_job::perform(&conn, &conn, h, &mut crate::rollup::rollup_job::Rng::PerGroup).unwrap();
+        }
+        for (deploy, hours_ago) in [("d1", 5), ("d2", 3)] {
+            f.c.with(|x| {
+                x.execute(
+                    "INSERT INTO deploys (environment_id, deploy, ref, deployed_at, created_at, updated_at) VALUES (?1, ?2, ?2, ?3, ?3, ?3)",
+                    params![f.env, deploy, qt(NOW - hours_ago * 3600 * 1_000_000)],
+                )
+            })
+            .unwrap();
+        }
+
+        let page = visits_page(&f, &[("window", "24h")]);
+        let (s, api) = get(&f, &format!("/api/v1/applications/{}/environments/{}/visits?window=24h", f.app, f.env), "full");
+        assert_eq!(s, 200, "{api}");
+        let mcp = mcp_tool(&f, "web_vitals", json!({"application_slug": "shop", "environment": "production", "window": "24h"}));
+
+        // p75 of 5 samples is the 4th smallest (index ceil(5 * 0.75) - 1 = 3).
+        let overall = json!({"samples": 5, "redirect_ms": 1180, "connect_ms": 40, "server_ms": 118, "redirected_at_least": 0.2});
+        assert_eq!(page["ttfb_phases"], overall, "the page");
+        assert_eq!(api["ttfb_phases"], overall, "the API");
+        assert_eq!(mcp["ttfb_phases"], overall, "MCP");
+
+        // Per component: the sign-in page's first byte is redirects.
+        let sign_in = mcp["components"].as_array().unwrap().iter().find(|c| c["component"] == "auth/sign_in").unwrap();
+        // 4 samples: the 3rd smallest. redirect_ms [3, 1130, 1180, 1200].
+        assert_eq!(sign_in["ttfb_phases"], json!({"samples": 4, "redirect_ms": 1180, "connect_ms": 30, "server_ms": 107, "redirected_at_least": 0.25}));
+        let page_row = page["components"].as_array().unwrap().iter().find(|c| c["name"] == "auth/sign_in").unwrap();
+        assert_eq!(page_row["redirect_ms"], 1180, "the page's component table");
+        let api_row = api["data"].as_array().unwrap().iter().find(|c| c["name"] == "auth/sign_in").unwrap();
+        assert_eq!(api_row["ttfb_phases"], sign_in["ttfb_phases"]);
+
+        // Per release: d2 is where the redirects came in.
+        let by_deploy: Vec<(String, Value)> =
+            mcp["releases"].as_array().unwrap().iter().map(|r| (r["deploy"].as_str().unwrap().to_string(), r["ttfb_phases"]["redirect_ms"].clone())).collect();
+        assert_eq!(json!(by_deploy), json!([["d2", 1200], ["d1", 3]]));
+        assert_eq!(api["releases"][0]["ttfb_phases"], mcp["releases"][0]["ttfb_phases"]);
+
+        // One component: its phases only.
+        let orders = mcp_tool(&f, "web_vitals", json!({"application_slug": "shop", "environment": "production", "component": "orders/index"}));
+        assert_eq!(orders["ttfb_phases"]["samples"], 1);
+
+        // Each recent visit carries its own split; NULL count stays null.
+        let hidden = page["recent"].as_array().unwrap().iter().find(|v| v["redirect_ms"] == 1130).unwrap();
+        assert_eq!((hidden["redirect_count"].clone(), hidden["server_ms"].clone()), (Value::Null, json!(100)));
     }
 
     #[test]

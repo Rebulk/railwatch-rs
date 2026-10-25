@@ -33,6 +33,10 @@ interface Visit {
   cls: number | null
   inp: number | null
   ttfb: number | null
+  redirect_ms: number | null
+  redirect_count: number | null
+  connect_ms: number | null
+  server_ms: number | null
 }
 type VitalKey = "lcp" | "cls" | "inp" | "ttfb"
 interface Vital {
@@ -40,11 +44,27 @@ interface Vital {
   rating: "good" | "needs-improvement" | "poor"
   samples: number
 }
+// p75 of each phase of the initial loads' TTFB. Empty when no load sent
+// them (a browser client before railwatch 1.2).
+interface TtfbPhases {
+  samples?: number
+  redirect_ms?: number | null
+  connect_ms?: number | null
+  server_ms?: number | null
+  // Loads whose browser showed a redirect. A floor: browsers hide a chain
+  // with a cross-origin hop, whose time is still in redirect_ms.
+  redirected_at_least?: number
+}
 interface Props {
-  components: (GroupRow & { lcp: number | null; inp: number | null })[]
+  components: (GroupRow & {
+    lcp: number | null
+    inp: number | null
+    redirect_ms: number | null
+  })[]
   series: SeriesPoint[]
   recent: Visit[]
   vitals: Partial<Record<VitalKey, Vital>>
+  ttfb_phases?: TtfbPhases
   sort: string
   dir: string
   q: string
@@ -67,11 +87,20 @@ const ratingTones = {
 const vitalValue = (key: VitalKey, value: number) =>
   key === "cls" ? value.toFixed(2) : ms(value)
 
+// A null count is "none or hidden" (cross-origin), so only a positive one
+// is shown; the redirect time is shown either way.
+const redirectPart = (v: Visit) =>
+  v.redirect_ms === null
+    ? null
+    : `redirect ${ms(v.redirect_ms, 0)}${v.redirect_count ? ` (${v.redirect_count})` : ""}`
+
 const visitVitals = (v: Visit) =>
   [
     v.lcp === null ? null : `LCP ${ms(v.lcp)}`,
     v.inp === null ? null : `INP ${ms(v.inp)}`,
     v.cls === null ? null : `CLS ${v.cls.toFixed(2)}`,
+    v.ttfb === null ? null : `TTFB ${ms(v.ttfb)}`,
+    redirectPart(v),
   ]
     .filter((part): part is string => part !== null)
     .join(" · ")
@@ -94,6 +123,7 @@ export default function Visits(p: Props) {
     )
 
   const measured = vitalKeys.filter((key) => p.vitals[key])
+  const phases = p.ttfb_phases ?? {}
 
   return (
     <EnvLayout title="Visits">
@@ -127,6 +157,30 @@ export default function Visits(p: Props) {
           .
         </p>
       )}
+      {phases.samples ? (
+        <StatStrip>
+          <Stat
+            label="TTFB: redirects"
+            value={ms(phases.redirect_ms, 0)}
+            hint={`p75 of ${count(phases.samples)} · navigation start to the final request`}
+          />
+          <Stat
+            label="TTFB: connection"
+            value={ms(phases.connect_ms, 0)}
+            hint="p75 · cache, DNS, TCP, TLS"
+          />
+          <Stat
+            label="TTFB: server"
+            value={ms(phases.server_ms, 0)}
+            hint="p75 · request sent to first byte"
+          />
+          <Stat
+            label="Redirected"
+            value={`≥ ${pct(phases.redirected_at_least ?? 0, 1)}`}
+            hint="of initial loads; browsers hide cross-origin redirects"
+          />
+        </StatStrip>
+      ) : null}
       <div className="grid gap-4 lg:grid-cols-2">
         <VolumePanel
           legend="outcome"
@@ -209,6 +263,13 @@ export default function Visits(p: Props) {
             header: "INP",
             align: "right",
             cell: (c) => ms(c.inp),
+          },
+          {
+            key: "redirect",
+            hideOnMobile: true,
+            header: "Redirect",
+            align: "right",
+            cell: (c) => ms(c.redirect_ms, 0),
           },
           {
             key: percentile,

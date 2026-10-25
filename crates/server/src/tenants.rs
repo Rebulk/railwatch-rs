@@ -221,9 +221,43 @@ pub fn open_tenant(path: &Path) -> rusqlite::Result<Connection> {
     if fresh || !has_schema {
         let now = crate::time::quoted_date_micros(crate::time::now_micros());
         schema::create_tenant(&mut conn, &now)?;
+    } else {
+        schema::add_missing_columns(&conn)?;
     }
     conn.set_prepared_statement_cache_capacity(256);
     Ok(conn)
+}
+
+/// Every tenant file under `tenants_dir` (single files and every file of a
+/// per-day directory) gets the schema::ADDED_COLUMNS it lacks. Runs once at
+/// startup, before any reader attaches: a union reader's views read every
+/// day file, and one file short a column fails every page of that
+/// environment. Returns the files changed; a file it cannot open is
+/// reported and skipped (its environment's pages fail until it is fixed,
+/// the rest are unaffected).
+pub fn add_missing_columns_everywhere(tenants_dir: &Path) -> usize {
+    let mut files = Vec::new();
+    for e in std::fs::read_dir(tenants_dir).into_iter().flatten().flatten() {
+        let path = e.path();
+        if path.is_dir() && crate::storage::layout::meta_path(&path).is_file() {
+            files.extend(crate::storage::layout::all_files(&path));
+        } else if path.extension().is_some_and(|x| x == "sqlite3") {
+            files.push(path);
+        }
+    }
+    let mut changed = 0;
+    for path in files {
+        let result = Connection::open(&path).and_then(|c| {
+            schema::configure(&c)?;
+            schema::add_missing_columns(&c)
+        });
+        match result {
+            Ok(0) => {}
+            Ok(_) => changed += 1,
+            Err(e) => tracing::error!(file = %path.display(), error = %e, "cannot add the new telemetry columns"),
+        }
+    }
+    changed
 }
 
 fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Duration, followups: &FollowupSender, disk: &crate::storage::budget::State) {

@@ -1366,32 +1366,128 @@ pub fn vital_thresholds() -> Value {
     )
 }
 
+/// One initial load that split its TTFB (gem 1.2+'s browser client):
+/// navigation start -> final request (`redirect_ms`, every redirect hop),
+/// -> request sent (`connect_ms`), -> first byte (`server_ms`).
+pub struct PhaseSample {
+    pub component: String,
+    pub deploy: Option<String>,
+    redirect_ms: i64,
+    connect_ms: Option<i64>,
+    server_ms: Option<i64>,
+    /// The browser showed at least one redirect. It shows none for a chain
+    /// with a cross-origin hop, so false is "none or hidden", never "none".
+    counted_redirect: bool,
+}
+
+/// The window's loads with TTFB phases, newest first, at most
+/// MAX_VITAL_SAMPLES. Read beside `vital_samples` by the visits page, the
+/// MCP web_vitals tool and /api/v1 .../visits.
+pub struct TtfbPhases(Vec<PhaseSample>);
+
+pub fn ttfb_phases(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<TtfbPhases> {
+    let rows = db::query(
+        conn,
+        &format!(
+            "SELECT \"visits\".\"component\", \"visits\".\"deploy\", \"visits\".\"redirect_ms\", \"visits\".\"connect_ms\", \"visits\".\"server_ms\", \
+             \"visits\".\"redirect_count\" FROM \"visits\" WHERE \"visits\".\"occurred_at\" BETWEEN ?1 AND ?2 AND \"visits\".\"redirect_ms\" IS NOT NULL \
+             ORDER BY \"visits\".\"occurred_at\" DESC LIMIT {MAX_VITAL_SAMPLES}"
+        ),
+        rusqlite::params![qt(from), qt(to)],
+    )?;
+    Ok(TtfbPhases(
+        rows.iter()
+            .map(|r| PhaseSample {
+                component: r.s("component").unwrap_or("").to_string(),
+                deploy: r.s("deploy").map(str::to_string),
+                redirect_ms: r.i("redirect_ms").unwrap_or(0),
+                connect_ms: r.i("connect_ms"),
+                server_ms: r.i("server_ms"),
+                counted_redirect: r.i("redirect_count").is_some_and(|n| n > 0),
+            })
+            .collect(),
+    ))
+}
+
+impl TtfbPhases {
+    pub fn summary(&self) -> Map<String, Value> {
+        summarize_phases(&self.0.iter().collect::<Vec<_>>())
+    }
+
+    /// `summary` per `key` (a component, a deploy). Samples whose key is
+    /// None are left out.
+    pub fn summary_by(&self, key: impl Fn(&PhaseSample) -> Option<&str>) -> HashMap<String, Map<String, Value>> {
+        let mut by: HashMap<String, Vec<&PhaseSample>> = HashMap::new();
+        for s in &self.0 {
+            if let Some(k) = key(s) {
+                by.entry(k.to_string()).or_default().push(s);
+            }
+        }
+        by.into_iter().map(|(k, samples)| (k, summarize_phases(&samples))).collect()
+    }
+
+    pub fn of_component(self, component: &str) -> TtfbPhases {
+        TtfbPhases(self.0.into_iter().filter(|s| s.component == component).collect())
+    }
+}
+
+/// `{samples, redirect_ms, connect_ms, server_ms, redirected_at_least}`,
+/// or empty with no samples. Each phase is its own p75, so they need not add
+/// up to the TTFB p75. `redirected_at_least` is the share of loads whose
+/// browser showed a redirect: a floor, because a chain with a cross-origin
+/// hop shows none. `redirect_ms` includes those hidden hops.
+fn summarize_phases(samples: &[&PhaseSample]) -> Map<String, Value> {
+    if samples.is_empty() {
+        return Map::new();
+    }
+    let n = samples.len();
+    let p75_of = |values: Vec<i64>| if values.is_empty() { Value::Null } else { p75(values.into_iter().map(Sql::Integer).collect()) };
+    let counted = samples.iter().filter(|s| s.counted_redirect).count();
+    let mut out = Map::new();
+    out.insert("samples".into(), n.into());
+    out.insert("redirect_ms".into(), p75_of(samples.iter().map(|s| s.redirect_ms).collect()));
+    out.insert("connect_ms".into(), p75_of(samples.iter().filter_map(|s| s.connect_ms).collect()));
+    out.insert("server_ms".into(), p75_of(samples.iter().filter_map(|s| s.server_ms).collect()));
+    out.insert("redirected_at_least".into(), jf(rb::round(counted as f64 / n as f64, 4)));
+    out
+}
+
+/// The TTFB phases of each deploy's loads, for the deploys given.
+pub fn ttfb_phases_by_deploy(phases: &TtfbPhases, deploys: &[String]) -> Vec<Map<String, Value>> {
+    let by = phases.summary_by(|s| s.deploy.as_deref());
+    deploys.iter().map(|d| by.get(d).cloned().unwrap_or_default()).collect()
+}
+
 /// The visits page's components (`grouped("visit", 100)`, so visit count,
 /// errors and duration percentiles in ms) with each one's `vitals`. A
 /// `sort` of a vital orders by its p75, worst first unless `dir` is asc,
 /// components without that vital last; any other sort is `grouped`'s.
 /// `component` keeps only that one. Both filter and vital sort look at
 /// every component before the 100-row cap, so neither misses one ranked
-/// past it by visit count.
+/// past it by visit count. Each row also carries its `ttfb_phases`.
+#[allow(clippy::too_many_arguments)]
 pub fn visit_components(
     conn: &Connection,
     from: i64,
     to: i64,
     samples: &VitalSamples,
+    phases: &TtfbPhases,
     sort: Option<&str>,
     dir: Option<&str>,
     component: Option<&str>,
 ) -> rusqlite::Result<Vec<Value>> {
     const LIMIT: usize = 100;
     let by = samples.summary_by(|s| Some(&s.component));
+    let phases_by = phases.summary_by(|s| Some(&s.component));
     let vital = sort.filter(|s| VITALS.iter().any(|(m, _, _)| m == s));
     let limit = if vital.is_some() || component.is_some() { usize::MAX } else { LIMIT };
     let rows: Vec<Value> = aggregations::grouped(conn, "visit", from, to, limit, if vital.is_some() { None } else { sort }, dir)?
         .into_iter()
         .filter(|row| component.is_none_or(|c| row["name"].as_str() == Some(c)))
         .map(|mut row| {
-            let v = by.get(row["name"].as_str().unwrap_or("")).cloned().unwrap_or_default();
-            db::merge_into(&mut row, "vitals", Value::Object(v));
+            let name = row["name"].as_str().unwrap_or("").to_string();
+            db::merge_into(&mut row, "vitals", Value::Object(by.get(&name).cloned().unwrap_or_default()));
+            db::merge_into(&mut row, "ttfb_phases", Value::Object(phases_by.get(&name).cloned().unwrap_or_default()));
             row
         })
         .collect();
@@ -1419,25 +1515,32 @@ pub fn visits_index(conn: &Connection, ctx: &PageContext, _control: &dyn Control
     }
     let rows = select(conn, "visits", "\"visits\".*", &rc, &super::recent("visits"), Some(200))?;
     let samples = vital_samples(conn, from, to)?;
+    let phases = ttfb_phases(conn, from, to)?;
     let by_component = samples.summary_by(|s| Some(&s.component));
+    let phases_by_component = phases.summary_by(|s| Some(&s.component));
     let components: Vec<Value> = grouped(conn, ctx, "visit", 100, true)?
         .into_iter()
         .map(|mut row| {
-            let v = by_component.get(row["name"].as_str().unwrap_or(""));
+            let name = row["name"].as_str().unwrap_or("").to_string();
+            let v = by_component.get(&name);
             for m in ["lcp", "inp"] {
                 db::merge_into(&mut row, m, v.and_then(|v| v.get(m)).map_or(Value::Null, |x| x["value"].clone()));
             }
+            let redirect = phases_by_component.get(&name).and_then(|p| p.get("redirect_ms")).cloned().unwrap_or(Value::Null);
+            db::merge_into(&mut row, "redirect_ms", redirect);
             row
         })
         .collect();
     Ok(crate::obj! {
         "components" => components, "series" => series(conn, ctx, "visit", None)?, "vitals" => Value::Object(samples.summary()),
+        "ttfb_phases" => Value::Object(phases.summary()),
         "sort" => sort_param(ctx, "count"), "dir" => dir_param(ctx), "q" => ctx.param_s("q"),
         "recent" => rows.iter().map(|v| crate::obj! {
             "id" => ji(v.i("id")), "component" => js(v.s("component")), "url" => js(v.s("url")), "method" => js(v.s("method")), "duration" => dur(v, 1),
             "status" => js(v.s("status")), "partial" => v.attr("visits", "partial"), "only" => v.json("only"), "props_bytes" => ji(v.i("props_bytes")),
             "occurred_at" => jt(v.t("occurred_at")), "user_ref" => js(v.s("user_ref")), "lcp" => ji(v.i("lcp")), "cls" => v.attr("visits", "cls"),
-            "inp" => ji(v.i("inp")), "ttfb" => ji(v.i("ttfb")),
+            "inp" => ji(v.i("inp")), "ttfb" => ji(v.i("ttfb")), "redirect_ms" => ji(v.i("redirect_ms")),
+            "redirect_count" => ji(v.i("redirect_count")), "connect_ms" => ji(v.i("connect_ms")), "server_ms" => ji(v.i("server_ms")),
         }).collect::<Vec<_>>(),
     })
 }
