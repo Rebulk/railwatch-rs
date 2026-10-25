@@ -616,8 +616,8 @@ all of it (identical; 130/130).
     lock past busy_timeout) is retried three more times a second apart; if it
     is still narrow the server starts anyway, logs an error, and a background
     thread retries it every 30 seconds until it is widened. Until then that
-    environment's visits pages fail; the rest of the server is unaffected. A writer that cannot open its tenant answers what is queued
-    and exits, so the next job opens the file again.
+    environment's visits pages fail; the rest of the server is unaffected. A writer that cannot open its
+    tenant answers what is queued and exits, so the next job opens the file again.
 
     **Rolling back past this release is roll-forward-only once a day rolls
     over.** The older release keeps reading the widened files, but it creates
@@ -625,7 +625,11 @@ all of it (identical; 130/130).
     the same `SELECT *` union: from the first new day file onward, every
     per-day environment that already holds a widened file fails to read until
     the widths agree again. Roll forward (the startup sweep widens the narrow
-    files before any reader attaches), or, to stay on the older release, drop
+    files before readers attach, except a file still locked after its
+    retries, which the background retry widens later; check the log for
+    "cannot add the new telemetry columns" with no matching "added the new
+    telemetry columns" before relying on that environment's visits pages),
+    or, to stay on the older release, drop
     the four columns from every widened file
     (`ALTER TABLE visits DROP COLUMN redirect_ms` and the other three) with
     the server stopped. Single-file tenants are unaffected either way.
