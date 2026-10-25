@@ -252,3 +252,18 @@ fn a_reader_built_while_a_file_was_narrow_recovers_after_the_background_widen() 
     assert!(railwatch_server::storage::reader::refresh(&conn, &dir, &mut attached).unwrap(), "the widen makes the reader rebuild");
     assert_eq!(count(&conn).unwrap(), 1, "the same connection reads visits again");
 }
+
+/// Retention can delete a day still queued for the background widen. The
+/// retry must drop it, never recreate it: an empty file in core/ has no
+/// tables, and every union reader of the environment fails on it.
+#[test]
+fn the_background_widen_never_recreates_a_deleted_day() {
+    let tenants = Scratch::new("deleted");
+    let dir = tenants.0.join("shop-production");
+    std::fs::create_dir_all(dir.join(Tier::Core.dir())).unwrap();
+    old_tenant(&meta_path(&dir));
+    let gone = day_path(&dir, Tier::Core, "2026-10-13");
+
+    railwatch_server::tenants::widen_until_done(vec![gone.clone()], std::time::Duration::from_millis(1));
+    assert!(!gone.exists(), "a day retention removed stays removed");
+}

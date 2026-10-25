@@ -310,10 +310,11 @@ pub fn widen_until_done(mut paths: Vec<PathBuf>, every: Duration) {
     while !paths.is_empty() {
         std::thread::sleep(every);
         paths.retain(|path| {
-            if !path.exists() {
-                return false;
-            }
-            let result = Connection::open(path).and_then(|c| {
+            // Never create: a day retention deletes between two retries must
+            // not come back as an empty file (no tables), which every union
+            // reader of that environment would then fail on.
+            let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+            let result = Connection::open_with_flags(path, flags).and_then(|c| {
                 schema::configure(&c)?;
                 schema::add_missing_columns(&c)
             });
@@ -324,6 +325,7 @@ pub fn widen_until_done(mut paths: Vec<PathBuf>, every: Duration) {
                     crate::storage::reader::schema_changed();
                     false
                 }
+                Err(_) if !path.exists() => false,
                 Err(_) => true,
             }
         });
