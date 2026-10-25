@@ -29,6 +29,7 @@ use serde_json::{Map, Value, json};
 
 use super::WebState;
 use super::mcp::{Env, Token, present, ruby_to_i, to_s, with_tenant};
+use super::proxy_auth::Claims;
 use crate::dashboard::cursor_page::{self, Order};
 use crate::dashboard::db::{self, jf, js, jt, qt};
 use crate::dashboard::filter_query::{self, Resource};
@@ -55,6 +56,10 @@ pub fn routes() -> Router<Arc<WebState>> {
 
 async fn handle(State(state): State<Arc<WebState>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
+    let proxied = match Token::proxied_claims(&parts) {
+        Ok(p) => p,
+        Err(refused) => return render(&parts.method, &parts.headers, StatusCode::FORBIDDEN, &refused).into_response(),
+    };
     let Ok(bytes) = axum::body::to_bytes(body, 4 << 20).await else {
         return (StatusCode::PAYLOAD_TOO_LARGE, [(header::CONTENT_TYPE, "application/json; charset=utf-8")], r#"{"error":"body too large"}"#).into_response();
     };
@@ -68,7 +73,7 @@ async fn handle(State(state): State<Arc<WebState>>, req: Request) -> Response {
     };
     tokio::task::spawn_blocking(move || {
         let env = Env { control: &s.control, tenants: &s.tenants, readers: &s.readers, cursor_key: &s.cursor_key };
-        call(&env, &s.api_rate_limit, crate::time::now_micros(), &req)
+        call_as(&env, &s.api_rate_limit, crate::time::now_micros(), &req, proxied.as_ref())
     })
     .await
     .unwrap_or_else(|e| {
@@ -416,6 +421,12 @@ fn error_page(status: StatusCode, req_headers: &HeaderMap, format: &str, params_
 
 /// Routes, authenticates and runs one request at `now`.
 pub fn call(env: &Env, limit: &FixedWindow<(&'static str, i64)>, now: i64, req: &ApiRequest) -> ApiResponse {
+    call_as(env, limit, now, req, None)
+}
+
+/// `call`, for a request that may carry the trusted proxy's verified claims
+/// instead of a token (Token::from_request).
+pub fn call_as(env: &Env, limit: &FixedWindow<(&'static str, i64)>, now: i64, req: &ApiRequest, proxied: Option<&Claims>) -> ApiResponse {
     let Some((action, path_params, format)) = route(&req.method, &req.path) else {
         return error_page(StatusCode::NOT_FOUND, &req.headers, route_format(&req.path), false);
     };
@@ -427,7 +438,7 @@ pub fn call(env: &Env, limit: &FixedWindow<(&'static str, i64)>, now: i64, req: 
     let params = Params::parse(req, path_params);
     let readable = params.is_ok();
     let authorization = req.headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
-    match run(env, limit, now, action, authorization, params) {
+    match run(env, limit, now, action, authorization, proxied, params) {
         Ok(r) => render(&req.method, &req.headers, r.status, &r.body),
         Err(Halt::Json(status, body)) => render(&req.method, &req.headers, status, &body),
         Err(Halt::Page(status)) => error_page(status, &req.headers, &format, readable),
@@ -439,9 +450,17 @@ fn route_format(path: &str) -> &str {
     path.rsplit_once('.').map_or("", |(_, f)| f).trim_end_matches('/')
 }
 
-fn run(env: &Env, limit: &FixedWindow<(&'static str, i64)>, now: i64, action: Action, authorization: Option<&str>, params: Result<Params, ()>) -> R<Rendered> {
-    // ApiTokenAuthenticated#authenticate_user!
-    let token = Token::from_authorization(env.control, authorization, now)?.ok_or(Halt::Json(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"})))?;
+fn run(
+    env: &Env,
+    limit: &FixedWindow<(&'static str, i64)>,
+    now: i64,
+    action: Action,
+    authorization: Option<&str>,
+    proxied: Option<&Claims>,
+    params: Result<Params, ()>,
+) -> R<Rendered> {
+    // ApiTokenAuthenticated#authenticate_user!, or the trusted proxy's user.
+    let token = Token::from_request(env.control, authorization, proxied, now)?.ok_or(Halt::Json(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"})))?;
     if !(token.allows("api") && token.allows("read")) {
         return Err(Halt::Json(StatusCode::FORBIDDEN, json!({"error": "insufficient_scope"})));
     }
@@ -453,6 +472,11 @@ fn run(env: &Env, limit: &FixedWindow<(&'static str, i64)>, now: i64, action: Ac
     // The write before_actions (DeploysController's runs before
     // EnvironmentScoped's, which it is declared ahead of).
     if matches!(action, Action::CreateDeploy | Action::UpdateIssue | Action::CreateComment) && !token.allows("write") {
+        return Err(Halt::Json(StatusCode::FORBIDDEN, json!({"error": "insufficient_scope"})));
+    }
+    // Deploys are recorded by a deploy hook with its own token, never from
+    // the dashboard, so the proxy's user does not get them with `write`.
+    if action == Action::CreateDeploy && token.is_proxied() {
         return Err(Halt::Json(StatusCode::FORBIDDEN, json!({"error": "insufficient_scope"})));
     }
     let params = match params {

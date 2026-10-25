@@ -46,6 +46,8 @@ pub const PREAUTH_IP_LIMIT: u64 = 300;
 const PREAUTH_IP_WINDOW_SECS: i64 = 60;
 /// ApiToken::LAST_USED_WRITE_INTERVAL.
 const LAST_USED_WRITE_INTERVAL: i64 = 5 * 60 * 1_000_000;
+/// Token::id of a trusted-proxy identity, which has no api_tokens row.
+const PROXIED_TOKEN_ID: i64 = 0;
 const TELEMETRY_RESOURCES: [&str; 4] = ["jobs", "exceptions", "logs", "queries"];
 /// Alert::STATUSES, which list_alerts filters by (wider than the schema's enum).
 const ALERT_STATUSES: [&str; 7] = ["pending", "delivering", "sent", "failed", "skipped", "collapsed", "summarized"];
@@ -171,13 +173,17 @@ async fn create(State(state): State<Arc<WebState>>, req: Request) -> Response {
     }
     let (parts, body) = req.into_parts();
     let auth = parts.headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let proxied = match Token::proxied_claims(&parts) {
+        Ok(p) => p,
+        Err(refused) => return json_body(StatusCode::FORBIDDEN, &refused),
+    };
     let Ok(bytes) = axum::body::to_bytes(body, 4 << 20).await else {
         return json_body(StatusCode::PAYLOAD_TOO_LARGE, &json!({"error": "body too large"}));
     };
     let s = state.clone();
     let (status, v) = tokio::task::spawn_blocking(move || {
         let env = Env { control: &s.control, tenants: &s.tenants, readers: &s.readers, cursor_key: &s.cursor_key };
-        call(&env, crate::time::now_micros(), auth.as_deref(), &bytes)
+        call_as(&env, crate::time::now_micros(), auth.as_deref(), proxied.as_ref(), &bytes)
     })
     .await
     .unwrap_or_else(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": format!("mcp task failed: {e}")})));
@@ -225,8 +231,85 @@ impl Token {
         }
     }
 
+    /// The request's verified trusted-proxy claims (proxy_auth::layer put
+    /// them there and removed the header), for /mcp and /api/v1. A proxied
+    /// request the browser marks cross-origin is refused (the JSON body is
+    /// Err): the proxy signs whatever passes the host app's gate, and with
+    /// no CSRF token on these routes the Origin check is what keeps another
+    /// site's page from calling them through a signed-in browser (the MCP
+    /// transport's "servers MUST validate the Origin header"). Agents send
+    /// no Origin.
+    pub fn proxied_claims(parts: &axum::http::request::Parts) -> Result<Option<super::proxy_auth::Claims>, Value> {
+        let Some(super::proxy_auth::Proxied(claims)) = parts.extensions.get::<super::proxy_auth::Proxied>() else { return Ok(None) };
+        if !super::session::same_origin(&parts.headers) {
+            tracing::warn!(path = parts.uri.path(), "trusted proxy: cross-origin MCP/API request refused");
+            return Err(json!({"error": "cross_origin"}));
+        }
+        // Any Authorization header, readable or not, is the credential: one
+        // that is not ASCII is a bad token (401), not a fall back to the proxy.
+        if parts.headers.contains_key(header::AUTHORIZATION) {
+            return Ok(None);
+        }
+        Ok(Some(claims.clone()))
+    }
+
+    /// Whether this is a trusted-proxy identity rather than a token row.
+    pub fn is_proxied(&self) -> bool {
+        self.id == PROXIED_TOKEN_ID
+    }
+
+    /// The request's identity on /mcp and /api/v1: an Authorization header,
+    /// when there is one, is the only credential looked at (a bad token is
+    /// 401 whatever else the request carries); without one, the trusted
+    /// proxy's verified claims (`from_proxied`). Err is a database failure.
+    pub fn from_request(
+        control: &Control,
+        authorization: Option<&str>,
+        proxied: Option<&super::proxy_auth::Claims>,
+        now: i64,
+    ) -> rusqlite::Result<Option<Token>> {
+        match (authorization, proxied) {
+            (None, Some(claims)) => Self::from_proxied(control, claims),
+            _ => Self::from_authorization(control, authorization, now),
+        }
+    }
+
+    /// A token for a user the trusted proxy names: the user and session
+    /// proxy_auth::resolve gives the dashboard, with what that user can do
+    /// in the dashboard (read, and write issues and comments; not deploys,
+    /// which api::run refuses it), limited to the account the proxy fronts.
+    /// Not a row: nothing to revoke or record.
+    pub fn from_proxied(control: &Control, claims: &super::proxy_auth::Claims) -> rusqlite::Result<Option<Token>> {
+        let resolved = control.tx(|tx| {
+            let (_, user) = super::proxy_auth::resolve(tx, claims)?;
+            let account: i64 = tx.query_row("SELECT id FROM accounts ORDER BY id LIMIT 1", [], |r| r.get(0))?;
+            Ok((user.id, account))
+        });
+        match resolved {
+            Ok((user_id, account)) => Ok(Some(Token {
+                id: PROXIED_TOKEN_ID,
+                user_id,
+                scopes: ["mcp", "api", "read", "write"].map(String::from).to_vec(),
+                account_id: Some(account),
+                application_id: None,
+                name: super::proxy_auth::SESSION_AGENT.to_string(),
+                expires_at: None,
+                last_used_at: None,
+            })),
+            Err(crate::control::ModelError::Sql(e)) => Err(e),
+            // No account yet: setup has not run. Nobody to be.
+            Err(crate::control::ModelError::Invalid(m)) => {
+                tracing::warn!(?m, "trusted proxy: no identity for MCP/API");
+                Ok(None)
+            }
+        }
+    }
+
     /// ApiToken#record_use!: last_used_at at most every five minutes.
     pub fn record_use(&self, control: &Control, now: i64) {
+        if self.is_proxied() {
+            return;
+        }
         if self.last_used_at.is_none_or(|t| t <= now - LAST_USED_WRITE_INTERVAL) {
             let at = qt(now);
             let _ = control.with(|c| c.execute("UPDATE api_tokens SET last_used_at = ?1, updated_at = ?1 WHERE id = ?2", params![at, self.id]));
@@ -279,7 +362,13 @@ impl Token {
 /// body; a `Value::Null` body is Rails' HTML 500 page (an exception the
 /// controller does not rescue).
 pub fn call(env: &Env, now: i64, authorization: Option<&str>, body: &Bytes) -> (StatusCode, Value) {
-    let token = match Token::from_authorization(env.control, authorization, now) {
+    call_as(env, now, authorization, None, body)
+}
+
+/// `call`, for a request that may carry the trusted proxy's verified claims
+/// instead of a token (Token::from_request).
+pub fn call_as(env: &Env, now: i64, authorization: Option<&str>, proxied: Option<&super::proxy_auth::Claims>, body: &Bytes) -> (StatusCode, Value) {
+    let token = match Token::from_request(env.control, authorization, proxied, now) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error = %e, "mcp token lookup failed");

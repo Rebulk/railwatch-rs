@@ -28,6 +28,9 @@
 //!   nobody knows), a member of the server's first account only, with one
 //!   long-lived session row reused on every request. CSRF is unchanged:
 //!   a state-changing request still needs the session's token.
+//! - /mcp and /api/v1 take the same claims in place of a token
+//!   (mcp::Token::from_request): that user's dashboard access, refused
+//!   when the browser marks the request cross-origin (no CSRF token there).
 //!
 //! The proxy must drop any copy of the header the browser sent.
 
