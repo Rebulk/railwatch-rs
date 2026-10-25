@@ -13,6 +13,8 @@
 //! A meta, control or single-file snapshot is skipped when the database has
 //! had no commit since the last upload (`unchanged`, by `PRAGMA
 //! data_version`): an idle environment's meta was re-uploaded every pass.
+//! A changed meta file is uploaded at most every META_INTERVAL (`deferred`
+//! until then); the control DB every pass it changes.
 //!
 //! Snapshots use the SQLite online backup API into a temporary file, so a
 //! snapshot is a consistent database even while ingest writes; it is then
@@ -39,6 +41,8 @@ pub struct Pass {
     pub snapshots: usize,
     /// Snapshots skipped because the database had not changed.
     pub unchanged: usize,
+    /// Changed meta files left for a later pass (META_INTERVAL).
+    pub deferred: usize,
     pub day_files: usize,
     pub skipped: usize,
     pub bytes_raw: u64,
@@ -135,25 +139,52 @@ fn free_bytes(dir: &Path) -> Option<u64> {
 struct Watch {
     conn: Connection,
     uploaded_at: i64,
+    uploaded: std::time::Instant,
+}
+
+/// How often a changed meta file is uploaded at most. Meta (rollups,
+/// receipts, people) changes on every ingest, and rebulk-system's is
+/// 557 MB, so a 5-minute pass re-uploaded ~116 MB compressed each time.
+/// A restore already loses the open day files (the last two days of raw
+/// rows, see the module comment), so meta older than this costs little.
+pub const META_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// META_INTERVAL, unless RAILWATCH_BACKUP_META_INTERVAL_SECONDS overrides
+/// it (tests and drills).
+fn meta_interval() -> std::time::Duration {
+    std::env::var("RAILWATCH_BACKUP_META_INTERVAL_SECONDS").ok().and_then(|v| v.parse().ok()).map_or(META_INTERVAL, std::time::Duration::from_secs)
 }
 
 fn data_version(conn: &Connection) -> Option<i64> {
     conn.query_row("PRAGMA data_version", [], |r| r.get(0)).ok()
 }
 
-/// Uploads `src` unless it is unchanged since this process last uploaded it.
-fn upload_if_changed(s3: &S3, src: &Path, key: &str, scratch: &Path, pass: &mut Pass, last: &mut Uploaded) -> Result<(), String> {
-    if let Some(w) = last.0.get(key)
-        && data_version(&w.conn) == Some(w.uploaded_at)
-    {
-        pass.unchanged += 1;
-        return Ok(());
+/// Uploads `src` unless it is unchanged since this process last uploaded
+/// it, or was uploaded less than `min_interval` ago.
+fn upload_if_changed(
+    s3: &S3,
+    src: &Path,
+    key: &str,
+    scratch: &Path,
+    pass: &mut Pass,
+    last: &mut Uploaded,
+    min_interval: std::time::Duration,
+) -> Result<(), String> {
+    if let Some(w) = last.0.get(key) {
+        if data_version(&w.conn) == Some(w.uploaded_at) {
+            pass.unchanged += 1;
+            return Ok(());
+        }
+        if w.uploaded.elapsed() < min_interval {
+            pass.deferred += 1;
+            return Ok(());
+        }
     }
     // Read before the snapshot: a commit during it moves data_version past
     // this, so the next pass uploads again rather than missing it.
     let watch = Connection::open_with_flags(src, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .ok()
-        .and_then(|conn| data_version(&conn).map(|uploaded_at| Watch { conn, uploaded_at }));
+        .and_then(|conn| data_version(&conn).map(|uploaded_at| Watch { conn, uploaded_at, uploaded: std::time::Instant::now() }));
     upload_snapshot(s3, src, key, scratch, pass)?;
     match watch {
         Some(w) => last.0.insert(key.to_string(), w),
@@ -191,14 +222,14 @@ pub fn run_pass(s3: &S3, data_dir: &Path, tenants_dir: &Path, now_micros: i64, l
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
     let control = data_dir.join("control.sqlite3");
     if control.is_file() {
-        upload_if_changed(s3, &control, "control/latest.sqlite3.zst", &scratch, &mut pass, last)?;
+        upload_if_changed(s3, &control, "control/latest.sqlite3.zst", &scratch, &mut pass, last, std::time::Duration::ZERO)?;
     }
     let mut existing: Option<std::collections::HashSet<String>> = None;
     for entry in std::fs::read_dir(tenants_dir).map_err(|e| e.to_string())?.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         if path.is_dir() && layout::meta_path(&path).is_file() {
-            upload_if_changed(s3, &layout::meta_path(&path), &format!("tenants/{name}/meta.sqlite3.zst"), &scratch, &mut pass, last)?;
+            upload_if_changed(s3, &layout::meta_path(&path), &format!("tenants/{name}/meta.sqlite3.zst"), &scratch, &mut pass, last, meta_interval())?;
             let known = match &existing {
                 Some(k) => k,
                 None => existing.insert(s3.list("tenants/")?.into_iter().collect()),
@@ -224,7 +255,7 @@ pub fn run_pass(s3: &S3, data_dir: &Path, tenants_dir: &Path, now_micros: i64, l
         } else if let Some(slug) = name.strip_suffix(".sqlite3")
             && path.is_file()
         {
-            upload_if_changed(s3, &path, &format!("tenants/{slug}.sqlite3.zst"), &scratch, &mut pass, last)?;
+            upload_if_changed(s3, &path, &format!("tenants/{slug}.sqlite3.zst"), &scratch, &mut pass, last, std::time::Duration::ZERO)?;
         }
     }
     let _ = std::fs::remove_dir_all(&scratch);
@@ -324,6 +355,7 @@ pub fn spawn(settings: Settings, data_dir: PathBuf, tenants_dir: PathBuf) -> std
                         tracing::info!(
                             snapshots = p.snapshots,
                             unchanged = p.unchanged,
+                            deferred = p.deferred,
                             day_files = p.day_files,
                             skipped = p.skipped,
                             raw = p.bytes_raw,
