@@ -21,8 +21,24 @@ use rusqlite::{Connection, OpenFlags};
 
 use super::layout::{self, Tier};
 
-/// Which files a reader has attached, to notice a new or deleted day.
-pub type Attached = Vec<PathBuf>;
+/// Which files a reader has attached, to notice a new or deleted day, and
+/// the schema generation its views were built at.
+pub type Attached = (Vec<PathBuf>, u64);
+
+/// Bumped when a file's columns change after readers may already have built
+/// views over it (tenants::widen_until_done). A union view is `SELECT *`
+/// expanded when it is created, so a reader built while one file was still
+/// narrow keeps failing after that file is widened unless it rebuilds; the
+/// attached file list alone does not change.
+static SCHEMA_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn schema_changed() {
+    SCHEMA_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn schema_generation() -> u64 {
+    SCHEMA_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 /// A union reader's page cache across all its attached files, in KiB, and
 /// the least any one file gets. Pages are read through mmap, so the cache
@@ -45,14 +61,15 @@ pub fn open(dir: &Path) -> rusqlite::Result<(Connection, Attached)> {
 }
 
 /// The files a reader of `dir` should have attached right now.
-pub fn wanted(dir: &Path) -> Attached {
+pub fn wanted(dir: &Path) -> Vec<PathBuf> {
     layout::all_files(dir)
 }
 
-/// Re-attaches if the directory's files changed since `attached`.
+/// Re-attaches if the directory's files changed since `attached`, or a
+/// file's columns did (schema_changed).
 pub fn refresh(conn: &Connection, dir: &Path, attached: &mut Attached) -> rusqlite::Result<bool> {
     let now = wanted(dir);
-    if now == *attached {
+    if now == attached.0 && schema_generation() == attached.1 {
         return Ok(false);
     }
     conn.flush_prepared_statement_cache();
@@ -73,6 +90,9 @@ pub fn refresh(conn: &Connection, dir: &Path, attached: &mut Attached) -> rusqli
 }
 
 fn attach_all(conn: &Connection, dir: &Path) -> rusqlite::Result<Attached> {
+    // Read before the views are built: a widen racing this build bumps the
+    // generation after, so the next refresh rebuilds.
+    let generation = schema_generation();
     let meta = layout::meta_path(dir);
     let core = layout::days(dir, Tier::Core);
     let detail = layout::days(dir, Tier::Detail);
@@ -153,7 +173,7 @@ fn attach_all(conn: &Connection, dir: &Path) -> rusqlite::Result<Attached> {
             .join(" UNION ALL ")
     };
     conn.execute_batch(&format!("CREATE TEMP VIEW \"logs_fts\" AS {fts}"))?;
-    Ok(attached)
+    Ok((attached, generation))
 }
 
 /// Every gem table a page can read (meta and day tables alike).
@@ -475,7 +495,7 @@ mod tests {
         assert!(!refresh(&conn, &dir, &mut attached).unwrap());
         open_or_create(&day_path(&dir, Tier::Core, "2026-10-15")).unwrap();
         assert!(refresh(&conn, &dir, &mut attached).unwrap());
-        assert_eq!(attached.len(), 6);
+        assert_eq!(attached.0.len(), 6);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -493,7 +513,7 @@ mod tests {
         std::fs::remove_file(day_path(&dir, Tier::Core, "2026-10-13")).unwrap();
         std::os::unix::fs::symlink(dir.join("gone"), day_path(&dir, Tier::Core, "2026-10-13")).unwrap();
         let (conn, attached) = open(&dir).unwrap();
-        assert_eq!(attached, vec![meta_path(&dir), day_path(&dir, Tier::Core, "2026-10-14")]);
+        assert_eq!(attached.0, vec![meta_path(&dir), day_path(&dir, Tier::Core, "2026-10-14")]);
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM executions", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
         let _ = std::fs::remove_dir_all(&dir);

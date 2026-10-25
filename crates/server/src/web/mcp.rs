@@ -1438,20 +1438,22 @@ impl Mcp<'_> {
         })?;
         self.with_telemetry(&env, |conn| {
             let samples = crate::dashboard::pages::vital_samples(conn, from, to)?;
+            let phases = crate::dashboard::pages::ttfb_phases(conn, from, to)?;
             let components =
-                crate::dashboard::pages::visit_components(conn, from, to, &samples, Some(&sort), a.presence("dir").as_deref(), component.as_deref())?;
-            let samples = match &component {
-                Some(c) => samples.of_component(c),
-                None => samples,
+                crate::dashboard::pages::visit_components(conn, from, to, &samples, &phases, Some(&sort), a.presence("dir").as_deref(), component.as_deref())?;
+            let (samples, phases) = match &component {
+                Some(c) => (samples.of_component(c), phases.of_component(c)),
+                None => (samples, phases),
             };
             let names: Vec<String> = deploys.iter().map(|d| d.0.clone()).collect();
             let releases: Vec<Value> = deploys
                 .iter()
                 .zip(crate::dashboard::pages::vitals_by_deploy(&samples, &names))
-                .map(|((deploy, ref_, at), vitals)| {
+                .zip(crate::dashboard::pages::ttfb_phases_by_deploy(&phases, &names))
+                .map(|(((deploy, ref_, at), vitals), ttfb_phases)| {
                     crate::obj! {
                         "deploy" => deploy.clone(), "ref" => ref_.clone().map_or(Value::Null, Value::from), "deployed_at" => db_time_s(Some(at.clone())),
-                        "vitals" => Value::Object(vitals),
+                        "vitals" => Value::Object(vitals), "ttfb_phases" => Value::Object(ttfb_phases),
                     }
                 })
                 .collect();
@@ -1459,10 +1461,11 @@ impl Mcp<'_> {
                 "window" => json!({"from": time_s(Some(from)), "to": time_s(Some(to))}),
                 "component" => component.clone().map_or(Value::Null, Value::from),
                 "vitals" => Value::Object(samples.summary()), "thresholds" => crate::dashboard::pages::vital_thresholds(),
+                "ttfb_phases" => Value::Object(phases.summary()),
                 "components" => components.into_iter().take(limit as usize).map(|r| crate::obj! {
                     "component" => r["name"].clone(), "group_hash" => r["group_hash"].clone(), "visits" => r["count"].clone(), "errors" => r["errors"].clone(),
                     "avg_ms" => r["avg"].clone(), "p50_ms" => r["p50"].clone(), "p95_ms" => r["p95"].clone(), "p99_ms" => r["p99"].clone(),
-                    "max_ms" => r["max"].clone(), "vitals" => r["vitals"].clone(),
+                    "max_ms" => r["max"].clone(), "vitals" => r["vitals"].clone(), "ttfb_phases" => r["ttfb_phases"].clone(),
                 }).collect::<Vec<_>>(),
                 "releases" => releases,
             };

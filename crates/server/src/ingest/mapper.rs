@@ -408,11 +408,22 @@ fn mapped(t: &str, rec: &Value) -> R<Option<(&'static str, Attrs)>> {
         "transaction" => child(rec, "transactions", &["duration", "outcome", "connection", "statement_count"])?,
         "n_plus_one" => child(rec, "n_plus_ones", &["sql", "count", "source"])?,
         "deprecation" => child(rec, "deprecations", &["message", "gem_name", "horizon", "source"])?,
-        "visit" => child(
-            rec,
-            "visits",
-            &["component", "url", "method", "duration", "status", "partial", "only", "props_bytes", "user_agent", "lcp", "cls", "inp", "ttfb"],
-        )?,
+        "visit" => {
+            let (table, mut attrs) = child(
+                rec,
+                "visits",
+                &["component", "url", "method", "duration", "status", "partial", "only", "props_bytes", "user_agent", "lcp", "cls", "inp", "ttfb"],
+            )?;
+            // The TTFB phases (schema::ADDED_COLUMNS) only when the record
+            // carries them, so a record from a gem without them maps to
+            // exactly the row Rails' mapper makes.
+            for k in ["redirect_ms", "redirect_count", "connect_ms", "server_ms"] {
+                if !rec.get(k).is_nil() {
+                    set(&mut attrs, k, take(rec, k));
+                }
+            }
+            (table, attrs)
+        }
         "session" => {
             let mut attrs = envelope(rec)?;
             set(&mut attrs, "session_id", Value::Str(ruby::to_s(rec.get("id"))));
@@ -931,6 +942,30 @@ mod tests {
             let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
             assert_eq!(detail["dropped_records"], 21, "{t}");
             assert_eq!(detail["dropped_bytes"], 55977, "{t}");
+        }
+    }
+
+    // railwatch 1.2's browser client splits the initial load's TTFB. A
+    // record without the split (any older gem) maps to the row it always
+    // did, which is the row Rails' mapper makes (mapper_vs_ruby).
+    #[test]
+    fn a_visit_keeps_its_ttfb_phases_and_an_older_visit_maps_as_before() {
+        let row = |json: &str| {
+            let rec = rjson::parse(json.as_bytes()).unwrap();
+            row_for(&rec, &mut vec![]).unwrap().unwrap().row
+        };
+        let base = r#""v":1,"t":"visit","timestamp":1767225600.0,"component":"auth/sign_in","duration":1,"ttfb":1300"#;
+        let split = row(&format!(r#"{{{base},"redirect_ms":1180,"redirect_count":null,"connect_ms":20,"server_ms":100}}"#));
+        let get = |k: &str| split.iter().find(|(c, _)| *c == k).map(|(_, v)| v.clone());
+        assert_eq!(get("redirect_ms"), Some(Bind::Int(1180)));
+        assert_eq!(get("connect_ms"), Some(Bind::Int(20)));
+        assert_eq!(get("server_ms"), Some(Bind::Int(100)));
+        assert_eq!(get("redirect_count"), None, "a hidden count stays NULL");
+
+        let old = row(&format!("{{{base}}}"));
+        let names: Vec<&str> = old.iter().map(|(k, _)| *k).collect();
+        for k in ["redirect_ms", "redirect_count", "connect_ms", "server_ms"] {
+            assert!(!names.contains(&k), "{k} absent from an older gem's row: {names:?}");
         }
     }
 }

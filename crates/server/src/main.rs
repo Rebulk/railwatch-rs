@@ -1300,6 +1300,11 @@ fn serve() -> ExitCode {
                 std::process::exit(1);
             }
         }
+        // Before any reader or writer opens a tenant (schema::ADDED_COLUMNS).
+        let migrated = railwatch_server::tenants::add_missing_columns_everywhere(&cfg.tenants_dir());
+        if migrated > 0 {
+            tracing::info!(files = migrated, "added the new telemetry columns");
+        }
         let (followups_tx, followups_rx) = followups::channel();
         let tenants = Tenants::new(cfg.tenants_dir(), Duration::from_secs(cfg.tenant_idle_seconds), followups_tx);
         let disk = tenants.disk();

@@ -73,7 +73,7 @@ fn load() -> Schema {
         .collect();
     let mut tables = HashMap::new();
     for (table, cols) in raw["columns"].as_object().unwrap() {
-        let cols = cols
+        let cols: Vec<Column> = cols
             .as_array()
             .unwrap()
             .iter()
@@ -103,6 +103,15 @@ fn load() -> Schema {
             .collect();
         tables.insert(table.clone(), cols);
     }
+    for (table, name, ty) in ADDED_COLUMNS {
+        tables.get_mut(*table).expect("added column's table is exported").push(Column {
+            name: name.to_string(),
+            ty: *ty,
+            limit: None,
+            null: true,
+            default: None,
+        });
+    }
     let text_limits = raw["text_limits"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_u64().unwrap() as usize)).collect();
     let schema_migrations = raw["schema_migrations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
     Schema { ddl, tables, text_limits, schema_migrations }
@@ -116,6 +125,43 @@ impl Schema {
     pub fn column(&self, table: &str, name: &str) -> &Column {
         self.columns(table).iter().find(|c| c.name == name).unwrap_or_else(|| panic!("no column {table}.{name}"))
     }
+}
+
+/// Columns this server adds to the exported Rails tables (docs/DIFFERENCES.md):
+/// nullable, no default, appended with `ALTER TABLE ... ADD COLUMN`, so Rails
+/// still opens the file and a row without them reads NULL. Every tenant file
+/// must have all of them before a union reader attaches it: its views are
+/// `SELECT *` over every day file, and SQLite refuses a UNION ALL whose
+/// branches differ in column count. New files get them in `create_tenant`,
+/// existing ones in `add_missing_columns` (every `tenants::open_tenant`, and
+/// `tenants::add_missing_columns_everywhere` when the server starts).
+///
+/// visits: the initial load's TTFB split into phases (gem 1.2's browser
+/// client). `redirect_count` is NULL when the browser showed no redirect,
+/// which includes a cross-origin chain it hid; `redirect_ms` still holds it.
+pub const ADDED_COLUMNS: &[(&str, &str, ColType)] = &[
+    ("visits", "redirect_ms", ColType::Integer),
+    ("visits", "redirect_count", ColType::Integer),
+    ("visits", "connect_ms", ColType::Integer),
+    ("visits", "server_ms", ColType::Integer),
+];
+
+/// Adds every ADDED_COLUMNS column `conn`'s main database lacks. Returns
+/// how many it added (0 on a file that already has them all).
+pub fn add_missing_columns(conn: &Connection) -> rusqlite::Result<usize> {
+    let mut added = 0;
+    for (table, name, ty) in ADDED_COLUMNS {
+        let present: bool = conn.query_row("SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)", [*table, *name], |r| r.get(0))?;
+        if !present {
+            let sql_type = match ty {
+                ColType::Integer => "integer",
+                other => unreachable!("no added column is {other:?}"),
+            };
+            conn.execute_batch(&format!("ALTER TABLE \"{table}\" ADD COLUMN \"{name}\" {sql_type}"))?;
+            added += 1;
+        }
+    }
+    Ok(added)
 }
 
 /// ar_internal_metadata.schema_sha1 in a tenant Rails created (railwatch-cloud @ 464f0fd).
@@ -189,5 +235,6 @@ pub fn create_tenant(conn: &mut Connection, now: &str) -> rusqlite::Result<()> {
     // A fresh Rails tenant carries this sqlite_sequence row: a migration
     // inserted into and emptied export_deliveries.
     tx.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('export_deliveries', 0)", [])?;
+    add_missing_columns(&tx)?;
     tx.commit()
 }

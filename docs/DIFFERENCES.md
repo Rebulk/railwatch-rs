@@ -595,6 +595,44 @@ all of it (identical; 130/130).
     floor, or over the budget with only today's files left, ingest answers
     503 + Retry-After, which Rails never does for disk space. Off, nothing
     changes.
+13. **`visits` has four more columns** (`schema::ADDED_COLUMNS`:
+    `redirect_ms`, `redirect_count`, `connect_ms`, `server_ms`, nullable
+    integers): the initial load's TTFB split into phases, which gem 1.2's
+    browser client sends and the Rails cloud does not store. Unlike #11 this
+    alters existing files: `ALTER TABLE ... ADD COLUMN` on every tenant file
+    when the server starts (and on any file `open_tenant` opens), because
+    the per-day union reader's `SELECT *` views refuse files of different
+    widths (tests/schema.rs shows the failure). The columns are appended
+    after Rails' own, so Rails opens the file with 0 pending migrations, its
+    `Visit` model gains four readable attributes, and its mapper writes
+    NULL there. A visit record without the fields maps to exactly Rails' row
+    (mapper_vs_ruby is unchanged). Rails' exact-schema restore check
+    (`Operations::RestoredSchema`, run by RestoreVerificationJob, which is
+    not ported here, #13 under Jobs) DOES reject these files: it reports the
+    four as unexpected columns. That check only matters for a file moved back
+    under railwatch-cloud; add the four to its expected columns first.
+
+    A file the startup sweep cannot widen (another process holding its write
+    lock past busy_timeout) is retried three more times a second apart; if it
+    is still narrow the server starts anyway, logs an error, and a background
+    thread retries it every 30 seconds until it is widened. Until then that
+    environment's visits pages fail; the rest of the server is unaffected. A writer that cannot open its
+    tenant answers what is queued and exits, so the next job opens the file again.
+
+    **Rolling back past this release is roll-forward-only once a day rolls
+    over.** The older release keeps reading the widened files, but it creates
+    each new day file with its own narrower schema, and its reader's views are
+    the same `SELECT *` union: from the first new day file onward, every
+    per-day environment that already holds a widened file fails to read until
+    the widths agree again. Roll forward (the startup sweep widens the narrow
+    files before readers attach, except a file still locked after its
+    retries, which the background retry widens later; check the log for
+    "cannot add the new telemetry columns" with no matching "added the new
+    telemetry columns" before relying on that environment's visits pages),
+    or, to stay on the older release, drop
+    the four columns from every widened file
+    (`ALTER TABLE visits DROP COLUMN redirect_ms` and the other three) with
+    the server stopped. Single-file tenants are unaffected either way.
 
 ## Process
 

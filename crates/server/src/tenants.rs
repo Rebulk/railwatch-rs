@@ -221,9 +221,192 @@ pub fn open_tenant(path: &Path) -> rusqlite::Result<Connection> {
     if fresh || !has_schema {
         let now = crate::time::quoted_date_micros(crate::time::now_micros());
         schema::create_tenant(&mut conn, &now)?;
+    } else {
+        schema::add_missing_columns(&conn)?;
     }
     conn.set_prepared_statement_cache_capacity(256);
     Ok(conn)
+}
+
+/// Every tenant file under `tenants_dir` (single files and every file of a
+/// per-day directory) gets the schema::ADDED_COLUMNS it lacks. Runs once at
+/// startup, before any reader attaches: a union reader's views read every
+/// day file, and one file short a column fails every page of that
+/// environment. Returns the files changed.
+///
+/// A missing `tenants_dir` is a fresh install. Any other failure (a
+/// directory or entry it cannot read, a file it cannot open) is logged and
+/// skipped, so that environment's pages fail until it is fixed while the
+/// rest are unaffected; it is never silently passed over. Only regular files
+/// and directories are followed: the layout (storage/layout.rs) has no
+/// symlinks, and following one could widen a file outside `tenants_dir`.
+pub fn add_missing_columns_everywhere(tenants_dir: &Path) -> usize {
+    let mut files = Vec::new();
+    for (path, kind) in regular_entries(tenants_dir) {
+        match kind {
+            Kind::Dir => per_day_files(&path, &mut files),
+            Kind::File if path.extension().is_some_and(|x| x == "sqlite3") => files.push(path),
+            Kind::File => {}
+        }
+    }
+    let widen = |path: &Path| {
+        Connection::open(path).and_then(|c| {
+            schema::configure(&c)?;
+            schema::add_missing_columns(&c)
+        })
+    };
+    let mut changed = 0;
+    let mut failed = Vec::new();
+    for path in files {
+        match widen(&path) {
+            Ok(0) => {}
+            Ok(_) => changed += 1,
+            Err(e) => {
+                tracing::warn!(file = %path.display(), error = %e, "cannot add the new telemetry columns yet; retrying");
+                failed.push(path);
+            }
+        }
+    }
+    // A per-day file left narrow fails every visits page of its environment
+    // until it is widened, and nothing else widens an old day file. So a
+    // file that failed (typically a lock held past busy_timeout) gets more
+    // tries before the server takes traffic.
+    for _ in 0..STARTUP_WIDEN_RETRIES {
+        if failed.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let mut still = Vec::new();
+        for path in failed {
+            match widen(&path) {
+                Ok(n) => changed += usize::from(n > 0),
+                Err(_) => still.push(path),
+            }
+        }
+        failed = still;
+    }
+    // Still narrow: start serving anyway (other environments must not wait
+    // on one locked file) and keep trying in the background, so the
+    // environment's visits pages come back on their own once the lock clears.
+    if !failed.is_empty() {
+        for path in &failed {
+            tracing::error!(file = %path.display(), "cannot add the new telemetry columns; that environment's visits fail to read until a background retry succeeds");
+        }
+        let _ = std::thread::Builder::new().name("widen-retry".into()).spawn(|| widen_until_done(failed, BACKGROUND_WIDEN_EVERY));
+    }
+    changed
+}
+
+/// Further passes over files the startup sweep could not widen, before the
+/// server starts serving.
+const STARTUP_WIDEN_RETRIES: u32 = 3;
+/// How often a file still narrow after startup is tried again.
+const BACKGROUND_WIDEN_EVERY: Duration = Duration::from_secs(30);
+
+/// Widens every file in `paths`, trying the ones that fail again every
+/// `every`, until none is left. A file that disappears (retention, the disk
+/// budget) is dropped, not retried.
+pub fn widen_until_done(mut paths: Vec<PathBuf>, every: Duration) {
+    while !paths.is_empty() {
+        std::thread::sleep(every);
+        paths.retain(|path| {
+            // Never create: a day retention deletes between two retries must
+            // not come back as an empty file (no tables), which every union
+            // reader of that environment would then fail on.
+            let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+            let result = Connection::open_with_flags(path, flags).and_then(|c| {
+                schema::configure(&c)?;
+                schema::add_missing_columns(&c)
+            });
+            match result {
+                Ok(_) => {
+                    tracing::info!(file = %path.display(), "added the new telemetry columns");
+                    // Readers built while this file was narrow rebuild their views.
+                    crate::storage::reader::schema_changed();
+                    false
+                }
+                Err(_) if !path.exists() => false,
+                Err(_) => true,
+            }
+        });
+    }
+}
+
+enum Kind {
+    File,
+    Dir,
+}
+
+/// The regular files and directories directly in `dir`, by `DirEntry::file_type`
+/// (which does not follow symlinks). A missing `dir` is empty; every other
+/// error is logged.
+fn regular_entries(dir: &Path) -> Vec<(PathBuf, Kind)> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::error!(dir = %dir.display(), error = %e, "cannot list tenant files for the new telemetry columns");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::error!(dir = %dir.display(), error = %e, "cannot read a tenant directory entry");
+                continue;
+            }
+        };
+        match entry.file_type() {
+            Ok(t) if t.is_file() => out.push((entry.path(), Kind::File)),
+            Ok(t) if t.is_dir() => out.push((entry.path(), Kind::Dir)),
+            Ok(_) => tracing::warn!(path = %entry.path().display(), "not a regular file or directory: skipped"),
+            Err(e) => tracing::error!(path = %entry.path().display(), error = %e, "cannot read a tenant entry's type"),
+        }
+    }
+    out
+}
+
+/// A per-day tenant directory's meta file and day files, as
+/// storage::layout::all_files lists them, but through regular_entries.
+fn per_day_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let meta = crate::storage::layout::meta_path(dir);
+    match std::fs::symlink_metadata(&meta) {
+        Ok(m) if m.file_type().is_file() => files.push(meta),
+        // Not a per-day tenant (no meta file), or meta is not a regular file.
+        Ok(_) => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::error!(file = %meta.display(), error = %e, "cannot read a tenant's meta file");
+            return;
+        }
+    }
+    for tier in [crate::storage::layout::Tier::Core, crate::storage::layout::Tier::Detail] {
+        let tier_dir = dir.join(tier.dir());
+        // read_dir follows a symlinked tier directory, so check it first.
+        match std::fs::symlink_metadata(&tier_dir) {
+            Ok(m) if m.file_type().is_dir() => {}
+            Ok(_) => {
+                tracing::warn!(path = %tier_dir.display(), "not a regular directory: skipped");
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::error!(path = %tier_dir.display(), error = %e, "cannot read a tenant's tier directory");
+                continue;
+            }
+        }
+        let mut days: Vec<PathBuf> = regular_entries(&tier_dir)
+            .into_iter()
+            .filter_map(|(path, kind)| {
+                let day = path.file_name()?.to_str()?.strip_suffix(".sqlite3")?;
+                (matches!(kind, Kind::File) && day.len() == 10 && crate::storage::layout::day_of(day) == Some(day)).then_some(path)
+            })
+            .collect();
+        days.sort();
+        files.extend(days);
+    }
 }
 
 fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Duration, followups: &FollowupSender, disk: &crate::storage::budget::State) {
@@ -231,8 +414,13 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
         Ok(c) => c,
         Err(e) => {
             tracing::error!(tenant = slug, error = %e, "cannot open tenant file");
-            // Answer everything that arrives until the senders go away.
-            for job in rx.iter() {
+            // Answer what is already queued, then exit: the spawn wrapper
+            // unregisters this writer, so the next job starts a new one that
+            // opens the file again. Answering until the senders went away
+            // never ended (the registry holds a sender), so one transient
+            // failure (a lock held past busy_timeout while the new columns
+            // were added) refused that tenant's ingest until a restart.
+            while let Ok(job) = rx.try_recv() {
                 fail(job, format!("cannot open tenant: {e}"));
             }
             return;
