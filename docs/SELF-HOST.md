@@ -363,8 +363,9 @@ At install: `--backup-s3-endpoint https://s3.us-east-1.amazonaws.com
 them to an existing install. Works with AWS S3, Cloudflare R2, Backblaze
 B2, Wasabi, MinIO (path-style SigV4).
 
-Every 5 minutes the control DB and each environment's meta file are
-snapshotted (SQLite online backup, zstd) and uploaded; each day file is
+Every 5 minutes the control DB is snapshotted (SQLite online backup, zstd)
+and uploaded if it changed; each environment's meta file (rollups,
+receipts, people) at most hourly, when it changed; each day file is
 uploaded once, after it closes (two days old). `sudo -u railwatch
 railwatch backup` runs a pass now. Details and the restore proof:
 docs/STORAGE.md, "Backups".

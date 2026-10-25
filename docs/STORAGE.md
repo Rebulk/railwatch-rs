@@ -142,7 +142,8 @@ Off unless `RAILWATCH_BACKUP_S3_ENDPOINT`, `_BUCKET`, `_ACCESS_KEY_ID` and
 `RAILWATCH_BACKUP_INTERVAL_SECONDS` default 300). Path-style SigV4 (checked
 against AWS's published example). Each pass: control DB, every meta file and
 every single-file tenant via the SQLite online backup API into a temp file,
-zstd -3, PUT; every closed day file (2+ days old) once, skipped if listed
+zstd -3, PUT, each only if it changed since its last upload (`PRAGMA
+data_version`), and a meta file at most hourly (`META_INTERVAL`); every closed day file (2+ days old) once, skipped if listed
 (a core day re-uploads as `<day>.ex` after its exemplar copy). `railwatch
 backup` runs one pass; `railwatch restore` downloads into an empty data dir,
 control DB last.
