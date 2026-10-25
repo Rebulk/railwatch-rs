@@ -1,5 +1,8 @@
 # Dependabot version and security updates. Grouped weekly so a week of
 # bumps is one PR per ecosystem; security updates still open on their own.
+# Majors get their own group: one breaking upgrade (a RustCrypto 0.x bump, a
+# TypeScript major) used to hold every patch in its group back until someone
+# did the migration.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -9,6 +12,10 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+        update-types: [minor, patch]
+      cargo-major:
+        patterns: ["*"]
+        update-types: [major]
   - package-ecosystem: npm
     directory: /frontend
     schedule:
@@ -16,6 +23,10 @@ updates:
     groups:
       npm:
         patterns: ["*"]
+        update-types: [minor, patch]
+      npm-major:
+        patterns: ["*"]
+        update-types: [major]
   - package-ecosystem: github-actions
     directory: /
     schedule:
