@@ -1372,7 +1372,7 @@ pub fn vital_thresholds() -> Value {
 pub struct PhaseSample {
     pub component: String,
     pub deploy: Option<String>,
-    redirect_ms: i64,
+    redirect_ms: Option<i64>,
     connect_ms: Option<i64>,
     server_ms: Option<i64>,
     /// The browser showed at least one redirect. It shows none for a chain
@@ -1390,7 +1390,7 @@ pub fn ttfb_phases(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<Tt
         conn,
         &format!(
             "SELECT \"visits\".\"component\", \"visits\".\"deploy\", \"visits\".\"redirect_ms\", \"visits\".\"connect_ms\", \"visits\".\"server_ms\", \
-             \"visits\".\"redirect_count\" FROM \"visits\" WHERE \"visits\".\"occurred_at\" BETWEEN ?1 AND ?2 AND \"visits\".\"redirect_ms\" IS NOT NULL \
+             \"visits\".\"redirect_count\" FROM \"visits\" WHERE \"visits\".\"occurred_at\" BETWEEN ?1 AND ?2 AND (\"visits\".\"redirect_ms\" IS NOT NULL OR \"visits\".\"connect_ms\" IS NOT NULL OR \"visits\".\"server_ms\" IS NOT NULL) \
              ORDER BY \"visits\".\"occurred_at\" DESC LIMIT {MAX_VITAL_SAMPLES}"
         ),
         rusqlite::params![qt(from), qt(to)],
@@ -1400,7 +1400,7 @@ pub fn ttfb_phases(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<Tt
             .map(|r| PhaseSample {
                 component: r.s("component").unwrap_or("").to_string(),
                 deploy: r.s("deploy").map(str::to_string),
-                redirect_ms: r.i("redirect_ms").unwrap_or(0),
+                redirect_ms: r.i("redirect_ms"),
                 connect_ms: r.i("connect_ms"),
                 server_ms: r.i("server_ms"),
                 counted_redirect: r.i("redirect_count").is_some_and(|n| n > 0),
@@ -1445,7 +1445,7 @@ fn summarize_phases(samples: &[&PhaseSample]) -> Map<String, Value> {
     let counted = samples.iter().filter(|s| s.counted_redirect).count();
     let mut out = Map::new();
     out.insert("samples".into(), n.into());
-    out.insert("redirect_ms".into(), p75_of(samples.iter().map(|s| s.redirect_ms).collect()));
+    out.insert("redirect_ms".into(), p75_of(samples.iter().filter_map(|s| s.redirect_ms).collect()));
     out.insert("connect_ms".into(), p75_of(samples.iter().filter_map(|s| s.connect_ms).collect()));
     out.insert("server_ms".into(), p75_of(samples.iter().filter_map(|s| s.server_ms).collect()));
     out.insert("redirected_at_least".into(), jf(rb::round(counted as f64 / n as f64, 4)));
@@ -1625,6 +1625,32 @@ mod like_tests {
         assert_eq!(l["recent"].as_array().unwrap().iter().map(|x| x["model"].clone()).collect::<Vec<_>>(), ["gpt_4"]);
         let l = page(llm_calls_index, "attachments:100%");
         assert_eq!(l["recent"].as_array().unwrap().iter().map(|x| x["attachment_types"].clone()).collect::<Vec<_>>(), ["100%png"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A visit whose browser gave connect and server time but no redirect
+    /// time still counts for those phases, and its missing redirect time is
+    /// left out of that p75 rather than read as 0 ms.
+    #[test]
+    fn ttfb_phases_keep_a_visit_without_redirect_time() {
+        let dir = std::env::temp_dir().join(format!("rw-phases-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = crate::tenants::open_tenant(&dir.join("t.sqlite3")).unwrap();
+        let now = 1_792_000_000_000_000;
+        let at = qt(now - 60_000_000);
+        for (redirect, connect, server) in [(Some(900), Some(10), Some(100)), (None, Some(30), Some(300))] {
+            t.execute(
+                "INSERT INTO visits (component, group_hash, url, method, duration, status, occurred_at, ttfb, redirect_ms, connect_ms, server_ms)
+                 VALUES ('a/b', 'g', '/x', 'GET', 1, 'success', ?1, 1, ?2, ?3, ?4)",
+                rusqlite::params![at, redirect, connect, server],
+            )
+            .unwrap();
+        }
+        let summary = ttfb_phases(&t, now - 3_600_000_000, now).unwrap().summary();
+        assert_eq!(summary["samples"], 2, "the redirect-less visit is a sample");
+        assert_eq!(summary["redirect_ms"], 900, "its missing redirect time is not a 0 ms sample");
+        assert_eq!(summary["server_ms"], 300, "its server time counts");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
