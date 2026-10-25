@@ -103,15 +103,35 @@ pub fn index(conn: &Connection, from: i64, to: i64, q: Option<&str>, sort: Optio
     let mut binds = vec![Sql::Text("request".into())];
     binds.extend(range.clone());
     binds.extend(fb.clone());
-    for r in db::query(
+    // Per day file, AVG as SUM/COUNT of the integer column (exact) and
+    // COUNT(DISTINCT user_ref) over each file's (tenant, user) groups.
+    let per_day = aggregate(
         conn,
+        "executions",
+        ("idx_executions_tenant_summary", "index_executions_on_kind_and_occurred_at"),
+        (from, to),
         &format!(
-            "SELECT \"executions\".\"app_tenant\", COUNT(*), {ERRORS}, AVG(duration), MAX(duration), COUNT(DISTINCT user_ref) FROM {summary_from} \
-             WHERE \"executions\".\"kind\" = ? AND \"executions\".\"app_tenant\" IS NOT NULL AND \"executions\".\"occurred_at\" BETWEEN ? AND ? AND {fsql} \
-             GROUP BY \"executions\".\"app_tenant\""
+            "SELECT \"executions\".\"app_tenant\" AS app_tenant, \"executions\".\"user_ref\" AS user_ref, COUNT(*) AS n, {ERRORS} AS errors, \
+             SUM(duration) AS total, MAX(duration) AS longest FROM {{t}} WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"app_tenant\" IS NOT NULL \
+             AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 AND {} GROUP BY \"executions\".\"app_tenant\", \"executions\".\"user_ref\"",
+            numbered(&fsql, 4)
         ),
-        rusqlite::params_from_iter(binds),
-    )? {
+        "SELECT app_tenant, SUM(n), SUM(errors), CAST(SUM(total) AS REAL) / SUM(n), MAX(longest), COUNT(DISTINCT user_ref) FROM {u} GROUP BY app_tenant",
+        &binds,
+    )?;
+    let found = match per_day {
+        Some(rows) => rows,
+        None => db::query(
+            conn,
+            &format!(
+                "SELECT \"executions\".\"app_tenant\", COUNT(*), {ERRORS}, AVG(duration), MAX(duration), COUNT(DISTINCT user_ref) FROM {summary_from} \
+                 WHERE \"executions\".\"kind\" = ? AND \"executions\".\"app_tenant\" IS NOT NULL AND \"executions\".\"occurred_at\" BETWEEN ? AND ? AND {fsql} \
+                 GROUP BY \"executions\".\"app_tenant\""
+            ),
+            rusqlite::params_from_iter(binds),
+        )?,
+    };
+    for r in found {
         let t = key(r.at(0));
         let row = rows.entry(t.clone()).or_insert_with(|| Row::blank(t));
         row.requests = int(r.at(1));
@@ -124,31 +144,68 @@ pub fn index(conn: &Connection, from: i64, to: i64, q: Option<&str>, sort: Optio
     let mut binds = vec![Sql::Text("job_attempt".into())];
     binds.extend(range.clone());
     binds.extend(fb.clone());
-    for r in db::query(
+    let per_day = aggregate(
         conn,
+        "executions",
+        ("idx_executions_tenant_summary", "index_executions_on_kind_and_occurred_at"),
+        (from, to),
         &format!(
-            "SELECT \"executions\".\"app_tenant\", COUNT(*), {FAILED} FROM {summary_from} WHERE \"executions\".\"kind\" = ? \
-             AND \"executions\".\"app_tenant\" IS NOT NULL AND \"executions\".\"occurred_at\" BETWEEN ? AND ? AND {fsql} GROUP BY \"executions\".\"app_tenant\""
+            "SELECT \"executions\".\"app_tenant\" AS app_tenant, COUNT(*) AS n, {FAILED} AS failed FROM {{t}} WHERE \"executions\".\"kind\" = ?1 \
+             AND \"executions\".\"app_tenant\" IS NOT NULL AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 AND {} GROUP BY \"executions\".\"app_tenant\"",
+            numbered(&fsql, 4)
         ),
-        rusqlite::params_from_iter(binds),
-    )? {
+        "SELECT app_tenant, SUM(n), SUM(failed) FROM {u} GROUP BY app_tenant",
+        &binds,
+    )?;
+    let found = match per_day {
+        Some(rows) => rows,
+        None => db::query(
+            conn,
+            &format!(
+                "SELECT \"executions\".\"app_tenant\", COUNT(*), {FAILED} FROM {summary_from} WHERE \"executions\".\"kind\" = ? \
+                 AND \"executions\".\"app_tenant\" IS NOT NULL AND \"executions\".\"occurred_at\" BETWEEN ? AND ? AND {fsql} GROUP BY \"executions\".\"app_tenant\""
+            ),
+            rusqlite::params_from_iter(binds),
+        )?,
+    };
+    for r in found {
         let t = key(r.at(0));
         let row = rows.entry(t.clone()).or_insert_with(|| Row::blank(t));
         row.jobs = int(r.at(1));
         row.failed_jobs = int(r.at(2));
     }
 
-    for (table, which) in [("exceptions", 0), ("logs", 1)] {
+    for (table, which, index) in [
+        ("exceptions", 0, ("idx_exceptions_tenant_cursor", "index_exceptions_on_occurred_at")),
+        ("logs", 1, ("idx_logs_tenant_cursor", "index_logs_on_occurred_at")),
+    ] {
         let mut binds = range.clone();
         binds.extend(fb.clone());
-        for r in db::query(
+        let per_day = aggregate(
             conn,
+            table,
+            index,
+            (from, to),
             &format!(
-                "SELECT COUNT(*) AS \"count_all\", \"{table}\".\"app_tenant\" AS \"{table}_app_tenant\" FROM \"{table}\" \
-                 WHERE \"{table}\".\"occurred_at\" BETWEEN ? AND ? AND {fsql} GROUP BY \"{table}\".\"app_tenant\""
+                "SELECT \"{table}\".\"app_tenant\" AS app_tenant, COUNT(*) AS n FROM {{t}} WHERE \"{table}\".\"occurred_at\" BETWEEN ?1 AND ?2 AND {} \
+                 GROUP BY \"{table}\".\"app_tenant\"",
+                numbered(&fsql, 3)
             ),
-            rusqlite::params_from_iter(binds),
-        )? {
+            "SELECT SUM(n), app_tenant FROM {u} GROUP BY app_tenant",
+            &binds,
+        )?;
+        let found = match per_day {
+            Some(rows) => rows,
+            None => db::query(
+                conn,
+                &format!(
+                    "SELECT COUNT(*) AS \"count_all\", \"{table}\".\"app_tenant\" AS \"{table}_app_tenant\" FROM \"{table}\" \
+                     WHERE \"{table}\".\"occurred_at\" BETWEEN ? AND ? AND {fsql} GROUP BY \"{table}\".\"app_tenant\""
+                ),
+                rusqlite::params_from_iter(binds),
+            )?,
+        };
+        for r in found {
             let t = key(r.at(1));
             let row = rows.entry(t.clone()).or_insert_with(|| Row::blank(t));
             if which == 0 {
@@ -163,15 +220,33 @@ pub fn index(conn: &Connection, from: i64, to: i64, q: Option<&str>, sort: Optio
     let mut binds: Vec<Sql> = ["request", "job_attempt", "scheduled_task", "command", "channel_action"].iter().map(|k| Sql::Text(k.to_string())).collect();
     binds.extend(range.clone());
     binds.extend(fb.clone());
-    for r in db::query(
+    let per_day = aggregate(
         conn,
+        "executions",
+        ("idx_executions_tenant_summary", "index_executions_on_kind_and_occurred_at"),
+        (from, to),
         &format!(
-            "SELECT MAX(\"executions\".\"occurred_at\") AS \"maximum_occurred_at\", \"executions\".\"app_tenant\" AS \"executions_app_tenant\" FROM {summary_from} \
-             WHERE \"executions\".\"kind\" IN (?, ?, ?, ?, ?) AND \"executions\".\"app_tenant\" IS NOT NULL AND \"executions\".\"occurred_at\" BETWEEN ? AND ? \
-             AND {fsql} GROUP BY \"executions\".\"app_tenant\""
+            "SELECT \"executions\".\"app_tenant\" AS app_tenant, MAX(\"executions\".\"occurred_at\") AS latest FROM {{t}} \
+             WHERE \"executions\".\"kind\" IN (?1, ?2, ?3, ?4, ?5) AND \"executions\".\"app_tenant\" IS NOT NULL AND \"executions\".\"occurred_at\" BETWEEN ?6 AND ?7 \
+             AND {} GROUP BY \"executions\".\"app_tenant\"",
+            numbered(&fsql, 8)
         ),
-        rusqlite::params_from_iter(binds),
-    )? {
+        "SELECT MAX(latest) AS \"maximum_occurred_at\", app_tenant FROM {u} GROUP BY app_tenant",
+        &binds,
+    )?;
+    let found = match per_day {
+        Some(rows) => rows,
+        None => db::query(
+            conn,
+            &format!(
+                "SELECT MAX(\"executions\".\"occurred_at\") AS \"maximum_occurred_at\", \"executions\".\"app_tenant\" AS \"executions_app_tenant\" FROM {summary_from} \
+                 WHERE \"executions\".\"kind\" IN (?, ?, ?, ?, ?) AND \"executions\".\"app_tenant\" IS NOT NULL AND \"executions\".\"occurred_at\" BETWEEN ? AND ? \
+                 AND {fsql} GROUP BY \"executions\".\"app_tenant\""
+            ),
+            rusqlite::params_from_iter(binds),
+        )?,
+    };
+    for r in found {
         let t = key(r.at(1));
         let row = rows.entry(t.clone()).or_insert_with(|| Row::blank(t));
         row.last_seen_at = jt(r.s("maximum_occurred_at").and_then(crate::time::parse_db_time));
@@ -179,9 +254,42 @@ pub fn index(conn: &Connection, from: i64, to: i64, q: Option<&str>, sort: Optio
 
     // absorb_sparklines
     let tenants: Vec<String> = rows.keys().flatten().cloned().collect();
-    if !tenants.is_empty() {
-        let width = (rb::time_sub(to, from) / SPARKLINE_BUCKETS as f64).max(1.0);
-        let bucket = format!("CAST((strftime('%s', occurred_at) - {}) / {} AS INTEGER)", rb::to_i(from), float_lit(width));
+    let width = (rb::time_sub(to, from) / SPARKLINE_BUCKETS as f64).max(1.0);
+    let bucket = format!("CAST((strftime('%s', occurred_at) - {}) / {} AS INTEGER)", rb::to_i(from), float_lit(width));
+    // Per day file, the tenants are `filtered`'s instead of an IN list
+    // (repeated per file it could pass SQLite's bind limit): the same
+    // tenants, as every row above matched `filtered` and a tenant with a
+    // request in the window has a row; counts for any other are dropped below.
+    let mut binds = vec![Sql::Text("request".into())];
+    binds.extend(range.clone());
+    binds.extend(fb.clone());
+    let per_day = if tenants.is_empty() {
+        None
+    } else {
+        aggregate(
+            conn,
+            "executions",
+            ("idx_executions_tenant_summary", "index_executions_on_kind_and_occurred_at"),
+            (from, to),
+            &format!(
+                "SELECT \"executions\".\"app_tenant\" AS app_tenant, {bucket} AS k, COUNT(*) AS n FROM {{t}} WHERE \"executions\".\"kind\" = ?1 \
+                 AND \"executions\".\"app_tenant\" IS NOT NULL AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 AND {} \
+                 GROUP BY \"executions\".\"app_tenant\", k",
+                numbered(&fsql, 4)
+            ),
+            "SELECT SUM(n), app_tenant, k FROM {u} GROUP BY app_tenant, k",
+            &binds,
+        )?
+    };
+    if let Some(found) = per_day {
+        for r in found {
+            let t = key(r.at(1));
+            let idx = (int(r.at(2)) as usize).min(SPARKLINE_BUCKETS - 1);
+            if let Some(row) = rows.get_mut(&t) {
+                row.sparkline[idx] += int(r.at(0));
+            }
+        }
+    } else if !tenants.is_empty() {
         for slice in tenants.chunks(TENANT_SLICE) {
             let ph = vec!["?"; slice.len()].join(", ");
             let mut binds = vec![Sql::Text("request".into())];
@@ -226,6 +334,28 @@ pub fn index(conn: &Connection, from: i64, to: i64, q: Option<&str>, sort: Optio
         _ => Num::I(r.requests * sign as i64),
     });
     Ok(sorted.into_iter().take(MAX_TENANTS).map(|r| r.json()).collect())
+}
+
+/// One of `index`'s GROUP BY statements per day file, on `inside` where the
+/// window touches the file's day and `outside` elsewhere, combined by
+/// `outer` (storage::reader::aggregate_hinted). Through the views SQLite
+/// grouped the union's rows and each file read them from the table. None on
+/// a single file: run the plain statement.
+fn aggregate(
+    conn: &Connection,
+    table: &str,
+    (inside, outside): (&str, &str),
+    window: (i64, i64),
+    inner: &str,
+    outer: &str,
+    binds: &[Sql],
+) -> rusqlite::Result<Option<Vec<db::Rec>>> {
+    crate::storage::reader::aggregate_hinted(conn, table, Some(crate::storage::reader::Hint { window, inside, outside }), inner, outer, binds)
+}
+
+/// `filtered`'s SQL with its bind numbered `?n`.
+fn numbered(fsql: &str, n: usize) -> String {
+    fsql.replace('?', &format!("?{n}"))
 }
 
 /// Ruby's `Float#to_s` as interpolated into SQL.

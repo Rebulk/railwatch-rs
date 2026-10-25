@@ -1311,12 +1311,18 @@ impl Mcp<'_> {
                 return not_found("execution");
             };
             let start = exe.t("occurred_at").unwrap_or(0);
-            let v = crate::obj! {
+            let mut v = crate::obj! {
                 "kind" => exe.s("kind"), "name" => exe.s("name"),
                 "duration_ms" => jf(exe.i("duration").unwrap_or(0) as f64 / 1000.0),
                 "status" => exe.i("status"), "outcome" => exe.s("outcome"), "occurred_at" => time_s(Some(start)),
                 "timeline" => execution_timeline(conn, &eid, start)?,
             };
+            // The gem's per-execution buffer kept the earliest child records
+            // and dropped the rest: say so, or the timeline reads as complete.
+            if let Some(dropped) = exe.json("detail").get("dropped_records").filter(|d| d.as_i64().is_some_and(|n| n > 0)) {
+                db::merge_into(&mut v, "dropped_records", dropped.clone());
+                db::merge_into(&mut v, "dropped_bytes", exe.json("detail").get("dropped_bytes").cloned().unwrap_or(Value::Null));
+            }
             Ok(v.to_string())
         })
     }
