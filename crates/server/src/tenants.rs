@@ -320,6 +320,8 @@ pub fn widen_until_done(mut paths: Vec<PathBuf>, every: Duration) {
             match result {
                 Ok(_) => {
                     tracing::info!(file = %path.display(), "added the new telemetry columns");
+                    // Readers built while this file was narrow rebuild their views.
+                    crate::storage::reader::schema_changed();
                     false
                 }
                 Err(_) => true,

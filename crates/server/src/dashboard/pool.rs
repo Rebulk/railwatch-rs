@@ -98,7 +98,7 @@ impl Drop for Reader {
 
 impl Pooled {
     fn attaches_deleted(&self) -> bool {
-        self.days.as_ref().is_some_and(|(_, attached)| attached.iter().any(|f| !f.exists()))
+        self.days.as_ref().is_some_and(|(_, (attached, _))| attached.iter().any(|f| !f.exists()))
     }
 }
 

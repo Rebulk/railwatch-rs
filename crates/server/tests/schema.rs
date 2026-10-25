@@ -228,3 +228,27 @@ fn a_file_still_locked_after_startup_is_widened_once_the_lock_clears() {
     let cols = visit_columns(&rusqlite::Connection::open(&day).unwrap());
     assert!(cols.iter().any(|c| c == "redirect_ms"), "widened by the background retry");
 }
+
+/// A union reader built while one day file was still narrow fails every
+/// visits query. Once the background retry widens that file, the reader's
+/// next refresh rebuilds its views, so a pooled reader recovers too, not only
+/// a freshly opened one.
+#[test]
+fn a_reader_built_while_a_file_was_narrow_recovers_after_the_background_widen() {
+    let tenants = Scratch::new("pooled");
+    let dir = tenants.0.join("shop-production");
+    std::fs::create_dir_all(dir.join(Tier::Core.dir())).unwrap();
+    old_tenant(&meta_path(&dir));
+    railwatch_server::tenants::add_missing_columns_everywhere(&tenants.0);
+    let narrow = day_path(&dir, Tier::Core, "2026-10-13");
+    old_tenant(&narrow);
+    drop(open_or_create(&day_path(&dir, Tier::Core, "2026-10-14")).unwrap());
+
+    let (conn, mut attached) = railwatch_server::storage::reader::open(&dir).unwrap();
+    let count = |c: &rusqlite::Connection| c.query_row("SELECT count(*) FROM visits", [], |r| r.get::<_, i64>(0));
+    assert!(count(&conn).is_err(), "mixed widths: the views cannot read visits");
+
+    railwatch_server::tenants::widen_until_done(vec![narrow], std::time::Duration::from_millis(1));
+    assert!(railwatch_server::storage::reader::refresh(&conn, &dir, &mut attached).unwrap(), "the widen makes the reader rebuild");
+    assert_eq!(count(&conn).unwrap(), 1, "the same connection reads visits again");
+}
