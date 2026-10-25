@@ -187,7 +187,8 @@ fn upload_if_changed(
         .and_then(|conn| data_version(&conn).map(|uploaded_at| Watch { conn, uploaded_at, uploaded: std::time::Instant::now() }));
     upload_snapshot(s3, src, key, scratch, pass)?;
     match watch {
-        Some(w) => last.0.insert(key.to_string(), w),
+        // The interval runs from the finished upload.
+        Some(w) => last.0.insert(key.to_string(), Watch { uploaded: std::time::Instant::now(), ..w }),
         None => last.0.remove(key),
     };
     Ok(())
@@ -229,11 +230,11 @@ pub fn run_pass(s3: &S3, data_dir: &Path, tenants_dir: &Path, now_micros: i64, l
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         if path.is_dir() && layout::meta_path(&path).is_file() {
-            upload_if_changed(s3, &layout::meta_path(&path), &format!("tenants/{name}/meta.sqlite3.zst"), &scratch, &mut pass, last, meta_interval())?;
             let known = match &existing {
                 Some(k) => k,
                 None => existing.insert(s3.list("tenants/")?.into_iter().collect()),
             };
+            let mut new_days = Vec::new();
             for tier in [Tier::Core, Tier::Detail] {
                 for day in layout::days(&path, tier) {
                     if !closed(&day, now_micros) {
@@ -245,12 +246,21 @@ pub fn run_pass(s3: &S3, data_dir: &Path, tenants_dir: &Path, now_micros: i64, l
                     let key = format!("tenants/{name}/{}/{day}{}.sqlite3.zst", tier.dir(), if ex { ".ex" } else { "" });
                     if known.contains(&key) {
                         pass.skipped += 1;
-                        continue;
+                    } else {
+                        new_days.push((file, key));
                     }
-                    upload_snapshot(s3, &file, &key, &scratch, &mut pass)?;
-                    pass.snapshots -= 1;
-                    pass.day_files += 1;
                 }
+            }
+            // Meta holds each day table's id high-water mark (sqlite_sequence):
+            // a day file is only uploaded after a meta snapshot taken after it
+            // closed, so a restore never pairs it with a meta whose marks are
+            // behind its ids. Hence no META_INTERVAL wait on those passes.
+            let interval = if new_days.is_empty() { meta_interval() } else { std::time::Duration::ZERO };
+            upload_if_changed(s3, &layout::meta_path(&path), &format!("tenants/{name}/meta.sqlite3.zst"), &scratch, &mut pass, last, interval)?;
+            for (file, key) in new_days {
+                upload_snapshot(s3, &file, &key, &scratch, &mut pass)?;
+                pass.snapshots -= 1;
+                pass.day_files += 1;
             }
         } else if let Some(slug) = name.strip_suffix(".sqlite3")
             && path.is_file()
