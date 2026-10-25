@@ -288,6 +288,34 @@ pub fn aggregate(
     outer: &str,
     binds: &[rusqlite::types::Value],
 ) -> rusqlite::Result<Option<Vec<crate::dashboard::db::Rec>>> {
+    aggregate_hinted(conn, table, None, inner, outer, binds)
+}
+
+/// The indexes `aggregate_hinted` names: `inside` in the files whose day
+/// the window [lo, hi] (epoch micros) touches, `outside` (one that leads
+/// with occurred_at, or with kind and occurred_at) in the others.
+pub struct Hint<'a> {
+    pub window: (i64, i64),
+    pub inside: &'a str,
+    pub outside: &'a str,
+}
+
+/// `aggregate` with `INDEXED BY` on every branch. In the window's files a
+/// covering index filtered on occurred_at beats the planner's occurred_at
+/// range, which reads every row of the range from the table (people@7d
+/// 111 -> 20 ms, the tenants' log counts 222 -> 49 ms). In the others the
+/// range is empty, but without ANALYZE stats the planner can take an index
+/// that does not lead with occurred_at and read it whole (the tenants' job
+/// counts, 23 files: 569 -> 56 ms cold). A hint picks a plan; every file is
+/// read either way.
+pub fn aggregate_hinted(
+    conn: &Connection,
+    table: &str,
+    hint: Option<Hint<'_>>,
+    inner: &str,
+    outer: &str,
+    binds: &[rusqlite::types::Value],
+) -> rusqlite::Result<Option<Vec<crate::dashboard::db::Rec>>> {
     if !is_union(conn) {
         return Ok(None);
     }
@@ -295,13 +323,19 @@ pub fn aggregate(
     if files.is_empty() {
         return Ok(None);
     }
+    let days =
+        hint.as_ref().map(|h| (crate::time::quoted_date_micros(h.window.0)[..10].to_string(), crate::time::quoted_date_micros(h.window.1)[..10].to_string()));
     let n = binds.len();
     let parts: Vec<String> = files
         .iter()
         .enumerate()
         .map(|(k, f)| {
+            let hinted = match (&hint, &days) {
+                (Some(h), Some((from_day, to_day))) => format!(" INDEXED BY {}", if f.day >= *from_day && f.day <= *to_day { h.inside } else { h.outside }),
+                _ => String::new(),
+            };
             // ?i -> this branch's own slot, in one pass over the SQL.
-            let sql = renumber(&inner.replace("{t}", &format!("{}.\"{table}\" AS \"{table}\"", f.alias)), k * n);
+            let sql = renumber(&inner.replace("{t}", &format!("{}.\"{table}\" AS \"{table}\"{hinted}", f.alias)), k * n);
             format!("SELECT * FROM ({sql})")
         })
         .collect();
@@ -316,12 +350,13 @@ pub fn aggregate(
 /// `idx_queries_slowest` is left out on purpose: it walks a whole file's
 /// queries by duration to find a window, which pays in one big file but, in
 /// every day file, costs more than each file's own occurred_at plan (queries@1h
-/// 1.9 -> 9.9 ms with it).
+/// 1.9 -> 9.9 ms with it). `idx_queries_explained` is the API's explained groups.
 const HINTED: &[(&str, Option<&str>)] = &[
     ("executions", Some("index_executions_on_group_hash_and_occurred_at")),
     ("executions", Some("idx_executions_with_preview")),
     ("executions", Some("idx_executions_tenant_summary")),
     ("executions", None),
+    ("queries", Some("idx_queries_explained")),
 ];
 
 fn hinted_view(table: &str, hint: Option<&str>) -> String {

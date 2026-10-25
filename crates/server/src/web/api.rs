@@ -924,37 +924,38 @@ impl Api<'_> {
         })
     }
 
+    /// The grouped table, the slowest-queries page, which groups have an
+    /// EXPLAIN and the n+1s, each on its own pooled reader (as
+    /// queries_index_parallel): over a per-day tenant each one reads every
+    /// day file, and one after another they added up. The explained lookup
+    /// needs the grouped page, so it runs after it.
     fn queries(&self, e: &Scoped) -> R<Rendered> {
         let (from, to) = self.window().range();
         let (sort, dir) = (self.params.opt("sort"), self.params.opt("dir"));
-        let groups = self.telemetry(e, |conn| Ok(aggregations::grouped(conn, "query", from, to, 200, sort.as_deref(), dir.as_deref())?))?;
-        let (items, meta) = self.paginate(groups)?;
         let q = self.params.opt("q");
-        let (page, explained, n_plus_ones) = self.telemetry(e, |conn| {
-            let cond = filter_query::apply(conn, Resource::Queries, q.as_deref(), from, to, &[])?;
-            let page = self.cursor_page(conn, e, "queries", "queries", "Railwatch::Telemetry::Query", models::QUERY_WITH_SQL, cond, Order::Slowest)?;
-            // Query.between(from, to).where(group_hash: page).where.not(explain: nil).distinct.pluck(:group_hash)
-            let hashes: Vec<String> = items.iter().filter_map(|i| i["group_hash"].as_str().map(str::to_string)).collect();
-            let explained: Vec<String> = if hashes.is_empty() {
-                vec![]
-            } else {
-                let ph = vec!["?"; hashes.len()].join(", ");
-                let mut binds: Vec<rusqlite::types::Value> = vec![qt(from).into(), qt(to).into()];
-                binds.extend(hashes.iter().map(|h| h.clone().into()));
-                db::query(
-                    conn,
-                    &format!(
-                        "SELECT DISTINCT \"queries\".\"group_hash\" FROM \"queries\" WHERE \"queries\".\"occurred_at\" BETWEEN ?1 AND ?2 \
-                         AND \"queries\".\"group_hash\" IN ({ph}) AND \"queries\".\"explain\" IS NOT NULL"
-                    ),
-                    params_from_iter(binds),
-                )?
-                .iter()
-                .filter_map(|r| r.s("group_hash").map(str::to_string))
-                .collect()
-            };
-            Ok((page, explained, pages::n_plus_ones(conn, from, to)?))
-        })?;
+        let (grouped, page, n_plus_ones) = std::thread::scope(|s| {
+            let grouped = s.spawn(|| -> R<(Vec<Value>, Value, Vec<String>)> {
+                let groups = self.telemetry(e, |conn| Ok(aggregations::grouped(conn, "query", from, to, 200, sort.as_deref(), dir.as_deref())?))?;
+                let (items, meta) = self.paginate(groups)?;
+                let hashes: Vec<String> = items.iter().filter_map(|i| i["group_hash"].as_str().map(str::to_string)).collect();
+                let explained = if hashes.is_empty() { vec![] } else { self.telemetry(e, |conn| Ok(explained_groups(conn, from, to, &hashes)?))? };
+                Ok((items, meta, explained))
+            });
+            let page = s.spawn(|| {
+                self.telemetry(e, |conn| {
+                    let cond = filter_query::apply(conn, Resource::Queries, q.as_deref(), from, to, &[])?;
+                    self.cursor_page(conn, e, "queries", "queries", "Railwatch::Telemetry::Query", models::QUERY_WITH_SQL, cond, Order::Slowest)
+                })
+            });
+            let n_plus_ones = s.spawn(|| self.telemetry(e, |conn| Ok(pages::n_plus_ones(conn, from, to)?)));
+            (
+                grouped.join().expect("queries section panicked"),
+                page.join().expect("queries section panicked"),
+                n_plus_ones.join().expect("queries section panicked"),
+            )
+        });
+        let (items, meta, explained) = grouped?;
+        let (page, n_plus_ones) = (page?, n_plus_ones?);
         let items: Vec<Value> = items
             .into_iter()
             .map(|mut i| {
@@ -1560,6 +1561,28 @@ impl IssueRow {
 
 // ---------------------------------------------------------------------------
 // Shapes
+
+/// `Query.between(from, to).where(group_hash: hashes).where.not(explain: nil)
+/// .distinct.pluck(:group_hash)`, on the partial index of EXPLAINed rows:
+/// without stats the planner took the group_hash index and read every row
+/// of those groups in the window to test `explain` (queries@7d: 248 of
+/// 306 ms of SQL).
+fn explained_groups(conn: &Connection, from: i64, to: i64, hashes: &[String]) -> rusqlite::Result<Vec<String>> {
+    let ph = vec!["?"; hashes.len()].join(", ");
+    let mut binds: Vec<rusqlite::types::Value> = vec![qt(from).into(), qt(to).into()];
+    binds.extend(hashes.iter().map(|h| h.clone().into()));
+    Ok(db::query(
+        conn,
+        &format!(
+            "SELECT DISTINCT \"queries\".\"group_hash\" FROM \"queries\" INDEXED BY idx_queries_explained WHERE \"queries\".\"occurred_at\" BETWEEN ?1 AND ?2 \
+             AND \"queries\".\"group_hash\" IN ({ph}) AND \"queries\".\"explain\" IS NOT NULL"
+        ),
+        params_from_iter(binds),
+    )?
+    .iter()
+    .filter_map(|r| r.s("group_hash").map(str::to_string))
+    .collect())
+}
 
 fn meta(page: i64, per_page: i64, total: i64) -> Value {
     crate::obj! { "page" => page, "per_page" => per_page, "total" => total }

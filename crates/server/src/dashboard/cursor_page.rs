@@ -209,8 +209,12 @@ fn per_file(
         return Ok(None);
     }
     let col = order.column();
+    let slowest = order == Order::Slowest && table == "queries";
+    // Only unfiltered: under a filter that matches almost nothing the hint
+    // walks the whole file (queries.q, docs/PERF.md).
+    let inside = if slowest && cond.parts.len() == 1 { files_inside(conn, table, range)? } else { vec![] };
     let Some((union, binds)) = crate::storage::reader::per_file(conn, table, range, &cond_sql, &cond.binds, |f, covered, cond_sql| {
-        let hint = if covered && order == Order::Slowest && table == "queries" { " INDEXED BY idx_queries_slowest" } else { "" };
+        let hint = if slowest && (covered || inside.contains(&f.alias)) { " INDEXED BY idx_queries_slowest" } else { "" };
         format!(
             "SELECT {select} FROM {}.\"{table}\" AS \"{table}\"{hint} WHERE {cond_sql} ORDER BY \"{table}\".\"{col}\" DESC, \"{table}\".\"id\" DESC LIMIT {n}",
             f.alias
@@ -220,6 +224,33 @@ fn per_file(
         return Ok(None);
     };
     Ok(Some((format!("{union} ORDER BY \"{col}\" DESC, \"id\" DESC LIMIT {n}"), binds)))
+}
+
+/// The day files at the window's two edges that hold no row outside it:
+/// mostly today's file, under a window that ends now. There the hint stops
+/// after the page's rows, where the occurred_at plan sorts the whole day so
+/// far (the queries page at 24h, 500k rows a day: 41 -> 14 ms). Two index
+/// seeks per edge file.
+fn files_inside(conn: &Connection, table: &str, (lo, hi): (i64, i64)) -> rusqlite::Result<Vec<String>> {
+    let (from_day, to_day) = (db::qt(lo)[..10].to_string(), db::qt(hi)[..10].to_string());
+    let mut out = vec![];
+    for f in crate::storage::reader::branches(conn, table)? {
+        if f.day != from_day && f.day != to_day {
+            continue;
+        }
+        let outside: bool = conn.query_row(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM {a}.\"{table}\" WHERE \"occurred_at\" < ?1) OR EXISTS (SELECT 1 FROM {a}.\"{table}\" WHERE \"occurred_at\" > ?2)",
+                a = f.alias
+            ),
+            [db::qt(lo), db::qt(hi)],
+            |r| r.get(0),
+        )?;
+        if !outside {
+            out.push(f.alias);
+        }
+    }
+    Ok(out)
 }
 
 /// How many rows of `idx_queries_slowest` the slowest-queries probe reads.
