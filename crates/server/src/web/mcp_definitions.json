@@ -193,7 +193,7 @@
     },
     {
       "name": "explain_route",
-      "description": "Why one route is slow, with the evidence, in one call: start here for \"why is /checkout slow?\". Reads the timelines of up to 20 of the route's requests in the window (its slowest and its newest) and returns answer, one paragraph naming the biggest causes (\"N+1 at app/models/order.rb:12 (60x), fix: Order.includes(:items); 3.5 s per request inside transactions...\"); time_ms_per_request (sql, transactions, view, external, cache, other, untracked: the buckets overlap, tracked is their union); queries_per_request; n_plus_ones with source file:line and an Active Record fix; top_queries, the shapes with the most total time, with their stored EXPLAIN plan when the app captures plans; profile, the hottest methods in the route's profiles, or a note on how to turn the profiler on; the route's count and p50/p95 from rollups; and its slowest requests. get_route has the same route's raw lists. Next: get_execution on a slowest_requests execution_id; explain_query on a group_hash.",
+      "description": "Why one route is slow, with the evidence, in one call: start here for \"why is /checkout slow?\". Reads the timelines of up to 20 of the route's requests in the window (its slowest and its newest) and returns answer, one paragraph naming the biggest causes (\"N+1 at app/models/order.rb:12 (60x), fix: Order.includes(:items); 3.5 s per request inside transactions...\"); time_ms_per_request (sql, transactions, view, external, cache, other, untracked: the buckets overlap, tracked is their union); queries_per_request; n_plus_ones with source file:line and an Active Record fix; top_queries, the shapes with the most total time, with their stored EXPLAIN plan when the app captures plans; profile, the hottest methods in the route's profiles, or a note on how to turn the profiler on; the route's count and p50/p95 from rollups; and its slowest requests. get_route has the same route's raw lists. Next: fix, then compare to prove it; get_execution on a slowest_requests execution_id; explain_query on a group_hash.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -231,6 +231,75 @@
               "30d"
             ],
             "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "compare",
+      "description": "Before and after, to prove a change worked (or find what made things worse): one route, one job class, or the whole environment. Production: two deploys, by default the latest against the one before it; before/after pick others. Development, or any change without a deploy: since, a time or the execution_id of the last request before the change; the after side is everything later, the before side the window before it (Rails reloads code without changing the deploy value, so a mark is how to cut the sides). Returns verdict first (\"Better: p95 -38% (3669 -> 480 ms), queries per request 826 -> 80, N+1 at customer_documents.rb:511 gone.\"); before and after with count, errors, p50/p95/avg ms, queries and db ms per request; deltas in percent; worst_regression_pct (the largest percent any of p95, avg, queries or db time per request got worse, 0 when none did: gate CI on it); low_samples when a side has fewer than 20 executions; n_plus_ones gained, lost and still there, with fixes; query_shapes that appeared, disappeared or changed runs per request the most. Next: explain_route for where the after side's time goes; get_execution on one of its requests.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug from list_applications. Optional when this token can see only one application (an embedded server always has one)."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production. Optional when the application has only one environment."
+          },
+          "route": {
+            "type": "string",
+            "description": "Route name as list_slow_routes shows it, e.g. \"GET /widgets/:id\". Optional: without route, job or group_hash the whole environment's requests (or jobs, with kind: job) are compared."
+          },
+          "job": {
+            "type": "string",
+            "description": "Job class name, e.g. \"InvoiceSyncJob\" (with kind: job)."
+          },
+          "group_hash": {
+            "type": "string",
+            "description": "Route or job group hash, from list_slow_routes or list_jobs. Preferred over route/job when you have it."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "request",
+              "job"
+            ],
+            "description": "What to compare: request (default) or job executions."
+          },
+          "before": {
+            "type": "string",
+            "description": "Deploy for the before side: its deploy value, a ref prefix (7+ characters) or its name, from recent_deploys. Defaults to the deploy before after."
+          },
+          "after": {
+            "type": "string",
+            "description": "Deploy for the after side. Defaults to the latest deploy (or the one after before)."
+          },
+          "since": {
+            "type": "string",
+            "description": "A mark instead of deploys: a time (\"2026-10-25T17:00:00Z\") or an execution_id (the last request before your change; it counts as before). The after side is everything since; the before side the window before it."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "With since: how far back the before side reaches. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
           }
         },
         "required": []
@@ -452,7 +521,7 @@
     },
     {
       "name": "last_execution",
-      "description": "The newest request or job, in get_execution's summary-first shape: the dev loop. Load a page or run a job, then call this to see where the time went, which queries repeated and the N+1s with file:line and fix. path matches a substring of the request path, the route pattern or the execution name (\"/checkout\", \"OrdersController\", \"InvoiceJob\"). With no executions yet, the result says why records may be missing. Next: fix, repeat the request, call this again to compare.",
+      "description": "The newest request or job, in get_execution's summary-first shape: the dev loop. Load a page or run a job, then call this to see where the time went, which queries repeated and the N+1s with file:line and fix. path matches a substring of the request path, the route pattern or the execution name (\"/checkout\", \"OrdersController\", \"InvoiceJob\"). With no executions yet, the result says why records may be missing. Next: fix, repeat the request, then compare with since: this execution_id to see the before and after.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -933,7 +1002,7 @@
   ],
   "prompt_texts": {
     "triage_issue": "Triage Railwatch issue \u0001key\u0001.\n\n1. Call investigate_issue with key \"\u0001key\u0001\". It returns the exception\n   with its in-app frames and code, lead_up (the summary of the request or\n   job it was raised in, and the queries, calls and log lines just before the\n   raise), started_in (the deploy it first appeared in, the deploy before it,\n   the commit range and the deploy's commits), trend, who, and similar_issues\n   with how resolved ones were fixed. A null occurrence means its stored\n   telemetry is past retention; do not invent a stack trace.\n2. Read the in-app frames. Open those files if you have the repository, and\n   the commits in started_in that touch them.\n3. Only if the bundle is not enough: get_execution on occurrence.execution_id\n   pages the full timeline (timeline_offset), get_issue with frames \"all\" has\n   every frame, search_logs finds the same failure outside this issue.\n\nThen report: what breaks, for whom, how often, which change most likely\ncaused it, and the smallest fix. If you are confident, call add_comment with\nyour findings and update_issue to set a priority. Do not resolve the issue.\n",
-    "slow_route": "Find out why \u0001route\u0001 is slow in \u0001application_slug\u0001/\u0001environment\u0001.\n\n1. Call explain_route with application_slug \"\u0001application_slug\u0001\", environment\n   \"\u0001environment\u0001\", route \"\u0001route\u0001\"\u0001window_clause\u0001. Its answer names the\n   biggest causes; time_ms_per_request splits a request's time into SQL,\n   transactions, views, external calls and untracked (Ruby) time; n_plus_ones\n   carry the source line, a fix and how often each ran per request;\n   top_queries are the shapes with the most total time, with stored plans.\n2. For a query without a plan, call explain_query with its group_hash, or run\n   EXPLAIN on its sql yourself. A sequential scan on a filtered column is an\n   index.\n3. If profile has frames, they say which methods the untracked time is in.\n   If it is null and the time is untracked, say the profiler should be on.\n\nThen report, in order of expected saving: the specific indexes to add, the\nspecific .includes / preload calls to add and where, and anything that should\nmove to a background job. Quote the measured milliseconds behind each\nrecommendation rather than estimating.\n",
+    "slow_route": "Find out why \u0001route\u0001 is slow in \u0001application_slug\u0001/\u0001environment\u0001.\n\n1. Call explain_route with application_slug \"\u0001application_slug\u0001\", environment\n   \"\u0001environment\u0001\", route \"\u0001route\u0001\"\u0001window_clause\u0001. Its answer names the\n   biggest causes; time_ms_per_request splits a request's time into SQL,\n   transactions, views, external calls and untracked (Ruby) time; n_plus_ones\n   carry the source line, a fix and how often each ran per request;\n   top_queries are the shapes with the most total time, with stored plans.\n2. For a query without a plan, call explain_query with its group_hash, or run\n   EXPLAIN on its sql yourself. A sequential scan on a filtered column is an\n   index.\n3. If profile has frames, they say which methods the untracked time is in.\n   If it is null and the time is untracked, say the profiler should be on.\n4. After a fix ships, call compare for this route to prove it.\n\nThen report, in order of expected saving: the specific indexes to add, the\nspecific .includes / preload calls to add and where, and anything that should\nmove to a background job. Quote the measured milliseconds behind each\nrecommendation rather than estimating.\n",
     "daily_summary": "Summarise what changed in \u0001application_slug\u0001/\u0001environment\u0001\u0001window_clause\u0001.\n\n1. Call list_issues with status \"open\" for this application and environment.\n   Anything whose first_seen_at falls inside the window is new; anything with\n   a much higher occurrence count than its age suggests is spiking.\n2. Call recent_deploys and line the deploys up against those first_seen_at\n   timestamps to attribute new issues to a release.\n3. Call release_health for crash-free session and user rates per release. A\n   release whose crash-free rate is below the one before it is a regression,\n   even if no new issue opened.\n4. Call list_slow_routes (ranked by total time) and flag any route whose\n   total_ms or p95_ms is high enough to matter; use get_route on the worst one\n   for the reason.\n5. Call list_alerts to see what already fired, so you do not re-report it.\n\nThen write a short summary: new issues (with keys), regressions, deploys that\nshipped, release health movement, and the slowest routes. Lead with the one\nthing worth acting on today. Milliseconds everywhere; no percentages you did\nnot compute from returned numbers.\n"
   }
 }

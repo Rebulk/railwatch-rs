@@ -37,6 +37,8 @@ use super::mcp_summary;
 /// call that answers a question the low-level tools take several to.
 #[path = "mcp_answers.rs"]
 mod answers;
+#[path = "mcp_compare.rs"]
+mod compare;
 use crate::control::Control;
 use crate::dashboard::cursor_page::{self, CursorKey, Order};
 use crate::dashboard::db::{self, Rec, jf, qt};
@@ -571,6 +573,7 @@ impl Mcp<'_> {
             "list_alerts" => self.list_alerts(&a),
             "investigate_issue" => self.investigate_issue(&a),
             "explain_route" => self.explain_route(&a),
+            "compare" => self.compare(&a),
             "update_issue" => self.update_issue(&a),
             "add_comment" => self.add_comment(&a),
             _ => unreachable!("known tool"),
@@ -2607,6 +2610,7 @@ fn narrow_hint(tool: &str) -> &'static str {
         "release_health" => "Pass a narrower window.",
         "get_route" => "Pass a narrower window.",
         "explain_route" => "Pass a narrower window; get_execution on one of slowest_requests has a single request's detail.",
+        "compare" => "Pass route or job to compare one route or job class instead of the whole environment.",
         "investigate_issue" => "Read occurrence and lead_up first; get_execution on occurrence.execution_id pages the full timeline.",
         "get_profile" => "Pass a smaller limit.",
         _ => "Pass a smaller limit or a narrower window.",
@@ -3504,6 +3508,155 @@ mod tests {
         assert_eq!(v["profile"]["frames"][0]["frame"], "Net::HTTP#request");
         assert!(v["answer"].as_str().unwrap().ends_with("profile.frames shows which methods that time is in."));
         assert_eq!(f.tool("explain_route", json!({"route": "GET /nope"}))["error"], "route not found");
+    }
+
+    /// `n` requests of the invoicing route on `deploy`, from `at` back one
+    /// minute apart: 826 queries with the N+1 when `slow`, 80 without it.
+    fn seed_route_requests(conn: &Connection, deploy: &str, at: i64, n: i64, slow: bool) {
+        for i in 0..n {
+            let eid = format!("{deploy}-{i}");
+            let t = at - i * 60_000_000;
+            let (dur, queries) = if slow { (3_000_000 + i * 10_000, 826) } else { (400_000 + i * 2_000, 80) };
+            conn.execute(
+                "INSERT INTO executions (execution_id, kind, name, route, group_hash, status, occurred_at, duration, deploy, counters, detail)
+                 VALUES (?1, 'request', 'GET /:org_slug/invoicing(.:format)', '/:org_slug/invoicing(.:format)', 'route_invoicing', ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    eid,
+                    if !slow && i == 0 { 500 } else { 200 },
+                    qt(t),
+                    dur,
+                    deploy,
+                    json!({"queries": queries}).to_string(),
+                    json!({"db_runtime": if slow { 80.0 } else { 12.0 }}).to_string()
+                ],
+            )
+            .unwrap();
+            // Two shapes per request; the N+1's runs 60 times before the fix.
+            let shapes: &[(&str, &str, i64)] = if slow {
+                &[("g_invoices", "app/services/billing/customer_documents.rb:511", 60), ("g_customers", "app/models/customer.rb:9", 1)]
+            } else {
+                &[("g_customers", "app/models/customer.rb:9", 1), ("g_preload", "app/services/billing/customer_documents.rb:500", 1)]
+            };
+            for (g, src, runs) in shapes {
+                for k in 0..*runs {
+                    conn.execute(
+                        "INSERT INTO queries (execution_id, occurred_at, duration, sql, group_hash, source) VALUES (?1, ?2, 100, ?3, ?4, ?5)",
+                        params![eid, qt(t + k), format!("SELECT \"{g}\".* FROM \"{g}\" WHERE \"{g}\".\"customer_id\" = ?"), g, src],
+                    )
+                    .unwrap();
+                }
+            }
+            if slow {
+                conn.execute(
+                    "INSERT INTO n_plus_ones (execution_id, occurred_at, count, sql, group_hash, source) VALUES (?1, ?2, 5, ?3, 'g_invoices', 'app/services/billing/customer_documents.rb:511')",
+                    params![eid, qt(t), "SELECT \"car_invoices\".* FROM \"car_invoices\" WHERE \"car_invoices\".\"customer_id\" = ?"],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn compare_deploys_reports_deltas_the_verdict_and_the_n_plus_one_gone() {
+        let f = seeded("compare");
+        let conn = f.tenant();
+        let (d1, d2) = (NOW - 2 * 86_400_000_000, NOW - 3_600_000_000);
+        f.c.with(|x| {
+            x.execute(
+                "INSERT INTO deploys (environment_id, deploy, ref, name, deployed_at, created_at, updated_at) VALUES
+                 (?1, 'aaaaaaaaaaaa1111111111111111111111111111', 'aaaaaaaaaaaa1111111111111111111111111111', 'shop@1', ?2, ?2, ?2),
+                 (?1, 'bbbbbbbbbbbb2222222222222222222222222222', 'bbbbbbbbbbbb2222222222222222222222222222', 'shop@2', ?3, ?3, ?3)",
+                params![f.env, qt(d1), qt(d2)],
+            )
+        })
+        .unwrap();
+        // The gem stamps records with the SHA shortened to 12.
+        seed_route_requests(&conn, "aaaaaaaaaaaa", d2 - 60_000_000, 30, true);
+        seed_route_requests(&conn, "bbbbbbbbbbbb", NOW - 60_000_000, 25, false);
+        let v = f.tool("compare", json!({"route": "GET /:org_slug/invoicing(.:format)"}));
+        assert_eq!(v["by"], "deploy", "{v}");
+        assert_eq!(
+            (v["before"]["deploy"].as_str(), v["after"]["deploy"].as_str()),
+            (Some("aaaaaaaaaaaa1111111111111111111111111111"), Some("bbbbbbbbbbbb2222222222222222222222222222"))
+        );
+        assert_eq!((v["before"]["count"].as_i64(), v["after"]["count"].as_i64()), (Some(30), Some(25)));
+        // Nearest-rank p95 of 3000..3290 ms (step 10) is 3280; of 400..448 (step 2) is 446.
+        assert_eq!((v["before"]["p95_ms"].as_f64(), v["after"]["p95_ms"].as_f64()), (Some(3280.0), Some(446.0)));
+        assert_eq!(v["deltas"]["p95_pct"].as_f64(), Some(-86.4));
+        assert_eq!((v["before"]["queries_per_request"].as_f64(), v["after"]["queries_per_request"].as_f64()), (Some(826.0), Some(80.0)));
+        assert_eq!(v["deltas"]["queries_per_request_pct"].as_f64(), Some(-90.3));
+        assert_eq!(v["deltas"]["db_ms_per_request_pct"].as_f64(), Some(-85.0));
+        // One 500 in 25 after: +4 percentage points.
+        assert_eq!(v["deltas"]["error_rate_pts"].as_f64(), Some(4.0));
+        assert_eq!(v["worst_regression_pct"].as_f64(), Some(0.0));
+        assert_eq!(v["low_samples"], false);
+        assert_eq!(v["n_plus_ones"]["lost"][0]["source"], "app/services/billing/customer_documents.rb:511");
+        assert_eq!(v["n_plus_ones"]["lost"][0]["fix"], "Customer.includes(:car_invoices)");
+        assert!(v["n_plus_ones"]["gained"].as_array().unwrap().is_empty());
+        assert_eq!(v["query_shapes"]["disappeared"][0]["group_hash"], "g_invoices");
+        assert_eq!(v["query_shapes"]["disappeared"][0]["before_per_request"].as_f64(), Some(60.0));
+        assert_eq!(v["query_shapes"]["appeared"][0]["group_hash"], "g_preload");
+        assert_eq!(
+            v["verdict"],
+            "Mixed: p95 -86.4% (3280 -> 446 ms), queries per request 826 -> 80, db time per request -85%, error rate +4 pts, N+1 at customer_documents.rb:511 gone."
+        );
+        assert!(v["before"]["url"].as_str().unwrap().contains("/deploys/"));
+        // Swapped explicitly, by ref prefix and by name: every regression is
+        // the worst one, and the N+1 is new.
+        let w = f.tool("compare", json!({"route": "GET /:org_slug/invoicing(.:format)", "before": "bbbbbbb", "after": "shop@1"}));
+        assert_eq!(w["worst_regression_pct"].as_f64(), Some(932.5));
+        assert!(w["verdict"].as_str().unwrap().starts_with("Mixed: p95 +635.4% (446 -> 3280 ms), queries per request 80 -> 826"), "{}", w["verdict"]);
+        assert_eq!(w["n_plus_ones"]["gained"][0]["source"], "app/services/billing/customer_documents.rb:511");
+        // Unknown deploy, unknown route.
+        let e = f.tool("compare", json!({"before": "zzz", "after": "shop@1"}));
+        assert_eq!(e["error"], "no deploy \"zzz\"");
+        assert_eq!(e["known"][0], "bbbbbbbbbbbb2222222222222222222222222222");
+        assert_eq!(f.tool("compare", json!({"route": "GET /nope"}))["error"], "route not found");
+        // A deploy name that is a prefix of a newer one picks itself.
+        f.c.with(|x| {
+            x.execute(
+                "INSERT INTO deploys (environment_id, deploy, ref, name, deployed_at, created_at, updated_at) VALUES (?1, 'shop@10', NULL, 'shop@10', ?2, ?2, ?2)",
+                params![f.env, qt(NOW - 60_000_000)],
+            )
+        })
+        .unwrap();
+        let p = f.tool("compare", json!({"before": "shop@1", "after": "shop@2"}));
+        assert_eq!(p["before"]["deploy"], "aaaaaaaaaaaa1111111111111111111111111111", "{p}");
+    }
+
+    #[test]
+    fn compare_since_a_mark_cuts_development_requests_without_a_deploy() {
+        let f = seeded("compare-mark");
+        let conn = f.tenant();
+        // Development: one deploy value (HEAD at boot) on every request.
+        seed_route_requests(&conn, "devsha", NOW - 20 * 60_000_000, 6, true);
+        seed_route_requests(&conn, "devsha2", NOW - 60_000_000, 4, false);
+        conn.execute("UPDATE executions SET deploy = 'c0ffee123456'", []).unwrap();
+        // Deploys can't split it.
+        let one = f.tool("compare", json!({}));
+        assert_eq!(one["error"], "fewer than two deploys to compare");
+        assert!(one["hint"].as_str().unwrap().contains("pass since"));
+        // The last slow request is the mark: it and everything before is "before".
+        let v = f.tool("compare", json!({"route": "GET /:org_slug/invoicing(.:format)", "since": "devsha-0"}));
+        assert_eq!(v["by"], "mark", "{v}");
+        assert_eq!((v["before"]["count"].as_i64(), v["after"]["count"].as_i64()), (Some(6), Some(4)));
+        assert_eq!(v["after"]["side"], "after execution devsha-0");
+        assert_eq!(v["low_samples"], true);
+        assert!(v["low_samples_hint"].as_str().unwrap().contains("before 6, after 4"));
+        let verdict = v["verdict"].as_str().unwrap();
+        assert!(verdict.contains("queries per request 826 -> 80") && verdict.contains("N+1 at customer_documents.rb:511 gone"), "{verdict}");
+        assert!(verdict.ends_with("Few samples (before 6, after 4): treat the percentiles as rough."), "{verdict}");
+        // A time works as the mark; nothing after it yet says so.
+        assert_eq!(f.tool("compare", json!({"since": "2026-10-15T00:00:00Z"}))["error"], "since is in the future");
+        let t = f.tool("compare", json!({"since": "2026-10-14T17:46:10Z"}));
+        assert_eq!(t["after"]["side"], "since 2026-10-14 17:46:10 UTC");
+        assert!(t["verdict"].as_str().unwrap().starts_with("Nothing to compare: the after side has no executions yet"), "{}", t["verdict"]);
+        // From no queries to some: no percent, but the gate still trips.
+        conn.execute("UPDATE executions SET counters = '{}' WHERE execution_id LIKE 'devsha-%'", []).unwrap();
+        let z = f.tool("compare", json!({"route": "GET /:org_slug/invoicing(.:format)", "since": "devsha-0"}));
+        assert!(z["deltas"]["queries_per_request_pct"].is_null() && z["worst_regression_pct"].as_f64() == Some(100.0), "{}", z["deltas"]);
+        let bad = f.tool("compare", json!({"since": "not-an-id"}));
+        assert_eq!(bad["error"], "since is neither a time nor a stored execution_id");
     }
 
     /// No tool's result is bigger than the cap, however much data the
