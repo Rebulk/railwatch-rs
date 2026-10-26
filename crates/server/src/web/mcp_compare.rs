@@ -151,25 +151,33 @@ impl Mcp<'_> {
 
     /// For the default compare when a side of the latest two deploys is
     /// empty: the newest recorded deploy (in the last 30 days) whose own
-    /// executions include this route or job, split at its deploy time with
-    /// the same span on each side (up to a week; from the previous deploy
-    /// when that is nearer, so the before side is one release). None when no
-    /// deploy has traffic, or the after side would be empty.
+    /// windows include this route or job on both sides, split at its deploy
+    /// time with the same span on each side (up to a week, and no longer
+    /// than the releases either side of it ran, so each side is one release).
+    /// None when no deploy has traffic on both sides.
     fn around_busy_deploy(&self, conn: &Connection, kind: &str, group: Option<&str>, deploys: &[Deploy]) -> R<Option<(Side, Side, String)>> {
         let recorded = recent_deploys(deploys.to_vec());
         for (i, d) in recorded.iter().enumerate() {
             if d.deployed_at < self.now - 30 * DAY {
                 break;
             }
-            let span = (self.now - d.deployed_at).min(7 * DAY);
+            // Equal spans either side, so counts compare too, and each side
+            // one release: up to a week, no longer than since the previous
+            // deploy or until the next one (or now).
+            let since_previous = recorded.get(i + 1).map_or(i64::MAX, |p| d.deployed_at - p.deployed_at);
+            let until_next = i.checked_sub(1).and_then(|j| recorded.get(j)).map_or(self.now, |n| n.deployed_at) - d.deployed_at;
+            let span = until_next.min(7 * DAY).min(since_previous);
             if span <= 0 {
                 continue;
             }
-            let probe = Side { label: String::new(), deploys: vec![], range: (d.deployed_at, d.deployed_at + span), exclusive_to: false, meta: Value::Null };
-            if measure_count(conn, kind, group, &probe)? == 0 {
+            let probe = |range| Side { label: String::new(), deploys: vec![], range, exclusive_to: false, meta: Value::Null };
+            // Both sides need traffic, or this deploy can't answer either.
+            if measure_count(conn, kind, group, &probe((d.deployed_at, d.deployed_at + span)))? == 0
+                || measure_count(conn, kind, group, &probe((d.deployed_at - span, d.deployed_at - 1)))? == 0
+            {
                 continue;
             }
-            let from = recorded.get(i + 1).map_or(d.deployed_at - span, |p| p.deployed_at.max(d.deployed_at - span));
+            let from = d.deployed_at - span;
             let before = Side {
                 label: "before".into(),
                 deploys: vec![],

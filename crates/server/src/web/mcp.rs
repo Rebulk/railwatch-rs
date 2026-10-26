@@ -3665,6 +3665,38 @@ mod tests {
     }
 
     #[test]
+    fn compare_fallback_skips_a_deploy_with_traffic_on_only_one_side() {
+        let f = seeded("compare-busy-oneside");
+        let conn = f.tenant();
+        // d1, then a quiet d2, then d3 and d4. The route ran around d1, then
+        // resumed only after d4: d4 has an after side but no before side.
+        let h = 3_600_000_000;
+        let (d1, d2, d3, d4) = (NOW - 10 * h, NOW - 9 * h, NOW - 3 * h, NOW - 2 * h);
+        f.c.with(|x| {
+            x.execute(
+                "INSERT INTO deploys (environment_id, deploy, ref, name, deployed_at, created_at, updated_at) VALUES
+                 (?1, 'd1', NULL, 'shop@1', ?2, ?2, ?2), (?1, 'd2', NULL, 'shop@2', ?3, ?3, ?3),
+                 (?1, 'd3', NULL, 'shop@3', ?4, ?4, ?4), (?1, 'd4', NULL, 'shop@4', ?5, ?5, ?5)",
+                params![f.env, qt(d1), qt(d2), qt(d3), qt(d4)],
+            )
+        })
+        .unwrap();
+        seed_route_requests(&conn, "d0", d1 - 60_000_000, 10, true);
+        seed_route_requests(&conn, "d1", d2 - 120_000_000, 8, false);
+        seed_route_requests(&conn, "d4", NOW - 60_000_000, 5, false);
+        let v = f.tool("compare", json!({"route": "GET /:org_slug/invoicing(.:format)"}));
+        assert!(v["defaulted"].as_str().unwrap().contains("around deploy d1"), "{v}");
+        assert_eq!((v["before"]["count"].as_i64(), v["after"]["count"].as_i64()), (Some(10), Some(8)), "{v}");
+        // Equal spans: d1 to d2 is one hour, so each side is one hour.
+        let span = |side: &str| {
+            let t = |k: &str| crate::time::parse_db_time(v[side][k].as_str().unwrap().trim_end_matches(" UTC")).unwrap();
+            t("to") - t("from")
+        };
+        assert_eq!(span("before"), h);
+        assert_eq!(span("after"), h);
+    }
+
+    #[test]
     fn compare_since_a_mark_cuts_development_requests_without_a_deploy() {
         let f = seeded("compare-mark");
         let conn = f.tenant();
