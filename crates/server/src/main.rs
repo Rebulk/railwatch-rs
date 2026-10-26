@@ -17,6 +17,9 @@
 //!   railwatch doctor
 //!   railwatch upgrade [--version vX.Y.Z] [--allow-downgrade]   fetch the release's install.sh and re-run it
 //!   railwatch version
+//!
+//!   railwatch login | issues | issue | why | last | compare | tail | open | tools | call
+//!                   the client: any Railwatch server's MCP endpoint (client.rs)
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -33,6 +36,8 @@ use railwatch_server::http::{self, AppState};
 use railwatch_server::rate_limit::FixedWindow;
 use railwatch_server::tenants::Tenants;
 use railwatch_server::web::{self, WebState};
+
+mod client;
 
 const USAGE: &str = "usage:
   railwatch serve
@@ -56,13 +61,19 @@ const USAGE: &str = "usage:
                                          an older release only with --allow-downgrade
   railwatch version
 
+{CLIENT}
+
 Configuration: RAILWATCH_* env vars (RAILWATCH_ENV_FILE=PATH reads them from a KEY=VALUE file),
 else railwatch.toml (RAILWATCH_CONFIG to point elsewhere). Run as root, every command but
 serve and upgrade switches to the owner of the data dir first.
 See `railwatch doctor` for every setting and where it came from.";
 
+fn usage_text() -> String {
+    USAGE.replace("{CLIENT}", client::USAGE)
+}
+
 fn usage() -> ExitCode {
-    eprintln!("{USAGE}");
+    eprintln!("{}", usage_text());
     ExitCode::from(2)
 }
 
@@ -183,6 +194,11 @@ fn tenants(cfg: &Config) -> Tenants {
 
 fn main() -> ExitCode {
     railwatch_server::memory::configure();
+    // The client reads no server configuration and runs as whoever calls it.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = client::run(&argv.iter().map(String::as_str).collect::<Vec<_>>()) {
+        return code;
+    }
     if let Err(e) = railwatch_server::config::load_env_file() {
         return fail(format!("RAILWATCH_ENV_FILE: {e}"));
     }
@@ -247,8 +263,12 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         ["upgrade", rest @ ..] => upgrade(rest),
+        ["help", "client"] => {
+            client::help();
+            ExitCode::SUCCESS
+        }
         ["help" | "--help" | "-h"] => {
-            println!("{USAGE}");
+            println!("{}", usage_text());
             ExitCode::SUCCESS
         }
         _ => usage(),
