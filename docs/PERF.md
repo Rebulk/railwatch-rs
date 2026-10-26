@@ -424,6 +424,114 @@ percentile, the summary's digests, max, client errors, the series' MAX and clien
 - Not measured against production data; the queries rollups in production have 1.6x the rows
   of this tenant at 30d.
 
+## Covering index on rollups (measured, not added; from main 669ec3b)
+
+Production on 2026-10-26 (rebulk-system, v0.2.8): `/api/v1/.../queries?window=30d` ~1.1 s warm,
+~700k query rollup rows of ~12k groups at 30d, meta 557 MB (rollups 410 MB). The question:
+does a covering index for the window read (`WHERE record_type = ? AND bucket BETWEEN ? AND ?`,
+on `index_rollups_on_record_type_and_bucket` today, every row then read from the table) make
+queries@30d about 2x faster at an acceptable write and backup cost. It does not.
+
+### Method
+
+Tenant: `gen_tenant.py --spread-days 30 --executions 210000 --seed 5 --records-per-batch 2000
+--shapes 12000 --tenants 300 --uniform --by-time --few-logs`, posted to a fresh per-day server
+and settled: 1.76M records, 792k query rollup rows of 12,000 groups at 30d (185k at 7d, 26k at
+24h), 856k rollup rows in all, meta 273 MB after VACUUM (rollups 183 MB, the two existing
+indexes 65 and 32 MB). That is production's rollup scale (above it in rows, at half its meta
+size: production's rows carry longer names and digests). Each variant is the same meta with one
+index added (`CREATE INDEX`, then VACUUM); the binary is main's.
+
+| shape | columns after (record_type, bucket) | size | build |
+|---|---|---:|---:|
+| A | id, group_hash, name, count, error_count, client_error_count, duration_sum, duration_max, digest (`Groups::between` without extra) | 173 MB | 1.9 s |
+| B | count, error_count, client_error_count, duration_sum, p50, p95, p99 (`rollup_series`) | 43 MB | 1.1 s |
+| C | A plus p50, p95, p99 (both) | 182 MB | 1.9 s |
+
+`id` follows bucket in A and C so rows within a bucket come in the same order as the existing
+index's (rowid), which the groups' first-appearance order and `sort_by`'s ties depend on. SQLite
+chose each index with no sqlite_stat1 (nothing was ANALYZEd). 30 `/api/v1` cases (queries under
+two sorts, series of queries, requests and one query group, summary, requests, jobs, spans, one
+route) and 9 MCP cases (search_telemetry queries, list_slow_routes, release_health) at
+24h/7d/30d, api-dump/mcp-dump on CPUs 8-11, 3 rounds of the 4 variants in turn. Warm: median of
+5 calls after one dropped, median of rounds. Cold: the tenant's files evicted
+(`posix_fadvise(DONTNEED)`), a fresh process, one call.
+
+### Results (ms)
+
+| case | main warm | A | B | C | main cold | A | B | C |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| API queries@24h | 21.1 | 20.7 | 26.2 | 21.2 | 2667* | 1037 | 1033 | 1182 |
+| API queries@7d | 122.4 | 110.5 | 152.5 | 114.5 | 1151 | 1088 | 1138 | 1123 |
+| API queries@30d | 456.7 | 433.3 | 603.7 | 462.2 | 1471 | 1487 | 1530 | 1541 |
+| API queries sort=p99@24h | 21.2 | 20.7 | 27.5 | 21.9 | 1344 | 1017 | 1009 | 1016 |
+| API queries sort=p99@30d | 484.5 | 465.6 | 595.0 | 468.5 | 1450 | 1436 | 1544 | 1485 |
+| API series.query@7d | 36.0 | 35.2 | 27.3 | 32.5 | 403 | 412 | 393 | 409 |
+| API series.query@30d | 148.4 | 151.5 | 115.1 | 137.1 | 552 | 560 | 493 | 564 |
+| API series.query (one group)@30d | 1.3 | 1.3 | 1.5 | 61.5 | 465 | 466 | 476 | 472 |
+| API series.request@30d | 5.6 | 5.9 | 3.8 | 4.0 | 466 | 467 | 371 | 377 |
+| API summary@30d | 18.0 | 17.6 | 21.5 | 18.1 | 473 | 474 | 483 | 477 |
+| API requests@30d | 12.2 | 10.0 | 14.1 | 10.8 | 467 | 378 | 473 | 393 |
+| API jobs@30d | 15.7 | 14.0 | 15.0 | 14.3 | 961 | 860 | 964 | 878 |
+| API route@30d | 50.0 | 49.6 | 49.6 | 49.5 | 1020 | 1014 | 1016 | 1021 |
+| MCP search_telemetry queries@30d | 6.1 | 4.9 | 4.8 | 5.6 | 1491 | 1495 | 1480 | 1515 |
+| MCP list_slow_routes@30d | 9.3 | 8.1 | 10.1 | 7.0 | 466 | 472 | 474 | 372 |
+
+\* main's three cold runs were 2675, 2667 and 1269 ms, the others' 1000-1250: the first cold case
+after the meta copy, on main only; not explained, and gone at 7d and 30d. Cases not shown were
+under 2 ms warm on all four, or within a few ms.
+
+Output: A and C byte-identical to main in every case and round. B is not: it returns the window's
+rows in (bucket, count, ...) order, not rowid order, so the groups' first-appearance order and
+with it `sort_by`'s ties change (queries, requests and jobs at 24h and 7d reorder equal rows). B
+would need the read to sort, which is what #51 removed.
+
+### Why it does not help
+
+- **The table lookup is not the cost.** The window statement takes ~490 ms of queries@30d
+  (`RW_SQL_PROFILE`; everything else on the page is 12 ms). The same rows, aggregated inside
+  SQLite with no rows returned, take 190 ms on main and 163 ms with A: the index saves the
+  27 ms of rowid lookups (rows of an hour sit together in the table, so the lookups are nearly
+  sequential). The other ~300 ms is stepping 792k rows out to Rust (`sqlite3VdbeExec` 33% of
+  the profile, column reads and type checks, the fold in `Groups::between` 12%), which a
+  covering index does not change. Net: 457 -> 433 ms, 5%.
+- **B slows the grouped tables down** (457 -> 604 ms at 30d, 122 -> 153 at 7d): SQLite picks B
+  for the grouped read too (it covers the WHERE, not the columns), then looks every row up in
+  the table in B's order, which is no longer the table's.
+- **C regresses one-group series**, 1.3 -> 61.5 ms at 30d: with no statistics the planner takes
+  the covering index's (record_type, bucket) range over the unique index's (record_type,
+  group_hash, bucket) for `... AND group_hash = ?4`. Fixing that takes an `INDEXED BY` or stats,
+  and the code must not depend on sqlite_stat1.
+- **Cold reads are reading the file.** 300-500 ms of every cold case is opening and attaching
+  the per-day files; the 30-day query cases are ~1.5 s with or without the index (A reads a
+  smaller index instead of the table, but its index is as large as the columns it covers).
+
+### Costs
+
+- **Size.** A is 94% of the rollups table (name and digest are most of a row), so it would be
+  ~385 MB on production's 557 MB meta (410 MB of rollups): the meta goes to ~940 MB. B is 23%
+  (~95 MB there).
+- **Build.** 1.9 s for A here (1.1 s for B, this machine's NVMe disk); an estimated 4-5 s for
+  A at production's size (not measured there), holding the meta's write lock: rollup flushes
+  and the ingest receipts in meta wait for it.
+- **Writes.** `write_type`'s statements replayed for the 24 latest query hours (1,092 rows an
+  hour: DELETE of the hour's groups, 500-row INSERTs, IMMEDIATE, server pragmas; CPUs 4-7,
+  3 x 6 rounds): the medians are bimodal by run (55-65 ms or 140-150 ms per flush, the same
+  for main and every shape, whichever checkpoint the run hit), so no difference in flush time
+  could be measured. WAL written per flush: main 4.97 MB, A 5.27 MB (+6%), B 5.05 MB (+2%),
+  C 5.27 MB.
+- **Backups.** The meta snapshot (zstd 3, uploaded at most hourly): main 45.0 MB, A 75.1 MB
+  (+67%), B 52.2 MB (+16%), C 77.6 MB. Production's meta compresses to ~116 MB
+  (storage/backup.rs); the same ratio would put A's uploads near 190 MB an hour.
+
+### What would
+
+The cost is the number of rows the window returns. 30 days of query rollups are 792k
+group-hours here but 311k group-days: reading days for the days a window covers fully (a daily
+rollup, or folding hours into days when they age) would return 2.5x fewer rows. It changes the
+stored digests (a merge of hourly t-digests is not byte-identical to one over the raw rows) and
+needs its own plan; not done here.
+
 ## Proposals
 
 None of these is implemented.
