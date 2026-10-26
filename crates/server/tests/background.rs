@@ -102,7 +102,7 @@ async fn outbox_refuses_private_destination_and_schedules_retry() {
         let payload = railwatch_server::alerts::as_hash(railwatch_server::rhash! { "message" => "m", "environment_id" => env });
         assert_eq!(rules::fire_issueless(&c, app, "quota", &payload).unwrap().len(), 1);
     }
-    assert_eq!(railwatch_server::alerts::deliver_pass(&control).await.unwrap(), 1);
+    assert_eq!(railwatch_server::alerts::deliver_pass(&control, std::path::Path::new("telemetry")).await.unwrap(), 1);
     let c = control.conn();
     let (status, attempts, error): (String, i64, String) =
         c.query_row("SELECT status, delivery_attempts, error FROM alerts", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
@@ -140,7 +140,7 @@ async fn alert_delivery_off_records_alerts_as_skipped_without_sending() {
         assert_eq!(rules::fire_issueless(&c, app, "quota", &payload).unwrap().len(), 1);
         integ
     };
-    assert_eq!(railwatch_server::alerts::deliver_pass(&control).await.unwrap(), 1);
+    assert_eq!(railwatch_server::alerts::deliver_pass(&control, std::path::Path::new("telemetry")).await.unwrap(), 1);
     assert_eq!(railwatch_server::alerts::deliver_test(&control, integ).await.unwrap(), "skipped");
     let c = control.conn();
     assert_eq!(count(&c, "SELECT COUNT(*) FROM alerts WHERE status = 'skipped' AND error IS NULL AND sent_at IS NULL"), 2);

@@ -18,7 +18,8 @@ gem's embedded store and the hosted platform without conversion.
 - `research/`     - measured experiments behind the storage and restart designs
 - `docs/`         - [SELF-HOST.md](docs/SELF-HOST.md) (install, config, backups, releases),
   [DIFFERENCES.md](docs/DIFFERENCES.md) (every known difference from the Rails server),
-  [STORAGE.md](docs/STORAGE.md), [PERF.md](docs/PERF.md), [GATE1.md](docs/GATE1.md) (benchmarks)
+  [STORAGE.md](docs/STORAGE.md), [PERF.md](docs/PERF.md), [GATE1.md](docs/GATE1.md) (benchmarks),
+  [agent-webhooks.md](docs/agent-webhooks.md) (alert webhooks an agent can act on, and a GitHub Action recipe)
 
 ## Self-hosting: the default path
 

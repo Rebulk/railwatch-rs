@@ -458,6 +458,15 @@ Checked against railwatch-cloud @ 464f0fd in rw-baseline by:
     with a message saying so. OutboundHttp's policy is ported (HTTPS, no
     credentials/fragment, every resolved address public, connection pinned
     to the checked address, 1 MiB, 15 s); redirects are not followed.
+    **Agent-ready webhooks** (railwatch-rs only, docs/agent-webhooks.md): an
+    issue alert's body adds `issue.{key, canonical_key, priority,
+    affected_users, first_seen_at, last_seen_at, deploy, application,
+    application_id, environment}`, `mcp` (endpoint and the investigate_issue
+    call) and a 16 KB-capped `summary` (the occurrence with collapsed frames,
+    and the execution summary). Every delivery also sends
+    `X-Railwatch-Event-Id` (the delivery key), `X-Railwatch-Timestamp` and,
+    with a secret, `X-Railwatch-Signature-256` over `<timestamp>.<body>`.
+    The Rails fields and `X-Railwatch-Signature` are unchanged.
 11. **Scheduled-task schedules** are parsed by croner from cron (5/6 fields,
     trailing `UTC`) and fugit's common "every ..." forms. A schedule with a
     non-UTC zone or another natural-language form is skipped (fugit would

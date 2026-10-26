@@ -213,7 +213,7 @@ fn main() {
                 }
                 "deliver" => {
                     drop(c);
-                    rt.block_on(railwatch_server::alerts::deliver_pass(&control)).unwrap();
+                    rt.block_on(railwatch_server::alerts::deliver_pass(&control, &dir.join("telemetry"))).unwrap();
                 }
                 other => panic!("unknown step {other}"),
             }

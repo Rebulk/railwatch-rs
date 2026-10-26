@@ -9,6 +9,7 @@ pub mod outbound_http;
 pub mod outbox;
 pub mod rules;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 
@@ -23,13 +24,23 @@ pub struct OutboxHealth {
 
 /// One reconcile + delivery pass: recover stale leases, summarize closed
 /// bursts, claim due alerts, deliver them concurrently, record outcomes.
-pub async fn deliver_pass(control: &Arc<Control>) -> Result<usize, String> {
+/// `tenants_dir` is where webhooks read what they tell an agent about the
+/// issue (delivery::Context::enrich).
+pub async fn deliver_pass(control: &Arc<Control>, tenants_dir: &Path) -> Result<usize, String> {
     let c = control.clone();
+    let dir = tenants_dir.to_path_buf();
     let claimed = tokio::task::spawn_blocking(move || {
-        let conn = c.conn();
-        outbox::summarize_bursts(&conn)?;
-        let claimed = outbox::claim_due(&conn, outbox::BATCH_SIZE)?;
-        claimed.into_iter().map(|a| delivery::Context::load(&conn, c.alerting(), a)).collect::<rusqlite::Result<Vec<_>>>()
+        let mut claimed = {
+            let conn = c.conn();
+            outbox::summarize_bursts(&conn)?;
+            let claimed = outbox::claim_due(&conn, outbox::BATCH_SIZE)?;
+            claimed.into_iter().map(|a| delivery::Context::load(&conn, c.alerting(), a)).collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        // After the control lock is released: these read telemetry files.
+        for ctx in &mut claimed {
+            ctx.enrich(&dir);
+        }
+        Ok::<_, rusqlite::Error>(claimed)
     })
     .await
     .map_err(|e| e.to_string())?
