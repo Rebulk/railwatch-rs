@@ -384,11 +384,9 @@ fn agent_names(c: &Connection, i: &Issue) -> rusqlite::Result<Option<AgentContex
     .optional()
 }
 
-/// get_execution's `summary` of the execution. Pending
-/// `web::mcp::execution_summary_of` (rs PR: MCP answer tools), which this
-/// becomes; until then the webhook carries the occurrence alone.
-fn execution_summary(_t: &Connection, _execution_id: &str) -> rusqlite::Result<Option<serde_json::Value>> {
-    Ok(None)
+/// get_execution's `summary` of the execution.
+fn execution_summary(t: &Connection, execution_id: &str) -> rusqlite::Result<Option<serde_json::Value>> {
+    crate::web::mcp::execution_summary_of(t, execution_id)
 }
 
 /// An exception occurrence for an agent: what get_issue shows, frames
@@ -564,6 +562,17 @@ mod tests {
             [serde_json::Value::Array(frames).to_string()],
         )
         .unwrap();
+        // The request it was raised in, with an N+1 for its summary.
+        t.execute(
+            "INSERT INTO executions (execution_id, kind, name, status, occurred_at, duration) VALUES ('e-1', 'request', 'GET /orders/:id', 500, '2026-10-25 11:59:59', 812000)",
+            [],
+        )
+        .unwrap();
+        t.execute(
+            "INSERT INTO n_plus_ones (execution_id, occurred_at, count, sql, group_hash, source) VALUES ('e-1', '2026-10-25 11:59:59.5', 12, 'SELECT \"line_items\".* FROM \"line_items\" WHERE \"line_items\".\"order_id\" = ?', 'gl', 'app/views/orders/show.html.erb:7')",
+            [],
+        )
+        .unwrap();
         let cipher = super::super::integration::SettingsCipher::new(b"k");
         let mut settings = serde_json::Map::new();
         settings.insert("url".into(), "https://hooks.example.com/railwatch".into());
@@ -630,6 +639,11 @@ mod tests {
         assert_eq!(frames.len(), 3, "{frames:?}");
         assert_eq!(frames[1]["file"], "app/models/order0.rb");
         assert_eq!(frames[2], serde_json::json!({"omitted_frames": 40, "gems": ["actionpack"]}));
+        // And the summary of the request it was raised in, as get_execution leads with.
+        let e = &v["summary"]["execution"];
+        assert_eq!(e["time_ms"]["duration"].as_f64(), Some(812.0));
+        assert_eq!(e["n_plus_ones"][0]["source"], "app/views/orders/show.html.erb:7");
+        assert_eq!(e["n_plus_ones"][0]["fix"], "Order.includes(:line_items)");
         // Signed over exactly the bytes sent.
         let json = rjson::generate(&ctx.webhook_body()).unwrap();
         let h = webhook_headers(&json, Some("s3cret"), &key, 1_792_000_000);

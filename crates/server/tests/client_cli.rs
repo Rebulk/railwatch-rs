@@ -259,12 +259,13 @@ async fn the_client_commands_against_a_server_mounted_under_a_path() {
     assert_eq!(raw[0]["key"], "SHOP-12");
     assert_eq!(raw[0]["url"], format!("http://{addr}/monitoring/issues/1"));
 
-    // issue: this server has no investigate_issue yet, so get_issue,
-    // rendered: the in-app frame with its code, the rest collapsed.
+    // issue: investigate_issue's markdown brief: the in-app frame with its
+    // code, the lead-up with the N+1, the deploy it ran.
     let issue = ok(&run(a(&["issue", "SHOP-12"])).await);
-    assert!(issue.starts_with("SHOP-12  ZeroDivisionError: divided by 0\n"), "{issue}");
-    assert!(issue.contains("→ app/models/order.rb:31 in total\n        line_items.sum(&:price) / count"), "{issue}");
-    assert!(issue.contains("deploy: abc1234"), "{issue}");
+    assert!(issue.starts_with("# SHOP-12 ZeroDivisionError: divided by 0\n"), "{issue}");
+    assert!(issue.contains("`app/models/order.rb:31` in `total`") && issue.contains("> 31: line_items.sum(&:price) / count"), "{issue}");
+    assert!(issue.contains("N+1 at `app/views/orders/show.html.erb:7` (12x)"), "{issue}");
+    assert!(issue.contains("Deploy `abc1234`"), "{issue}");
     // Not found is exit 2, with the tool's hint.
     let missing = run(a(&["issue", "SHOP-999"])).await;
     assert_eq!(missing.status.code(), Some(2));
@@ -276,10 +277,9 @@ async fn the_client_commands_against_a_server_mounted_under_a_path() {
     assert!(last.contains("app/views/orders/show.html.erb:7 — 12×"), "{last}");
 
     // why: by route name, or by a path (resolved through the newest
-    // request), on a server without explain_route: get_route.
+    // request): explain_route's answer first.
     let why = ok(&run(a(&["why", "GET /orders/:id"])).await);
-    assert!(why.starts_with("GET /orders/:id\n1 request · p50"), "{why}");
-    assert!(why.contains("app/views/orders/show.html.erb:7"), "{why}");
+    assert!(why.starts_with("GET /orders/:id\nOver 1 sampled requests (avg 812 ms): N+1 at app/views/orders/show.html.erb:7 (up to 12x per request), fix: Order.includes(:line_items)"), "{why}");
     let by_path = ok(&run(a(&["why", "/orders/12"])).await);
     assert!(by_path.starts_with("(GET /orders/:id: the route of the newest request matching /orders/12)\n"), "{by_path}");
     let no_route = run(a(&["why", "GET /nowhere"])).await;

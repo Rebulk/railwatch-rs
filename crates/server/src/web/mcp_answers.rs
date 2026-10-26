@@ -560,17 +560,21 @@ fn issue_markdown(issue: &IssueRow, v: &Value) -> String {
     line(&mut md, String::new());
     line(&mut md, "## When it started".into());
     if s.is_object() {
-        line(
-            &mut md,
-            format!(
-                "Deploy `{}`{} at {} ({}){}.",
-                rb::first_chars(s["deploy"].as_str().unwrap_or(""), 12),
-                s["name"].as_str().map_or(String::new(), |n| format!(" ({n})")),
-                str_of(&s["deployed_at"]),
-                str_of(&s["how"]),
-                s["first_seen_after_deploy"].as_str().map_or(String::new(), |a| format!("; first seen {a} after it"))
-            ),
-        );
+        let deploy = rb::first_chars(s["deploy"].as_str().unwrap_or(""), 12);
+        if s["deploy_recorded"] == false {
+            line(&mut md, format!("Deploy `{deploy}`: its first retained occurrence ran it, but no deploy by that name is recorded (no time, no commits)."));
+        } else {
+            line(
+                &mut md,
+                format!(
+                    "Deploy `{deploy}`{} at {} ({}){}.",
+                    s["name"].as_str().map_or(String::new(), |n| format!(" ({n})")),
+                    str_of(&s["deployed_at"]),
+                    str_of(&s["how"]),
+                    s["first_seen_after_deploy"].as_str().map_or(String::new(), |a| format!("; first seen {a} after it"))
+                ),
+            );
+        }
         if let Some(r) = s["commit_range"].as_str() {
             line(&mut md, format!("Commit range: `{r}`"));
         }
