@@ -10,7 +10,8 @@ One process on a small VPS serves many apps. Telemetry files stay
 byte-compatible with the gem's schema, so data moves between this server, the
 gem's embedded store and the hosted platform without conversion.
 
-- `crates/server` - the server (`railwatch` binary: ingest, dashboard, alerts, MCP, `/api/v1`)
+- `crates/server` - the server (`railwatch` binary: ingest, dashboard, alerts, MCP, `/api/v1`), and a
+  command-line client of any Railwatch server's MCP endpoint ([docs/CLI.md](docs/CLI.md))
 - `crates/load`   - `rw-load`, a load generator that speaks the gem's wire protocol
 - `frontend/`     - the dashboard (React + Inertia), embedded at build time
 - `bench/`        - differential harnesses against the Rails implementation, install proofs, benchmarks
