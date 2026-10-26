@@ -94,6 +94,35 @@
       }
     },
     {
+      "name": "investigate_issue",
+      "description": "Everything needed to find an issue's root cause, in one call: start here for \"what broke in SHOP-12?\". Returns the exception with its in-app frames and code (framework frames collapsed); lead_up, the summary of the request or job it was raised in (where its time went, its N+1s) and the queries, calls and log lines that ran just before the raise; started_in, the deploy it first appeared in, the deploy before it, the commit range and the deploy's commits; trend (per day, per deploy, last 7 days against the 7 before); who (users and tenants); similar_issues (same exception class or culprit file, resolved ones too, with their last comment); and markdown, the same as a brief to read or paste. Every record has its dashboard url. Next: open the in-app frames' files; get_execution on occurrence.execution_id for the full timeline; add_comment with your findings.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Issue key, e.g. APP-171 (application issue prefix, dash, number). The canonical_key form \"account_slug/application_id/APP-171\" is also accepted, and is required when a bare key matches issues in more than one application."
+          },
+          "issue_id": {
+            "type": "integer",
+            "description": "Stable issue_id from list_issues. Optional; the most precise way to name an issue."
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "key"
+            ]
+          },
+          {
+            "required": [
+              "issue_id"
+            ]
+          }
+        ]
+      }
+    },
+    {
       "name": "list_slow_routes",
       "description": "The 20 routes that cost the most request time in the window. Default ranking is total time (sum of durations: count x average), so a hot path outranks a route hit four times; sort: avg or p95 ranks by per-request latency instead. Each row has route, group_hash, count, errors, total_ms, avg_ms, p95_ms and the dashboard url. Next: get_route with the route or group_hash for its N+1s and slow queries.",
       "inputSchema": {
@@ -164,6 +193,51 @@
           "route": {
             "type": "string",
             "description": "Route name as shown by list_slow_routes, e.g. \"GET /widgets/:id\". Ignored when group_hash is given."
+          },
+          "group_hash": {
+            "type": "string",
+            "description": "Route group hash from list_slow_routes. Preferred over route when you have it."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "explain_route",
+      "description": "Why one route is slow, with the evidence, in one call: start here for \"why is /checkout slow?\". Reads the timelines of up to 20 of the route's requests in the window (its slowest and its newest) and returns answer, one paragraph naming the biggest causes (\"N+1 at app/models/order.rb:12 (60x), fix: Order.includes(:items); 3.5 s per request inside transactions...\"); time_ms_per_request (sql, transactions, view, external, cache, other, untracked: the buckets overlap, tracked is their union); queries_per_request; n_plus_ones with source file:line and an Active Record fix; top_queries, the shapes with the most total time, with their stored EXPLAIN plan when the app captures plans; profile, the hottest methods in the route's profiles, or a note on how to turn the profiler on; the route's count and p50/p95 from rollups; and its slowest requests. get_route has the same route's raw lists. Next: get_execution on a slowest_requests execution_id; explain_query on a group_hash.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug from list_applications. Optional when this token can see only one application (an embedded server always has one)."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production. Optional when the application has only one environment."
+          },
+          "route": {
+            "type": "string",
+            "description": "Route name as list_slow_routes shows it, e.g. \"GET /widgets/:id\". Ignored when group_hash is given."
           },
           "group_hash": {
             "type": "string",
@@ -880,8 +954,8 @@
     "add_comment"
   ],
   "prompt_texts": {
-    "triage_issue": "Triage Railwatch issue \u0001key\u0001.\n\n1. Call get_issue with key \"\u0001key\u0001\" to read the title, culprit, status,\n   occurrence count, affected-user count, sample_occurrence and last_occurrence\n   (which says same_as when it is the sample). Read their in-app frames, cause,\n   context and browser_breadcrumbs. A null occurrence means its stored\n   telemetry is unavailable; do not invent a stack trace.\n2. If an occurrence has an execution_id, call get_execution with it: its\n   summary says where the time went and which queries repeated, and its\n   timeline (paged with timeline_offset) holds the queries, cache reads,\n   outgoing HTTP calls, and log lines that ran in the same request or job,\n   each with an offset in milliseconds. Browser\n   exceptions may have no execution_id; use their recorded browser trail\n   and correlate nearby server requests without claiming an exact link.\n3. Call search_logs for distinctive strings from the message to see whether\n   the same failure shows up outside this issue.\n4. Call recent_deploys and compare first_seen_at against the deploy times: an\n   issue that starts within minutes of a deploy usually came from it.\n5. Read the stack frames in sample_occurrence or last_occurrence, focusing\n   on application frames. Open those files if you have the repository.\n\nThen report: what breaks, for whom, how often, which change most likely\ncaused it, and the smallest fix. If you are confident, call add_comment with\nyour findings and update_issue to set a priority. Do not resolve the issue.\n",
-    "slow_route": "Find out why \u0001route\u0001 is slow in \u0001application_slug\u0001/\u0001environment\u0001.\n\n1. Call get_route with application_slug \"\u0001application_slug\u0001\", environment\n   \"\u0001environment\u0001\", route \"\u0001route\u0001\"\u0001window_clause\u0001. It returns the\n   request count, p50/p95/p99/max in milliseconds, the slowest individual\n   requests, the slowest queries those requests ran, and any N+1 patterns\n   with a suggested Active Record fix.\n2. For each slow query group, call explain_query with its group_hash to read\n   the stored query plan. A sequential scan on a filtered column is an index.\n3. Call get_profile with the execution_id of the slowest request. If a profile\n   exists, the hottest frames say whether the time is in the database, in\n   view rendering, or in application code.\n4. Call get_execution on the slowest request. Its summary splits the time into\n   SQL, transactions, views, external calls and untracked (Ruby) time, and\n   lists the repeated queries with their source lines.\n\nThen report, in order of expected saving: the specific indexes to add, the\nspecific .includes / preload calls to add and where, and anything that should\nmove to a background job. Quote the measured milliseconds behind each\nrecommendation rather than estimating.\n",
+    "triage_issue": "Triage Railwatch issue \u0001key\u0001.\n\n1. Call investigate_issue with key \"\u0001key\u0001\". It returns the exception\n   with its in-app frames and code, lead_up (the summary of the request or\n   job it was raised in, and the queries, calls and log lines just before the\n   raise), started_in (the deploy it first appeared in, the deploy before it,\n   the commit range and the deploy's commits), trend, who, and similar_issues\n   with how resolved ones were fixed. A null occurrence means its stored\n   telemetry is past retention; do not invent a stack trace.\n2. Read the in-app frames. Open those files if you have the repository, and\n   the commits in started_in that touch them.\n3. Only if the bundle is not enough: get_execution on occurrence.execution_id\n   pages the full timeline (timeline_offset), get_issue with frames \"all\" has\n   every frame, search_logs finds the same failure outside this issue.\n\nThen report: what breaks, for whom, how often, which change most likely\ncaused it, and the smallest fix. If you are confident, call add_comment with\nyour findings and update_issue to set a priority. Do not resolve the issue.\n",
+    "slow_route": "Find out why \u0001route\u0001 is slow in \u0001application_slug\u0001/\u0001environment\u0001.\n\n1. Call explain_route with application_slug \"\u0001application_slug\u0001\", environment\n   \"\u0001environment\u0001\", route \"\u0001route\u0001\"\u0001window_clause\u0001. Its answer names the\n   biggest causes; time_ms_per_request splits a request's time into SQL,\n   transactions, views, external calls and untracked (Ruby) time; n_plus_ones\n   carry the source line, a fix and how often each ran per request;\n   top_queries are the shapes with the most total time, with stored plans.\n2. For a query without a plan, call explain_query with its group_hash, or run\n   EXPLAIN on its sql yourself. A sequential scan on a filtered column is an\n   index.\n3. If profile has frames, they say which methods the untracked time is in.\n   If it is null and the time is untracked, say the profiler should be on.\n\nThen report, in order of expected saving: the specific indexes to add, the\nspecific .includes / preload calls to add and where, and anything that should\nmove to a background job. Quote the measured milliseconds behind each\nrecommendation rather than estimating.\n",
     "daily_summary": "Summarise what changed in \u0001application_slug\u0001/\u0001environment\u0001\u0001window_clause\u0001.\n\n1. Call list_issues with status \"open\" for this application and environment.\n   Anything whose first_seen_at falls inside the window is new; anything with\n   a much higher occurrence count than its age suggests is spiking.\n2. Call recent_deploys and line the deploys up against those first_seen_at\n   timestamps to attribute new issues to a release.\n3. Call release_health for crash-free session and user rates per release. A\n   release whose crash-free rate is below the one before it is a regression,\n   even if no new issue opened.\n4. Call list_slow_routes (ranked by total time) and flag any route whose\n   total_ms or p95_ms is high enough to matter; use get_route on the worst one\n   for the reason.\n5. Call list_alerts to see what already fired, so you do not re-report it.\n\nThen write a short summary: new issues (with keys), regressions, deploys that\nshipped, release health movement, and the slowest routes. Lead with the one\nthing worth acting on today. Milliseconds everywhere; no percentages you did\nnot compute from returned numbers.\n"
   }
 }

@@ -32,6 +32,11 @@ use serde_json::{Map, Value, json};
 
 use super::WebState;
 use super::mcp_summary;
+
+/// The answer-shaped tools (investigate_issue, explain_route, ...): each one
+/// call that answers a question the low-level tools take several to.
+#[path = "mcp_answers.rs"]
+mod answers;
 use crate::control::Control;
 use crate::dashboard::cursor_page::{self, CursorKey, Order};
 use crate::dashboard::db::{self, Rec, jf, qt};
@@ -564,6 +569,8 @@ impl Mcp<'_> {
             "web_vitals" => self.web_vitals(&a),
             "recent_deploys" => self.recent_deploys(&a),
             "list_alerts" => self.list_alerts(&a),
+            "investigate_issue" => self.investigate_issue(&a),
+            "explain_route" => self.explain_route(&a),
             "update_issue" => self.update_issue(&a),
             "add_comment" => self.add_comment(&a),
             _ => unreachable!("known tool"),
@@ -1238,8 +1245,26 @@ impl Mcp<'_> {
         let mut v = self.issue_json(&issue);
         db::merge_into(&mut v, "sample", issue.sample_json());
         db::merge_into(&mut v, "detection", self.detection(&issue)?);
-        let (mut sample, mut last) = self.exception_occurrences(&issue)?;
-        let all_frames = a.s("frames") == "all";
+        let (sample, last) = self.agent_occurrences(&issue, a.s("frames") == "all")?;
+        if issue.kind == "exception" && sample.is_null() && last.is_null() {
+            db::merge_into(
+                &mut v,
+                "note",
+                Value::from(
+                    "This issue's occurrences are past the environment's retention: frames and context are gone. Its title, culprit and counts are all that is left.",
+                ),
+            );
+        }
+        db::merge_into(&mut v, "sample_occurrence", sample);
+        db::merge_into(&mut v, "last_occurrence", last);
+        Ok(v.to_string())
+    }
+
+    /// The sample and latest occurrences as get_issue prints them: framework
+    /// frames collapsed (unless `all_frames`), each with its execution_url,
+    /// and the latest one reduced to {id, same_as} when it is the sample.
+    fn agent_occurrences(&self, issue: &IssueRow, all_frames: bool) -> R<(Value, Value)> {
+        let (mut sample, mut last) = self.exception_occurrences(issue)?;
         let env = issue.env_row();
         for o in [&mut sample, &mut last] {
             if let Value::Object(m) = o {
@@ -1255,18 +1280,7 @@ impl Mcp<'_> {
         if sample.is_object() && sample.get("id") == last.get("id") {
             last = json!({"id": sample["id"], "same_as": "sample_occurrence"});
         }
-        if issue.kind == "exception" && sample.is_null() && last.is_null() {
-            db::merge_into(
-                &mut v,
-                "note",
-                Value::from(
-                    "This issue's occurrences are past the environment's retention: frames and context are gone. Its title, culprit and counts are all that is left.",
-                ),
-            );
-        }
-        db::merge_into(&mut v, "sample_occurrence", sample);
-        db::merge_into(&mut v, "last_occurrence", last);
-        Ok(v.to_string())
+        Ok((sample, last))
     }
 
     /// issue_json with the issue's dashboard link.
@@ -1370,17 +1384,7 @@ impl Mcp<'_> {
         let given = a.presence("group_hash");
         self.with_telemetry(&env, |conn| {
             let hour = qt(rb::beginning_of_hour(from));
-            let group_hash = match given {
-                Some(g) => Some(g),
-                None => db::query_one(
-                    conn,
-                    "SELECT \"rollups\".\"group_hash\" FROM \"rollups\" WHERE \"rollups\".\"record_type\" = 'request' AND \"rollups\".\"bucket\" BETWEEN ?1 AND ?2 \
-                     AND \"rollups\".\"name\" = ?3 LIMIT 1",
-                    params![hour, qt(to), route],
-                )?
-                .and_then(|r| r.s("group_hash").map(str::to_string)),
-            };
-            let Some(group_hash) = group_hash.filter(|g| rb::present(Some(g))) else { return not_found("route") };
+            let Some(group_hash) = find_group(conn, "request", &route, given, from, to)? else { return not_found("route") };
             let rollups = rollup::load(
                 conn,
                 "SELECT \"rollups\".* FROM \"rollups\" WHERE \"rollups\".\"record_type\" = 'request' AND \"rollups\".\"group_hash\" = ?1 \
@@ -1409,10 +1413,7 @@ impl Mcp<'_> {
                 Some(n) => n,
             };
             let ids: Vec<String> = requests.iter().filter_map(|r| r.s("execution_id").map(str::to_string)).collect();
-            let slowest: Vec<Value> = max_by_n(&requests, 10, |r| r.i("duration").unwrap_or(0))
-                .into_iter()
-                .map(|r| self.execution_row(&env, r))
-                .collect();
+            let slowest: Vec<Value> = max_by_n(&requests, 10, |r| r.i("duration").unwrap_or(0)).into_iter().map(|r| self.execution_row(&env, r)).collect();
             let v = crate::obj! {
                 "route" => name, "group_hash" => group_hash.clone(),
                 "url" => self.url(&format!("/apps/{}/envs/{}/requests/routes/{}", env.application_id, env.id, segment(&group_hash))),
@@ -1649,39 +1650,7 @@ impl Mcp<'_> {
         let eid = exe.s("execution_id").unwrap_or("").to_string();
         let start = exe.t("occurred_at").unwrap_or(0);
         let duration_ms = exe.i("duration").unwrap_or(0) as f64 / 1000.0;
-        let entries = execution_timeline(conn, &eid, start)?;
-        let n_plus_ones: Vec<mcp_summary::NPlusOne> = db::query(
-            conn,
-            "SELECT \"n_plus_ones\".* FROM \"n_plus_ones\" WHERE \"n_plus_ones\".\"execution_id\" = ?1 ORDER BY \"n_plus_ones\".\"id\"",
-            [&eid],
-        )?
-        .iter()
-        .map(|r| mcp_summary::NPlusOne {
-            group_hash: r.s("group_hash").map(str::to_string),
-            sql: r.s("sql").unwrap_or("").to_string(),
-            source: r.s("source").map(str::to_string),
-            count: r.i("count").unwrap_or(0),
-        })
-        .collect();
-        let warnings: Vec<Value> = db::query(
-            conn,
-            "SELECT \"logs\".* FROM \"logs\" WHERE \"logs\".\"execution_id\" = ?1 AND \"logs\".\"level\" IN ('warn', 'error', 'fatal') ORDER BY \"logs\".\"occurred_at\" LIMIT 5",
-            [&eid],
-        )?
-        .iter()
-        .map(|r| crate::obj! { "level" => r.s("level"), "message" => rb::first_chars(r.s("message").unwrap_or(""), 300), "source" => r.s("source") })
-        .collect();
-        let detail = exe.json("detail");
-        let dropped = detail.get("dropped_records").and_then(Value::as_i64).filter(|n| *n > 0);
-        let has_profile = entries.iter().any(|e| e.kind == "profile") || exe.i("profile_id").is_some();
-        let summary = mcp_summary::execution_summary(&mcp_summary::Facts {
-            duration_ms,
-            entries: &entries,
-            n_plus_ones: &n_plus_ones,
-            warnings,
-            dropped_records: dropped,
-            has_profile,
-        });
+        let ExecutionFacts { entries, summary, detail, dropped } = execution_facts(conn, exe)?;
 
         let kind = exe.s("kind");
         let mut v = crate::obj! {
@@ -2297,6 +2266,28 @@ fn n_plus_ones_for(conn: &Connection, ids: &[String]) -> rusqlite::Result<Value>
     Ok(Value::Array(sorted.into_iter().take(10).map(|(_, v)| v).collect()))
 }
 
+/// The group_hash of a route or job named `name` in [from, to] (a rollup
+/// with that name), or `given` when the caller passed one. A job class's
+/// group is the MD5 of its name (the gem's Record.group_hash), so a job
+/// with no rollup in the window still resolves.
+fn find_group(conn: &Connection, record_type: &str, name: &str, given: Option<String>, from: i64, to: i64) -> rusqlite::Result<Option<String>> {
+    if let Some(g) = given.filter(|g| rb::present(Some(g))) {
+        return Ok(Some(g));
+    }
+    let found = db::query_one(
+        conn,
+        "SELECT \"rollups\".\"group_hash\" FROM \"rollups\" WHERE \"rollups\".\"record_type\" = ?1 AND \"rollups\".\"bucket\" BETWEEN ?2 AND ?3 \
+         AND \"rollups\".\"name\" = ?4 LIMIT 1",
+        params![record_type, qt(rb::beginning_of_hour(from)), qt(to), name],
+    )?
+    .and_then(|r| r.s("group_hash").map(str::to_string))
+    .filter(|g| rb::present(Some(g)));
+    Ok(match found {
+        None if record_type == "job_attempt" && rb::present(Some(name)) => Some(filter_query::md5_hex(name)),
+        other => other,
+    })
+}
+
 /// `group_by`: groups in first-appearance order.
 fn group_by<K: PartialEq + Clone>(rows: &[Rec], key: impl Fn(&Rec) -> K) -> Vec<(K, Vec<&Rec>)> {
     let mut out: Vec<(K, Vec<&Rec>)> = vec![];
@@ -2452,6 +2443,63 @@ fn execution_timeline(conn: &Connection, eid: &str, start: i64) -> rusqlite::Res
     Ok(sorted.into_iter().map(|(_, e)| e).collect())
 }
 
+/// One execution's timeline and the summary get_execution leads with.
+struct ExecutionFacts {
+    entries: Vec<mcp_summary::Entry>,
+    summary: Value,
+    detail: Value,
+    dropped: Option<i64>,
+}
+
+fn execution_facts(conn: &Connection, exe: &Rec) -> rusqlite::Result<ExecutionFacts> {
+    let eid = exe.s("execution_id").unwrap_or("");
+    let start = exe.t("occurred_at").unwrap_or(0);
+    let duration_ms = exe.i("duration").unwrap_or(0) as f64 / 1000.0;
+    let entries = execution_timeline(conn, eid, start)?;
+    let n_plus_ones: Vec<mcp_summary::NPlusOne> =
+        db::query(conn, "SELECT \"n_plus_ones\".* FROM \"n_plus_ones\" WHERE \"n_plus_ones\".\"execution_id\" = ?1 ORDER BY \"n_plus_ones\".\"id\"", [eid])?
+            .iter()
+            .map(|r| mcp_summary::NPlusOne {
+                group_hash: r.s("group_hash").map(str::to_string),
+                sql: r.s("sql").unwrap_or("").to_string(),
+                source: r.s("source").map(str::to_string),
+                count: r.i("count").unwrap_or(0),
+            })
+            .collect();
+    let warnings: Vec<Value> = db::query(
+        conn,
+        "SELECT \"logs\".* FROM \"logs\" WHERE \"logs\".\"execution_id\" = ?1 AND \"logs\".\"level\" IN ('warn', 'error', 'fatal') ORDER BY \"logs\".\"occurred_at\" LIMIT 5",
+        [eid],
+    )?
+    .iter()
+    .map(|r| crate::obj! { "level" => r.s("level"), "message" => rb::first_chars(r.s("message").unwrap_or(""), 300), "source" => r.s("source") })
+    .collect();
+    let detail = exe.json("detail");
+    let dropped = detail.get("dropped_records").and_then(Value::as_i64).filter(|n| *n > 0);
+    let has_profile = entries.iter().any(|e| e.kind == "profile") || exe.i("profile_id").is_some();
+    let summary = mcp_summary::execution_summary(&mcp_summary::Facts {
+        duration_ms,
+        entries: &entries,
+        n_plus_ones: &n_plus_ones,
+        warnings,
+        dropped_records: dropped,
+        has_profile,
+    });
+    Ok(ExecutionFacts { entries, summary, detail, dropped })
+}
+
+/// get_execution's `summary` of one execution (where the time went, the
+/// repeated queries, the N+1s with their fix, warnings and notes); None when
+/// no execution has that id. For anything that hands an agent an execution
+/// without a tool call (the agent webhook).
+pub fn execution_summary_of(conn: &Connection, execution_id: &str) -> rusqlite::Result<Option<Value>> {
+    let Some(exe) = db::query_one(conn, "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"execution_id\" = ?1 LIMIT 1", [execution_id])?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(execution_facts(conn, &exe)?.summary))
+}
+
 /// Timeline rows per page by default, and at most.
 const TIMELINE_PAGE: i64 = 25;
 const TIMELINE_PAGE_MAX: i64 = 200;
@@ -2558,6 +2606,8 @@ fn narrow_hint(tool: &str) -> &'static str {
         "web_vitals" => "Pass a smaller limit, or component to read one component.",
         "release_health" => "Pass a narrower window.",
         "get_route" => "Pass a narrower window.",
+        "explain_route" => "Pass a narrower window; get_execution on one of slowest_requests has a single request's detail.",
+        "investigate_issue" => "Read occurrence and lead_up first; get_execution on occurrence.execution_id pages the full timeline.",
         "get_profile" => "Pass a smaller limit.",
         _ => "Pass a smaller limit or a narrower window.",
     }
@@ -3216,6 +3266,215 @@ mod tests {
         assert_eq!(v["url"], format!("/apps/{}/envs/{}/commands/a%20b%2Fc", f.app, f.env));
         let apps = f.tool("list_applications", json!({}));
         assert_eq!(apps[0]["environments"][0]["url"], format!("https://rw.example.com/railwatch/apps/{}/envs/{}", f.app, f.env));
+    }
+
+    /// Deploys "d1" (two days ago) and "d2" (four hours ago, with commits),
+    /// the issue's occurrences in d2's hour, and a resolved sibling issue of
+    /// the same class with a comment saying how it was fixed.
+    fn seed_issue_history(f: &Seeded, issue: i64) {
+        f.c.with(|x| {
+            x.execute(
+                "INSERT INTO deploys (environment_id, deploy, ref, name, deployed_at, commits, created_at, updated_at) VALUES
+                 (?1, 'd1', 'aaaaaaaaaaaa1111', 'shop@1', ?2, '[]', ?2, ?2),
+                 (?1, 'd2', 'bbbbbbbbbbbb2222', 'shop@2', ?3, ?4, ?3, ?3)",
+                params![
+                    f.env,
+                    qt(NOW - 48 * 3_600_000_000),
+                    qt(NOW - 4 * 3_600_000_000),
+                    json!([{"sha": "bbbbbbbbbbbb2222", "message": "Poll Cloudflare one lease at a time\n\nDetails", "author": "ada"}, {"sha": "cccc", "message": "Bump cloudflare-email to 0.4.2", "author": "bob"}]).to_string()
+                ],
+            )?;
+            x.execute("UPDATE issues SET first_seen_at = ?1, culprit = 'app/services/outbound_email/cloudflare_feedback_consumer.rb:41' WHERE id = ?2", params![qt(NOW - 3 * 3_600_000_000 - 1_800_000_000), issue])?;
+            x.execute(
+                "INSERT INTO issues (application_id, environment_id, number, title, kind, status, group_hash, occurrences, affected_users,
+                   first_seen_at, last_seen_at, created_at, updated_at, resolved_in_deploy)
+                 VALUES (?1, ?2, 12, 'Cloudflare::Email::NetworkError: timeout', 'exception', 'resolved', 'gy', 9, 0, ?3, ?3, ?3, ?3, 'd1')",
+                params![f.app, f.env, qt(NOW - 10 * 86_400_000_000)],
+            )?;
+            let sibling = x.last_insert_rowid();
+            x.execute("INSERT INTO comments (issue_id, body, created_at, updated_at) VALUES (?1, 'Fixed by retrying the ack with a fresh lease', ?2, ?2)", params![sibling, qt(NOW - 9 * 86_400_000_000)])?;
+            // Unrelated: neither class nor file.
+            x.execute(
+                "INSERT INTO issues (application_id, environment_id, number, title, kind, status, group_hash, occurrences, affected_users,
+                   first_seen_at, last_seen_at, created_at, updated_at, culprit)
+                 VALUES (?1, ?2, 13, 'NoMethodError: undefined method', 'exception', 'open', 'gz', 1, 0, ?3, ?3, ?3, ?3, 'app/models/order.rb:3')",
+                params![f.app, f.env, qt(NOW - 86_400_000_000)],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let conn = f.tenant();
+        // The job ran a few queries and logged before raising.
+        conn.execute(
+            "UPDATE exceptions SET deploy = 'd2', occurred_at = ?1, user_ref = 'u1', app_tenant = 'acme' WHERE id = 55",
+            [qt(NOW - 3 * 3_600_000_000)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE executions SET occurred_at = ?1, duration = 900000, outcome = 'failed' WHERE execution_id = 'e-job'",
+            [qt(NOW - 3 * 3_600_000_000 - 800_000)],
+        )
+        .unwrap();
+        for (i, sql) in ["SELECT \"leases\".* FROM \"leases\" WHERE \"leases\".\"id\" = ?", "UPDATE \"feedback\" SET \"acked\" = ?"].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO queries (execution_id, occurred_at, duration, sql, group_hash, source) VALUES ('e-job', ?1, 2000, ?2, ?3, 'app/services/outbound_email/cloudflare_feedback_consumer.rb:38')",
+                params![qt(NOW - 3 * 3_600_000_000 - 700_000 + i as i64 * 1000), sql, format!("gq{i}")],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO logs (execution_id, occurred_at, level, message) VALUES ('e-job', ?1, 'warn', 'cloudflare ack timed out, retry disabled')",
+            [qt(NOW - 3 * 3_600_000_000 - 100_000)],
+        )
+        .unwrap();
+        // A log line after the raise is not lead-up.
+        conn.execute(
+            "INSERT INTO logs (execution_id, occurred_at, level, message) VALUES ('e-job', ?1, 'info', 'job finished')",
+            [qt(NOW - 3 * 3_600_000_000 + 5_000_000)],
+        )
+        .unwrap();
+        for k in 0..2 {
+            conn.execute(
+                "INSERT INTO exceptions (class_name, message, occurred_at, group_hash, frames, deploy, user_ref) VALUES ('Cloudflare::Email::NetworkError', 'x', ?1, 'gx', '[]', 'd2', 'u2')",
+                [qt(NOW - 3_600_000_000 - k)],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn investigate_issue_attributes_the_deploy_and_brings_the_lead_up() {
+        let f = seeded("investigate");
+        let id = seed_exception_issue(&f);
+        seed_issue_history(&f, id);
+        let v = f.tool("investigate_issue", json!({"key": "SHOP-79"}));
+        assert_eq!(v["url"], format!("https://rw.example.com/railwatch/issues/{id}"));
+
+        // Where: get_issue's collapsed frames, code included.
+        let frames = v["occurrence"]["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 4);
+        assert_eq!(frames[1]["code"]["41"], "count = @client.poll(batch_size: 1) do |event|");
+
+        // When: the deploy its first occurrence ran, the one before it, the
+        // range between them and the deploy's commits.
+        let s = &v["started_in"];
+        assert_eq!(s["deploy"], "d2");
+        assert_eq!(s["how"], "the deploy its first retained occurrence ran");
+        assert_eq!(s["previous_deploy"]["deploy"], "d1");
+        assert_eq!(s["commit_range"], "aaaaaaaaaaaa..bbbbbbbbbbbb");
+        assert_eq!(s["commits"][0], json!({"sha": "bbbbbbbbbbbb", "message": "Poll Cloudflare one lease at a time", "author": "ada"}));
+        assert_eq!(s["first_seen_after_deploy"], "30 minutes");
+
+        // Lead-up: the job's summary and what ran before the raise, not after.
+        let l = &v["lead_up"];
+        assert_eq!((l["name"].as_str(), l["outcome"].as_str()), (Some("OutboundEmailFeedbackJob"), Some("failed")));
+        let before: Vec<&str> = l["before_raise"].as_array().unwrap().iter().map(|r| r["type"].as_str().unwrap()).collect();
+        assert_eq!(before, ["query", "query", "log"], "{l}");
+        assert_eq!(l["before_raise"][0]["source"], "app/services/outbound_email/cloudflare_feedback_consumer.rb:38");
+        assert_eq!(l["summary"]["warnings"][0]["message"], "cloudflare ack timed out, retry disabled");
+        assert!(l["summary"].get("slowest").is_none());
+
+        // How often and who: 3 occurrences in 30 days, all in the last week.
+        assert_eq!((v["trend"]["last_7d"].as_i64(), v["trend"]["previous_7d"].as_i64()), (Some(3), Some(0)));
+        assert_eq!(v["trend"]["by_deploy"][0]["deploy"], "d2");
+        assert_eq!((v["who"]["users_30d"].as_i64(), v["who"]["tenants_30d"].as_i64()), (Some(2), Some(1)));
+
+        // Similar: the resolved issue of the same class, with how it was fixed.
+        let sim = v["similar_issues"].as_array().unwrap();
+        assert_eq!(sim.len(), 1, "{sim:?}");
+        assert_eq!((sim[0]["key"].as_str(), sim[0]["status"].as_str(), sim[0]["resolved_in_deploy"].as_str()), (Some("SHOP-12"), Some("resolved"), Some("d1")));
+        assert_eq!(sim[0]["last_comment"], "Fixed by retrying the ack with a fresh lease");
+
+        // The brief says the same things.
+        let md = v["markdown"].as_str().unwrap();
+        for want in [
+            "# SHOP-79 Cloudflare::Email::NetworkError",
+            "`app/services/outbound_email/cloudflare_feedback_consumer.rb:41`",
+            "> 41: count = @client.poll(batch_size: 1) do |event|",
+            "Deploy `d2` (shop@2)",
+            "Commit range: `aaaaaaaaaaaa..bbbbbbbbbbbb`",
+            "Poll Cloudflare one lease at a time",
+            "cloudflare ack timed out",
+            "SHOP-12 [resolved]",
+        ] {
+            assert!(md.contains(want), "markdown lacks {want:?}:\n{md}");
+        }
+        assert!(!md.contains("job finished"));
+        let missing = f.tool("investigate_issue", json!({"key": "SHOP-404"}));
+        assert!(missing["hint"].as_str().unwrap().contains("list_issues"));
+    }
+
+    #[test]
+    fn execution_summary_of_is_get_executions_summary() {
+        let f = seeded("summary-of");
+        seed_invoicing(&f.tenant(), "e-invoicing", NOW - 60_000_000);
+        let conn = f.tenant();
+        let s = execution_summary_of(&conn, "e-invoicing").unwrap().unwrap();
+        assert_eq!(s, f.tool("get_execution", json!({"execution_id": "e-invoicing"}))["summary"]);
+        assert!(execution_summary_of(&conn, "nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn explain_route_aggregates_its_requests_and_names_the_causes() {
+        let f = seeded("explain");
+        let conn = f.tenant();
+        // Three invoicing requests shaped like production's, and a fast one.
+        for (i, eid) in ["e1", "e2", "e3"].iter().enumerate() {
+            seed_invoicing(&conn, eid, NOW - 600_000_000 - i as i64 * 60_000_000);
+        }
+        conn.execute(
+            "INSERT INTO executions (execution_id, kind, name, route, group_hash, status, occurred_at, duration, detail) \
+             VALUES ('e-fast', 'request', 'GET /:org_slug/invoicing(.:format)', '/:org_slug/invoicing(.:format)', 'route_invoicing', 200, ?1, 69559, '{}')",
+            [qt(NOW - 300_000_000)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE queries SET explain = 'SEARCH car_invoices USING INDEX idx (customer_id=?)' WHERE group_hash = 'g_invoices' AND execution_id = 'e1'",
+            [],
+        )
+        .unwrap();
+        for h in crate::rollup::rollup_job::hours_with_rows(&conn).unwrap() {
+            crate::rollup::rollup_job::perform(&conn, &conn, h, &mut crate::rollup::rollup_job::Rng::PerGroup).unwrap();
+        }
+        let v = f.tool("explain_route", json!({"route": "GET /:org_slug/invoicing(.:format)"}));
+        assert_eq!(v["requests"]["count"], 4);
+        assert_eq!(v["sampled_requests"], 4);
+        // Per request: (3 x 3669.559 + 69.559) / 4 ms; 3 x 2840 ms of commits.
+        let t = &v["time_ms_per_request"];
+        assert_eq!(t["duration"].as_f64(), Some(2769.6));
+        assert_eq!(t["transactions"].as_f64(), Some(2130.0));
+        assert_eq!(t["sql"].as_f64(), Some(61.9));
+        assert_eq!(v["queries_per_request"].as_f64(), Some(619.5));
+        // The N+1 with its fix, and how often it really ran per request.
+        let n = &v["n_plus_ones"][0];
+        assert_eq!((n["source"].as_str(), n["occurrences"].as_i64()), (Some("app/services/billing/customer_documents.rb:511"), Some(3)));
+        assert_eq!(n["suggestion"]["code"], "Customer.includes(:car_invoices)");
+        assert_eq!(n["runs_per_request"].as_f64(), Some(45.0));
+        // The costliest shape is the N+1's, with its stored plan.
+        let q = &v["top_queries"][0];
+        assert_eq!((q["group_hash"].as_str(), q["total_ms"].as_f64(), q["in_requests"].as_i64()), (Some("g_invoices"), Some(18.0), Some(3)));
+        assert_eq!(q["explain"], "SEARCH car_invoices USING INDEX idx (customer_id=?)");
+        // No profile: the note says how to get one.
+        assert!(v["profile"].is_null());
+        let answer = v["answer"].as_str().unwrap();
+        assert!(answer.starts_with("Over 4 sampled requests (avg 2.8 s): N+1 at app/services/billing/customer_documents.rb:511 (45x per request), fix: Customer.includes(:car_invoices)"), "{answer}");
+        assert!(answer.contains("2.1 s per request inside transactions but only 56 ms of SQL in them") && answer.contains("Enable the profiler"), "{answer}");
+        assert!(v["notes"].to_string().contains("RAILWATCH_PROFILE_SLOW_MS"));
+        assert_eq!(v["slowest_requests"][0]["queries"], Value::Null);
+        assert_eq!(v["url"], format!("https://rw.example.com/railwatch/apps/{}/envs/{}/requests/routes/route_invoicing", f.app, f.env));
+
+        // A profile of one of them turns the hint into its frames.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, b"Invoicing#index;Billing#sync;Net::HTTP#request 70\nInvoicing#index;render 30\n").unwrap();
+        conn.execute(
+            "INSERT INTO profiles (execution_id, group_hash, occurred_at, duration, profiler, samples, stacks) VALUES ('e1', 'route_invoicing', ?1, 3600000, 'vernier', 100, ?2)",
+            params![qt(NOW - 600_000_000), gz.finish().unwrap()],
+        )
+        .unwrap();
+        let v = f.tool("explain_route", json!({"group_hash": "route_invoicing"}));
+        assert_eq!(v["profile"]["frames"][0]["frame"], "Net::HTTP#request");
+        assert!(v["answer"].as_str().unwrap().ends_with("profile.frames shows which methods that time is in."));
+        assert_eq!(f.tool("explain_route", json!({"route": "GET /nope"}))["error"], "route not found");
     }
 
     /// No tool's result is bigger than the cap, however much data the
