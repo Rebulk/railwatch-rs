@@ -327,6 +327,103 @@ tests/disk_budget.rs (the real binary: four senders in a burst stay within the b
 batch each, then 503, logged once), storage::reader (a day file deleted between listing and ATTACH
 is skipped: trims now run during bursts, and the worker's re-attach failed on them).
 
+## Rollup reads (branch perf/rollup-reads, from main 36cd877)
+
+Production on 2026-10-25 (rebulk-system, v0.2.5): `/api/v1/.../queries?window=30d` 1.7-2.0 s,
+`series?type=query&window=30d` 0.85 s, MCP `search_telemetry` queries `tenant:` at 7d 1.9 s
+cold. A 30-day query window there is 696k rollup rows of 12k groups.
+
+### Method
+
+Tenant: `bench/diff/props/gen_tenant.py --spread-days 30 --executions 120000 --seed 5
+--records-per-batch 2000 --shapes 12000 --tenants 300 --uniform --by-time --few-logs`, posted
+to a fresh Rust server (per-day), rollups written by the server: 1.0M records, 660k queries,
+441k query rollup rows of 12,000 groups at 30d (494k rollup rows in all), meta 165 MB, 1.2 GB
+over 62 day files; the same rows exported to one 834 MB file. Cases: 296 page cases
+(make_cases.py + slow_pages.py page-cases, every window preset), 496 `/api/v1` cases (every
+endpoint at 1h/24h/7d/30d; queries under every sort, both directions, pages 1-3; requests, jobs
+and spans under every sort; tenants sorted and paged; `tenant:` filters, one matching nothing,
+a page past the end) and 32 MCP cases (list_tenants, search_telemetry queries plain, `tenant:`,
+matching nothing, list_slow_routes, release_health, web_vitals at every window). props-dump,
+api-dump and mcp-dump on CPUs 8-11, main and branch built from the same tree. Per statement:
+SQLITE_TRACE_PROFILE and EXPLAIN QUERY PLAN.
+
+### What was slow, and the changes
+
+1. **Grouped tables built a `Rollup` per row** (`aggregations::Groups`). queries@30d read
+   441k rows through `rollup::between` (`SELECT rollups.*`, 108 ms of SQLite) and then built
+   each one: its name and group hash as Strings, the digest copied, the bucket parsed, the
+   extra checked, then `group_by_hash` and `summarize` per group. Groups now folds the rows of
+   the same WHERE as they come (sums, the digests as bytes, the latest bucket's name, the
+   sparkline), from a column list without `extra` unless the page's summary needs it. The
+   statement keeps `between`'s WHERE and plan, so the groups' order of first appearance, and
+   with it `sort_by`'s ties, is unchanged. Not done: ranking in SQL (`GROUP BY group_hash`)
+   was slower (367 ms: a temp B-tree over 441k rows), and reading the shown groups' digests in
+   a second statement cost 80-100 ms (their rows are spread over the whole file).
+   `summary_with_delta` and the other `summarize(between(...))` callers on these pages fold
+   the same way (`rollup::summary_between`).
+2. **Rollup series grouped every row into steps** (`aggregations::rollup_series`):
+   `GROUP BY (strftime(bucket) / step)` sorted 441k rows in a temp B-tree (217 ms). It now
+   groups by `bucket` first, which the index already returns in order (no sort), then the
+   ~720 hours into steps. SUMs and MAXes of integer columns: the same integers.
+3. **Slowest queries filtered by tenant, per-day** (`cursor_page::per_file`): every file
+   walked `idx_queries_slowest` until it found 51 of the tenant's rows, most of the file for
+   a small tenant. With `tenant:` each file now reads `idx_queries_tenant_duration_cursor`,
+   the tenant's own (duration, id) range: 51 rows a file. Present in every day file (the
+   exported DDL, partial `WHERE app_tenant IS NOT NULL` in files this server creates, which
+   the `app_tenant = ?` term implies). Not an index added: every file already has it. The
+   single file keeps `slowest_probe`.
+
+| case (ms) | main cold | branch cold | main warm | branch warm |
+|---|---:|---:|---:|---:|
+| API queries@24h | 726 | 734 | 17.0 | 13.5 |
+| API queries@7d | 774 | 764 | 98.3 | 71.3 |
+| API queries@30d | 878 | 853 | 407.5 | 251.5 |
+| API series.query@24h | 135 | 133 | 7.8 | 3.1 |
+| API series.query@7d | 207 | 170 | 56.8 | 22.6 |
+| API series.query@30d | 468 | 337 | 212.6 | 84.9 |
+| MCP search queries tenant:transloadx@7d | 876 | 829 | 40.7 | 2.0 |
+| MCP search queries tenant:transloadx@30d | 1043 | 840 | 208.1 | 3.7 |
+| API summary@30d | 312 | 309 | 17.7 | 12.0 |
+| API requests@30d | 311 | 308 | 12.2 | 7.4 |
+| API tenants@30d | 1230 | 1234 | 184.3 | 186.7 |
+| MCP list_tenants@30d | 1240 | 1226 | 185.5 | 185.4 |
+| API visits@7d | 346 | 348 | 2.5 | 2.4 |
+
+Per-day, main 36cd877, 3 rounds alternating binaries. Warm: median of 5 calls in one process
+after one dropped. Cold: the tenant's files evicted from the page cache
+(`posix_fadvise(DONTNEED)`) and the first call of a fresh process, so it includes opening and
+attaching 63 files and reading what the page needs from disk (130 ms for the smallest pages).
+Sums of per-case warm medians, main / branch: pages 6316 / 5272 ms per-day and 5007 / 3872
+single; API 30047 / 22105 per-day and 28592 / 19934 single; MCP 1071 / 487 per-day. No case
+over 15% and 3 ms slower except profiles@7d per-day (15.2 -> 18.9 ms; nothing here touches it).
+
+Identical output: main == branch byte for byte for all 824 cases, per-day and single file,
+and single == per-day. Unit tests compare the new paths with the old ones on random rollups
+(`folded_groups_equal_the_row_by_row_tables`: 6 tenants x 3 record types x 5 windows x every
+sort and direction x 3 limits, ties, renamed groups, extras, missing digests;
+`rollup_series_by_hour_first_equals_grouping_every_row`;
+`folded_totals_equal_summarize_in_any_order`). Each was checked by breaking the code it
+covers: group order, latest name, avg rounding, dropped extras, sparkline index, an unsorted
+percentile, the summary's digests, max, client errors, the series' MAX and client errors.
+
+### Not changed (measured)
+
+- **tenants@30d / list_tenants@30d, 193 ms warm.** Three per-file GROUP BYs over the window's
+  95k tenant-tagged requests on `idx_executions_tenant_summary` (covering): 96, 39 and 36 ms,
+  about 1 us a row, each file's part 1.5 ms. The rows are what the page counts. Fewer passes
+  (one statement for the summary, last-seen and sparkline) would save perhaps a third and
+  changes how three ported Ruby queries are shaped; not done here.
+- **Cold reads.** A first call after the files leave the page cache pays for reading them:
+  130 ms for the smallest pages here, 300-1200 ms for the 30-day ones. The branch reads the
+  same pages of the same files (the rollups' rows are the same statement's), so cold time
+  moves only where CPU was a large part of it (series@30d, the tenant-filtered search).
+- **No index or schema change.** A covering index on rollups (record_type, group_hash, bucket,
+  sums) made a SQL ranking 85 ms; it would be 38 MB on this 165 MB meta (built in 0.7 s) and
+  need a migration path; the fold got most of that without it.
+- Not measured against production data; the queries rollups in production have 1.6x the rows
+  of this tenant at 30d.
+
 ## Proposals
 
 None of these is implemented.

@@ -2,6 +2,7 @@
 //! `merged_percentiles` and `merge_extras`.
 
 use rusqlite::Connection;
+use rusqlite::types::ValueRef;
 use serde_json::{Map, Value};
 
 use super::db::{self, qt};
@@ -49,51 +50,229 @@ pub fn bucket_range(conn: &Connection, record_type: &str, lo: i64, hi: i64) -> r
 /// value first and cost more than the SQL). Same values as `Rec`'s
 /// accessors: text columns lossily as UTF-8, numbers as `Rec::i`.
 pub fn load<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Vec<Rollup>> {
-    use rusqlite::types::ValueRef;
+    let mut out = Vec::new();
+    each(conn, sql, params, |r| {
+        out.push(Rollup {
+            group_hash: r.group_hash.clone().into_owned(),
+            name: r.name().map(|n| n.into_owned()),
+            bucket: r.bucket,
+            count: r.count,
+            error_count: r.error_count,
+            client_error_count: r.client_error_count,
+            duration_sum: r.duration_sum,
+            duration_max: r.duration_max,
+            digest: r.digest.map(<[u8]>::to_vec),
+            extra: r.extra().unwrap_or_default(),
+        })
+    })?;
+    Ok(out)
+}
+
+/// One row as the statement returns it, borrowed: for callers that fold the
+/// rows as they arrive instead of holding a `Rollup` per row (the 30-day
+/// queries page reads 440k rows of 12k groups on a busy tenant; building
+/// them was most of its time). Same values as `load`'s.
+pub struct RowRef<'a> {
+    pub group_hash: std::borrow::Cow<'a, str>,
+    name: ValueRef<'a>,
+    /// Epoch micros of the hour.
+    pub bucket: i64,
+    pub count: i64,
+    pub error_count: i64,
+    pub client_error_count: i64,
+    pub duration_sum: i64,
+    pub duration_max: i64,
+    pub digest: Option<&'a [u8]>,
+    extra: ValueRef<'a>,
+}
+
+impl RowRef<'_> {
+    pub fn name(&self) -> Option<std::borrow::Cow<'_, str>> {
+        text(self.name)
+    }
+
+    /// The name's bytes as stored (None when it is not text): `name` is
+    /// these, read lossily as UTF-8.
+    pub fn name_bytes(&self) -> Option<&[u8]> {
+        match self.name {
+            ValueRef::Text(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// `extra`, parsed; None when there is nothing in it (`{}`, the usual
+    /// value, is not parsed at all).
+    pub fn extra(&self) -> Option<Map<String, Value>> {
+        Some(extra_map(self.extra)).filter(|m| !m.is_empty())
+    }
+}
+
+/// Each row of `sql` (a `SELECT "rollups".*`), in the statement's order.
+pub fn each<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P, mut f: impl FnMut(&RowRef<'_>)) -> rusqlite::Result<()> {
     let mut stmt = db::prepare(conn, sql)?;
     let col = |name: &str| stmt.column_index(name).ok();
     let [group_hash, name, bucket, count, error_count, client_error_count, duration_sum, duration_max, digest, extra] =
         ["group_hash", "name", "bucket", "count", "error_count", "client_error_count", "duration_sum", "duration_max", "digest", "extra"].map(col);
-    fn text(v: ValueRef<'_>) -> Option<std::borrow::Cow<'_, str>> {
-        match v {
-            ValueRef::Text(t) => Some(String::from_utf8_lossy(t)),
-            _ => None,
-        }
-    }
-    let int = |v: ValueRef<'_>| match v {
-        ValueRef::Integer(i) => i,
-        ValueRef::Real(f) => f as i64,
-        ValueRef::Text(t) => std::str::from_utf8(t).ok().and_then(|t| t.parse().ok()).unwrap_or(0),
-        _ => 0,
-    };
     let mut rows = stmt.query(params)?;
-    let mut out = Vec::new();
+    // An hour's rows come together: parse each bucket's text once.
+    let mut last: (Vec<u8>, i64) = (vec![], 0);
     while let Some(r) = rows.next()? {
         let get = |i: Option<usize>| -> rusqlite::Result<ValueRef<'_>> { i.map_or(Ok(ValueRef::Null), |i| r.get_ref(i)) };
-        out.push(Rollup {
-            group_hash: text(get(group_hash)?).unwrap_or_default().into_owned(),
-            name: text(get(name)?).map(|n| n.into_owned()),
-            bucket: text(get(bucket)?).and_then(|b| crate::time::parse_db_time(&b)).unwrap_or(0),
+        let at = match get(bucket)? {
+            ValueRef::Text(t) if t == last.0.as_slice() => last.1,
+            ValueRef::Text(t) => {
+                let at = crate::time::parse_db_time(&String::from_utf8_lossy(t)).unwrap_or(0);
+                last = (t.to_vec(), at);
+                at
+            }
+            _ => 0,
+        };
+        f(&RowRef {
+            group_hash: text(get(group_hash)?).unwrap_or_default(),
+            name: get(name)?,
+            bucket: at,
             count: int(get(count)?),
             error_count: int(get(error_count)?),
             client_error_count: int(get(client_error_count)?),
             duration_sum: int(get(duration_sum)?),
             duration_max: int(get(duration_max)?),
-            digest: match get(digest)? {
-                ValueRef::Blob(b) | ValueRef::Text(b) => Some(b.to_vec()),
-                _ => None,
-            },
-            extra: match text(get(extra)?) {
-                Some(t) if t == "{}" => Map::new(),
-                Some(t) => match serde_json::from_str(&t) {
-                    Ok(Value::Object(m)) => m,
-                    _ => Map::new(),
-                },
-                None => Map::new(),
-            },
+            digest: blob(get(digest)?),
+            extra: get(extra)?,
         });
     }
-    Ok(out)
+    Ok(())
+}
+
+/// `summarize` folded a row at a time. The digests are kept as bytes and
+/// read only for a summary's percentiles.
+#[derive(Debug, Default)]
+pub struct Totals {
+    rows: usize,
+    count: i64,
+    errors: i64,
+    client_errors: i64,
+    duration_sum: i64,
+    max: i64,
+    digests: Vec<u8>,
+    ends: Vec<usize>,
+    extra: Map<String, Value>,
+}
+
+impl Totals {
+    /// The row's numbers and digest; its extra (parsed once by the caller,
+    /// who may merge it elsewhere too) goes to `merge_extra`.
+    pub fn add(&mut self, r: &RowRef<'_>) {
+        self.add_numbers(r);
+        if let Some(d) = r.digest {
+            self.digests.extend_from_slice(d);
+            self.ends.push(self.digests.len());
+        }
+    }
+
+    /// `add` without keeping the digest: for a total whose percentiles come
+    /// from digests kept elsewhere (`summary_over`).
+    pub fn add_numbers(&mut self, r: &RowRef<'_>) {
+        self.max = if self.rows == 0 { r.duration_max } else { self.max.max(r.duration_max) };
+        self.rows += 1;
+        self.count += r.count;
+        self.errors += r.error_count;
+        self.client_errors += r.client_error_count;
+        self.duration_sum += r.duration_sum;
+    }
+
+    pub fn merge_extra(&mut self, extra: &Map<String, Value>) {
+        merge_extra(&mut self.extra, extra);
+    }
+
+    /// Every digest added, in the order they came.
+    pub fn digests(&self) -> impl Iterator<Item = &[u8]> {
+        self.ends.iter().scan(0, |start, &end| {
+            let d = &self.digests[*start..end];
+            *start = end;
+            Some(d)
+        })
+    }
+
+    /// `cheap_summary` of the rows added.
+    pub fn cheap(&self) -> Summary {
+        Summary {
+            count: self.count,
+            errors: self.errors,
+            avg: if self.count == 0 { 0 } else { self.duration_sum.div_euclid(self.count) },
+            max: self.max,
+            ..Summary::default()
+        }
+    }
+
+    /// `summarize` of the rows added.
+    pub fn summary(&self) -> Summary {
+        self.summary_over(self.digests())
+    }
+
+    /// `summarize` of the rows added, with the percentiles of `digests`:
+    /// these rows' own, held elsewhere (grouped totals keep them per group).
+    pub fn summary_over<'d>(&self, digests: impl Iterator<Item = &'d [u8]>) -> Summary {
+        if self.rows == 0 {
+            return Summary::default();
+        }
+        let ps = digest_percentiles(digests, &[0.5, 0.95, 0.99]);
+        Summary { client_errors: self.client_errors, p50: ps[0], p95: ps[1], p99: ps[2], extra: self.extra.clone(), ..self.cheap() }
+    }
+}
+
+/// `summarize(load(sql))` without holding the rows.
+pub fn summary_of<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Summary> {
+    let mut t = Totals::default();
+    each(conn, sql, params, |r| {
+        t.add(r);
+        if let Some(e) = r.extra() {
+            t.merge_extra(&e);
+        }
+    })?;
+    Ok(t.summary())
+}
+
+pub fn summary_between(conn: &Connection, record_type: &str, from: i64, to: i64) -> rusqlite::Result<Summary> {
+    summary_of(conn, BETWEEN, rusqlite::params![record_type, qt(rb::beginning_of_hour(from)), qt(to)])
+}
+
+pub fn summary_between_group(conn: &Connection, record_type: &str, from: i64, to: i64, group_hash: &str) -> rusqlite::Result<Summary> {
+    let sql = format!(r#"{BETWEEN} AND "rollups"."group_hash" = ?4"#);
+    summary_of(conn, &sql, rusqlite::params![record_type, qt(rb::beginning_of_hour(from)), qt(to), group_hash])
+}
+
+fn text(v: ValueRef<'_>) -> Option<std::borrow::Cow<'_, str>> {
+    match v {
+        ValueRef::Text(t) => Some(String::from_utf8_lossy(t)),
+        _ => None,
+    }
+}
+
+fn int(v: ValueRef<'_>) -> i64 {
+    match v {
+        ValueRef::Integer(i) => i,
+        ValueRef::Real(f) => f as i64,
+        ValueRef::Text(t) => std::str::from_utf8(t).ok().and_then(|t| t.parse().ok()).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn blob<'a>(v: ValueRef<'a>) -> Option<&'a [u8]> {
+    match v {
+        ValueRef::Blob(b) | ValueRef::Text(b) => Some(b),
+        _ => None,
+    }
+}
+
+fn extra_map(v: ValueRef<'_>) -> Map<String, Value> {
+    match text(v) {
+        Some(t) if t == "{}" => Map::new(),
+        Some(t) => match serde_json::from_str(&t) {
+            Ok(Value::Object(m)) => m,
+            _ => Map::new(),
+        },
+        None => Map::new(),
+    }
 }
 
 /// Rollup.summarize's hash.
@@ -180,6 +359,24 @@ pub fn merged_percentiles(rows: &[&Rollup], ps: &[f64]) -> Vec<i64> {
             let _ = tdigest_decode::centroids(d, &mut means, &mut counts);
         }
     }
+    nearest_ranks(means, counts, ps)
+}
+
+/// `merged_percentiles` of rows whose digests are `digests`. Their order
+/// does not change the answer: the centroids are sorted by mean, and a rank
+/// that lands in a run of equal means gets that mean whichever of them it
+/// lands on (the run's end is the same count either way).
+pub fn digest_percentiles<'d>(digests: impl Iterator<Item = &'d [u8]>, ps: &[f64]) -> Vec<i64> {
+    let mut means = Vec::new();
+    let mut counts = Vec::new();
+    for d in digests {
+        // As in merged_percentiles: a digest we cannot read is skipped.
+        let _ = tdigest_decode::centroids(d, &mut means, &mut counts);
+    }
+    nearest_ranks(means, counts, ps)
+}
+
+fn nearest_ranks(means: Vec<f64>, counts: Vec<u64>, ps: &[f64]) -> Vec<i64> {
     if means.is_empty() {
         return ps.iter().map(|_| 0).collect();
     }
@@ -209,15 +406,19 @@ pub fn merged_percentiles(rows: &[&Rollup], ps: &[f64]) -> Vec<i64> {
 pub fn merge_extras(rows: &[&Rollup]) -> Map<String, Value> {
     let mut out = Map::new();
     for row in rows {
-        for (k, v) in &row.extra {
-            let merged = match out.get(k) {
-                Some(existing) if existing.is_number() && v.is_number() => num_add(existing, v),
-                _ => v.clone(),
-            };
-            out.insert(k.clone(), merged);
-        }
+        merge_extra(&mut out, &row.extra);
     }
     out
+}
+
+fn merge_extra(out: &mut Map<String, Value>, extra: &Map<String, Value>) {
+    for (k, v) in extra {
+        let merged = match out.get(k) {
+            Some(existing) if existing.is_number() && v.is_number() => num_add(existing, v),
+            _ => v.clone(),
+        };
+        out.insert(k.clone(), merged);
+    }
 }
 
 /// Integer + Integer stays an Integer; anything with a Float is a Float.
@@ -315,5 +516,53 @@ mod tests {
         b.extra = serde_json::from_str(r#"{"hits":3,"kind":"template","cost":1}"#).unwrap();
         let m = merge_extras(&[&a, &b]);
         assert_eq!(serde_json::to_string(&m).unwrap(), r#"{"hits":5,"kind":"template","cost":2.5}"#);
+    }
+
+    /// `Totals` folded a row at a time is `summarize` of the rows, and
+    /// `digest_percentiles` does not depend on the digests' order.
+    #[test]
+    fn folded_totals_equal_summarize_in_any_order() {
+        use crate::rollup::random::RubyRandom;
+        use crate::rollup::tdigest::TDigest;
+        let dir = std::env::temp_dir().join(format!("rw-totals-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = crate::tenants::open_tenant(&dir.join("t.sqlite3")).unwrap();
+        let mut rng = RubyRandom::new(9);
+        for i in 0..400i64 {
+            let mut d = TDigest::new(0.01);
+            for _ in 0..(1 + rng.limited(30)) {
+                d.push_int([7, 7, 9, 120, 3000, 45_000][rng.limited(5) as usize], &mut rng);
+            }
+            d.compress(&mut rng);
+            let extra = [r#"{}"#, r#"{"hits":2,"kind":"partial"}"#, r#"{"hits":1.5,"kind":"template"}"#][rng.limited(2) as usize];
+            t.execute(
+                "INSERT INTO rollups (record_type, group_hash, bucket, name, count, error_count, client_error_count, duration_sum, duration_max, digest, extra) \
+                 VALUES ('query', 'g', ?1, 'n', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    format!("2026-10-{:02} {:02}:00:00", 1 + i / 24, i % 24),
+                    1 + rng.limited(9) as i64,
+                    rng.limited(3) as i64,
+                    rng.limited(2) as i64,
+                    rng.limited(100_000) as i64,
+                    rng.limited(50_000) as i64,
+                    if i % 17 == 0 { None } else { Some(d.as_small_bytes()) },
+                    extra
+                ],
+            )
+            .unwrap();
+        }
+        let (from, to) = (crate::time::parse_db_time("2026-10-01 00:00:00").unwrap(), crate::time::parse_db_time("2026-10-30 00:00:00").unwrap());
+        let rows = between(&t, "query", from, to).unwrap();
+        assert_eq!(rows.len(), 400);
+        let want = summarize_owned(&rows);
+        assert_eq!(summary_between(&t, "query", from, to).unwrap().to_json(), want.to_json());
+        let all: Vec<&Rollup> = rows.iter().collect();
+        let mut digests: Vec<&[u8]> = rows.iter().filter_map(|r| r.digest.as_deref()).collect();
+        let ps = [0.5, 0.95, 0.99];
+        for _ in 0..20 {
+            rng.shuffle(&mut digests);
+            assert_eq!(digest_percentiles(digests.iter().copied(), &ps), merged_percentiles(&all, &ps));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -210,11 +210,23 @@ fn per_file(
     }
     let col = order.column();
     let slowest = order == Order::Slowest && table == "queries";
+    // A tenant's slowest queries are the front of its own (app_tenant,
+    // duration, id) range in every file. Under idx_queries_slowest a file
+    // walked its slowest rows until it found 51 of the tenant's, which for
+    // a small tenant is most of the file (MCP search_telemetry with
+    // `tenant:`, 30 days: 228 -> 4.5 ms warm).
+    let tenant = slowest && cond.parts.iter().any(|p| p == "\"queries\".\"app_tenant\" = ?");
     // Only unfiltered: under a filter that matches almost nothing the hint
     // walks the whole file (queries.q, docs/PERF.md).
     let inside = if slowest && cond.parts.len() == 1 { files_inside(conn, table, range)? } else { vec![] };
     let Some((union, binds)) = crate::storage::reader::per_file(conn, table, range, &cond_sql, &cond.binds, |f, covered, cond_sql| {
-        let hint = if slowest && (covered || inside.contains(&f.alias)) { " INDEXED BY idx_queries_slowest" } else { "" };
+        let hint = if tenant {
+            " INDEXED BY idx_queries_tenant_duration_cursor"
+        } else if slowest && (covered || inside.contains(&f.alias)) {
+            " INDEXED BY idx_queries_slowest"
+        } else {
+            ""
+        };
         format!(
             "SELECT {select} FROM {}.\"{table}\" AS \"{table}\"{hint} WHERE {cond_sql} ORDER BY \"{table}\".\"{col}\" DESC, \"{table}\".\"id\" DESC LIMIT {n}",
             f.alias
