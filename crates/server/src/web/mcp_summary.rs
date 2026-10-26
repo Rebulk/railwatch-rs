@@ -54,42 +54,97 @@ const TOP_N_PLUS_ONES: usize = 5;
 const TOP_SLOWEST: usize = 10;
 const TOP_EXCEPTIONS: usize = 5;
 
+/// The time_ms buckets, in order. They overlap (SQL runs inside
+/// transactions), so they do not add up to the duration; `tracked` is the
+/// time covered by at least one of them.
+pub const TIME_BUCKETS: [&str; 6] = ["sql", "transactions", "view", "external", "cache", "other"];
+
+/// Where one execution's milliseconds went.
+#[derive(Debug, Clone, Default)]
+pub struct TimeSplit {
+    pub duration: f64,
+    /// TIME_BUCKETS order.
+    pub buckets: [f64; 6],
+    pub tracked: f64,
+    pub untracked: f64,
+    /// SQL milliseconds that ran while a transaction was open.
+    pub sql_in_transactions: f64,
+    pub transactions: usize,
+}
+
+impl TimeSplit {
+    pub fn of(entries: &[Entry], duration: f64) -> TimeSplit {
+        let mut buckets = [0.0; 6];
+        for e in entries {
+            if let Some(i) = time_bucket(e.kind).and_then(|b| TIME_BUCKETS.iter().position(|k| *k == b)) {
+                buckets[i] += e.duration.unwrap_or(0.0);
+            }
+        }
+        let tracked = covered_ms(entries.iter().filter(|e| time_bucket(e.kind).is_some()), duration);
+        TimeSplit {
+            duration,
+            buckets,
+            tracked,
+            untracked: (duration - tracked).max(0.0),
+            sql_in_transactions: sql_inside_transactions(entries),
+            transactions: entries.iter().filter(|e| e.kind == "transaction").count(),
+        }
+    }
+
+    /// Element-wise sum, for a split across many executions.
+    pub fn add(&mut self, o: &TimeSplit) {
+        self.duration += o.duration;
+        for (a, b) in self.buckets.iter_mut().zip(o.buckets) {
+            *a += b;
+        }
+        self.tracked += o.tracked;
+        self.untracked += o.untracked;
+        self.sql_in_transactions += o.sql_in_transactions;
+        self.transactions += o.transactions;
+    }
+
+    pub fn sql(&self) -> f64 {
+        self.buckets[0]
+    }
+
+    pub fn transaction_ms(&self) -> f64 {
+        self.buckets[1]
+    }
+
+    /// `time_ms`: every number rounded to 0.1 ms, each divided by `n` (1
+    /// for one execution, the sample size for an average).
+    pub fn to_json(&self, n: f64) -> Value {
+        let n = n.max(1.0);
+        let mut time = Map::new();
+        time.insert("duration".into(), jf(rb::round(self.duration / n, 1)));
+        for (k, v) in TIME_BUCKETS.iter().zip(self.buckets) {
+            time.insert((*k).into(), jf(rb::round(v / n, 1)));
+        }
+        time.insert("tracked".into(), jf(rb::round(self.tracked / n, 1)));
+        time.insert("untracked".into(), jf(rb::round(self.untracked / n, 1)));
+        Value::Object(time)
+    }
+}
+
 /// Where an execution's time went, and what to look at first.
 pub fn execution_summary(f: &Facts) -> Value {
     let total = f.duration_ms;
-    let mut by_type: Vec<(&str, f64)> = ["sql", "transactions", "view", "external", "cache", "other"].iter().map(|k| (*k, 0.0)).collect();
     let mut counts: Map<String, Value> = Map::new();
     for e in f.entries {
         let n = counts.get(e.kind).and_then(Value::as_i64).unwrap_or(0);
         counts.insert(e.kind.to_string(), Value::from(n + 1));
-        if let Some(bucket) = time_bucket(e.kind)
-            && let Some(slot) = by_type.iter_mut().find(|(k, _)| *k == bucket)
-        {
-            slot.1 += e.duration.unwrap_or(0.0);
-        }
     }
-    let tracked = covered_ms(f.entries.iter().filter(|e| time_bucket(e.kind).is_some()), total);
-    let untracked = (total - tracked).max(0.0);
-    let mut time = Map::new();
-    time.insert("duration".into(), jf(rb::round(total, 1)));
-    for (k, v) in &by_type {
-        time.insert((*k).into(), jf(rb::round(*v, 1)));
-    }
-    time.insert("tracked".into(), jf(rb::round(tracked, 1)));
-    time.insert("untracked".into(), jf(rb::round(untracked, 1)));
+    let split = TimeSplit::of(f.entries, total);
 
     let repeated = repeated_queries(f.entries);
     let n_plus_ones = n_plus_ones(f);
     let slowest = slowest(f.entries);
     let exceptions: Vec<Value> = f.entries.iter().filter(|e| e.kind == "exception").take(TOP_EXCEPTIONS).map(|e| e.row.clone()).collect();
 
-    let sql = by_type[0].1;
-    let transactions = by_type[1].1;
-    let tx_count = f.entries.iter().filter(|e| e.kind == "transaction").count();
-    let notes = notes(f, total, sql, transactions, tx_count, sql_inside_transactions(f.entries), untracked, n_plus_ones.len());
+    let notes = notes(f, &split, n_plus_ones.len());
 
     crate::obj! {
-        "time_ms" => Value::Object(time),
+        "time_ms" => split.to_json(1.0),
         "counts" => Value::Object(counts),
         "distinct_query_shapes" => distinct_shapes(f.entries),
         "repeated_queries" => repeated,
@@ -255,39 +310,56 @@ fn ms_s(v: f64) -> String {
     format!("{} ms", v.round() as i64)
 }
 
-/// What the numbers mean, in sentences an agent can act on.
-#[allow(clippy::too_many_arguments)]
-fn notes(f: &Facts, total: f64, sql: f64, transactions: f64, tx_count: usize, sql_in_tx: f64, untracked: f64, n_plus_ones: usize) -> Vec<String> {
+/// The sentences about where the time is (transactions holding Ruby code,
+/// untracked time, SQL-bound), and whether a profile would explain more.
+/// `of` names what the split is of ("" for one execution, " per request"
+/// for a route's average); `sql_next` says where to look when it is SQL.
+pub fn time_notes(split: &TimeSplit, of: &str, sql_next: &str) -> (Vec<String>, bool) {
+    let total = split.duration;
+    let (sql, transactions, untracked) = (split.sql(), split.transaction_ms(), split.untracked);
     let mut out = vec![];
-    let profile = if f.has_profile {
-        "A profile exists for this execution: call get_profile with its execution_id to see which methods the time is in.".to_string()
-    } else {
-        format!("No profile was captured for it. {}", super::mcp::PROFILE_SETUP)
-    };
     let mut wants_profile = false;
     if total > 0.0 && transactions >= total * 0.5 {
         out.push(format!(
-            "{}% of the time ({}) is inside {tx_count} database transaction(s), but the SQL inside them took {}: application code runs while those transactions are open. Look at what the transaction blocks do besides SQL.",
+            "{}% of the time ({}{of}) is inside {} database transaction(s), but the SQL inside them took {}: application code runs while those transactions are open. Look at what the transaction blocks do besides SQL.",
             pct(transactions, total),
             ms_s(transactions),
-            ms_s(sql_in_tx)
+            split.transactions,
+            ms_s(split.sql_in_transactions)
         ));
         wants_profile = true;
     }
     if total > 0.0 && untracked >= total * 0.5 && untracked >= 50.0 {
         out.push(format!(
-            "{}% of the time ({}) is not covered by any recorded query, transaction, view render or outgoing call: it is Ruby code, GC or waiting.",
+            "{}% of the time ({}{of}) is not covered by any recorded query, transaction, view render or outgoing call: it is Ruby code, GC or waiting.",
             pct(untracked, total),
             ms_s(untracked)
         ));
         wants_profile = true;
     }
-    if wants_profile {
-        out.push(profile);
-    }
     if total > 0.0 && sql >= total * 0.5 {
-        out.push(format!("{}% of the time ({}) is SQL: start with repeated_queries and slowest.", pct(sql, total), ms_s(sql)));
+        out.push(format!("{}% of the time ({}{of}) is SQL: start with {sql_next}.", pct(sql, total), ms_s(sql)));
     }
+    (out, wants_profile)
+}
+
+/// What the numbers mean, in sentences an agent can act on.
+fn notes(f: &Facts, split: &TimeSplit, n_plus_ones: usize) -> Vec<String> {
+    let (time, wants_profile) = time_notes(split, "", "repeated_queries and slowest");
+    let mut out = vec![];
+    let mut time = time.into_iter();
+    // The SQL note goes after the profile pointer, the others before it.
+    let sql_bound = split.duration > 0.0 && split.sql() >= split.duration * 0.5;
+    let before = time.len() - usize::from(sql_bound);
+    out.extend(time.by_ref().take(before));
+    if wants_profile {
+        out.push(if f.has_profile {
+            "A profile exists for this execution: call get_profile with its execution_id to see which methods the time is in.".to_string()
+        } else {
+            format!("No profile was captured for it. {}", super::mcp::PROFILE_SETUP)
+        });
+    }
+    out.extend(time);
     if n_plus_ones > 0 {
         out.push(format!(
             "{} N+1 pattern(s) detected; n_plus_ones lists the most repeated with the source line and an Active Record fix.",
