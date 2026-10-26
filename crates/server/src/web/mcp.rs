@@ -3725,6 +3725,7 @@ mod tests {
         assert_eq!(j["exceptions"][0], json!({"exception": "Faraday::ServerError: 502", "runs": 2}));
         // By group_hash too; an unknown job says what to pass.
         assert_eq!(f.tool("get_job", json!({"group_hash": group("MailJob")}))["summary"]["runs"], 4);
+        assert!(j["runs_note"].is_null(), "all 10 runs were read");
         assert_eq!(f.tool("get_job", json!({"job": "NopeJob"}))["error"], "job not found");
     }
 

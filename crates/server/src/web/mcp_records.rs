@@ -144,6 +144,9 @@ impl Mcp<'_> {
                 "summary" => side(summary), "previous_window" => side(previous),
                 "exceptions" => exceptions.into_iter().take(5).map(|(e, n)| json!({"exception": e, "runs": n})).collect::<Vec<_>>(),
                 "recent_failures" => failures, "slowest_runs" => slowest, "runs_read" => attempts.len(),
+                "runs_note" => if (attempts.len() as i64) < summary["count"].as_i64().unwrap_or(0) {
+                    Value::from(format!("exceptions, recent_failures and slowest_runs are from the newest {} of the window's {} runs; summary is all of them. Pass a shorter window, or search_telemetry resource jobs with q class:<job> status:failed, for older ones.", attempts.len(), summary["count"]))
+                } else { Value::Null },
                 "next" => "get_execution on a run's execution_id for its timeline and summary; investigate_issue on the exception's issue (list_issues) for its root cause.",
             };
             Ok(v.to_string())

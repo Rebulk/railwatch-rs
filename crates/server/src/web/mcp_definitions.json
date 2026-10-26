@@ -729,7 +729,7 @@
     },
     {
       "name": "get_job",
-      "description": "One job class: runs, failures and avg/p50/p95/max in the window against the window before it; the exceptions its failures raised, most frequent first; its recent failed runs and its slowest runs, each with execution_id, duration, queue latency, attempt, deploy and url. Use it after list_jobs, or for \"why does InvoiceSyncJob keep failing?\". Next: get_execution on a run's execution_id; investigate_issue for the exception's issue.",
+      "description": "One job class: runs, failures and avg/p50/p95/max in the window against the window before it; the exceptions its failures raised, most frequent first, and its recent failed runs and slowest runs (all three from its newest 200 runs in the window; runs_note says so when there were more), each with execution_id, duration, queue latency, attempt, deploy and url. Use it after list_jobs, or for \"why does InvoiceSyncJob keep failing?\". Next: get_execution on a run's execution_id; investigate_issue for the exception's issue.",
       "inputSchema": {
         "type": "object",
         "properties": {
