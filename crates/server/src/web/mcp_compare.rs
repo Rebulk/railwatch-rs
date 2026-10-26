@@ -93,6 +93,20 @@ impl Mcp<'_> {
             };
             let b = measure(conn, kind, group.as_deref(), &before)?;
             let f = measure(conn, kind, group.as_deref(), &after)?;
+            // The default pair is the latest two deploys, but an app that
+            // deploys several times a day often has a route or job with no
+            // traffic in one of them: compare around the newest deploy that
+            // has some instead, the same length of time either side of it.
+            let defaulted = !(a.present("since") || a.present("before") || a.present("after"));
+            if defaulted && (b.count == 0 || f.count == 0)
+                && let Some((before, after, note)) = self.around_busy_deploy(conn, kind, group.as_deref(), &deploys)?
+            {
+                let b = measure(conn, kind, group.as_deref(), &before)?;
+                let f = measure(conn, kind, group.as_deref(), &after)?;
+                let mut v = self.compared(&env, kind, group.as_deref(), &name, &before, &after, &b, &f, true);
+                db::merge_into(&mut v, "defaulted", Value::from(note));
+                return Ok(v.to_string());
+            }
             let v = self.compared(&env, kind, group.as_deref(), &name, &before, &after, &b, &f, a.present("since"));
             Ok(v.to_string())
         })
@@ -133,6 +147,70 @@ impl Mcp<'_> {
             meta: crate::obj! { "from" => time_s(Some(split)), "to" => time_s(Some(self.now)) },
         };
         Ok(Ok((before, after)))
+    }
+
+    /// For the default compare when a side of the latest two deploys is
+    /// empty: the newest recorded deploy (in the last 30 days) whose own
+    /// windows include this route or job on both sides, split at its deploy
+    /// time with the same span on each side (up to a week, and no longer
+    /// than the releases either side of it ran, so each side is one release).
+    /// None when no deploy has traffic on both sides.
+    fn around_busy_deploy(&self, conn: &Connection, kind: &str, group: Option<&str>, deploys: &[Deploy]) -> R<Option<(Side, Side, String)>> {
+        let recorded = recent_deploys(deploys.to_vec());
+        for (i, d) in recorded.iter().enumerate() {
+            if d.deployed_at < self.now - 30 * DAY {
+                break;
+            }
+            // Equal spans either side, so counts compare too, and each side
+            // one release: up to a week, no longer than since the previous
+            // deploy or until the next one (or now).
+            let since_previous = recorded.get(i + 1).map_or(i64::MAX, |p| d.deployed_at - p.deployed_at);
+            let until_next = i.checked_sub(1).and_then(|j| recorded.get(j)).map_or(self.now, |n| n.deployed_at) - d.deployed_at;
+            let span = until_next.min(7 * DAY).min(since_previous);
+            if span <= 0 {
+                continue;
+            }
+            let probe = |range| Side { label: String::new(), deploys: vec![], range, exclusive_to: false, meta: Value::Null };
+            // Both sides need traffic, or this deploy can't answer either.
+            if measure_count(conn, kind, group, &probe((d.deployed_at, d.deployed_at + span)))? == 0
+                || measure_count(conn, kind, group, &probe((d.deployed_at - span, d.deployed_at - 1)))? == 0
+            {
+                continue;
+            }
+            let from = d.deployed_at - span;
+            let before = Side {
+                label: "before".into(),
+                deploys: vec![],
+                range: (from, d.deployed_at),
+                exclusive_to: true,
+                meta: crate::obj! { "from" => time_s(Some(from)), "to" => time_s(Some(d.deployed_at)) },
+            };
+            let after = Side {
+                label: format!("since deploy {}", d.name.clone().unwrap_or_else(|| rb::first_chars(&d.deploy, 12).to_string())),
+                deploys: vec![],
+                range: (d.deployed_at, d.deployed_at + span),
+                exclusive_to: false,
+                meta: crate::obj! {
+                    "from" => time_s(Some(d.deployed_at)), "to" => time_s(Some(d.deployed_at + span)), "deploy" => d.deploy.clone(),
+                    "deployed_at" => time_s(Some(d.deployed_at)), "deploy_id" => d.id,
+                },
+            };
+            let note = if i == 0 {
+                format!(
+                    "The latest two deploys had no {} executions on one side, so this compares the time before and after the latest deploy instead.",
+                    if kind == "request" { "matching request" } else { "matching job" }
+                )
+            } else {
+                format!(
+                    "The latest deploy{} had no matching executions, so this compares around deploy {} ({}), the newest one with traffic. Pass before/after or since to choose.",
+                    if i > 1 { "s" } else { "" },
+                    rb::first_chars(&d.deploy, 12),
+                    str_of(&time_s(Some(d.deployed_at)))
+                )
+            };
+            return Ok(Some((before, after, note)));
+        }
+        Ok(None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -438,6 +516,21 @@ fn opt(x: Option<f64>) -> Value {
 
 fn str_of(v: &Value) -> String {
     v.as_str().map_or_else(|| v.to_string(), str::to_string)
+}
+
+/// 1 when the side has an execution of `kind` (and `group`), else 0: a
+/// LIMIT 1 probe on the kind/occurred_at index, for around_busy_deploy.
+fn measure_count(conn: &Connection, kind: &str, group: Option<&str>, side: &Side) -> rusqlite::Result<usize> {
+    let mut sql = String::from("SELECT 1 FROM \"executions\" WHERE \"executions\".\"kind\" = ?");
+    let mut binds: Vec<rusqlite::types::Value> = vec![kind.to_string().into()];
+    if let Some(g) = group {
+        sql.push_str(" AND \"executions\".\"group_hash\" = ?");
+        binds.push(g.to_string().into());
+    }
+    sql.push_str(" AND \"executions\".\"occurred_at\" >= ? AND \"executions\".\"occurred_at\" <= ? LIMIT 1");
+    binds.push(qt(side.range.0).into());
+    binds.push(qt(side.range.1).into());
+    Ok(db::query(conn, &sql, params_from_iter(binds))?.len())
 }
 
 fn measure(conn: &Connection, kind: &str, group: Option<&str>, side: &Side) -> rusqlite::Result<Measured> {
