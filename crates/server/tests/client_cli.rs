@@ -279,7 +279,7 @@ async fn the_client_commands_against_a_server_mounted_under_a_path() {
     // why: by route name, or by a path (resolved through the newest
     // request): explain_route's answer first.
     let why = ok(&run(a(&["why", "GET /orders/:id"])).await);
-    assert!(why.starts_with("GET /orders/:id\nOver 1 sampled requests (avg 812 ms): N+1 at app/views/orders/show.html.erb:7 (up to 12x per request), fix: Order.includes(:line_items)"), "{why}");
+    assert!(why.starts_with("GET /orders/:id\nOver 1 sampled requests, slowest first (avg 812 ms): N+1 at app/views/orders/show.html.erb:7 (up to 12x per request), fix: Order.includes(:line_items)"), "{why}");
     let by_path = ok(&run(a(&["why", "/orders/12"])).await);
     assert!(by_path.starts_with("(GET /orders/:id: the route of the newest request matching /orders/12)\n"), "{by_path}");
     let no_route = run(a(&["why", "GET /nowhere"])).await;

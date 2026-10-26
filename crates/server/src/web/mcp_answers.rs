@@ -43,11 +43,14 @@ impl Mcp<'_> {
             db::merge_into(&mut v, "detection", detection);
         }
         let (sample, last) = self.agent_occurrences(&issue, false)?;
+        // The sample can be past retention while newer occurrences are not:
+        // then the newest one is the occurrence to read.
+        let (sample, last) = if sample.is_null() && last.is_object() { (last, Value::Null) } else { (sample, last) };
         let deploys = self.env.control.with(|c| super::super::dashboard_bridge::DbControl::load(c, env.id))?.deploys();
         let sample_meta = issue.sample_json();
         let (lead_up, trend) = self.with_telemetry(&env, |conn| {
             let lead_up = match sample.get("execution_id").and_then(Value::as_str).or_else(|| sample_meta["execution_id"].as_str()) {
-                Some(eid) => lead_up(conn, eid, sample.get("occurred_at").and_then(Value::as_str))?,
+                Some(eid) => lead_up(conn, eid, sample.get("id").and_then(Value::as_i64), sample.get("occurred_at").and_then(Value::as_str))?,
                 None => Value::Null,
             };
             Ok((lead_up, trend(conn, &issue.group_hash, self.now)?))
@@ -154,26 +157,18 @@ impl Mcp<'_> {
             };
             let summary = rollup::summary_between_group(conn, "request", from, to, &group_hash)?;
             // The slowest requests say most about where the time goes; the
-            // newest ones say what a typical request does. Half of each.
-            let slowest = db::query(
+            // newest ones say what a typical request does. Half of each, from
+            // the route's newest 200 requests (as get_route reads them: a
+            // duration sort over a hot route's whole window is a scan).
+            let recent = db::query(
                 conn,
-                &format!(
-                    "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"kind\" = 'request' AND \"executions\".\"group_hash\" = ?1 \
-                     AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 ORDER BY \"executions\".\"duration\" DESC LIMIT {}",
-                    ROUTE_SAMPLE / 2
-                ),
+                "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"kind\" = 'request' AND \"executions\".\"group_hash\" = ?1 \
+                 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 ORDER BY \"executions\".\"occurred_at\" DESC LIMIT 200",
                 params![group_hash, qt(from), qt(to)],
             )?;
-            let newest = db::query(
-                conn,
-                &format!(
-                    "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"kind\" = 'request' AND \"executions\".\"group_hash\" = ?1 \
-                     AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 ORDER BY \"executions\".\"occurred_at\" DESC LIMIT {ROUTE_SAMPLE}"
-                ),
-                params![group_hash, qt(from), qt(to)],
-            )?;
-            let mut sample: Vec<&Rec> = slowest.iter().collect();
-            for r in &newest {
+            let slowest = super::max_by_n(&recent, ROUTE_SAMPLE / 2, |r| r.i("duration").unwrap_or(0));
+            let mut sample: Vec<&Rec> = slowest.clone();
+            for r in &recent {
                 if sample.len() >= ROUTE_SAMPLE {
                     break;
                 }
@@ -223,6 +218,7 @@ impl Mcp<'_> {
                     "p95_ms" => ms(Some(summary.p95)), "max_ms" => ms(Some(summary.max)),
                 },
                 "sampled_requests" => sampled,
+                "sample" => format!("the {} slowest of the route's newest {} requests in the window and the newest others; the per-request numbers average these, so they lean toward the slow tail (requests has the window's own avg and p50)", slowest.len(), recent.len()),
                 "time_ms_per_request" => per,
                 "queries_per_request" => jf(rb::round(explained.queries as f64 / sampled.max(1) as f64, 1)),
                 "n_plus_ones" => n_plus_ones,
@@ -246,14 +242,18 @@ impl Mcp<'_> {
 
 /// What ran in the occurrence's execution before the raise: its summary
 /// and the last LEAD_UP queries, calls and log lines up to the exception.
-fn lead_up(conn: &Connection, eid: &str, raised_at: Option<&str>) -> rusqlite::Result<Value> {
+fn lead_up(conn: &Connection, eid: &str, exception_id: Option<i64>, raised_at: Option<&str>) -> rusqlite::Result<Value> {
     let Some(exe) = db::query_one(conn, "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"execution_id\" = ?1 LIMIT 1", [eid])? else {
         return Ok(json!({"execution_id": eid, "note": "The execution is not stored (sampled out, or past retention): only the occurrence remains."}));
     };
     let facts = super::execution_facts(conn, &exe)?;
     let start = exe.t("occurred_at").unwrap_or(0);
-    // The raise's offset in the execution; without it, the whole timeline.
-    let cut = raised_at.and_then(|t| crate::time::parse_db_time(t.trim_end_matches(" UTC"))).map(|t| rb::time_sub(t, start) * 1000.0 + 1000.0);
+    // The raise's offset in the execution: its exception row in the
+    // timeline, else its time (whole seconds, so up to a second late);
+    // without either, the whole timeline.
+    let at_row = facts.entries.iter().find(|e| e.kind == "exception" && exception_id.is_some() && e.row["id"].as_i64() == exception_id).map(|e| e.offset);
+    let cut =
+        at_row.or_else(|| raised_at.and_then(|t| crate::time::parse_db_time(t.trim_end_matches(" UTC"))).map(|t| rb::time_sub(t, start) * 1000.0 + 1000.0));
     let before: Vec<&mcp_summary::Entry> = facts
         .entries
         .iter()
@@ -365,7 +365,7 @@ fn started_in(issue: &IssueRow, sample: &Value, trend: &Value, deploys: &[Deploy
     // a deploy row may carry the full SHA, or the same value as its ref.
     let matches = |d: &Deploy, v: &str| d.deploy == v || (v.len() >= 7 && (d.deploy.starts_with(v) || d.ref_.as_deref().is_some_and(|r| r.starts_with(v))));
     let (deploy, how) = match recorded.as_deref() {
-        Some(v) => match sorted.iter().find(|d| matches(d, v)) {
+        Some(v) => match find_deploy(&sorted, v, |d, v| matches(d, v)) {
             Some(d) => (Some(d), "the deploy its first retained occurrence ran"),
             None => (None, "the deploy its first retained occurrence ran (no deploy was recorded for it)"),
         },
@@ -413,6 +413,20 @@ fn started_in(issue: &IssueRow, sample: &Value, trend: &Value, deploys: &[Deploy
         );
     }
     v
+}
+
+/// The deploy `v` names: an exact deploy value or name first; else the one
+/// deploy whose value or ref it is a prefix of (`loose`); none when the
+/// prefix is ambiguous ("v1.2.10" must not pick "v1.2.100").
+pub(super) fn find_deploy<'a>(deploys: &'a [Deploy], v: &str, loose: impl Fn(&Deploy, &str) -> bool) -> Option<&'a Deploy> {
+    if let Some(d) = deploys.iter().find(|d| d.deploy == v || d.name.as_deref() == Some(v)) {
+        return Some(d);
+    }
+    let mut prefixed = deploys.iter().filter(|d| loose(d, v));
+    match (prefixed.next(), prefixed.next()) {
+        (Some(d), None) => Some(d),
+        _ => None,
+    }
 }
 
 /// "3 minutes", "2 hours", "4 days".
@@ -829,7 +843,7 @@ fn route_answer(sum: &TimeSplit, n: usize, n_plus_ones: &Value, top: &[Value], p
     if avg.buckets[3] >= avg.duration * 0.3 && avg.buckets[3] >= 50.0 {
         parts.push(format!("external calls {} per request", ms(avg.buckets[3])));
     }
-    let mut s = format!("Over {n} sampled requests (avg {}): ", ms(avg.duration));
+    let mut s = format!("Over {n} sampled requests, slowest first (avg {}): ", ms(avg.duration));
     if parts.is_empty() {
         s.push_str("no single cause stands out; time_ms_per_request has the split.");
     } else {
@@ -922,6 +936,11 @@ mod tests {
         let s = started_in(&issue, &json!({"deploy": "dddddddddddd"}), &json!({"by_deploy": []}), &deploys);
         assert_eq!((s["deploy"].as_str(), s["deploy_recorded"].as_bool()), (Some("dddddddddddd"), Some(false)));
         // A deploy value that is the full SHA matches the gem's 12-char one.
+        // An exact value wins over a newer deploy it is a prefix of.
+        let tags = vec![deploy(5, "v1.2.10", t0, 0), deploy(6, "v1.2.100", t0 + DAY, 0)];
+        assert_eq!(started_in(&issue, &json!({"deploy": "v1.2.10"}), &json!({"by_deploy": []}), &tags)["deploy"], "v1.2.10");
+        // An ambiguous prefix names neither.
+        assert_eq!(started_in(&issue, &json!({"deploy": "v1.2.1"}), &json!({"by_deploy": []}), &tags)["deploy_recorded"], false);
         let full = vec![deploy(9, "bbbbbbbbbbbb0000000000000000000000000000", t0, 0)];
         assert_eq!(started_in(&issue, &Value::Null, &trend, &full)["deploy"], "bbbbbbbbbbbb0000000000000000000000000000");
     }

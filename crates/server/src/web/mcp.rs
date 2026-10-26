@@ -3401,6 +3401,29 @@ mod tests {
             assert!(md.contains(want), "markdown lacks {want:?}:\n{md}");
         }
         assert!(!md.contains("job finished"));
+        // A row logged in the same second as the raise but after it is not lead-up.
+        f.tenant()
+            .execute(
+                "INSERT INTO logs (execution_id, occurred_at, level, message) VALUES ('e-job', ?1, 'error', 'retrying in 30s')",
+                [qt(NOW - 3 * 3_600_000_000 + 300_000)],
+            )
+            .unwrap();
+        f.tenant().execute("INSERT INTO exceptions (id, class_name, message, occurred_at, group_hash, frames, execution_id) VALUES (54, 'X', 'y', ?1, 'other', '[]', 'e-job')", [qt(NOW - 3 * 3_600_000_000)]).unwrap();
+        let again = f.tool("investigate_issue", json!({"key": "SHOP-79"}));
+        let labels: Vec<&str> = again["lead_up"]["before_raise"].as_array().unwrap().iter().map(|r| r["label"].as_str().unwrap()).collect();
+        assert!(!labels.contains(&"retrying in 30s"), "{labels:?}");
+        // The sample past retention, a newer occurrence kept: that one is read.
+        f.tenant().execute("DELETE FROM exceptions WHERE id = 55", []).unwrap();
+        f.tenant()
+            .execute(
+                "INSERT INTO exceptions (id, class_name, message, occurred_at, group_hash, frames, execution_id, execution_source) VALUES (60, 'Cloudflare::Email::NetworkError', 'later', ?1, 'gx', ?2, 'e-job', 'job')",
+                params![qt(NOW - 60_000_000), json!([{"file": "app/services/outbound_email/cloudflare_feedback_consumer.rb", "line": 41, "function": "poll", "in_app": true}]).to_string()],
+            )
+            .unwrap();
+        let aged = f.tool("investigate_issue", json!({"key": "SHOP-79"}));
+        assert_eq!(aged["occurrence"]["id"], 60);
+        assert!(aged.get("note").is_none(), "{}", aged["note"]);
+        assert_eq!(aged["lead_up"]["name"], "OutboundEmailFeedbackJob");
         let missing = f.tool("investigate_issue", json!({"key": "SHOP-404"}));
         assert!(missing["hint"].as_str().unwrap().contains("list_issues"));
     }
@@ -3463,7 +3486,7 @@ mod tests {
         // No profile: the note says how to get one.
         assert!(v["profile"].is_null());
         let answer = v["answer"].as_str().unwrap();
-        assert!(answer.starts_with("Over 4 sampled requests (avg 2.8 s): N+1 at app/services/billing/customer_documents.rb:511 (up to 60x per request), fix: Customer.includes(:car_invoices)"), "{answer}");
+        assert!(answer.starts_with("Over 4 sampled requests, slowest first (avg 2.8 s): N+1 at app/services/billing/customer_documents.rb:511 (up to 60x per request), fix: Customer.includes(:car_invoices)"), "{answer}");
         assert!(answer.contains("2.1 s per request inside transactions but only 56 ms of SQL in them") && answer.contains("Enable the profiler"), "{answer}");
         assert!(v["notes"].to_string().contains("RAILWATCH_PROFILE_SLOW_MS"));
         assert_eq!(v["slowest_requests"][0]["queries"], Value::Null);
