@@ -891,6 +891,17 @@ AmbiguousIdentifier (the baseline has one account; the SQL is Rails'
    (`web_vitals_match_the_visits_page_in_the_api_and_mcp`). Rails has no
    such tool, so the diff's `tools/list` cases are EXPECTED.
 
+8. **Rust-only answer tools `investigate_issue` and `explain_route`**
+   (2026-10-26), and changed `triage_issue` / `slow_route` prompt texts that
+   start from them. investigate_issue is get_issue's occurrence plus the
+   execution summary and the rows before the raise, the deploy its first
+   retained occurrence ran (with the previous deploy, commit range and
+   commits), a 30-day trend, users/tenants and similar issues, and a
+   `markdown` brief. explain_route folds the timelines of up to 20 of a
+   route's requests into a per-request time split, N+1s with runs per
+   request, the costliest shapes with stored plans and profile frames.
+   Rails has neither, so `tools/list` and the two prompts are EXPECTED.
+
 # Detectors diff (`bench/diff/detectors/`, 2026-10-15)
 
 What `run.sh` found and fixed in the ports (each was a Rust difference,
