@@ -39,6 +39,8 @@ use super::mcp_summary;
 mod answers;
 #[path = "mcp_compare.rs"]
 mod compare;
+#[path = "mcp_records.rs"]
+mod records;
 use crate::control::Control;
 use crate::dashboard::cursor_page::{self, CursorKey, Order};
 use crate::dashboard::db::{self, Rec, jf, qt};
@@ -574,6 +576,9 @@ impl Mcp<'_> {
             "investigate_issue" => self.investigate_issue(&a),
             "explain_route" => self.explain_route(&a),
             "compare" => self.compare(&a),
+            "list_jobs" => self.list_jobs(&a),
+            "get_job" => self.get_job(&a),
+            "list_llm_calls" => self.list_llm_calls(&a),
             "update_issue" => self.update_issue(&a),
             "add_comment" => self.add_comment(&a),
             _ => unreachable!("known tool"),
@@ -2610,6 +2615,8 @@ fn narrow_hint(tool: &str) -> &'static str {
         "release_health" => "Pass a narrower window.",
         "get_route" => "Pass a narrower window.",
         "explain_route" => "Pass a narrower window; get_execution on one of slowest_requests has a single request's detail.",
+        "list_jobs" | "list_llm_calls" => "Pass a smaller limit or a narrower window.",
+        "get_job" => "Pass a narrower window.",
         "compare" => "Pass route or job to compare one route or job class instead of the whole environment.",
         "investigate_issue" => "Read occurrence and lead_up first; get_execution on occurrence.execution_id pages the full timeline.",
         "get_profile" => "Pass a smaller limit.",
@@ -3657,6 +3664,132 @@ mod tests {
         assert!(z["deltas"]["queries_per_request_pct"].is_null() && z["worst_regression_pct"].as_f64() == Some(100.0), "{}", z["deltas"]);
         let bad = f.tool("compare", json!({"since": "not-an-id"}));
         assert_eq!(bad["error"], "since is neither a time nor a stored execution_id");
+    }
+
+    #[test]
+    fn list_jobs_and_get_job_show_failures_latency_and_the_slow_runs() {
+        let f = seeded("jobs");
+        let conn = f.tenant();
+        let group = |n: &str| filter_query::md5_hex(n);
+        // InvoiceSyncJob: 10 runs, 3 failed with two exceptions; MailJob: 4 fast runs.
+        for i in 0..10i64 {
+            let failed = i % 4 == 1;
+            conn.execute(
+                "INSERT INTO executions (execution_id, kind, name, group_hash, occurred_at, duration, outcome, queue, queue_latency, attempt, exception_preview)
+                 VALUES (?1, 'job_attempt', 'InvoiceSyncJob', ?2, ?3, ?4, ?5, 'billing', ?6, 1, ?7)",
+                params![
+                    format!("inv-{i}"),
+                    group("InvoiceSyncJob"),
+                    qt(NOW - (i + 1) * 60_000_000),
+                    (100 + i * 100) * 1000,
+                    if failed { "failed" } else { "processed" },
+                    2_000_000,
+                    if !failed { None } else if i == 1 { Some("Timeout::Error: execution expired") } else { Some("Faraday::ServerError: 502") }
+                ],
+            )
+            .unwrap();
+        }
+        for i in 0..4i64 {
+            conn.execute(
+                "INSERT INTO executions (execution_id, kind, name, group_hash, occurred_at, duration, outcome, queue, queue_latency)
+                 VALUES (?1, 'job_attempt', 'MailJob', ?2, ?3, 20000, 'processed', 'mailers', 500000)",
+                params![format!("mail-{i}"), group("MailJob"), qt(NOW - (i + 1) * 30_000_000)],
+            )
+            .unwrap();
+        }
+        for h in crate::rollup::rollup_job::hours_with_rows(&conn).unwrap() {
+            crate::rollup::rollup_job::perform(&conn, &conn, h, &mut crate::rollup::rollup_job::Rng::PerGroup).unwrap();
+        }
+        let v = f.tool("list_jobs", json!({}));
+        assert_eq!(v["job_classes"], 2);
+        let inv = &v["jobs"][0];
+        assert_eq!((inv["job"].as_str(), inv["runs"].as_i64(), inv["failed"].as_i64()), (Some("InvoiceSyncJob"), Some(10), Some(3)));
+        assert_eq!((inv["failure_rate_pct"].as_f64(), inv["avg_ms"].as_f64(), inv["max_ms"].as_f64()), (Some(30.0), Some(550.0), Some(1000.0)));
+        assert_eq!((inv["queue"].as_str(), inv["avg_queue_latency_ms"].as_f64()), (Some("billing"), Some(2000.0)));
+        assert_eq!(inv["url"], format!("https://rw.example.com/railwatch/apps/{}/envs/{}/jobs/classes/{}", f.app, f.env, group("InvoiceSyncJob")));
+        let queues: Vec<(&str, i64)> = v["queues"].as_array().unwrap().iter().map(|q| (q["queue"].as_str().unwrap(), q["failed"].as_i64().unwrap())).collect();
+        assert!(queues.contains(&("billing", 3)) && queues.contains(&("mailers", 0)), "{queues:?}");
+        assert_eq!(f.tool("list_jobs", json!({"sort": "errors"}))["jobs"][0]["job"], "InvoiceSyncJob");
+        assert_eq!(f.tool("list_jobs", json!({"sort": "max", "limit": 1}))["jobs"].as_array().unwrap().len(), 1);
+        assert_eq!(f.tool("list_jobs", json!({"sort": "name"}))["error"], "sort must be count, errors, p95, avg or max");
+
+        let j = f.tool("get_job", json!({"job": "InvoiceSyncJob"}));
+        assert_eq!((j["summary"]["runs"].as_i64(), j["summary"]["failed"].as_i64()), (Some(10), Some(3)));
+        assert_eq!(j["summary"]["max_ms"].as_f64(), Some(1000.0));
+        assert_eq!(j["previous_window"]["runs"], 0);
+        // Failures newest first; the slowest run is the oldest (1000 ms).
+        let fails: Vec<&str> = j["recent_failures"].as_array().unwrap().iter().map(|r| r["execution_id"].as_str().unwrap()).collect();
+        assert_eq!(fails, ["inv-1", "inv-5", "inv-9"]);
+        assert_eq!((j["slowest_runs"][0]["execution_id"].as_str(), j["slowest_runs"][0]["duration_ms"].as_f64()), (Some("inv-9"), Some(1000.0)));
+        assert_eq!(j["slowest_runs"][0]["url"], format!("https://rw.example.com/railwatch/apps/{}/envs/{}/jobs/inv-9", f.app, f.env));
+        assert_eq!(j["exceptions"][0], json!({"exception": "Faraday::ServerError: 502", "runs": 2}));
+        // By group_hash too; an unknown job says what to pass.
+        assert_eq!(f.tool("get_job", json!({"group_hash": group("MailJob")}))["summary"]["runs"], 4);
+        assert_eq!(f.tool("get_job", json!({"job": "NopeJob"}))["error"], "job not found");
+    }
+
+    #[test]
+    fn list_llm_calls_sums_tokens_and_cost_by_model_and_lists_calls() {
+        let f = seeded("llm");
+        let conn = f.tenant();
+        let call = |i: i64, model: &str, provider: &str, cost: Option<i64>, status: &str, finish: &str| {
+            conn.execute(
+                "INSERT INTO llm_calls (occurred_at, operation, provider, model, duration, input_tokens, output_tokens, cost_nanos, status, finish_reason, execution_id, group_hash, prompt)
+                 VALUES (?1, 'chat', ?2, ?3, ?4, 1000, 100, ?5, ?6, ?7, ?8, ?9, 'Classify this email')",
+                params![
+                    qt(NOW - (i + 1) * 60_000_000),
+                    provider,
+                    model,
+                    (500 + i * 100) * 1000,
+                    cost,
+                    status,
+                    finish,
+                    format!("job-{i}"),
+                    filter_query::md5_hex(&format!("{provider},{model}"))
+                ],
+            )
+            .unwrap();
+        };
+        for i in 0..3 {
+            call(i, "claude-sonnet-5-5", "anthropic", Some(2_000_000), "succeeded", "stop");
+        }
+        call(3, "claude-sonnet-5-5", "anthropic", Some(2_000_000), "succeeded", "max_tokens");
+        call(4, "gpt-5-mini", "openai", None, "failed", "error");
+        conn.execute(
+            "INSERT INTO llm_calls (occurred_at, operation, tool_name, duration, status, group_hash) VALUES (?1, 'tool', 'lookup_customer', 30000, 'succeeded', 'gt')",
+            [qt(NOW - 60_000_000)],
+        )
+        .unwrap();
+        for h in crate::rollup::rollup_job::hours_with_rows(&conn).unwrap() {
+            crate::rollup::rollup_job::perform(&conn, &conn, h, &mut crate::rollup::rollup_job::Rng::PerGroup).unwrap();
+        }
+        let v = f.tool("list_llm_calls", json!({}));
+        let t = &v["totals"];
+        assert_eq!((t["calls"].as_i64(), t["errors"].as_i64(), t["tool_calls"].as_i64()), (Some(5), Some(1), Some(1)));
+        assert_eq!((t["input_tokens"].as_i64(), t["output_tokens"].as_i64()), (Some(5000), Some(500)));
+        assert_eq!(t["cost_usd"].as_f64(), Some(0.008));
+        // Priced first, then by calls.
+        let m = &v["models"][0];
+        assert_eq!(
+            (m["model"].as_str(), m["calls"].as_i64(), m["cost_usd"].as_f64(), m["truncated"].as_i64()),
+            (Some("claude-sonnet-5-5 · chat"), Some(4), Some(0.008), Some(1))
+        );
+        assert_eq!(
+            (v["models"][1]["model"].as_str(), v["models"][1]["errors"].as_i64(), v["models"][1]["cost_usd"].as_f64()),
+            (Some("gpt-5-mini · chat"), Some(1), None)
+        );
+        assert_eq!(v["tools"][0]["tool"], "lookup_customer");
+        assert_eq!(v["url"], format!("https://rw.example.com/railwatch/apps/{}/envs/{}/llm", f.app, f.env));
+
+        let l = f.tool("list_llm_calls", json!({"group": "none", "q": "finish:max_tokens"}));
+        let calls = l["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            (calls[0]["execution_id"].as_str(), calls[0]["prompt"].as_str(), calls[0]["duration_ms"].as_f64()),
+            (Some("job-3"), Some("Classify this email"), Some(800.0))
+        );
+        assert_eq!(f.tool("list_llm_calls", json!({"group": "none", "limit": 2}))["calls"].as_array().unwrap().len(), 2);
+        assert_eq!(f.tool("list_llm_calls", json!({"group": "provider"}))["error"], "group must be model or none");
     }
 
     /// No tool's result is bigger than the cap, however much data the
