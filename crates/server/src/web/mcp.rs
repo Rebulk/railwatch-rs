@@ -3632,6 +3632,39 @@ mod tests {
     }
 
     #[test]
+    fn compare_by_default_falls_back_to_around_the_newest_deploy_with_traffic() {
+        let f = seeded("compare-busy");
+        let conn = f.tenant();
+        // Three deploys an hour apart (a busy deploy day). The route ran
+        // before and after the oldest; the two newest saw no traffic for it.
+        let (d1, d2, d3) = (NOW - 3 * 3_600_000_000, NOW - 2 * 3_600_000_000, NOW - 3_600_000_000);
+        f.c.with(|x| {
+            x.execute(
+                "INSERT INTO deploys (environment_id, deploy, ref, name, deployed_at, created_at, updated_at) VALUES
+                 (?1, 'd1', NULL, 'shop@1', ?2, ?2, ?2), (?1, 'd2', NULL, 'shop@2', ?3, ?3, ?3), (?1, 'd3', NULL, 'shop@3', ?4, ?4, ?4)",
+                params![f.env, qt(d1), qt(d2), qt(d3)],
+            )
+        })
+        .unwrap();
+        // 10 slow requests in the hour before d1, 8 fast ones between d1 and d2.
+        seed_route_requests(&conn, "d0", d1 - 60_000_000, 10, true);
+        seed_route_requests(&conn, "d1", d2 - 120_000_000, 8, false);
+        let v = f.tool("compare", json!({"route": "GET /:org_slug/invoicing(.:format)"}));
+        assert_eq!(v["by"], "mark", "{v}");
+        assert!(v["defaulted"].as_str().unwrap().contains("around deploy d1"), "{}", v["defaulted"]);
+        assert_eq!((v["before"]["count"].as_i64(), v["after"]["count"].as_i64()), (Some(10), Some(8)), "{v}");
+        assert_eq!(v["after"]["side"], "since deploy shop@1");
+        assert!(v["verdict"].as_str().unwrap().contains("queries per request 826 -> 80"), "{}", v["verdict"]);
+        // Explicit sides are never replaced, even when one is empty.
+        let e = f.tool("compare", json!({"route": "GET /:org_slug/invoicing(.:format)", "before": "shop@2", "after": "shop@3"}));
+        assert!(e.get("defaulted").is_none(), "{e}");
+        assert!(e["verdict"].as_str().unwrap().starts_with("Nothing to compare"), "{}", e["verdict"]);
+        // No deploy with traffic for the route: the plain default stands.
+        let n = f.tool("compare", json!({"route": "GET /:org_slug/invoicing(.:format)", "kind": "job"}));
+        assert!(n.get("defaulted").is_none(), "{n}");
+    }
+
+    #[test]
     fn compare_since_a_mark_cuts_development_requests_without_a_deploy() {
         let f = seeded("compare-mark");
         let conn = f.tenant();
