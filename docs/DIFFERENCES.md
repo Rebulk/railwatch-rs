@@ -902,6 +902,13 @@ AmbiguousIdentifier (the baseline has one account; the SQL is Rails'
    request, the costliest shapes with stored plans and profile frames.
    Rails has neither, so `tools/list` and the two prompts are EXPECTED.
 
+9. **Rust-only tool `compare`** (2026-10-26): two deploys (or the deploy
+   values executions carry) or a `since` mark, per side from the
+   executions themselves (nearest-rank p50/p95 over up to 20,000 rows; queries
+   and db time from `counters.queries` and `detail.db_runtime`), plus the
+   query shapes and N+1s of up to 100 executions a side. EXPECTED in
+   `tools/list`.
+
 # Detectors diff (`bench/diff/detectors/`, 2026-10-15)
 
 What `run.sh` found and fixed in the ports (each was a Rust difference,
