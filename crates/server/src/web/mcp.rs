@@ -3450,6 +3450,11 @@ mod tests {
         assert_eq!((n["source"].as_str(), n["occurrences"].as_i64()), (Some("app/services/billing/customer_documents.rb:511"), Some(3)));
         assert_eq!(n["suggestion"]["code"], "Customer.includes(:car_invoices)");
         assert_eq!(n["runs_per_request"].as_f64(), Some(45.0));
+        // An N+1 whose group no query shares is matched by its line.
+        conn.execute("UPDATE n_plus_ones SET group_hash = 'g_other'", []).unwrap();
+        let by_line = f.tool("explain_route", json!({"group_hash": "route_invoicing"}));
+        assert_eq!(by_line["n_plus_ones"][0]["runs_per_request"].as_f64(), Some(45.0));
+        conn.execute("UPDATE n_plus_ones SET group_hash = 'g_invoices'", []).unwrap();
         // The costliest shape is the N+1's, with its stored plan.
         let q = &v["top_queries"][0];
         assert_eq!((q["group_hash"].as_str(), q["total_ms"].as_f64(), q["in_requests"].as_i64()), (Some("g_invoices"), Some(18.0), Some(3)));

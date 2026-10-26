@@ -191,7 +191,7 @@ impl Mcp<'_> {
             // request (the gem records an N+1 at its threshold count).
             let mut n_plus_ones = super::n_plus_ones_for(conn, &ids)?;
             for p in n_plus_ones.as_array_mut().into_iter().flatten() {
-                let runs = p["group_hash"].as_str().and_then(|g| explained.runs.get(g)).copied();
+                let runs = p["group_hash"].as_str().and_then(|g| explained.runs.get(g)).copied().or_else(|| p["source"].as_str().and_then(|s| explained.runs_by_source.get(s)).map(|r| rb::round(*r, 1)));
                 db::merge_into(p, "runs_per_request", runs.map_or(Value::Null, jf));
             }
             let profiles = route_profiles(conn, &group_hash, &ids, from, to)?;
@@ -614,8 +614,11 @@ struct Explained {
     split: TimeSplit,
     queries: usize,
     top_queries: Vec<Value>,
-    /// Every shape's runs per sampled request, by group_hash.
+    /// Every shape's runs per sampled request, by group_hash, and by source
+    /// line (summed over its shapes) for an N+1 whose group the queries
+    /// do not share.
     runs: std::collections::HashMap<String, f64>,
+    runs_by_source: std::collections::HashMap<String, f64>,
     dropped: Option<usize>,
 }
 
@@ -677,6 +680,12 @@ fn explain_sample(conn: &Connection, sample: &[&Rec]) -> rusqlite::Result<Explai
     shapes.sort_by(|a, b| b.total.total_cmp(&a.total));
     let n = sample.len().max(1) as f64;
     let runs = shapes.iter().filter_map(|s| s.group_hash.clone().map(|g| (g, rb::round(s.count as f64 / n, 1)))).collect();
+    let mut runs_by_source: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for s in &shapes {
+        if let Some(src) = &s.source {
+            *runs_by_source.entry(src.clone()).or_default() += s.count as f64 / n;
+        }
+    }
     let mut top_queries = vec![];
     for s in shapes.into_iter().take(5) {
         let explain = match &s.group_hash {
@@ -696,7 +705,7 @@ fn explain_sample(conn: &Connection, sample: &[&Rec]) -> rusqlite::Result<Explai
             "explain" => explain.map_or(Value::Null, Value::from),
         });
     }
-    Ok(Explained { split, queries, top_queries, runs, dropped: (dropped > 0).then_some(dropped) })
+    Ok(Explained { split, queries, top_queries, runs, runs_by_source, dropped: (dropped > 0).then_some(dropped) })
 }
 
 /// The per-request average of a summed split (for time_notes' sentences).
