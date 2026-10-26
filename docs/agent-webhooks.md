@@ -186,7 +186,8 @@ write some of that text, so treat it as untrusted input to the model
   instructions, and forbids putting secrets in the PR, commit or comment.
 - **Tools:** the allowed tools are named one by one:
   - Railwatch's read tools plus `add_comment`, without `update_issue`;
-  - git limited to branching, committing, diffing and pushing to `origin`;
+  - git limited to branching, committing and diffing, and pushing only the
+    run's own `railwatch/<issue>` branch (`git push origin $branch`, no flags);
   - `gh pr create`;
   - the test runners.
 

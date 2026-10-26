@@ -23,6 +23,7 @@ import hmac
 import http.server
 import json
 import os
+import threading
 import time
 import urllib.request
 
@@ -34,6 +35,7 @@ EVENTS = set(os.environ.get("RELAY_EVENTS", "new_issue").split(","))
 TOLERANCE = 300
 MAX_BODY = 1 << 20
 seen = {}  # event id -> when relayed; a delivery retried after a timeout is not dispatched twice
+LOCK = threading.Lock()  # ThreadingHTTPServer: one thread per request share `seen`
 
 
 def verify(headers, raw):
@@ -74,8 +76,15 @@ def dispatch(body):
 
 
 class Relay(http.server.BaseHTTPRequestHandler):
+    # Reached before the signature is checked, by anyone: a slow or silent
+    # client must not hold a thread.
+    timeout = 15
+
     def do_POST(self):
-        length = int(self.headers.get("Content-Length") or 0)
+        raw_length = self.headers.get("Content-Length") or "0"
+        if not (raw_length.isascii() and raw_length.isdigit()):
+            return self.answer(400)
+        length = int(raw_length)
         if length > MAX_BODY:
             return self.answer(413)
         raw = self.rfile.read(length)
@@ -85,17 +94,22 @@ class Relay(http.server.BaseHTTPRequestHandler):
         event_id = self.headers.get("X-Railwatch-Event-Id") or body.get("alert_id")
         if body.get("event") not in EVENTS or body.get("payload", {}).get("test"):
             return self.answer(204)  # not wanted here; 2xx so Railwatch does not retry
-        now = time.time()
-        for k in [k for k, at in seen.items() if now - at > 86400]:
-            del seen[k]
-        if event_id in seen:
-            return self.answer(204)
+        # Reserve the id before dispatching, so two concurrent deliveries of
+        # one event cannot both dispatch; release it if the dispatch fails.
+        with LOCK:
+            now = time.time()
+            for k in [k for k, at in seen.items() if now - at > 86400]:
+                del seen[k]
+            if event_id in seen:
+                return self.answer(204)
+            seen[event_id] = now
         try:
             dispatch(body)
         except Exception as e:  # GitHub down or the token refused: let Railwatch retry
+            with LOCK:
+                seen.pop(event_id, None)
             self.log_error("dispatch failed: %s", e)
             return self.answer(502)
-        seen[event_id] = now
         self.answer(204)
 
     def answer(self, status):

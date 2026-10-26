@@ -97,7 +97,7 @@ jobs:
           PROMPT
           )" \
             --mcp-config "$RUNNER_TEMP/mcp.json" --strict-mcp-config \
-            --allowedTools "mcp__railwatch__investigate_issue,mcp__railwatch__get_issue,mcp__railwatch__get_execution,mcp__railwatch__last_execution,mcp__railwatch__search_logs,mcp__railwatch__recent_deploys,mcp__railwatch__add_comment,Read,Edit,Write,Grep,Glob,Bash(git checkout -b:*),Bash(git add:*),Bash(git commit:*),Bash(git push origin:*),Bash(git diff:*),Bash(git status),Bash(git log:*),Bash(gh pr create:*),Bash(bin/rails test:*),Bash(bundle exec rails test:*),Bash(bundle exec rspec:*)" \
+            --allowedTools "mcp__railwatch__investigate_issue,mcp__railwatch__get_issue,mcp__railwatch__get_execution,mcp__railwatch__last_execution,mcp__railwatch__search_logs,mcp__railwatch__recent_deploys,mcp__railwatch__add_comment,Read,Edit,Write,Grep,Glob,Bash(git checkout -b:*),Bash(git add:*),Bash(git commit:*),Bash(git push origin $branch),Bash(git diff:*),Bash(git status),Bash(git log:*),Bash(gh pr create:*),Bash(bin/rails test:*),Bash(bundle exec rails test:*),Bash(bundle exec rspec:*)" \
             --permission-mode acceptEdits \
             --max-budget-usd 5 \
             --output-format text
