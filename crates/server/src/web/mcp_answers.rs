@@ -189,11 +189,16 @@ impl Mcp<'_> {
             let ids: Vec<String> = sample.iter().filter_map(|r| r.s("execution_id").map(str::to_string)).collect();
             // get_route's N+1s, with how often each shape actually ran per
             // request (the gem records an N+1 at its threshold count).
-            let mut n_plus_ones = super::n_plus_ones_for(conn, &ids)?;
-            for p in n_plus_ones.as_array_mut().into_iter().flatten() {
-                let runs = p["group_hash"].as_str().and_then(|g| explained.runs.get(g)).copied().or_else(|| p["source"].as_str().and_then(|s| explained.runs_by_source.get(s)).map(|r| rb::round(*r, 1)));
-                db::merge_into(p, "runs_per_request", runs.map_or(Value::Null, jf));
+            // Ranked by those runs: the line that repeats most costs most.
+            let mut n_plus_ones: Vec<Value> = super::n_plus_ones_for(conn, &ids)?.as_array().cloned().unwrap_or_default();
+            for p in &mut n_plus_ones {
+                let runs = p["group_hash"].as_str().and_then(|g| explained.runs.get(g)).or_else(|| p["source"].as_str().and_then(|s| explained.runs_by_source.get(s))).copied();
+                db::merge_into(p, "runs_per_request", runs.map_or(Value::Null, |r| jf(rb::round(r.0, 1))));
+                db::merge_into(p, "max_per_request", runs.map_or(Value::Null, |r| Value::from(r.1)));
             }
+            let key = |p: &Value| (p["max_per_request"].as_u64().unwrap_or(0), p["runs_per_request"].as_f64().unwrap_or(0.0));
+            n_plus_ones.sort_by(|a, b| key(b).0.cmp(&key(a).0).then(key(b).1.total_cmp(&key(a).1)));
+            let n_plus_ones = Value::Array(n_plus_ones);
             let profiles = route_profiles(conn, &group_hash, &ids, from, to)?;
             let sampled = sample.len();
             let per = explained.split.to_json(sampled as f64);
@@ -614,11 +619,11 @@ struct Explained {
     split: TimeSplit,
     queries: usize,
     top_queries: Vec<Value>,
-    /// Every shape's runs per sampled request, by group_hash, and by source
-    /// line (summed over its shapes) for an N+1 whose group the queries
-    /// do not share.
-    runs: std::collections::HashMap<String, f64>,
-    runs_by_source: std::collections::HashMap<String, f64>,
+    /// Every shape's (runs per sampled request, most runs in one request)
+    /// by group_hash, and by source line (over its shapes) for an N+1 whose
+    /// group the queries do not share.
+    runs: std::collections::HashMap<String, (f64, usize)>,
+    runs_by_source: std::collections::HashMap<String, (f64, usize)>,
     dropped: Option<usize>,
 }
 
@@ -632,6 +637,9 @@ fn explain_sample(conn: &Connection, sample: &[&Rec]) -> rusqlite::Result<Explai
         max: f64,
         requests: usize,
         last_request: usize,
+        /// Runs in the current request, and the most in any one.
+        in_current: usize,
+        max_in_one: usize,
     }
     let mut split = TimeSplit::default();
     let mut queries = 0;
@@ -659,6 +667,8 @@ fn explain_sample(conn: &Connection, sample: &[&Rec]) -> rusqlite::Result<Explai
                         max: 0.0,
                         requests: 0,
                         last_request: usize::MAX,
+                        in_current: 0,
+                        max_in_one: 0,
                     });
                     shapes.len() - 1
                 }
@@ -674,16 +684,21 @@ fn explain_sample(conn: &Connection, sample: &[&Rec]) -> rusqlite::Result<Explai
             if s.last_request != n {
                 s.last_request = n;
                 s.requests += 1;
+                s.in_current = 0;
             }
+            s.in_current += 1;
+            s.max_in_one = s.max_in_one.max(s.in_current);
         }
     }
     shapes.sort_by(|a, b| b.total.total_cmp(&a.total));
     let n = sample.len().max(1) as f64;
-    let runs = shapes.iter().filter_map(|s| s.group_hash.clone().map(|g| (g, rb::round(s.count as f64 / n, 1)))).collect();
-    let mut runs_by_source: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let runs = shapes.iter().filter_map(|s| s.group_hash.clone().map(|g| (g, (rb::round(s.count as f64 / n, 1), s.max_in_one)))).collect();
+    let mut runs_by_source: std::collections::HashMap<String, (f64, usize)> = std::collections::HashMap::new();
     for s in &shapes {
         if let Some(src) = &s.source {
-            *runs_by_source.entry(src.clone()).or_default() += s.count as f64 / n;
+            let e = runs_by_source.entry(src.clone()).or_default();
+            e.0 += s.count as f64 / n;
+            e.1 = e.1.max(s.max_in_one);
         }
     }
     let mut top_queries = vec![];
@@ -701,7 +716,7 @@ fn explain_sample(conn: &Connection, sample: &[&Rec]) -> rusqlite::Result<Explai
         top_queries.push(crate::obj! {
             "group_hash" => s.group_hash.clone(), "sql" => rb::first_chars(&s.sql, 300), "source" => s.source.clone(),
             "total_ms" => jf(rb::round(s.total, 1)), "runs_per_request" => jf(rb::round(s.count as f64 / n, 1)),
-            "max_ms" => jf(rb::round(s.max, 2)), "in_requests" => s.requests,
+            "max_ms" => jf(rb::round(s.max, 2)), "in_requests" => s.requests, "max_per_request" => s.max_in_one,
             "explain" => explain.map_or(Value::Null, Value::from),
         });
     }
@@ -775,9 +790,9 @@ fn route_answer(sum: &TimeSplit, n: usize, n_plus_ones: &Value, top: &[Value], p
     let avg = avg_split(sum, n);
     let mut parts: Vec<String> = vec![];
     for p in n_plus_ones.as_array().into_iter().flatten().take(2) {
-        let runs = p["runs_per_request"].as_f64().map_or_else(|| str_of(&p["max_repeats"]), |r| (r.round() as i64).to_string());
+        let runs = p["max_per_request"].as_u64().map_or_else(|| str_of(&p["max_repeats"]), |r| r.to_string());
         parts.push(format!(
-            "N+1 at {} ({runs}x per request){}",
+            "N+1 at {} (up to {runs}x per request){}",
             p["source"].as_str().unwrap_or("an unknown line"),
             p["suggestion"]["code"].as_str().map_or(String::new(), |c| format!(", fix: {c}"))
         ));

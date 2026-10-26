@@ -3449,7 +3449,7 @@ mod tests {
         let n = &v["n_plus_ones"][0];
         assert_eq!((n["source"].as_str(), n["occurrences"].as_i64()), (Some("app/services/billing/customer_documents.rb:511"), Some(3)));
         assert_eq!(n["suggestion"]["code"], "Customer.includes(:car_invoices)");
-        assert_eq!(n["runs_per_request"].as_f64(), Some(45.0));
+        assert_eq!((n["runs_per_request"].as_f64(), n["max_per_request"].as_u64()), (Some(45.0), Some(60)));
         // An N+1 whose group no query shares is matched by its line.
         conn.execute("UPDATE n_plus_ones SET group_hash = 'g_other'", []).unwrap();
         let by_line = f.tool("explain_route", json!({"group_hash": "route_invoicing"}));
@@ -3462,7 +3462,7 @@ mod tests {
         // No profile: the note says how to get one.
         assert!(v["profile"].is_null());
         let answer = v["answer"].as_str().unwrap();
-        assert!(answer.starts_with("Over 4 sampled requests (avg 2.8 s): N+1 at app/services/billing/customer_documents.rb:511 (45x per request), fix: Customer.includes(:car_invoices)"), "{answer}");
+        assert!(answer.starts_with("Over 4 sampled requests (avg 2.8 s): N+1 at app/services/billing/customer_documents.rb:511 (up to 60x per request), fix: Customer.includes(:car_invoices)"), "{answer}");
         assert!(answer.contains("2.1 s per request inside transactions but only 56 ms of SQL in them") && answer.contains("Enable the profiler"), "{answer}");
         assert!(v["notes"].to_string().contains("RAILWATCH_PROFILE_SLOW_MS"));
         assert_eq!(v["slowest_requests"][0]["queries"], Value::Null);
