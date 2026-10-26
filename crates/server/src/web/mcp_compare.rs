@@ -158,7 +158,18 @@ impl Mcp<'_> {
             "queries_per_request_pct" => opt(pct(b.queries, f.queries)), "db_ms_per_request_pct" => opt(pct(b.db_ms, f.db_ms)),
             "error_rate_pts" => match (b.error_rate(), f.error_rate()) { (Some(x), Some(y)) => jf(rb::round((y - x) * 100.0, 2)), _ => Value::Null },
         };
-        let worse: Vec<f64> = ["p95_pct", "avg_pct", "queries_per_request_pct", "db_ms_per_request_pct"].iter().filter_map(|k| deltas[*k].as_f64()).collect();
+        let mut worse: Vec<f64> =
+            ["p95_pct", "avg_pct", "queries_per_request_pct", "db_ms_per_request_pct"].iter().filter_map(|k| deltas[*k].as_f64()).collect();
+        // From none to some has no percent: count it as doubling, so a CI
+        // gate on worst_regression_pct still trips (0 -> 500 queries).
+        for (x, y) in [(b.queries, f.queries), (b.db_ms, f.db_ms)] {
+            if let (Some(x), Some(y)) = (x, y)
+                && x <= 0.0
+                && y >= 1.0
+            {
+                worse.push(100.0);
+            }
+        }
         let worst = worse.iter().copied().fold(0.0f64, f64::max);
         let low = b.count < MIN_SAMPLES || f.count < MIN_SAMPLES;
         let shapes = shape_diff(&b.shapes, &f.shapes, b.sampled, f.sampled);
@@ -214,63 +225,100 @@ impl Mcp<'_> {
     }
 }
 
+/// The deploys a side can be: the recorded ones, newest first, and (read
+/// only when those cannot answer: a 30-day GROUP BY) the deploy values the
+/// executions carry, oldest first.
+struct Deploys<'a> {
+    conn: &'a Connection,
+    kind: &'a str,
+    group: Option<&'a str>,
+    now: i64,
+    recorded: Vec<Deploy>,
+    seen: Option<Vec<(String, i64, i64)>>,
+}
+
+impl Deploys<'_> {
+    fn seen(&mut self) -> rusqlite::Result<&[(String, i64, i64)]> {
+        if self.seen.is_none() {
+            self.seen = Some(seen_deploys(self.conn, self.kind, self.group, self.now)?);
+        }
+        Ok(self.seen.as_deref().unwrap_or_default())
+    }
+
+    /// The side `v` names: an exact deploy value or name first, else the one
+    /// deploy it is a prefix (7+ characters) of; recorded deploys before
+    /// the seen values. An ambiguous prefix names none.
+    fn find(&mut self, v: &str) -> rusqlite::Result<Option<Side>> {
+        let loose = |d: &Deploy, v: &str| v.len() >= 7 && (d.deploy.starts_with(v) || d.ref_.as_deref().is_some_and(|r| r.starts_with(v)));
+        if let Some(d) = super::answers::find_deploy(&self.recorded, v, loose) {
+            return Ok(Some(recorded_side(d, &self.recorded, self.now)));
+        }
+        let seen = self.seen()?;
+        if let Some(s) = seen.iter().find(|(d, ..)| d == v) {
+            return Ok(Some(seen_side(s)));
+        }
+        let mut prefixed = seen.iter().filter(|(d, ..)| v.len() >= 7 && d.starts_with(v));
+        Ok(match (prefixed.next(), prefixed.next()) {
+            (Some(s), None) => Some(seen_side(s)),
+            _ => None,
+        })
+    }
+
+    fn no_deploy(&mut self, v: &str) -> rusqlite::Result<Value> {
+        let seen = self.seen()?.to_vec();
+        Ok(no_deploy(v, &self.recorded, &seen))
+    }
+
+    /// Newest first: the recorded deploys, or with fewer than two of them
+    /// the seen values.
+    fn order(&mut self) -> rusqlite::Result<Vec<Side>> {
+        if self.recorded.len() >= 2 {
+            return Ok(self.recorded.iter().map(|d| recorded_side(d, &self.recorded, self.now)).collect());
+        }
+        Ok(self.seen()?.iter().rev().map(seen_side).collect())
+    }
+}
+
 /// The two deploys' sides: `before`/`after` when given, else the latest
 /// deploy and the one before it. Deploys come from the control rows, or,
 /// when fewer than two are recorded, from the deploy values the executions
 /// carry (development, an app without a deploy hook).
 fn deploy_sides(conn: &Connection, a: &Args, deploys: &[Deploy], kind: &str, group: Option<&str>, now: i64) -> rusqlite::Result<Result<(Side, Side), Value>> {
-    let recorded = recent_deploys(deploys.to_vec());
-    let seen = seen_deploys(conn, kind, group, now)?;
-    let find = |v: &str| -> Option<Side> {
-        if let Some(d) = recorded.iter().find(|d| {
-            d.deploy == v || d.name.as_deref() == Some(v) || (v.len() >= 7 && (d.deploy.starts_with(v) || d.ref_.as_deref().is_some_and(|r| r.starts_with(v))))
-        }) {
-            return Some(recorded_side(d, &recorded, now));
-        }
-        seen.iter().find(|(d, ..)| d == v || (v.len() >= 7 && d.starts_with(v))).map(seen_side)
+    let mut d = Deploys { conn, kind, group, now, recorded: recent_deploys(deploys.to_vec()), seen: None };
+    let (b, f) = (a.presence("before"), a.presence("after"));
+    let b_side = match &b {
+        Some(v) => match d.find(v)? {
+            Some(s) => Some(s),
+            None => return Ok(Err(d.no_deploy(v)?)),
+        },
+        None => None,
     };
-    let given = |k: &str| a.presence(k);
-    match (given("before"), given("after")) {
-        (Some(b), Some(f)) => Ok(match (find(&b), find(&f)) {
-            (Some(b), Some(f)) => Ok((b, f)),
-            (None, _) => Err(no_deploy(&b, &recorded, &seen)),
-            (_, None) => Err(no_deploy(&f, &recorded, &seen)),
-        }),
-        (b, f) => {
-            // Defaults: the latest and the one before it, or the one before
-            // `after`, or the one after `before`.
-            let order: Vec<Side> = if recorded.len() >= 2 {
-                recorded.iter().map(|d| recorded_side(d, &recorded, now)).collect()
-            } else {
-                // seen is oldest first; make it newest first like recorded.
-                seen.iter().rev().map(seen_side).collect()
-            };
-            if order.len() < 2 && b.is_none() && f.is_none() {
-                return Ok(Err(json!({"error": "fewer than two deploys to compare",
-                    "hint": "Each record carries the deploy (release) the app reports; there is only one in the last 30 days. To compare before and after a change without a deploy (development: Rails reloads code without changing it), pass since: the execution_id of the last request before the change, or the time you made it."})));
-            }
-            let pick = |want: &Option<String>| want.as_ref().map(|v| find(v));
-            Ok(match (pick(&b), pick(&f)) {
-                (Some(None), _) => Err(no_deploy(b.as_deref().unwrap_or(""), &recorded, &seen)),
-                (_, Some(None)) => Err(no_deploy(f.as_deref().unwrap_or(""), &recorded, &seen)),
-                (Some(Some(bs)), None) => {
-                    let i = order.iter().position(|s| s.label == bs.label);
-                    match i.and_then(|i| i.checked_sub(1)).and_then(|j| order.get(j)) {
-                        Some(n) => Ok((bs, clone_side(n))),
-                        None => Err(json!({"error": format!("no deploy after {}", bs.label)})),
-                    }
-                }
-                (None, Some(Some(fs))) => {
-                    let i = order.iter().position(|s| s.label == fs.label);
-                    match i.and_then(|i| order.get(i + 1)) {
-                        Some(p) => Ok((clone_side(p), fs)),
-                        None => Err(json!({"error": format!("no deploy before {}", fs.label)})),
-                    }
-                }
-                _ => Ok((clone_side(&order[1]), clone_side(&order[0]))),
-            })
-        }
+    let f_side = match &f {
+        Some(v) => match d.find(v)? {
+            Some(s) => Some(s),
+            None => return Ok(Err(d.no_deploy(v)?)),
+        },
+        None => None,
+    };
+    if let (Some(b), Some(f)) = (&b_side, &f_side) {
+        return Ok(Ok((clone_side(b), clone_side(f))));
     }
+    // Defaults: the latest and the one before it, or the one before
+    // `after`, or the one after `before`.
+    let order = d.order()?;
+    Ok(match (b_side, f_side) {
+        (Some(bs), None) => match order.iter().position(|s| s.label == bs.label).and_then(|i| i.checked_sub(1)).and_then(|j| order.get(j)) {
+            Some(n) => Ok((bs, clone_side(n))),
+            None => Err(json!({"error": format!("no deploy after {}", bs.label)})),
+        },
+        (None, Some(fs)) => match order.iter().position(|s| s.label == fs.label).and_then(|i| order.get(i + 1)) {
+            Some(p) => Ok((clone_side(p), fs)),
+            None => Err(json!({"error": format!("no deploy before {}", fs.label)})),
+        },
+        _ if order.len() < 2 => Err(json!({"error": "fewer than two deploys to compare",
+            "hint": "Each record carries the deploy (release) the app reports; there is only one in the last 30 days. To compare before and after a change without a deploy (development: Rails reloads code without changing it), pass since: the execution_id of the last request before the change, or the time you made it."})),
+        _ => Ok((clone_side(&order[1]), clone_side(&order[0]))),
+    })
 }
 
 fn clone_side(s: &Side) -> Side {
@@ -586,7 +634,8 @@ fn verdict(b: &Measured, f: &Measured, d: &Value, worst: f64, n1: &Value, low: b
         parts.push(format!("new N+1 at {}", src(r)));
     }
     let improved = ["p95_pct", "queries_per_request_pct", "avg_pct"].iter().any(|k| d[*k].as_f64().is_some_and(|p| p <= -NOISE_PCT))
-        || n1["lost"].as_array().is_some_and(|l| !l.is_empty());
+        || n1["lost"].as_array().is_some_and(|l| !l.is_empty())
+        || d["error_rate_pts"].as_f64().is_some_and(|e| e <= -1.0);
     let regressed = worst >= NOISE_PCT || n1["gained"].as_array().is_some_and(|g| !g.is_empty()) || d["error_rate_pts"].as_f64().is_some_and(|e| e >= 1.0);
     let head = match (improved, regressed) {
         (true, false) => "Better",
@@ -597,6 +646,12 @@ fn verdict(b: &Measured, f: &Measured, d: &Value, worst: f64, n1: &Value, low: b
     let mut s = format!("{head}: {}.", if parts.is_empty() { "the numbers moved less than 10%".to_string() } else { parts.join(", ") });
     if low {
         s.push_str(&format!(" Few samples (before {}, after {}): treat the percentiles as rough.", b.count, f.count));
+    }
+    if b.truncated || f.truncated {
+        s.push_str(&format!(" A side had more than {SIDE_ROWS} executions: its numbers are of its newest {SIDE_ROWS}, and count is a floor."));
+    }
+    if n1["lost"].as_array().is_some_and(|l| !l.is_empty()) && f.sampled < f.count {
+        s.push_str(&format!(" N+1s are compared over {} executions a side; one that fires only sometimes can be missed.", SHAPE_SAMPLE));
     }
     s
 }

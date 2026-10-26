@@ -3605,13 +3605,23 @@ mod tests {
         // the worst one, and the N+1 is new.
         let w = f.tool("compare", json!({"route": "GET /:org_slug/invoicing(.:format)", "before": "bbbbbbb", "after": "shop@1"}));
         assert_eq!(w["worst_regression_pct"].as_f64(), Some(932.5));
-        assert!(w["verdict"].as_str().unwrap().starts_with("Worse: p95 +635.4% (446 -> 3280 ms), queries per request 80 -> 826"), "{}", w["verdict"]);
+        assert!(w["verdict"].as_str().unwrap().starts_with("Mixed: p95 +635.4% (446 -> 3280 ms), queries per request 80 -> 826"), "{}", w["verdict"]);
         assert_eq!(w["n_plus_ones"]["gained"][0]["source"], "app/services/billing/customer_documents.rb:511");
         // Unknown deploy, unknown route.
         let e = f.tool("compare", json!({"before": "zzz", "after": "shop@1"}));
         assert_eq!(e["error"], "no deploy \"zzz\"");
         assert_eq!(e["known"][0], "bbbbbbbbbbbb2222222222222222222222222222");
         assert_eq!(f.tool("compare", json!({"route": "GET /nope"}))["error"], "route not found");
+        // A deploy name that is a prefix of a newer one picks itself.
+        f.c.with(|x| {
+            x.execute(
+                "INSERT INTO deploys (environment_id, deploy, ref, name, deployed_at, created_at, updated_at) VALUES (?1, 'shop@10', NULL, 'shop@10', ?2, ?2, ?2)",
+                params![f.env, qt(NOW - 60_000_000)],
+            )
+        })
+        .unwrap();
+        let p = f.tool("compare", json!({"before": "shop@1", "after": "shop@2"}));
+        assert_eq!(p["before"]["deploy"], "aaaaaaaaaaaa1111111111111111111111111111", "{p}");
     }
 
     #[test]
@@ -3641,6 +3651,10 @@ mod tests {
         let t = f.tool("compare", json!({"since": "2026-10-14T17:46:10Z"}));
         assert_eq!(t["after"]["side"], "since 2026-10-14 17:46:10 UTC");
         assert!(t["verdict"].as_str().unwrap().starts_with("Nothing to compare: the after side has no executions yet"), "{}", t["verdict"]);
+        // From no queries to some: no percent, but the gate still trips.
+        conn.execute("UPDATE executions SET counters = '{}' WHERE execution_id LIKE 'devsha-%'", []).unwrap();
+        let z = f.tool("compare", json!({"route": "GET /:org_slug/invoicing(.:format)", "since": "devsha-0"}));
+        assert!(z["deltas"]["queries_per_request_pct"].is_null() && z["worst_regression_pct"].as_f64() == Some(100.0), "{}", z["deltas"]);
         let bad = f.tool("compare", json!({"since": "not-an-id"}));
         assert_eq!(bad["error"], "since is neither a time nor a stored execution_id");
     }
