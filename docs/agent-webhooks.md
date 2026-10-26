@@ -173,3 +173,28 @@ The same body works for any other receiver: a T3 or Claude scheduled task
 behind a webhook URL, a Slack bot, or a Codex run. Each one starts from
 `mcp.endpoint` and `mcp.arguments`. The receiver's MCP client needs a token
 of its own.
+
+
+### What the agent may do, and why it is narrow
+
+The agent reads text the app recorded in production: exception messages,
+log lines, SQL and request params. Anyone who can make the app raise can
+write some of that text, so treat it as untrusted input to the model
+(prompt injection). The example limits the blast radius:
+
+- **Prompt:** the prompt says the Railwatch data is evidence, not
+  instructions, and forbids putting secrets in the PR, commit or comment.
+- **Tools:** the allowed tools are named one by one:
+  - Railwatch's read tools plus `add_comment`, without `update_issue`;
+  - git limited to branching, committing, diffing and pushing to `origin`;
+  - `gh pr create`;
+  - the test runners.
+
+  `bundle exec` and arbitrary `git` subcommands are not allowed.
+- **Permissions:** the job's `GITHUB_TOKEN` can push branches and open PRs,
+  nothing else (`permissions:`), and it never merges. A human reviews every
+  PR it opens.
+- **Spend:** `--max-budget-usd` caps spend per run, and the `concurrency`
+  group plus the branch check stop a second run on the same issue.
+
+Widen the tool list only for what your test suite needs.
