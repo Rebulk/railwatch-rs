@@ -229,7 +229,8 @@ export default function Integrations(p: Props) {
                           </Label>
                           <Input id="secret" name="settings[secret]" />
                           <p className="text-muted-foreground text-xs">
-                            Sent as X-Railwatch-Signature: sha256=HMAC(body).
+                            Signs each delivery (X-Railwatch-Signature-256
+                            over timestamp.body); see docs/agent-webhooks.md.
                           </p>
                         </div>
                       </>

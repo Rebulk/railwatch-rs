@@ -342,7 +342,7 @@ pub async fn scheduler(control: Arc<Control>, bg: Background, tenants_dir: PathB
         ));
     }
     // weekly_digest: every monday at 8am (UTC).
-    handles.push(tokio::spawn(weekly_digest::run_forever(control.clone(), tenants_dir, shutdown.clone())));
+    handles.push(tokio::spawn(weekly_digest::run_forever(control.clone(), tenants_dir.clone(), shutdown.clone())));
     // Daily: prune at 03:00 UTC, auto-resolve at 04:00 UTC. Prune also runs
     // once at start: a server that was not up at 03:00 (an app's dev box,
     // a deploy at the wrong minute) would otherwise never prune. It is
@@ -383,7 +383,7 @@ pub async fn scheduler(control: Arc<Control>, bg: Background, tenants_dir: PathB
     // Alert delivery loop (reconcile + deliver), every 5 s.
     let outbox = Arc::new(crate::alerts::OutboxHealth::default());
     {
-        let (c, o) = (control.clone(), outbox.clone());
+        let (c, o, dir) = (control.clone(), outbox.clone(), tenants_dir.clone());
         let mut sd = shutdown.clone();
         handles.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -391,7 +391,7 @@ pub async fn scheduler(control: Arc<Control>, bg: Background, tenants_dir: PathB
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
-                        match crate::alerts::deliver_pass(&c).await {
+                        match crate::alerts::deliver_pass(&c, &dir).await {
                             Ok(n) => {
                                 o.last_pass.store(time::now_micros() / 1_000_000, Ordering::Relaxed);
                                 if n > 0 { tracing::info!(alerts = n, "alerts delivered or retried"); }

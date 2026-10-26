@@ -4,9 +4,10 @@
 //! for a linear integration fails with a message saying so).
 
 use hmac::{Hmac, Mac};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::Sha256;
 
+use super::as_hash;
 use super::outbound_http::{self, Kind};
 use super::outbox::Claimed;
 use crate::grouping::issue::{self, Issue};
@@ -63,6 +64,25 @@ pub struct Context {
     pub settings: Value,
     pub settings_error: Option<String>,
     pub base_url: String,
+    /// What the webhook adds for an agent (agent_context), read from the
+    /// environment's telemetry by `enrich` once the control lock is free.
+    pub agent: Option<AgentContext>,
+}
+
+/// The issue's application and environment, and what its telemetry says:
+/// enough for an agent to start on the issue without another call.
+#[derive(Default)]
+pub struct AgentContext {
+    pub account_slug: String,
+    pub application_slug: String,
+    pub application_id: i64,
+    pub environment: String,
+    environment_slug: String,
+    /// The occurrence the webhook describes: frames collapsed as get_issue
+    /// shows them, plus where it happened.
+    pub occurrence: Option<serde_json::Value>,
+    /// get_execution's summary of the execution it happened in.
+    pub execution_summary: Option<serde_json::Value>,
 }
 
 fn pstr(p: &Value, k: &str) -> Option<String> {
@@ -86,6 +106,10 @@ impl Context {
         let environment_display = issue.as_ref().map(|i| issue::environment_name(c, i.environment_id));
         let integration = super::integration::find(c, cipher, alert.integration_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         let settings = rjson::parse(serde_json::Value::Object(integration.settings).to_string().as_bytes()).unwrap_or(Value::Hash(rjson::Hash::new()));
+        let agent = match (&issue, integration.kind.as_str()) {
+            (Some(i), "webhook") => agent_names(c, i)?,
+            _ => None,
+        };
         Ok(Context {
             alert,
             issue,
@@ -96,7 +120,49 @@ impl Context {
             settings,
             settings_error: integration.settings_error,
             base_url: alerting.map_or_else(host_url, |a| a.url.trim_end_matches('/').to_string()),
+            agent,
         })
+    }
+
+    /// Reads the occurrence and its execution summary from the issue's
+    /// telemetry into `agent`, for webhooks. Best effort: a webhook still
+    /// goes out without them (an environment with no telemetry yet, or
+    /// occurrences past retention), and a read error is logged, not fatal.
+    pub fn enrich(&mut self, tenants_dir: &std::path::Path) {
+        let (Some(issue), Some(agent)) = (&self.issue, self.agent.as_mut()) else { return };
+        if crate::storage::Layout::detect(tenants_dir, &agent.environment_slug).is_none() {
+            return;
+        }
+        let read = || -> rusqlite::Result<(Option<serde_json::Value>, Option<serde_json::Value>)> {
+            let t = crate::dashboard::pool::open_tenant_reader(tenants_dir, &agent.environment_slug)?;
+            let sample: serde_json::Value = serde_json::from_str(&rjson::generate(&issue.sample).unwrap_or_default()).unwrap_or_default();
+            let occurrence = if issue.kind == "exception" {
+                let (first, last) = crate::web::mcp::issue_exception_occurrences(&t, &issue.group_hash, &sample)?;
+                // The newest occurrence: the one that fired the alert.
+                last.or(first).map(|e| occurrence_for_agent(&crate::web::mcp::exception_occurrence(&e)))
+            } else {
+                None
+            };
+            let execution_id = occurrence
+                .as_ref()
+                .and_then(|o| o.get("execution_id"))
+                .or_else(|| sample.get("execution_id"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|e| !e.is_empty())
+                .map(str::to_string);
+            let summary = match execution_id {
+                Some(eid) => execution_summary(&t, &eid)?,
+                None => None,
+            };
+            Ok((occurrence, summary))
+        };
+        match read() {
+            Ok((occurrence, summary)) => {
+                agent.occurrence = occurrence;
+                agent.execution_summary = summary;
+            }
+            Err(e) => tracing::warn!(alert = self.alert.id, issue = issue.id, error = %e, "webhook: issue telemetry unreadable; sending without it"),
+        }
     }
 
     fn payload(&self) -> &Value {
@@ -149,14 +215,29 @@ impl Context {
         self.url().unwrap_or_else(|| format!("{}/alerts", self.base_url))
     }
 
+    /// The webhook's JSON (docs/agent-webhooks.md). `alert_id` is the
+    /// alert's delivery key: the same on every retry of one alert, so a
+    /// receiver dedupes on it (also sent as X-Railwatch-Event-Id).
     pub fn webhook_body(&self) -> Value {
+        let deploy = self.issue.as_ref().and_then(|i| pstr(&i.sample, "deploy")).or_else(|| pstr(self.payload(), "deploy"));
         let issue = self.issue.as_ref().map(|i| {
-            crate::rhash! {
+            let mut h = as_hash(crate::rhash! {
                 "id" => i.id, "number" => i.number, "title" => i.title.clone(), "status" => i.status.clone(),
                 "kind" => i.kind.clone(), "culprit" => i.culprit.clone(), "occurrences" => i.occurrences,
+                "key" => self.issue_key.clone(), "priority" => i.priority.clone(), "affected_users" => i.affected_users,
+                "first_seen_at" => crate::time::iso8601(i.first_seen_at.div_euclid(1_000_000)),
+                "last_seen_at" => crate::time::iso8601(i.last_seen_at.div_euclid(1_000_000)),
+                "deploy" => deploy.clone(),
+            });
+            if let Some(a) = &self.agent {
+                h.insert("canonical_key".into(), format!("{}/{}/{}", a.account_slug, a.application_id, self.issue_key.clone().unwrap_or_default()).into());
+                h.insert("application".into(), a.application_slug.clone().into());
+                h.insert("application_id".into(), a.application_id.into());
+                h.insert("environment".into(), a.environment.clone().into());
             }
+            Value::Hash(h)
         });
-        crate::rhash! {
+        let mut body = as_hash(crate::rhash! {
             "alert_id" => self.alert.delivery_key.clone(),
             "event" => self.alert.event.clone(),
             "issue" => issue,
@@ -164,7 +245,45 @@ impl Context {
             "url" => self.url(),
             "payload" => self.payload().clone(),
             "sent_at" => crate::time::iso8601(crate::time::now_micros() / 1_000_000),
+        });
+        if let (Some(_), Some(key)) = (&self.issue, &self.issue_key) {
+            body.insert("mcp".into(), self.mcp_hint(key));
+            if let Some(summary) = self.agent_summary() {
+                body.insert("summary".into(), summary);
+            }
         }
+        Value::Hash(body)
+    }
+
+    /// Where an agent continues: the server's MCP endpoint and the call
+    /// that investigates this issue.
+    fn mcp_hint(&self, key: &str) -> Value {
+        let canonical = self.agent.as_ref().map(|a| format!("{}/{}/{key}", a.account_slug, a.application_id));
+        crate::rhash! {
+            "endpoint" => format!("{}/mcp", self.base_url),
+            "tool" => "investigate_issue",
+            "arguments" => crate::rhash! { "key" => canonical.unwrap_or_else(|| key.to_string()) },
+            "fallback_tool" => "get_issue",
+        }
+    }
+
+    /// The occurrence (collapsed frames) and the execution summary, as the
+    /// MCP tools shape them, cut to SUMMARY_MAX_BYTES of JSON.
+    fn agent_summary(&self) -> Option<Value> {
+        let a = self.agent.as_ref()?;
+        if a.occurrence.is_none() && a.execution_summary.is_none() {
+            return None;
+        }
+        let mut v = serde_json::Map::new();
+        if let Some(o) = &a.occurrence {
+            v.insert("occurrence".into(), o.clone());
+        }
+        if let Some(e) = &a.execution_summary {
+            v.insert("execution".into(), e.clone());
+        }
+        let v = serde_json::Value::Object(v);
+        let text = crate::web::mcp_summary::cap(v.to_string(), SUMMARY_MAX_BYTES, SUMMARY_HINT);
+        rjson::parse(text.as_bytes()).ok()
     }
 
     pub fn slack_body(&self) -> Value {
@@ -238,6 +357,55 @@ impl Context {
     }
 }
 
+/// The most JSON the webhook's `summary` may have: a webhook is not a tool
+/// result, and the receivers (a GitHub dispatch's client_payload is 64 KB at
+/// most) are smaller. The rest is one MCP call away.
+pub const SUMMARY_MAX_BYTES: usize = 16_000;
+
+const SUMMARY_HINT: &str = "Call the tool in `mcp` (investigate_issue, or get_issue then get_execution) for everything.";
+
+/// The issue's account, application and environment, for webhooks.
+fn agent_names(c: &Connection, i: &Issue) -> rusqlite::Result<Option<AgentContext>> {
+    c.query_row(
+        "SELECT ac.slug, ap.slug, ap.id, e.name, e.slug FROM environments e JOIN applications ap ON ap.id = e.application_id
+         JOIN accounts ac ON ac.id = ap.account_id WHERE e.id = ?",
+        [i.environment_id],
+        |r| {
+            Ok(AgentContext {
+                account_slug: r.get(0)?,
+                application_slug: r.get(1)?,
+                application_id: r.get(2)?,
+                environment: r.get(3)?,
+                environment_slug: r.get(4)?,
+                ..Default::default()
+            })
+        },
+    )
+    .optional()
+}
+
+/// get_execution's `summary` of the execution. Pending
+/// `web::mcp::execution_summary_of` (rs PR: MCP answer tools), which this
+/// becomes; until then the webhook carries the occurrence alone.
+fn execution_summary(_t: &Connection, _execution_id: &str) -> rusqlite::Result<Option<serde_json::Value>> {
+    Ok(None)
+}
+
+/// An exception occurrence for an agent: what get_issue shows, frames
+/// collapsed, without the browser trail and locals (in the MCP result).
+fn occurrence_for_agent(o: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for k in ["class_name", "message", "file", "line", "handled", "occurred_at", "deploy", "execution_id", "execution_source", "execution_preview", "cause"] {
+        if let Some(v) = o.get(k).filter(|v| !v.is_null()) {
+            out.insert(k.into(), v.clone());
+        }
+    }
+    if let Some(f) = o.get("frames") {
+        out.insert("frames".into(), crate::web::mcp_summary::collapse_frames(f));
+    }
+    serde_json::Value::Object(out)
+}
+
 fn first(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
@@ -266,12 +434,25 @@ pub fn sign(secret: &str, body: &str) -> String {
     format!("sha256={hex}")
 }
 
-async fn post(url: &str, body: &Value, secret: Option<&str>, kind: Kind) -> Result<(), String> {
-    let json = rjson::generate(body).map_err(|e| e.0)?;
+/// The headers a delivery carries: the event id (the alert's delivery
+/// key, stable across retries), the time it was signed, and with a secret
+/// the two signatures (module docs; docs/agent-webhooks.md).
+pub fn webhook_headers(json: &str, secret: Option<&str>, event_id: &str, now_secs: i64) -> Vec<(&'static str, String)> {
     let mut headers = vec![("User-Agent", "Railwatch-Alerts/1.0".to_string())];
-    if let Some(s) = secret.filter(|s| !s.is_empty()) {
-        headers.push(("X-Railwatch-Signature", sign(s, &json)));
+    if !event_id.is_empty() {
+        headers.push(("X-Railwatch-Event-Id", event_id.to_string()));
     }
+    headers.push(("X-Railwatch-Timestamp", now_secs.to_string()));
+    if let Some(s) = secret.filter(|s| !s.is_empty()) {
+        headers.push(("X-Railwatch-Signature", sign(s, json)));
+        headers.push(("X-Railwatch-Signature-256", sign(s, &format!("{now_secs}.{json}"))));
+    }
+    headers
+}
+
+async fn post(url: &str, body: &Value, secret: Option<&str>, event_id: &str, kind: Kind) -> Result<(), String> {
+    let json = rjson::generate(body).map_err(|e| e.0)?;
+    let headers = webhook_headers(&json, secret, event_id, crate::time::now_micros() / 1_000_000);
     let res = outbound_http::post_json(url, json, &headers, kind).await?;
     if (200..300).contains(&res.status) {
         Ok(())
@@ -311,8 +492,8 @@ pub async fn deliver(ctx: &Context, smtp: Option<&crate::config::Smtp>) -> Resul
     }
     let s = |k: &str| pstr(&ctx.settings, k);
     match ctx.integration_kind.as_str() {
-        "webhook" => post(&s("url").ok_or("webhook has no url")?, &ctx.webhook_body(), s("secret").as_deref(), Kind::Webhook).await,
-        "slack" => post(&s("webhook_url").ok_or("slack has no webhook_url")?, &ctx.slack_body(), None, Kind::Slack).await,
+        "webhook" => post(&s("url").ok_or("webhook has no url")?, &ctx.webhook_body(), s("secret").as_deref(), &ctx.alert.delivery_key, Kind::Webhook).await,
+        "slack" => post(&s("webhook_url").ok_or("slack has no webhook_url")?, &ctx.slack_body(), None, "", Kind::Slack).await,
         "email" => send_email(&s("to").ok_or("email has no recipient")?, ctx, smtp).await,
         "linear" => Err("Linear delivery is not supported by railwatch-rs".into()),
         other => Err(format!("unknown integration kind {other}")),
@@ -336,6 +517,157 @@ mod tests {
     fn signature_is_hex_hmac_sha256_like_openssl() {
         // OpenSSL::HMAC.hexdigest("SHA256", "key", "The quick brown fox jumps over the lazy dog")
         assert_eq!(sign("key", "The quick brown fox jumps over the lazy dog"), "sha256=f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8");
+    }
+
+    #[test]
+    fn the_timestamped_signature_covers_the_time_and_the_event_id_is_sent() {
+        let body = r#"{"event":"new_issue"}"#;
+        let h = webhook_headers(body, Some("s3cret"), "4f1c-key", 1_792_000_000);
+        let get = |k: &str| h.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("X-Railwatch-Event-Id"), Some("4f1c-key"));
+        assert_eq!(get("X-Railwatch-Timestamp"), Some("1792000000"));
+        assert_eq!(get("X-Railwatch-Signature"), Some(sign("s3cret", body).as_str()), "the body-only signature is unchanged");
+        // What a receiver computes: HMAC over "<timestamp>.<body>". Same
+        // vector as `printf '1792000000.{"event":"new_issue"}' | openssl dgst -sha256 -hmac s3cret`.
+        assert_eq!(get("X-Railwatch-Signature-256"), Some("sha256=8b012c03658598c25b9b059d35186b605ad0a3a2713f989e8465125d4931aaa0"));
+        let unsigned = webhook_headers(body, None, "k", 1);
+        assert!(unsigned.iter().all(|(n, _)| !n.starts_with("X-Railwatch-Signature")), "no secret, no signature");
+        assert!(webhook_headers(body, Some(""), "k", 1).iter().all(|(n, _)| !n.starts_with("X-Railwatch-Signature")));
+    }
+
+    /// An account, an application (SHOP), its production environment with
+    /// a telemetry file, a webhook integration, and an exception issue whose
+    /// occurrence has `in_app` frames of `code_len` characters of code each.
+    fn seeded(name: &str, in_app: usize, code_len: usize) -> (std::path::PathBuf, crate::control::Control, i64, i64) {
+        use crate::control::{Control, create_account, create_environment, insert_application, insert_user, test_password};
+        let dir = std::env::temp_dir().join(format!("rw-webhook-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("telemetry")).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let ada = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
+        let account = c.tx(|tx| create_account(tx, "Acme", ada)).unwrap();
+        let app = c.tx(|tx| insert_application(tx, account, "Shop", "shop", "SHOP", None, "main")).unwrap();
+        let (env, _) = c.tx(|tx| create_environment(tx, app, "production")).unwrap();
+        let slug: String = c.with(|x| x.query_row("SELECT slug FROM environments WHERE id = ?", [env], |r| r.get(0))).unwrap();
+        let t = crate::tenants::open_tenant(&dir.join("telemetry").join(format!("{slug}.sqlite3"))).unwrap();
+        let mut frames = vec![serde_json::json!({"file": "/gems/activerecord-8.1.4/lib/x.rb", "line": 1, "function": "raise_it", "in_app": false})];
+        for i in 0..in_app {
+            frames.push(serde_json::json!({"file": format!("app/models/order{i}.rb"), "line": 31, "function": "total", "in_app": true,
+                                           "code": {"31": "x".repeat(code_len)}}));
+        }
+        for i in 0..40 {
+            frames.push(serde_json::json!({"file": format!("/gems/actionpack-8.1.4/lib/a{i}.rb"), "line": i, "function": "f", "in_app": false}));
+        }
+        t.execute(
+            "INSERT INTO exceptions (id, class_name, message, occurred_at, group_hash, frames, execution_id, execution_source, deploy)
+             VALUES (7, 'ZeroDivisionError', 'divided by 0', '2026-10-25 12:00:00', 'gx', ?1, 'e-1', 'request', 'abc1234')",
+            [serde_json::Value::Array(frames).to_string()],
+        )
+        .unwrap();
+        let cipher = super::super::integration::SettingsCipher::new(b"k");
+        let mut settings = serde_json::Map::new();
+        settings.insert("url".into(), "https://hooks.example.com/railwatch".into());
+        settings.insert("secret".into(), "s3cret".into());
+        let integration = c.with(|x| super::super::integration::insert(x, &cipher, account, "webhook", "agent", &settings)).unwrap();
+        let issue = c
+            .with(|x| {
+                x.execute(
+                    "INSERT INTO issues (application_id, environment_id, number, title, kind, status, priority, group_hash, occurrences, affected_users,
+                       first_seen_at, last_seen_at, created_at, updated_at, sample, culprit)
+                     VALUES (?1, ?2, 12, 'ZeroDivisionError: divided by 0', 'exception', 'open', 'normal', 'gx', 4, 2,
+                       '2026-10-25 11:00:00', '2026-10-25 12:00:00', '2026-10-25 11:00:00', '2026-10-25 12:00:00', ?3, 'app/models/order.rb:31')",
+                    rusqlite::params![app, env, r#"{"exception_id":7,"execution_id":"e-1","deploy":"abc1234"}"#],
+                )?;
+                Ok(x.last_insert_rowid())
+            })
+            .unwrap();
+        c.configure_alerting(super::super::integration::Alerting { cipher, smtp: None, url: "https://rw.example.com/monitoring".into(), deliver: true });
+        (dir, c, integration, issue)
+    }
+
+    /// What deliver_pass builds for one new_issue alert: claimed, loaded,
+    /// enriched from telemetry. The body as it is sent, and its delivery key.
+    fn delivered(c: &crate::control::Control, dir: &std::path::Path, integration: i64, issue: i64) -> (serde_json::Value, String, Context) {
+        let conn = c.conn();
+        let payload = crate::rhash! { "environment" => "production" };
+        super::super::outbox::create(&conn, None, integration, "new_issue", Some(issue), &payload, "pending", None).unwrap();
+        let claimed = super::super::outbox::claim_due(&conn, 10).unwrap().pop().unwrap();
+        let mut ctx = Context::load(&conn, c.alerting(), claimed).unwrap();
+        drop(conn);
+        ctx.enrich(&dir.join("telemetry"));
+        let json = rjson::generate(&ctx.webhook_body()).unwrap();
+        let key = ctx.alert.delivery_key.clone();
+        (serde_json::from_str(&json).unwrap(), key, ctx)
+    }
+
+    #[test]
+    fn a_new_issue_webhook_carries_what_an_agent_needs() {
+        let (dir, c, integration, issue) = seeded("payload", 1, 40);
+        let (v, key, ctx) = delivered(&c, &dir, integration, issue);
+        assert_eq!(v["alert_id"], key.as_str(), "the event id is the alert's delivery key");
+        assert_eq!(v["event"], "new_issue");
+        let i = &v["issue"];
+        assert_eq!(i["key"], "SHOP-12");
+        assert_eq!(i["canonical_key"], "acme/1/SHOP-12");
+        assert_eq!((i["application"].as_str(), i["environment"].as_str()), (Some("shop"), Some("production")));
+        assert_eq!((i["kind"].as_str(), i["culprit"].as_str(), i["occurrences"].as_i64()), (Some("exception"), Some("app/models/order.rb:31"), Some(4)));
+        assert_eq!((i["first_seen_at"].as_str(), i["last_seen_at"].as_str()), (Some("2026-10-25T11:00:00Z"), Some("2026-10-25T12:00:00Z")));
+        assert_eq!(i["deploy"], "abc1234");
+        assert_eq!(v["url"], format!("https://rw.example.com/monitoring/issues/{issue}"));
+        assert_eq!(
+            v["mcp"],
+            serde_json::json!({"endpoint": "https://rw.example.com/monitoring/mcp", "tool": "investigate_issue",
+                               "arguments": {"key": "acme/1/SHOP-12"}, "fallback_tool": "get_issue"})
+        );
+        // The occurrence as get_issue shows it: the raising frame, the
+        // in-app frame with its code, the 40 framework frames as one entry.
+        let o = &v["summary"]["occurrence"];
+        assert_eq!(
+            (o["class_name"].as_str(), o["message"].as_str(), o["execution_id"].as_str()),
+            (Some("ZeroDivisionError"), Some("divided by 0"), Some("e-1"))
+        );
+        let frames = o["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 3, "{frames:?}");
+        assert_eq!(frames[1]["file"], "app/models/order0.rb");
+        assert_eq!(frames[2], serde_json::json!({"omitted_frames": 40, "gems": ["actionpack"]}));
+        // Signed over exactly the bytes sent.
+        let json = rjson::generate(&ctx.webhook_body()).unwrap();
+        let h = webhook_headers(&json, Some("s3cret"), &key, 1_792_000_000);
+        assert!(h.contains(&("X-Railwatch-Signature", sign("s3cret", &json))));
+        assert!(h.contains(&("X-Railwatch-Event-Id", key.clone())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_summary_is_capped_and_the_event_id_survives_a_retry() {
+        // 60 in-app frames of 2 KB of code: ~120 KB before the cap.
+        let (dir, c, integration, issue) = seeded("cap", 60, 2_000);
+        let (v, key, _) = delivered(&c, &dir, integration, issue);
+        let summary = v["summary"].to_string();
+        assert!(summary.len() <= SUMMARY_MAX_BYTES, "{} bytes", summary.len());
+        assert!(v["summary"]["truncated"]["hint"].as_str().unwrap().contains("investigate_issue"), "{}", &summary[..300]);
+        assert!(v["summary"]["result"]["occurrence"]["class_name"] == "ZeroDivisionError", "what fits is kept");
+        assert!(v.to_string().len() < 20_000, "the whole body stays small: {}", v.to_string().len());
+        // A failed attempt is retried with the same delivery key.
+        {
+            let conn = c.conn();
+            conn.execute("UPDATE alerts SET status = 'pending', next_delivery_at = NULL, delivery_lease_id = NULL, delivery_lease_expires_at = NULL", [])
+                .unwrap();
+            let again = super::super::outbox::claim_due(&conn, 10).unwrap();
+            assert_eq!(again.iter().map(|a| a.delivery_key.as_str()).collect::<Vec<_>>(), [key.as_str()]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_issue_past_retention_still_gets_its_webhook_without_a_summary() {
+        let (dir, c, integration, issue) = seeded("retention", 1, 10);
+        std::fs::remove_dir_all(dir.join("telemetry")).unwrap();
+        let (v, _, _) = delivered(&c, &dir, integration, issue);
+        assert_eq!(v["issue"]["key"], "SHOP-12");
+        assert!(v.get("summary").is_none(), "no telemetry, no summary: {v}");
+        assert_eq!(v["mcp"]["tool"], "investigate_issue");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

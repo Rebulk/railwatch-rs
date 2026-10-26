@@ -1,0 +1,97 @@
+# A new Railwatch issue -> headless Claude Code investigates, opens a PR,
+# and comments the PR link back on the issue (docs/agent-webhooks.md).
+#
+# Copy to .github/workflows/railwatch-agent.yml in the APP's repository.
+# Secrets:
+#   ANTHROPIC_API_KEY   for Claude Code
+#   RAILWATCH_TOKEN     a Railwatch API & MCP token (Settings > Profile), scopes
+#                       mcp, read and write (write: add_comment). A dedicated
+#                       token named for this workflow, so its comments say so.
+# Variables:
+#   RAILWATCH_URL       e.g. https://railwatch.example.com (the server's public url)
+#
+# Triggered by repository_dispatch (event_type railwatch-new_issue, which
+# relay.py sends) or by hand with an issue key.
+name: Railwatch agent
+
+on:
+  repository_dispatch:
+    types: [railwatch-new_issue, railwatch-regressed_issue]
+  workflow_dispatch:
+    inputs:
+      issue_key:
+        description: "Railwatch issue key (SHOP-12, or account/application_id/SHOP-12)"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# One run per issue: a redelivered or re-dispatched event waits, then finds
+# the branch already there.
+concurrency:
+  group: railwatch-${{ github.event.client_payload.issue_key || inputs.issue_key }}
+  cancel-in-progress: false
+
+jobs:
+  investigate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ISSUE_KEY: ${{ github.event.client_payload.issue_key || inputs.issue_key }}
+      ISSUE_URL: ${{ github.event.client_payload.url }}
+      RAILWATCH_URL: ${{ vars.RAILWATCH_URL }}
+      RAILWATCH_TOKEN: ${{ secrets.RAILWATCH_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      # The MCP server's token comes from the environment, never a file in the repo.
+      - name: Railwatch MCP config
+        run: |
+          jq -n --arg url "${RAILWATCH_URL%/}/mcp" \
+            '{mcpServers: {railwatch: {type: "http", url: $url, headers: {Authorization: "Bearer ${RAILWATCH_TOKEN}"}}}}' \
+            > "$RUNNER_TEMP/mcp.json"
+
+      # What Railwatch already sent, for the prompt: no extra lookup needed
+      # to start. Through an env var, never `${{ }}` inside the script: the
+      # exception message is the app's text and may hold quotes.
+      - name: Webhook context
+        if: github.event_name == 'repository_dispatch'
+        env:
+          EVENT_JSON: ${{ toJSON(github.event.client_payload.railwatch) }}
+        run: printf '%s' "$EVENT_JSON" > "$RUNNER_TEMP/railwatch-event.json"
+
+      - name: Investigate and open a PR
+        run: |
+          git config user.name "railwatch-agent"
+          git config user.email "railwatch-agent@users.noreply.github.com"
+          branch="railwatch/$(printf '%s' "$ISSUE_KEY" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')"
+          if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then
+            echo "$branch exists: an earlier run already took this issue"; exit 0
+          fi
+          context=""
+          [ -f "$RUNNER_TEMP/railwatch-event.json" ] && context="The alert's JSON (issue, occurrence with frames) is in $RUNNER_TEMP/railwatch-event.json."
+          claude -p "$(cat <<PROMPT
+          A Railwatch alert fired for issue $ISSUE_KEY in this repository's app. $context
+
+          1. Call the railwatch MCP tool investigate_issue with key "$ISSUE_KEY" (if the server has no
+             such tool, get_issue, then get_execution on its sample_occurrence's execution_id).
+          2. Find the root cause in this repository. If you can fix it with confidence, fix it on a new
+             branch named $branch, add or update a test that fails without the fix, run the tests that
+             cover it, commit, push, and open a pull request with gh pr create. The PR body links the
+             Railwatch issue ($ISSUE_URL) and says what caused it.
+          3. Call the railwatch MCP tool add_comment on "$ISSUE_KEY" with the PR link and a two-sentence
+             root cause; if you could not fix it, comment what you found instead and open no PR.
+          Do not change anything unrelated to this issue.
+          PROMPT
+          )" \
+            --mcp-config "$RUNNER_TEMP/mcp.json" --strict-mcp-config \
+            --allowedTools "mcp__railwatch__investigate_issue,mcp__railwatch__get_issue,mcp__railwatch__get_execution,mcp__railwatch__last_execution,mcp__railwatch__search_logs,mcp__railwatch__recent_deploys,mcp__railwatch__add_comment,Read,Edit,Write,Grep,Glob,Bash(git:*),Bash(gh pr create:*),Bash(bin/rails test:*),Bash(bundle exec:*)" \
+            --permission-mode acceptEdits \
+            --max-budget-usd 5 \
+            --output-format text
