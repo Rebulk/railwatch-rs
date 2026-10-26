@@ -909,6 +909,11 @@ AmbiguousIdentifier (the baseline has one account; the SQL is Rails'
    query shapes and N+1s of up to 100 executions a side. EXPECTED in
    `tools/list`.
 
+10. **Rust-only tools `list_jobs`, `get_job`, `list_llm_calls`**
+    (2026-10-26): the jobs, job class and LLM pages' props (`grouped`,
+    `queue_stats`, `jobs_klass`, `llm_calls_index`) reshaped for an agent.
+    EXPECTED in `tools/list`.
+
 # Detectors diff (`bench/diff/detectors/`, 2026-10-15)
 
 What `run.sh` found and fixed in the ports (each was a Rust difference,

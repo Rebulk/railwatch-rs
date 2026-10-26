@@ -676,6 +676,156 @@
       }
     },
     {
+      "name": "list_jobs",
+      "description": "The jobs page: every background job class in the window with runs, failed runs and failure rate, avg/p95/max duration in milliseconds, its queue and average queue latency (time from enqueue to start), plus each queue's totals. Use it for \"which jobs are failing or slow?\" and \"is a queue backed up?\". sort ranks by count (default), errors, p95, avg or max. Each job has its dashboard url. Next: get_job on one.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug from list_applications. Optional when this token can see only one application (an embedded server always has one)."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production. Optional when the application has only one environment."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          },
+          "sort": {
+            "type": "string",
+            "enum": [
+              "count",
+              "errors",
+              "p95",
+              "avg",
+              "max"
+            ],
+            "description": "Rank job classes by runs (count, default), failures (errors), or duration (p95, avg, max)."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Job classes to return, 1-200. Defaults to 30."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "get_job",
+      "description": "One job class: runs, failures and avg/p50/p95/max in the window against the window before it; the exceptions its failures raised, most frequent first, and its recent failed runs and slowest runs (all three from its newest 200 runs in the window; runs_note says so when there were more), each with execution_id, duration, queue latency, attempt, deploy and url. Use it after list_jobs, or for \"why does InvoiceSyncJob keep failing?\". Next: get_execution on a run's execution_id; investigate_issue for the exception's issue.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug from list_applications. Optional when this token can see only one application (an embedded server always has one)."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production. Optional when the application has only one environment."
+          },
+          "job": {
+            "type": "string",
+            "description": "Job class name as list_jobs shows it, e.g. \"InvoiceSyncJob\". Ignored when group_hash is given."
+          },
+          "group_hash": {
+            "type": "string",
+            "description": "Job group hash from list_jobs."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "list_llm_calls",
+      "description": "The LLM page: LLM calls the app made in the window. group: model (default) gives each model's calls, errors, input/output/cache tokens, cost in USD when the provider or price table gives one (unpriced_calls otherwise), truncated (max_tokens) count, and avg/p95 latency in ms, plus the tools models called; group: none lists recent calls with model, tokens, cost, latency, status, error, finish_reason, the request or job that made it, and the prompt and completion when the app captures them. totals sums the window. Use it for \"what are we spending on LLMs?\", \"which model is slow or failing?\". q filters with model:, provider:, operation:, finish:, workflow:, attachments:. Next: get_execution on a call's execution_id.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug from list_applications. Optional when this token can see only one application (an embedded server always has one)."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production. Optional when the application has only one environment."
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "1h",
+              "6h",
+              "24h",
+              "7d",
+              "30d"
+            ],
+            "description": "Time window ending now. One of 1h, 6h, 24h, 7d, 30d. Defaults to 24h."
+          },
+          "group": {
+            "type": "string",
+            "enum": [
+              "model",
+              "none"
+            ],
+            "description": "model (default): one row per model. none: recent calls."
+          },
+          "q": {
+            "type": "string",
+            "description": "Filter, e.g. \"model:claude provider:anthropic finish:max_tokens\"."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Rows to return, 1-100. Defaults to 20."
+          }
+        },
+        "required": []
+      }
+    },
+    {
       "name": "release_health",
       "description": "Crash-free session rate, crash-free user rate, and adoption per release (a release is a deploy) in the window. Rates are percentages, avg_duration_ms is milliseconds, and rates are null when there were no sessions to divide by.",
       "inputSchema": {
