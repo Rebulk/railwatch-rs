@@ -822,13 +822,17 @@ fn route_answer(sum: &TimeSplit, n: usize, n_plus_ones: &Value, top: &[Value], p
         ));
     }
     let ms = |x: f64| if x >= 1000.0 { format!("{:.1} s", x / 1000.0) } else { format!("{} ms", x.round() as i64) };
+    // Set when a sentence names Ruby time, which the profiler sentence is about.
+    let mut ruby_time = false;
     if avg.duration > 0.0 && avg.transaction_ms() >= avg.duration * 0.5 && avg.transaction_ms() - avg.sql_in_transactions > 50.0 {
+        ruby_time = true;
         parts.push(format!(
             "{} per request inside transactions but only {} of SQL in them (Ruby runs with the transaction open)",
             ms(avg.transaction_ms()),
             ms(avg.sql_in_transactions)
         ));
     } else if avg.duration > 0.0 && avg.untracked >= avg.duration * 0.4 && avg.untracked >= 50.0 {
+        ruby_time = true;
         parts.push(format!("{} per request untracked (Ruby code, GC or waiting)", ms(avg.untracked)));
     }
     if avg.duration > 0.0
@@ -850,7 +854,7 @@ fn route_answer(sum: &TimeSplit, n: usize, n_plus_ones: &Value, top: &[Value], p
         s.push_str(&parts.join("; "));
         s.push('.');
     }
-    if avg.untracked >= avg.duration * 0.4 && avg.untracked >= 50.0 || avg.transaction_ms() - avg.sql_in_transactions > 50.0 {
+    if ruby_time {
         s.push_str(if profile.is_null() {
             " Enable the profiler to see which methods that time is in."
         } else {
@@ -863,6 +867,25 @@ fn route_answer(sum: &TimeSplit, n: usize, n_plus_ones: &Value, top: &[Value], p
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The profiler sentence follows only a sentence about the time it means.
+    #[test]
+    fn the_profiler_hint_follows_the_time_it_explains() {
+        let split = |duration: f64, tx: f64, sql_in_tx: f64, untracked: f64| TimeSplit {
+            duration,
+            buckets: [sql_in_tx, tx, 0.0, 0.0, 0.0, 0.0],
+            tracked: duration - untracked,
+            untracked,
+            sql_in_transactions: sql_in_tx,
+            transactions: 1,
+        };
+        // 2 s with 200 ms of transactions (100 ms SQL in them): no Ruby-time sentence, no hint.
+        let a = route_answer(&split(2000.0, 200.0, 100.0, 0.0), 1, &json!([]), &[], &Value::Null, 1);
+        assert!(!a.contains("profiler"), "{a}");
+        // Mostly untracked: the sentence and the hint.
+        let b = route_answer(&split(2000.0, 0.0, 0.0, 1800.0), 1, &json!([]), &[], &Value::Null, 1);
+        assert!(b.contains("1.8 s per request untracked") && b.ends_with("Enable the profiler to see which methods that time is in."), "{b}");
+    }
 
     #[test]
     fn durations_read_as_words() {

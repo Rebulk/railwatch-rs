@@ -64,7 +64,7 @@
         "properties": {
           "key": {
             "type": "string",
-            "description": "Issue key, e.g. APP-171 (application issue prefix, dash, number). The canonical_key form \"account_slug/application_id/APP-171\" is also accepted, and is required when a bare key matches issues in more than one application."
+            "description": "Issue key, e.g. APP-171 (application issue prefix, dash, number). The canonical_key form \"account_slug/application_id/APP-171\" is also accepted, and is required when a bare key matches issues in more than one application. Pass key or issue_id."
           },
           "issue_id": {
             "type": "integer",
@@ -79,47 +79,25 @@
             "description": "app (default): every in-app frame and the raising frame, other runs collapsed to a count. all: every stored frame."
           }
         },
-        "anyOf": [
-          {
-            "required": [
-              "key"
-            ]
-          },
-          {
-            "required": [
-              "issue_id"
-            ]
-          }
-        ]
+        "required": []
       }
     },
     {
       "name": "investigate_issue",
-      "description": "Everything needed to find an issue's root cause, in one call: start here for \"what broke in SHOP-12?\". Returns the exception with its in-app frames and code (framework frames collapsed); lead_up, the summary of the request or job it was raised in (where its time went, its N+1s) and the queries, calls and log lines that ran just before the raise; started_in, the deploy it first appeared in, the deploy before it, the commit range and the deploy's commits; trend (per day, per deploy, last 7 days against the 7 before); who (users and tenants); similar_issues (same exception class or culprit file, resolved ones too, with their last comment); and markdown, the same as a brief to read or paste. Every record has its dashboard url. Next: open the in-app frames' files; get_execution on occurrence.execution_id for the full timeline; add_comment with your findings.",
+      "description": "Everything needed to find an issue's root cause, in one call: start here for \"what broke in SHOP-12?\". Returns the exception with its in-app frames and code (framework frames collapsed); lead_up, the summary of the request or job it was raised in (where its time went, its N+1s) and the queries, calls and log lines that ran just before the raise; started_in, the deploy its earliest retained occurrence ran (else the last deploy before first_seen_at), the deploy before it, the commit range and the deploy's commits; trend (per day, per deploy, last 7 days against the 7 before); who (users and tenants); similar_issues (same exception class or culprit file, resolved ones too, with their last comment); and markdown, the same as a brief to read or paste. Every record has its dashboard url. Next: open the in-app frames' files; get_execution on occurrence.execution_id for the full timeline; add_comment with your findings.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "key": {
             "type": "string",
-            "description": "Issue key, e.g. APP-171 (application issue prefix, dash, number). The canonical_key form \"account_slug/application_id/APP-171\" is also accepted, and is required when a bare key matches issues in more than one application."
+            "description": "Issue key, e.g. APP-171 (application issue prefix, dash, number). The canonical_key form \"account_slug/application_id/APP-171\" is also accepted, and is required when a bare key matches issues in more than one application. Pass key or issue_id."
           },
           "issue_id": {
             "type": "integer",
             "description": "Stable issue_id from list_issues. Optional; the most precise way to name an issue."
           }
         },
-        "anyOf": [
-          {
-            "required": [
-              "key"
-            ]
-          },
-          {
-            "required": [
-              "issue_id"
-            ]
-          }
-        ]
+        "required": []
       }
     },
     {
