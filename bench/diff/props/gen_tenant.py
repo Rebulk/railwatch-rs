@@ -4,6 +4,7 @@ the dashboard pages read, spread over --spread-days ending at --now, so the
 1h / 24h / 7d windows and both raw (sub-hour) and rollup series have data.
 
     gen_tenant.py FIXTURES OUT_DIR --now EPOCH [--spread-days 9] [--executions 6000] [--seed 11]
+                  [--shapes 60] [--tenants 0] [--uniform] [--by-time] [--few-logs]
 
 Writes OUT_DIR/NNNN.ndjson.gz and OUT_DIR/manifest.json (posted with
 bench/diff/post.py), plus OUT_DIR/deploys.json (posted to /ingest/deploys).
@@ -12,6 +13,14 @@ Differs from bench/diff/gen_batches.py on purpose: that one hunts ingest
 edge cases inside one hour; this one builds a tenant that looks like an
 app (few routes, many requests, tenants, users, failing jobs, n+1s, LLM
 calls, sessions per deploy) across days.
+
+The defaults are the props-diff tenant. For a rollup-heavy tenant like a
+busy production one (docs/PERF.md, "Rollup reads"): --shapes 12000 (query
+groups; 40% of queries go to the first 200), --tenants 300 (app tenants plus
+"transloadx", a small one), --uniform (times spread evenly, not denser near
+--now) and --by-time (batches in time order, so each batch touches an hour
+or two of rollups instead of all of them, which makes ingest 20x faster),
+--few-logs (one log line for a quarter of executions, not two for each).
 """
 import argparse, base64, copy, gzip, hashlib, json, os, random, uuid
 
@@ -23,6 +32,11 @@ ap.add_argument("--spread-days", type=float, default=9)
 ap.add_argument("--executions", type=int, default=6000)
 ap.add_argument("--seed", type=int, default=11)
 ap.add_argument("--records-per-batch", type=int, default=500)
+ap.add_argument("--shapes", type=int, default=60)
+ap.add_argument("--tenants", type=int, default=0)
+ap.add_argument("--uniform", action="store_true")
+ap.add_argument("--by-time", action="store_true")
+ap.add_argument("--few-logs", action="store_true")
 a = ap.parse_args()
 
 fixtures = json.load(open(a.fixtures))
@@ -38,7 +52,7 @@ def uid():
 
 TABLES = ["widgets", "gadgets", "users", "orders", "line_items", "accounts"]
 SHAPES = []
-for i in range(60):
+for i in range(a.shapes):
     t = TABLES[i % len(TABLES)]
     sql = f'SELECT "{t}".* FROM "{t}" WHERE "{t}"."id" = ? AND "{t}"."c{i}" = ? LIMIT ?'
     conn = "primary" if i % 5 else "replica"
@@ -47,6 +61,9 @@ ROUTES = [("GET", f"/widgets/{i}(.:format)") for i in range(1, 25)] + [("POST", 
 JOBS = ["WidgetJob", "ReportJob", "MailerJob", "CleanupJob", "SyncJob"]
 TENANTS = [None, None, "acme", "globex", "initech", "umbrella.co"]
 USERS = [None, None, "1", "2", "42", "acme:7", "globex:9"]
+if a.tenants:
+    TENANTS = [None, None] + [f"tenant{i}" for i in range(a.tenants)] + ["transloadx"]
+    USERS = [None, None] + [str(i) for i in range(2000)]
 # Deploys every ~2 days; each record carries the deploy live at its time.
 DEPLOYS = []
 t = a.now - SPAN
@@ -118,7 +135,10 @@ def execution(ts):
     for _ in range(rng.randrange(3, 9)):
         off += rng.uniform(0.0005, 0.01)
         q = stamp(base("query", ts + off, eid, trace), user, tenant)
-        conn, sql, group = rng.choice(SHAPES)
+        if len(SHAPES) > 200:
+            conn, sql, group = SHAPES[rng.randrange(200) if rng.random() < 0.4 else rng.randrange(len(SHAPES))]
+        else:
+            conn, sql, group = rng.choice(SHAPES)
         q["connection"], q["sql"], q["_group"] = conn, sql, group
         q["duration"] = int(rng.lognormvariate(7, 1.3))
         q["row_count"] = rng.randrange(0, 50)
@@ -140,7 +160,10 @@ def execution(ts):
         v["kind"] = "partial" if "/_" in ident else "template"
         v["duration"] = rng.randrange(100, 20000)
         out.append(v)
-    for msg in ["Started GET \"/widgets\" for 127.0.0.1", "Completed 200 OK in 12ms (Views: 3.1ms | ActiveRecord: 4.2ms)"]:
+    msgs = ["Started GET \"/widgets\" for 127.0.0.1", "Completed 200 OK in 12ms (Views: 3.1ms | ActiveRecord: 4.2ms)"]
+    if a.few_logs:
+        msgs = msgs[1:] if rng.random() < 0.25 else []
+    for msg in msgs:
         lg = stamp(base("log", ts + off, eid, trace), user, tenant)
         lg["message"] = msg
         lg["level"] = rng.choices(["info", "warn", "error", "debug"], [85, 7, 4, 4])[0]
@@ -229,7 +252,7 @@ def execution(ts):
 # health/process records near now (the processes page reads the last 10 min)
 records = []
 for i in range(a.executions):
-    ts = a.now - SPAN * (rng.random() ** 1.6)  # denser near now
+    ts = a.now - SPAN * (rng.random() if a.uniform else rng.random() ** 1.6)  # denser near now
     records.extend(execution(ts))
 for server, pid in [("web-1", 101), ("web-2", 102), ("worker-1", 201)]:
     for back in [30, 200, 400, 900, 3000]:
@@ -241,7 +264,10 @@ for server, pid in [("web-1", 101), ("web-2", 102), ("worker-1", 201)]:
     pr["server"], pr["pid"] = server, pid
     records.append(pr)
 
-rng.shuffle(records)
+if a.by_time:
+    records.sort(key=lambda r: r["timestamp"])
+else:
+    rng.shuffle(records)
 manifest = []
 for b in range(0, len(records), a.records_per_batch):
     chunk = records[b:b + a.records_per_batch]
