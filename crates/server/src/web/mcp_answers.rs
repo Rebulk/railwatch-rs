@@ -230,7 +230,7 @@ impl Mcp<'_> {
                     "queries" => r.json("counters").get("queries").cloned().unwrap_or(Value::Null),
                     "url" => self.execution_url(&env, r.s("kind"), r.s("execution_id")),
                 }).collect::<Vec<_>>(),
-                "next" => "get_execution on a slowest_requests execution_id for its full timeline; explain_query on a top_queries group_hash for its plan.",
+                "next" => "get_execution on a slowest_requests execution_id for its full timeline; explain_query on a top_queries group_hash for its plan; compare after a fix.",
             };
             Ok(v.to_string())
         })
