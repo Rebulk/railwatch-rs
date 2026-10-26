@@ -3131,8 +3131,8 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO exceptions (id, class_name, message, occurred_at, group_hash, frames, execution_id, execution_source)
-             VALUES (55, 'Cloudflare::Email::NetworkError', 'provider response could not be read', ?1, 'gx', ?2, 'e-job', 'job')",
+            "INSERT INTO exceptions (id, class_name, message, occurred_at, group_hash, frames, execution_id, execution_source, cause)
+             VALUES (55, 'Cloudflare::Email::NetworkError', 'provider response could not be read', ?1, 'gx', ?2, 'e-job', 'job', '{\"class\":\"Timeout::Error\",\"message\":\"execution expired\"}')",
             params![qt(NOW - 3_600_000_000), Value::Array(frames).to_string()],
         )
         .unwrap();
@@ -3391,6 +3391,7 @@ mod tests {
             "# SHOP-79 Cloudflare::Email::NetworkError",
             "`app/services/outbound_email/cloudflare_feedback_consumer.rb:41`",
             "> 41: count = @client.poll(batch_size: 1) do |event|",
+            "Caused by `Timeout::Error`: execution expired",
             "Deploy `d2` (shop@2)",
             "Commit range: `aaaaaaaaaaaa..bbbbbbbbbbbb`",
             "Poll Cloudflare one lease at a time",

@@ -467,13 +467,16 @@ fn issue_markdown(issue: &IssueRow, v: &Value) -> String {
                 &mut md,
                 format!(
                     "Caused by `{}`: {}",
-                    c.get("class_name").and_then(Value::as_str).unwrap_or("?"),
+                    c.get("class").or_else(|| c.get("class_name")).and_then(Value::as_str).unwrap_or("?"),
                     rb::first_chars(c.get("message").and_then(Value::as_str).unwrap_or(""), 200)
                 ),
             );
         }
         line(&mut md, String::new());
         line(&mut md, "## Where".into());
+        // A line already shown (a block and the method it is in) shows its
+        // code once.
+        let mut shown: Vec<(String, i64)> = vec![];
         for f in o["frames"].as_array().into_iter().flatten() {
             if let Some(n) = f.get("omitted_frames") {
                 line(
@@ -487,7 +490,10 @@ fn issue_markdown(issue: &IssueRow, v: &Value) -> String {
             }
             let app = if f["in_app"] == true { "" } else { " (gem)" };
             line(&mut md, format!("- `{}:{}` in `{}`{app}", str_of(&f["file"]), str_of(&f["line"]), str_of(&f["function"])));
-            if let (Some(code), Some(at)) = (f["code"].as_object(), f["line"].as_i64()) {
+            if let (Some(code), Some(at)) = (f["code"].as_object(), f["line"].as_i64())
+                && !shown.contains(&(str_of(&f["file"]), at))
+            {
+                shown.push((str_of(&f["file"]), at));
                 let lines: Vec<String> = code
                     .iter()
                     .filter(|(k, _)| k.parse::<i64>().is_ok_and(|n| (n - at).abs() <= 2))
