@@ -150,7 +150,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .merge(api::routes())
         .route("/cable", axum::routing::get(cable::upgrade))
         .route("/vite/{*path}", axum::routing::get(controllers::asset))
-        // AGPL-3.0 section 13: the Corresponding Source of this server.
+        // The source of this server (the license's notice).
         .route("/source", axum::routing::get(|| async { axum::response::Redirect::to(crate::SOURCE_URL) }))
         .route("/icon.png", axum::routing::get(controllers::icon))
         .route("/icon.svg", axum::routing::get(controllers::icon))

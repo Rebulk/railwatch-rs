@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only AND MIT
+// SPDX-License-Identifier: FSL-1.1-ALv2 AND MIT
 //
 // Follows fugit 1.11's schedule grammar ("every ..." natural forms and cron),
 // Copyright (c) 2017-2024 John Mettraux, MIT license (full text in

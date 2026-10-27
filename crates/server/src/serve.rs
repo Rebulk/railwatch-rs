@@ -118,7 +118,7 @@ impl Drop for IpSlot {
     }
 }
 
-/// Names the source on every response (AGPL-3.0 section 13): an RFC 8288
+/// Names the source on every response: an RFC 8288
 /// `Link` to the repository.
 pub fn source_link(router: axum::Router) -> axum::Router {
     let value = axum::http::HeaderValue::from_str(&format!("<{}>; rel=\"license source\"", crate::SOURCE_URL)).expect("ASCII URL");

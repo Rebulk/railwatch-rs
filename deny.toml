@@ -1,5 +1,5 @@
 # cargo deny check (CI: .github/workflows/ci.yml). Licenses: our own crates
-# are AGPL-3.0-only (allowed only for them, below); every third-party crate
+# are FSL-1.1-ALv2 (allowed only for them, below); every third-party crate
 # must be under one of the permissive licenses listed here. Advisories come
 # from RustSec; sources must be crates.io or the one pinned git dependency.
 
@@ -30,9 +30,9 @@ allow = [
 ]
 exceptions = [
   # This workspace (license in the root Cargo.toml and LICENSE). Not in
-  # `allow`, so no dependency may bring in AGPL code unnoticed.
-  { allow = ["AGPL-3.0-only"], crate = "railwatch-server" },
-  { allow = ["AGPL-3.0-only"], crate = "railwatch-load" },
+  # `allow`, so no dependency may bring in copyleft or source-available code unnoticed.
+  { allow = ["FSL-1.1-ALv2"], crate = "railwatch-server" },
+  { allow = ["FSL-1.1-ALv2"], crate = "railwatch-load" },
 ]
 
 [licenses.private]

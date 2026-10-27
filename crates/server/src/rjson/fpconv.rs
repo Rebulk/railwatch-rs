@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only AND BSL-1.0
+// SPDX-License-Identifier: FSL-1.1-ALv2 AND BSL-1.0
 //
 // Contains a port of fpconv_dtoa (https://github.com/night-shift/fpconv, as
 // vendored and modified by Ruby's json gem in ext/json/ext/vendor/fpconv.c):

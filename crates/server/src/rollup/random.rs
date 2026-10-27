@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only AND BSD-3-Clause
+// SPDX-License-Identifier: FSL-1.1-ALv2 AND BSD-3-Clause
 //
 // Contains a port of MT19937 as Ruby carries it (ruby/missing/mt19937.c):
 //

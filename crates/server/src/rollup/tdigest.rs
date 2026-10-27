@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only AND MIT
+// SPDX-License-Identifier: FSL-1.1-ALv2 AND MIT
 //
 // Contains a port of the tdigest gem 0.2.1 (lib/tdigest/tdigest.rb),
 // Copyright (c) 2015 Sebastian Wallin, MIT license (full text in
