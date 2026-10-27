@@ -55,8 +55,73 @@ pub struct Row<'a> {
     /// A Cloudflare `CF-IPCountry` header, when the app records one.
     pub country: Option<&'a str>,
     pub rate_limited: bool,
+    /// The `rate_limit`'s name ("" for an unnamed one) when it refused this.
+    pub rate_limit: Option<&'a str>,
     pub halted: Option<&'a str>,
     pub unpermitted: bool,
+    /// The dropped keys, as the JSON array the gem recorded.
+    pub unpermitted_keys: Option<&'a str>,
+    pub redirect_to: Option<&'a str>,
+    /// The response's Content-Length (0 when the app sent none).
+    pub response_size: Option<i64>,
+}
+
+impl Row<'_> {
+    pub fn outcome(&self) -> Option<&'static str> {
+        outcome(self.status, self.redirect_to, self.halted)
+    }
+}
+
+/// What came of a request, from its status, redirect and halted callback:
+/// - `error`: 5xx;
+/// - `refused`: 4xx, or a redirect a before_action made somewhere other than
+///   a sign-in page;
+/// - `redirected_to_auth`: a redirect to a sign-in page (its location, up to
+///   any query string, has one of AUTH_WORDS): the app asked who it is;
+/// - `redirected`: any other redirect;
+/// - `served`: 2xx, or a 3xx without a location (304): the app answered.
+///
+/// `outcome_sql` is the same as SQL over the request index's expressions;
+/// the tests hold the two equal.
+pub fn outcome(status: Option<i64>, redirect_to: Option<&str>, halted: Option<&str>) -> Option<&'static str> {
+    let status = status?;
+    Some(match status {
+        500.. => "error",
+        400..=499 => "refused",
+        300..=399 if redirect_to.is_some_and(|r| !r.is_empty()) => {
+            let r = redirect_to.unwrap_or_default();
+            let location = r.split_once('?').map_or(r, |(l, _)| l).to_ascii_lowercase();
+            if AUTH_WORDS.iter().any(|w| location.contains(w)) {
+                "redirected_to_auth"
+            } else if halted.is_some_and(|h| !h.is_empty()) {
+                "refused"
+            } else {
+                "redirected"
+            }
+        }
+        200..=399 => "served",
+        _ => return None,
+    })
+}
+
+/// A redirect whose location holds one of these goes to a sign-in page.
+pub const AUTH_WORDS: [&str; 10] = ["sign_in", "signin", "sign-in", "login", "log_in", "session", "auth", "sso", "saml", "oauth"];
+
+pub const OUTCOMES: [&str; 5] = ["served", "redirected_to_auth", "redirected", "refused", "error"];
+
+/// `outcome` as SQL on `alias`'s request fields.
+pub fn outcome_sql(alias: &str) -> String {
+    let status = format!("\"{alias}\".\"status\"");
+    let r = filter_query::detail_sql(alias, "$.redirect_to");
+    let halted = filter_query::detail_sql(alias, "$.halted_callback");
+    let location = format!("substr({r}, 1, CASE WHEN instr({r}, '?') > 0 THEN instr({r}, '?') - 1 ELSE length({r}) END)");
+    // LIKE is ASCII case-insensitive, as `outcome` lowercases; `_` escaped.
+    let auth = AUTH_WORDS.iter().map(|w| format!("{location} LIKE '%{}%' ESCAPE '\\'", w.replace('_', "\\_"))).collect::<Vec<_>>().join(" OR ");
+    format!(
+        "(CASE WHEN {status} >= 500 THEN 'error' WHEN {status} >= 400 THEN 'refused' \
+         WHEN {status} >= 300 AND {r} != '' THEN (CASE WHEN {auth} THEN 'redirected_to_auth' WHEN {halted} != '' THEN 'refused' ELSE 'redirected' END) \
+         WHEN {status} >= 200 THEN 'served' END)"
+    )
 }
 
 /// What a pass read: rows folded, and whether it stopped at the cap.
@@ -121,6 +186,9 @@ pub fn scan(conn: &Connection, cond: &Cond, cap: usize, mut f: impl FnMut(&Row<'
             })
         };
         let exception = text(9)?.map(|p| p.split_once(": ").map_or(p, |(c, _)| c));
+        let rate_limited = matches!(text(14)?, Some(t) if t != "null" && t != "false");
+        // An unnamed rate_limit records name "" (text() reads it as None).
+        let rate_limit = rate_limited.then(|| text(17)).transpose()?.map(|n| n.unwrap_or(""));
         let row = Row {
             at,
             execution_id: text(1)?.unwrap_or(""),
@@ -136,9 +204,13 @@ pub fn scan(conn: &Connection, cond: &Cond, cap: usize, mut f: impl FnMut(&Row<'
             user_agent: text(11)?,
             path: text(12)?,
             country: text(13)?,
-            rate_limited: matches!(text(14)?, Some(t) if t != "null" && t != "false"),
+            rate_limited,
+            rate_limit,
             halted: text(15)?,
             unpermitted: int(16)?.unwrap_or(0) > 0,
+            unpermitted_keys: text(18)?,
+            redirect_to: text(19)?,
+            response_size: int(20)?,
         };
         f(&row);
     }
@@ -159,7 +231,7 @@ pub fn scan_sql(conn: &Connection, cond: &Cond, cap: usize) -> rusqlite::Result<
     Ok(format!(
         "SELECT \"executions\".\"occurred_at\", \"executions\".\"execution_id\", \"executions\".\"name\", \"executions\".\"group_hash\", \
          \"executions\".\"method\", \"executions\".\"status\", \"executions\".\"duration\", \"executions\".\"user_ref\", \"executions\".\"app_tenant\", \
-         \"executions\".\"exception_preview\", {ip}, {ua}, {path}, {country}, {rl_type}, {halted}, {unpermitted} \
+         \"executions\".\"exception_preview\", {ip}, {ua}, {path}, {country}, {rl_type}, {halted}, {unpermitted}, {rl_name}, {keys}, {redirect}, {size} \
          FROM {from} WHERE {cond} ORDER BY \"executions\".\"occurred_at\" DESC LIMIT {limit}",
         ip = d("$.ip"),
         ua = d("$.user_agent"),
@@ -168,6 +240,10 @@ pub fn scan_sql(conn: &Connection, cond: &Cond, cap: usize) -> rusqlite::Result<
         rl_type = func("json_type", "$.rate_limited"),
         halted = d("$.halted_callback"),
         unpermitted = func("json_array_length", "$.unpermitted_parameters"),
+        rl_name = d("$.rate_limited.name"),
+        keys = d("$.unpermitted_parameters"),
+        redirect = d("$.redirect_to"),
+        size = d("$.response_size"),
         cond = cond.sql(),
         limit = cap + 1,
     ))
@@ -192,10 +268,32 @@ pub enum Key {
     Minute,
     Hour,
     Day,
+    Outcome,
+    Halted,
+    RateLimit,
+    Unpermitted,
 }
 
-pub const KEYS: [&str; 14] =
-    ["ip", "path", "route", "user_agent", "status", "status_class", "method", "user", "tenant", "country", "exception", "minute", "hour", "day"];
+pub const KEYS: [&str; 18] = [
+    "ip",
+    "path",
+    "route",
+    "user_agent",
+    "status",
+    "status_class",
+    "method",
+    "user",
+    "tenant",
+    "country",
+    "exception",
+    "minute",
+    "hour",
+    "day",
+    "outcome",
+    "halted",
+    "rate_limit",
+    "unpermitted",
+];
 
 impl Key {
     pub fn parse(s: &str) -> Option<Key> {
@@ -214,6 +312,10 @@ impl Key {
             "minute" => Key::Minute,
             "hour" => Key::Hour,
             "day" => Key::Day,
+            "outcome" => Key::Outcome,
+            "halted" => Key::Halted,
+            "rate_limit" => Key::RateLimit,
+            "unpermitted" => Key::Unpermitted,
             _ => return None,
         })
     }
@@ -234,6 +336,10 @@ impl Key {
             Key::Minute => "minute",
             Key::Hour => "hour",
             Key::Day => "day",
+            Key::Outcome => "outcome",
+            Key::Halted => "halted",
+            Key::RateLimit => "rate_limit",
+            Key::Unpermitted => "unpermitted",
         }
     }
 
@@ -265,6 +371,10 @@ impl Key {
             Key::Tenant => cut(r.tenant),
             Key::Country => cut(r.country),
             Key::Exception => cut(r.exception),
+            Key::Outcome => r.outcome().map(str::to_string),
+            Key::Halted => cut(r.halted),
+            Key::RateLimit => cut(r.rate_limit),
+            Key::Unpermitted => r.unpermitted.then(|| untrusted(&unpermitted_keys(r.unpermitted_keys).join(","), FIELD_CHARS)),
             Key::Minute | Key::Hour | Key::Day => {
                 let step = self.bucket().expect("time key") * 1_000_000;
                 Some(time_key(r.at.div_euclid(step) * step))
@@ -293,6 +403,14 @@ impl Key {
             Key::Method => vec![("method", v.to_string())],
             Key::User => vec![("user", v.to_string())],
             Key::Tenant => vec![("tenant", v.to_string())],
+            Key::Outcome => vec![("outcome", v.to_string())],
+            Key::Halted => vec![("halted", v.to_string())],
+            // An unnamed rate_limit ("") has no name to select it by.
+            Key::RateLimit if v.is_empty() => vec![("rate_limited", "true".into())],
+            Key::RateLimit => vec![("rate_limited", v.to_string())],
+            // Requests that dropped every one of these keys (a superset: some
+            // may have dropped others too); the first is enough to select.
+            Key::Unpermitted => v.split(',').next().map_or(vec![], |k| vec![("unpermitted", k.to_string())]),
             Key::Country | Key::Exception => vec![],
             Key::Minute | Key::Hour | Key::Day => {
                 let Some(at) = crate::time::parse_db_time(v) else { return vec![] };
@@ -303,16 +421,34 @@ impl Key {
     }
 }
 
+/// The gem's unpermitted_parameters (a JSON array), sorted.
+pub fn unpermitted_keys(json: Option<&str>) -> Vec<String> {
+    let mut keys: Vec<String> = json
+        .and_then(|j| serde_json::from_str::<Vec<Value>>(j).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|k| match k {
+            Value::String(s) => s,
+            other => other.to_string(),
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 /// "2026-10-27T15:04:00Z"
 fn time_key(micros: i64) -> String {
     format!("{}Z", crate::time::utc_seconds_string(micros.div_euclid(1_000_000)).replace(' ', "T"))
 }
 
 /// A metric a group can report beyond its count.
-pub const METRICS: [&str; 11] = [
+pub const METRICS: [&str; 13] = [
     "errors",
     "client_errors",
     "statuses",
+    "outcomes",
+    "served",
     "distinct_ips",
     "distinct_users",
     "distinct_paths",
@@ -325,8 +461,20 @@ pub const METRICS: [&str; 11] = [
 pub const DEFAULT_METRICS: [&str; 6] = ["client_errors", "errors", "distinct_ips", "distinct_users", "first_seen", "last_seen"];
 /// What a result can be sorted by: count, a metric that is a number, or the
 /// group's key.
-pub const SORTS: [&str; 11] =
-    ["count", "errors", "client_errors", "distinct_ips", "distinct_users", "distinct_paths", "distinct_user_agents", "p95", "first_seen", "last_seen", "key"];
+pub const SORTS: [&str; 12] = [
+    "count",
+    "errors",
+    "client_errors",
+    "served",
+    "distinct_ips",
+    "distinct_users",
+    "distinct_paths",
+    "distinct_user_agents",
+    "p95",
+    "first_seen",
+    "last_seen",
+    "key",
+];
 
 /// Distinct values a group counts exactly; past this it reports the bound
 /// and says so (a scanner's paths are what would grow without end).
@@ -340,6 +488,7 @@ struct Agg {
     first: i64,
     last: i64,
     statuses: HashMap<i64, i64>,
+    outcomes: HashMap<&'static str, i64>,
     exceptions: HashMap<String, i64>,
     ips: HashSet<String>,
     users: HashSet<String>,
@@ -408,6 +557,11 @@ pub fn query(conn: &Connection, cond: &Cond, parsed: &Parsed, q: &Query, cap: us
         {
             *g.statuses.entry(s).or_default() += 1;
         }
+        if (q.wants("outcomes") || q.wants("served"))
+            && let Some(o) = r.outcome()
+        {
+            *g.outcomes.entry(o).or_default() += 1;
+        }
         if q.wants("exceptions")
             && let Some(e) = r.exception
             && (g.exceptions.len() < 100 || g.exceptions.contains_key(e))
@@ -440,6 +594,7 @@ pub fn query(conn: &Connection, cond: &Cond, parsed: &Parsed, q: &Query, cap: us
         match q.sort {
             "errors" => g.errors,
             "client_errors" => g.client_errors,
+            "served" => g.outcomes.get("served").copied().unwrap_or(0),
             "distinct_ips" => g.ips.len() as i64,
             "distinct_users" => g.users.len() as i64,
             "distinct_paths" => g.paths.len() as i64,
@@ -482,6 +637,9 @@ fn group_json(q: &Query, parsed: &Parsed, key: &[Option<String>], g: &Agg) -> Va
                 s.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
                 Value::Object(s.into_iter().take(8).map(|(k, v)| (k.to_string(), Value::from(*v))).collect())
             }
+            // Every outcome, in OUTCOMES' order, zeros included.
+            "outcomes" => Value::Object(OUTCOMES.iter().map(|o| (o.to_string(), Value::from(g.outcomes.get(o).copied().unwrap_or(0)))).collect()),
+            "served" => Value::from(g.outcomes.get("served").copied().unwrap_or(0)),
             "exceptions" => {
                 let mut s: Vec<(&String, &i64)> = g.exceptions.iter().collect();
                 s.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
@@ -645,8 +803,12 @@ mod tests {
                 path: None,
                 country: None,
                 rate_limited: false,
+                rate_limit: None,
                 halted: None,
                 unpermitted: false,
+                unpermitted_keys: None,
+                redirect_to: None,
+                response_size: None,
             })
         };
         assert_eq!(r(Key::Minute).unwrap(), "2026-10-27T15:04:00Z");
@@ -835,10 +997,17 @@ mod per_day_tests {
             "probe:false",
             "rate_limited:true",
             "rate_limited:false",
+            "rate_limited:search",
             "halted:true",
             "halted:false",
+            "halted:authenticate|require_admin",
             "unpermitted:true",
             "unpermitted:false",
+            "unpermitted:role",
+            "outcome:served",
+            "outcome:redirected_to_auth|redirected",
+            "outcome:refused|error",
+            "probe:true outcome:served status:2xx|3xx",
         ];
         let all: Vec<Key> = KEYS.iter().filter_map(|k| Key::parse(k)).collect();
         let mut out = vec![];
@@ -853,8 +1022,21 @@ mod per_day_tests {
             let mut rows = vec![];
             scan(c, &cond, MAX_SCAN, |r| {
                 rows.push(format!(
-                    "{} {:?} {:?} {:?} {:?} {:?} {} {:?} {}",
-                    r.execution_id, r.ip, r.user_agent, r.path, r.country, r.status, r.rate_limited, r.halted, r.unpermitted
+                    "{} {:?} {:?} {:?} {:?} {:?} {} {:?} {:?} {} {:?} {:?} {:?} {:?}",
+                    r.execution_id,
+                    r.ip,
+                    r.user_agent,
+                    r.path,
+                    r.country,
+                    r.status,
+                    r.rate_limited,
+                    r.rate_limit,
+                    r.halted,
+                    r.unpermitted,
+                    r.unpermitted_keys,
+                    r.redirect_to,
+                    r.response_size,
+                    r.outcome()
                 ))
             })
             .unwrap();
@@ -920,8 +1102,8 @@ mod per_day_tests {
         assert!(filter_query::request_index(&single).unwrap().is_some());
         assert_eq!(security_reads(&single, from, to), want, "single file with the index");
         // The answers are not trivially empty.
-        assert!(want.iter().any(|l| l.starts_with("probe:true rows: r")), "probes exist");
-        assert!(want.iter().any(|l| l.starts_with("rate_limited:true rows: r")));
+        assert!(want.iter().any(|l| l.starts_with("outcome:served rows: r")), "served requests exist");
+        assert!(want.iter().any(|l| l.starts_with("rate_limited:search rows: r")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -936,7 +1118,7 @@ mod per_day_tests {
         let t = crate::tenants::open_tenant(&dir.join("t.sqlite3")).unwrap();
         // The detail column's position in executions.
         let detail: i64 = t.query_row("SELECT cid FROM pragma_table_info('executions') WHERE name = 'detail'", [], |r| r.get(0)).unwrap();
-        for q in ["", "ip:1.2.3.4", "ua:curl path:/admin* probe:true", "rate_limited:true halted:true unpermitted:false"] {
+        for q in ["", "ip:1.2.3.4", "ua:curl path:/admin* probe:true", "rate_limited:search halted:true unpermitted:role", "outcome:served|refused"] {
             let p = parse(Some(q));
             let cond = requests(&t, &p, 0, i64::MAX / 2).unwrap();
             // scan's own statement, as EXPLAIN: no Column read of the table's detail.

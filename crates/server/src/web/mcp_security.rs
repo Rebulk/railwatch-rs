@@ -110,6 +110,58 @@ impl Mcp<'_> {
         })
     }
 
+    /// One address's requests in the window: what it reached and whether it
+    /// got anything (`exposure`), then every request oldest first (up to
+    /// `limit`) with status, path, user and outcome. Security access only.
+    pub(super) fn ip_activity(&self, a: &Args) -> R<String> {
+        if !self.security_access() {
+            return Ok(json!({"error": "ip_activity needs security access", "access": access_json(false)}).to_string());
+        }
+        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
+        let ip = a.s("ip");
+        if ip.is_empty() || ip.contains(['|', '/', '*']) {
+            return Ok(json!({"error": "ip must be one address (for a range use query_requests with q ip:10.0.0.0/8 and group_by ip)"}).to_string());
+        }
+        let limit = clamp(a.get("limit"), 100, 500)? as usize;
+        let mut parsed = filter_query::parse(Some(&a.s("q")));
+        parsed.fields.insert("ip".into(), ip.clone());
+        if let Some(refused) = self.request_keys_refused(&parsed) {
+            return Ok(refused.to_string());
+        }
+        let (from, to) = self.window(a);
+        self.with_telemetry(&env, |conn| {
+            let cond = filter_query::requests(conn, &parsed, from, to)?;
+            let mut span = Activity::default();
+            // Rows come newest first; the timeline keeps the newest `limit`
+            // and is shown oldest first.
+            let scanned = request_scan::scan(conn, &cond, request_scan::MAX_SCAN, |r| span.add(r, limit))?;
+            span.timeline.reverse();
+            let mut v = crate::obj! {
+                "window" => window_json(from, to), "ip" => untrusted(&ip, 64), "q" => filter_query::unparse(&parsed),
+                "requests" => scanned.rows as i64,
+            };
+            if scanned.rows > 0 {
+                db::merge_into(&mut v, "exposure", span.exposure_json());
+            }
+            db::merge_into(&mut v, "timeline", Value::Array(std::mem::take(&mut span.timeline)));
+            if span.left_out > 0 {
+                db::merge_into(
+                    &mut v,
+                    "timeline_note",
+                    Value::from(format!(
+                        "The newest {limit} requests; {} older ones are counted in exposure but not listed. Pass after:/before: in q or a larger limit (500 at most).",
+                        span.left_out
+                    )),
+                );
+            }
+            db::merge_into(&mut v, "scan", scanned.to_json());
+            db::merge_into(&mut v, "next", Value::from(IP_NEXT));
+            db::merge_into(&mut v, "access", access_json(true));
+            self.dashboard_link(&mut v, &env, &parsed, a);
+            Ok(v.to_string())
+        })
+    }
+
     fn dashboard_link(&self, v: &mut Value, env: &EnvRow, parsed: &Parsed, a: &Args) {
         let window = crate::dashboard::window::Window::preset(Some(&a.s("window")), self.now).key;
         let q = filter_query::unparse(parsed);
@@ -185,7 +237,15 @@ impl Mcp<'_> {
                     );
                     db::merge_into(&mut f, "ips", json!(stuffing.iter().take(5).map(|(ip, n)| json!({"ip": ip, "distinct_users": n})).collect::<Vec<_>>()));
                     let first = stuffing[0].0;
-                    db::merge_into(&mut f, "next", json!([qr(&["user"], &format!("ip:{first} status:4xx"), None), qr(&["ip"], "status:4xx", Some("distinct_users"))]));
+                    db::merge_into(
+                        &mut f,
+                        "next",
+                        json!([
+                            qr(&["user"], &format!("ip:{first} status:4xx"), None),
+                            call("ip_activity", json!({"window": window, "ip": first})),
+                            qr(&["ip"], "status:4xx", Some("distinct_users")),
+                        ]),
+                    );
                     findings.push(f);
                 }
             }
@@ -206,49 +266,107 @@ impl Mcp<'_> {
                             scanners
                                 .iter()
                                 .take(10)
-                                .map(|(ip, s)| json!({"ip": ip, "client_errors": s.client_errors, "requests": s.count,
+                                .map(|(ip, s)| json!({"ip": ip, "client_errors": s.client_errors, "requests": s.count, "served": s.served,
                                      "distinct_paths": paths_json(&s.paths), "new": (compared && !before.scanned.capped).then(|| !before.by_ip.contains_key(*ip))}))
                                 .collect::<Vec<_>>()
                         ),
                     );
                     let first = scanners[0].0;
-                    db::merge_into(&mut f, "next", json!([qr(&["path"], &format!("ip:{first}"), None), qr(&["ip"], "status:4xx", Some("distinct_paths"))]));
+                    db::merge_into(
+                        &mut f,
+                        "next",
+                        json!([
+                            call("ip_activity", json!({"window": window, "ip": first})),
+                            qr(&["path", "outcome"], &format!("ip:{first}"), None),
+                            qr(&["ip"], "status:4xx", Some("distinct_paths")),
+                        ]),
+                    );
                 } else {
                     db::merge_into(&mut f, "next", json!([qr(&["route", "status"], "status:404", None)]));
                 }
                 findings.push(f);
             }
-            // Probe paths (.env, wp-, .git, ../, ...).
-            if now.probes.count > 0 {
+            // Probe paths (.env, wp-, .git, ../, ...), by what came of them:
+            // only a probe the app served (2xx, or a redirect not to sign-in
+            // with no before_action) is an alarm. A redirect to sign-in is
+            // the app refusing an unknown visitor, typically a catch-all
+            // route (`GET /:slug`) that took `/.env` for a slug.
+            let probes = &now.probes;
+            if probes.count > 0 {
+                let (served, redirected) = (probes.n("served"), probes.n("redirected"));
+                let refused = probes.n("refused") + probes.n("redirected_to_auth");
                 let mut f = finding(
                     "probe_paths",
-                    if now.probes.not_4xx > 0 { "high" } else { "low" },
+                    if served > 0 {
+                        "high"
+                    } else if redirected > 0 {
+                        "medium"
+                    } else {
+                        "low"
+                    },
                     format!(
-                        "{} requests for probe paths ({} distinct); {} of them were NOT answered with a 4xx.",
-                        now.probes.count,
-                        now.probes.paths.len(),
-                        now.probes.not_4xx
+                        "{} requests for probe paths ({} distinct): {served} served, {redirected} redirected elsewhere, {} sent to sign in, {} refused, {} errors.",
+                        probes.count,
+                        probes.paths.len(),
+                        probes.n("redirected_to_auth"),
+                        probes.n("refused"),
+                        probes.n("error"),
                     ),
                 );
-                db::merge_into(&mut f, "count", Value::from(now.probes.count));
+                db::merge_into(&mut f, "count", Value::from(probes.count));
                 db::merge_into(&mut f, "previous", Value::from(before.probes.count));
-                db::merge_into(&mut f, "not_4xx", Value::from(now.probes.not_4xx));
-                db::merge_into(&mut f, "paths", top(&now.probes.paths, 10, "path"));
+                db::merge_into(&mut f, "outcomes", json!(request_scan::OUTCOMES.iter().map(|o| (o.to_string(), Value::from(probes.n(o)))).collect::<Map<_, _>>()));
+                db::merge_into(&mut f, "refused", Value::from(refused));
+                if served > 0 {
+                    db::merge_into(&mut f, "served_paths", top(&probes.served, 10, "path"));
+                }
+                db::merge_into(&mut f, "paths", top(&probes.paths, 10, "path"));
                 db::merge_into(&mut f, "patterns", json!(filter_query::PROBE_PATTERNS));
-                let mut next = vec![qr(&["path", "status"], "probe:true", None)];
-                if now.probes.not_4xx > 0 {
-                    next.insert(0, call("search_requests", json!({"window": window, "q": "probe:true status:2xx"})));
+                let mut next = vec![qr(&["path", "outcome"], "probe:true", None)];
+                if served > 0 {
+                    next.insert(0, call("search_requests", json!({"window": window, "q": "probe:true outcome:served"})));
+                }
+                if redirected > 0 {
+                    next.insert(0, qr(&["path", "status"], "probe:true outcome:redirected", None));
                 }
                 if access {
-                    next.push(qr(&["ip"], "probe:true", Some("distinct_paths")));
+                    let q = if served > 0 { "probe:true outcome:served" } else { "probe:true" };
+                    next.push(qr(&["ip"], q, Some("distinct_paths")));
                 }
                 db::merge_into(&mut f, "next", json!(next));
                 findings.push(f);
             }
-            for (kind, n, nb, q, what) in [
-                ("rate_limited", now.rate_limited, before.rate_limited, "rate_limited:true", "were refused by a Rails rate_limit"),
-                ("halted_callbacks", now.halted, before.halted, "halted:true", "were stopped by a before_action (halted_callback)"),
-                ("unpermitted_parameters", now.unpermitted, before.unpermitted, "unpermitted:true", "sent parameters strong parameters dropped"),
+            for (kind, n, nb, q, key, names, group, what) in [
+                (
+                    "rate_limited",
+                    now.rate_limited,
+                    before.rate_limited,
+                    "rate_limited:true",
+                    "rate_limited",
+                    &now.rate_limits,
+                    "rate_limit",
+                    "were refused by a Rails rate_limit",
+                ),
+                (
+                    "halted_callbacks",
+                    now.halted,
+                    before.halted,
+                    "halted:true",
+                    "halted",
+                    &now.callbacks,
+                    "halted",
+                    "were stopped by a before_action (halted_callback)",
+                ),
+                (
+                    "unpermitted_parameters",
+                    now.unpermitted,
+                    before.unpermitted,
+                    "unpermitted:true",
+                    "unpermitted",
+                    &now.unpermitted_keys,
+                    "unpermitted",
+                    "sent parameters strong parameters dropped",
+                ),
             ] {
                 if n == 0 {
                     continue;
@@ -256,7 +374,13 @@ impl Mcp<'_> {
                 let mut f = finding(kind, severity(n, nb, 100), format!("{n} requests {what}; {nb} in the previous window."));
                 db::merge_into(&mut f, "count", Value::from(n));
                 db::merge_into(&mut f, "previous", Value::from(nb));
-                let mut next = vec![qr(&["route"], q, None)];
+                // Which rate limit, before_action or parameter, and how often
+                // (an unnamed rate_limit is "").
+                db::merge_into(&mut f, "by_name", top(names, 10, "name"));
+                let mut next = vec![qr(&[group, "route"], q, None)];
+                if let Some((first, _)) = names.iter().filter(|(k, _)| !k.is_empty()).max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))) {
+                    next.push(qr(&["route", "outcome"], &filter_query::token(key, first), None));
+                }
                 if access {
                     next.push(qr(&["ip"], q, None));
                 }
@@ -393,6 +517,109 @@ pub(super) fn access_json(access: bool) -> Value {
 const FILTER_HINT: &str = "Request keys: ip:1.2.3.4, ip:10.0.0.0/8 (IPv4 CIDR), ip:2001:db8:* (prefix); ua:curl (substring); path:.env (substring), path:/admin* (prefix); probe:true; rate_limited:true; halted:true; unpermitted:true. Several values of one key: status:401|403.";
 
 const NEXT: &str = "Each row's q selects its requests: pass it to search_requests for the rows (with execution_id), or to query_requests with another group_by to pivot. get_execution on a sample_execution_id for one request.";
+
+const IP_NEXT: &str = "get_execution on a timeline row's execution_id for one request in full; query_requests with q ip:<address> and group_by path, status, user or minute to count; search_telemetry resource exceptions or logs with the same q for what its requests raised and logged.";
+
+/// Distinct values ip_activity lists per field.
+const ACTIVITY_VALUES: usize = 50;
+
+/// One address's requests, folded for ip_activity.
+#[derive(Default)]
+struct Activity {
+    first: i64,
+    last: i64,
+    statuses: HashMap<i64, i64>,
+    outcomes: HashMap<&'static str, i64>,
+    paths: HashMap<String, i64>,
+    users: HashMap<String, i64>,
+    user_agents: HashMap<String, i64>,
+    /// Served requests other than to an unmatched route.
+    served_routes: HashMap<String, i64>,
+    /// Requests that carried a signed-in user and were served.
+    signed_in: i64,
+    rate_limited: i64,
+    halted: HashMap<String, i64>,
+    timeline: Vec<Value>,
+    left_out: i64,
+}
+
+impl Activity {
+    fn add(&mut self, r: &request_scan::Row<'_>, limit: usize) {
+        if self.last == 0 {
+            self.last = r.at;
+        }
+        self.first = r.at;
+        let outcome = r.outcome();
+        if let Some(s) = r.status {
+            *self.statuses.entry(s).or_default() += 1;
+        }
+        if let Some(o) = outcome {
+            *self.outcomes.entry(o).or_default() += 1;
+        }
+        let bump = |m: &mut HashMap<String, i64>, k: Option<&str>, n: usize| {
+            if let Some(k) = k.filter(|k| !k.is_empty())
+                && (m.len() < 10 * n || m.contains_key(k))
+            {
+                *m.entry(untrusted(k, FIELD_CHARS)).or_default() += 1;
+            }
+        };
+        bump(&mut self.paths, r.path, ACTIVITY_VALUES);
+        bump(&mut self.users, r.user, ACTIVITY_VALUES);
+        bump(&mut self.user_agents, r.user_agent, ACTIVITY_VALUES);
+        if outcome == Some("served") {
+            if !r.name.ends_with(" unmatched") {
+                bump(&mut self.served_routes, Some(r.name), ACTIVITY_VALUES);
+            }
+            self.signed_in += i64::from(r.user.is_some());
+        }
+        self.rate_limited += i64::from(r.rate_limited);
+        bump(&mut self.halted, r.halted, ACTIVITY_VALUES);
+        if self.timeline.len() < limit {
+            let mut row = crate::obj! {
+                "at" => crate::time::iso8601_6(r.at), "execution_id" => r.execution_id, "method" => r.method, "route" => untrusted(r.name, FIELD_CHARS),
+                "path" => r.path.map(|p| untrusted(p, FIELD_CHARS)), "status" => r.status, "outcome" => outcome, "user" => r.user,
+                "duration_ms" => crate::dashboard::db::jf(crate::dashboard::rb::round(r.duration as f64 / 1000.0, 2)),
+            };
+            for (k, v) in [("redirect_to", r.redirect_to), ("halted", r.halted), ("rate_limit", r.rate_limit), ("exception", r.exception)] {
+                if let Some(v) = v {
+                    db::merge_into(&mut row, k, Value::from(untrusted(v, FIELD_CHARS)));
+                }
+            }
+            // The Content-Length the app sent: a served probe with a body is the one to open.
+            if let Some(n) = r.response_size.filter(|n| *n > 0) {
+                db::merge_into(&mut row, "response_size", Value::from(n));
+            }
+            self.timeline.push(row);
+        } else {
+            self.left_out += 1;
+        }
+    }
+
+    fn exposure_json(&self) -> Value {
+        let served = self.outcomes.get("served").copied().unwrap_or(0);
+        let mut statuses: Vec<(&i64, &i64)> = self.statuses.iter().collect();
+        statuses.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let mut v = crate::obj! {
+            "first_seen" => crate::time::iso8601_6(self.first), "last_seen" => crate::time::iso8601_6(self.last),
+            "statuses" => Value::Object(statuses.into_iter().map(|(k, n)| (k.to_string(), Value::from(*n))).collect()),
+            "outcomes" => json!(request_scan::OUTCOMES.iter().map(|o| (o.to_string(), Value::from(self.outcomes.get(o).copied().unwrap_or(0)))).collect::<Map<_, _>>()),
+            "distinct_paths" => self.paths.len() as i64, "paths" => top(&self.paths, ACTIVITY_VALUES, "path"),
+            "users" => top(&self.users, ACTIVITY_VALUES, "user"), "user_agents" => top(&self.user_agents, ACTIVITY_VALUES, "user_agent"),
+            "served" => served, "served_routes" => top(&self.served_routes, ACTIVITY_VALUES, "route"), "signed_in_requests" => self.signed_in,
+            "rate_limited" => self.rate_limited, "halted" => top(&self.halted, ACTIVITY_VALUES, "name"),
+        };
+        // A plain reading for the agent; the counts above are the evidence.
+        let verdict = if self.signed_in > 0 {
+            "Some of its requests were served to a signed-in user: it has (or had) a session. Check users and served_routes."
+        } else if !self.served_routes.is_empty() {
+            "Some of its requests to matched routes were served (2xx, or a redirect not to sign-in): check served_routes for anything that should not be public."
+        } else {
+            "Nothing it sent to a matched route was served: every request was refused, sent to sign in, redirected, errored, or hit an unmatched route."
+        };
+        db::merge_into(&mut v, "reading", Value::from(verdict));
+        v
+    }
+}
 
 fn window_json(from: i64, to: i64) -> Value {
     json!({"from": crate::time::iso8601_6(from), "to": crate::time::iso8601_6(to)})
@@ -543,14 +770,25 @@ impl Auth {
 struct IpStat {
     count: i64,
     client_errors: i64,
+    /// Requests the app served (request_scan::outcome).
+    served: i64,
     paths: HashSet<String>,
 }
 
 #[derive(Default)]
 struct Probes {
     count: i64,
-    not_4xx: i64,
+    /// Requests per outcome (request_scan::outcome).
+    outcomes: HashMap<&'static str, i64>,
     paths: HashMap<String, i64>,
+    /// The paths that were served, with their counts.
+    served: HashMap<String, i64>,
+}
+
+impl Probes {
+    fn n(&self, outcome: &str) -> i64 {
+        self.outcomes.get(outcome).copied().unwrap_or(0)
+    }
 }
 
 /// One window's requests, folded for the summary.
@@ -562,6 +800,10 @@ struct Pass {
     rate_limited: i64,
     halted: i64,
     unpermitted: i64,
+    /// By rate_limit name, halted callback, dropped parameter.
+    rate_limits: HashMap<String, i64>,
+    callbacks: HashMap<String, i64>,
+    unpermitted_keys: HashMap<String, i64>,
     status_classes: HashMap<i64, i64>,
 }
 
@@ -585,6 +827,9 @@ impl Pass {
             rate_limited: 0,
             halted: 0,
             unpermitted: 0,
+            rate_limits: HashMap::new(),
+            callbacks: HashMap::new(),
+            unpermitted_keys: HashMap::new(),
             status_classes: HashMap::new(),
         }
     }
@@ -614,6 +859,7 @@ impl Pass {
             {
                 let s = p.by_ip.entry(untrusted(ip, 64)).or_default();
                 s.count += 1;
+                s.served += i64::from(r.outcome() == Some("served"));
                 if client_error {
                     s.client_errors += 1;
                     if let Some(path) = r.path
@@ -627,16 +873,37 @@ impl Pass {
                 && is_probe(path)
             {
                 p.probes.count += 1;
-                if !client_error {
-                    p.probes.not_4xx += 1;
+                let outcome = r.outcome();
+                if let Some(o) = outcome {
+                    *p.probes.outcomes.entry(o).or_default() += 1;
                 }
-                if p.probes.paths.len() < 1_000 || p.probes.paths.contains_key(path) {
-                    *p.probes.paths.entry(untrusted(path, FIELD_CHARS)).or_default() += 1;
+                let path = untrusted(path, FIELD_CHARS);
+                if outcome == Some("served") && (p.probes.served.len() < 1_000 || p.probes.served.contains_key(&path)) {
+                    *p.probes.served.entry(path.clone()).or_default() += 1;
+                }
+                if p.probes.paths.len() < 1_000 || p.probes.paths.contains_key(&path) {
+                    *p.probes.paths.entry(path).or_default() += 1;
                 }
             }
-            p.rate_limited += r.rate_limited as i64;
-            p.halted += r.halted.is_some() as i64;
-            p.unpermitted += r.unpermitted as i64;
+            let count = |m: &mut HashMap<String, i64>, k: &str| {
+                if m.len() < 1_000 || m.contains_key(k) {
+                    *m.entry(untrusted(k, 255)).or_default() += 1;
+                }
+            };
+            if let Some(name) = r.rate_limit {
+                p.rate_limited += 1;
+                count(&mut p.rate_limits, name);
+            }
+            if let Some(h) = r.halted {
+                p.halted += 1;
+                count(&mut p.callbacks, h);
+            }
+            if r.unpermitted {
+                p.unpermitted += 1;
+                for k in request_scan::unpermitted_keys(r.unpermitted_keys) {
+                    count(&mut p.unpermitted_keys, &k);
+                }
+            }
         })?;
         Ok(p)
     }
@@ -872,7 +1139,13 @@ mod tests {
         req(&f.tenant(), "nopath", 1, "GET", "/", 200, None, json!({}));
         assert!(search(&f, "probe:false").contains(&"nopath".to_string()));
         // Bad values say what is wrong.
-        for (q, says) in [("probe:yes", "probe"), ("ip:1.2.3.4/40", "8-32"), ("ip:fe80::/64", "IPv4 CIDR"), ("halted:1", "halted")] {
+        for (q, says) in [
+            ("probe:yes", "probe"),
+            ("ip:1.2.3.4/40", "8-32"),
+            ("ip:fe80::/64", "IPv4 CIDR"),
+            ("halted:true|require_admin", "stands alone"),
+            ("outcome:leaked", "not one of"),
+        ] {
             let v = f.tool("search_requests", json!({"q": q}));
             assert!(v["error"].as_str().unwrap_or("").contains(says), "{q}: {v}");
         }
@@ -1068,9 +1341,15 @@ mod tests {
         let stuffing = find("one_ip_many_accounts");
         assert_eq!((stuffing["severity"].as_str(), stuffing["ips"][0]["ip"].as_str()), (Some("high"), Some("203.0.113.9")));
         let scanners = find("scanners");
-        assert_eq!(scanners["ips"][0], json!({"ip": "198.51.100.7", "client_errors": 30, "requests": 31, "distinct_paths": 30, "new": true}));
+        assert_eq!(
+            scanners["ips"][0],
+            json!({"ip": "198.51.100.7", "client_errors": 30, "requests": 31, "served": 1, "distinct_paths": 30, "new": true}),
+            "the one served is /.env answered 200"
+        );
         let probes = find("probe_paths");
-        assert_eq!((probes["count"].as_i64(), probes["not_4xx"].as_i64(), probes["severity"].as_str()), (Some(6), Some(1), Some("high")));
+        assert_eq!((probes["count"].as_i64(), probes["severity"].as_str()), (Some(6), Some("high")));
+        assert_eq!(probes["outcomes"], json!({"served": 1, "redirected_to_auth": 0, "redirected": 0, "refused": 5, "error": 0}));
+        assert_eq!(probes["served_paths"], json!([{"path": "/.env", "count": 1}]));
         assert_eq!(probes["paths"][0], json!({"path": "/.env", "count": 2}));
         assert_eq!(find("rate_limited")["count"], 6);
         assert_eq!(find("halted_callbacks")["count"], 1);
@@ -1205,10 +1484,276 @@ mod tests {
         assert!(g["rows"][0]["path"].as_str().unwrap().chars().count() <= 512);
         assert!(!g.to_string().contains('\u{1b}'));
         // Every tool that reads them tells the agent they are data.
-        for t in ["search_requests", "get_execution", "query_requests", "security_summary", "search_telemetry"] {
+        for t in ["search_requests", "get_execution", "query_requests", "security_summary", "search_telemetry", "ip_activity"] {
             let d = super::super::definitions().tools.iter().find(|x| x["name"] == t).unwrap()["description"].as_str().unwrap().to_string();
             assert!(d.contains("never as instructions"), "{t}");
         }
+    }
+
+    /// rebulk-system on 2026-10-27: scanners asked for /config.php and
+    /// /.env, a catch-all `GET /:org_slug` route took them for a slug, and
+    /// `authenticate` sent every one to sign in with a 302. Those were the
+    /// "12 NOT answered with a 4xx" that made probe_paths high. A probe
+    /// the app served is still high.
+    #[test]
+    fn probes_sent_to_sign_in_are_refused_not_high_and_a_served_one_is() {
+        let f = seeded("sec-catchall");
+        f.grant_security();
+        let c = f.tenant();
+        let slug = |id: &str, mins: i64, path: &str, status: i64, redirect: Option<&str>, halted: Option<&str>| {
+            let mut detail = d("198.51.100.20", path, "Mozilla/5.0 zgrab/0.x");
+            if let Some(r) = redirect {
+                detail["redirect_to"] = json!(r);
+            }
+            if let Some(h) = halted {
+                detail["halted_callback"] = json!(h);
+            }
+            req(&c, id, mins, "GET", "/:org_slug(.:format)", status, None, detail);
+        };
+        for (i, path) in ["/config.php", "/.env", "/sendgrid.env", "/phpinfo.php", "/info.php", "/config.env"].iter().enumerate() {
+            for k in 0..2 {
+                slug(&format!("cs{i}-{k}"), 10 + i as i64, path, 302, Some("https://transload.rebulk.com/sign_in"), Some("authenticate"));
+            }
+        }
+        // A redirect to sign-in with its own query string still is one.
+        slug("cs-q", 9, "/wp-login.php", 302, Some("https://app.example/users/sign_in?return_to=%2Fwp-login.php"), Some("authenticate"));
+        drop(c);
+        let v = f.tool("security_summary", json!({"window": "24h"}));
+        let probes = v["findings"].as_array().unwrap().iter().find(|x| x["kind"] == "probe_paths").cloned().unwrap();
+        assert_eq!(probes["severity"], "low", "{probes}");
+        assert_eq!(probes["outcomes"], json!({"served": 0, "redirected_to_auth": 13, "redirected": 0, "refused": 0, "error": 0}));
+        assert!(probes["summary"].as_str().unwrap().contains("0 served"), "{probes}");
+        assert!(probes["summary"].as_str().unwrap().contains("13 sent to sign in"), "{probes}");
+        assert!(probes.get("served_paths").is_none());
+        // The outcome is a key and a filter.
+        let g = f.tool("query_requests", json!({"group_by": ["outcome"], "q": "probe:true", "window": "24h"}));
+        assert_eq!(g["rows"], json!([g["rows"][0].clone()]));
+        assert_eq!((g["rows"][0]["outcome"].as_str(), g["rows"][0]["count"].as_i64()), (Some("redirected_to_auth"), Some(13)));
+        assert_eq!(g["rows"][0]["q"], "probe:true outcome:redirected_to_auth");
+        assert_eq!(search(&f, "probe:true outcome:redirected_to_auth").len(), 13);
+        assert!(search(&f, "probe:true outcome:served").is_empty());
+        // One probe the catch-all served (it rendered a page for the "slug"):
+        // that is the alarm.
+        let c = f.tenant();
+        let mut served = d("198.51.100.20", "/.env", "Mozilla/5.0 zgrab/0.x");
+        served["response_size"] = json!(3172);
+        req(&c, "cs-served", 8, "GET", "/:org_slug(.:format)", 200, None, served);
+        drop(c);
+        let v = f.tool("security_summary", json!({"window": "24h"}));
+        let probes = v["findings"].as_array().unwrap().iter().find(|x| x["kind"] == "probe_paths").cloned().unwrap();
+        assert_eq!(probes["severity"], "high");
+        assert_eq!(probes["served_paths"], json!([{"path": "/.env", "count": 1}]));
+        let first = &probes["next"][0];
+        assert_eq!(first["arguments"]["q"], "probe:true outcome:served");
+        assert_eq!(ids(&f.tool(first["tool"].as_str().unwrap(), first["arguments"].clone())), vec!["cs-served"]);
+        let t = f.tool("ip_activity", json!({"ip": "198.51.100.20", "window": "24h"}))["timeline"].clone();
+        let row = t.as_array().unwrap().iter().find(|r| r["execution_id"] == "cs-served").unwrap();
+        assert_eq!((row["outcome"].as_str(), row["response_size"].as_i64()), (Some("served"), Some(3172)));
+    }
+
+    /// Every outcome, on the boundaries that decide it, the same from the
+    /// fold (request_scan::outcome) and from SQL (outcome_sql, which
+    /// outcome:... filters with).
+    #[test]
+    fn the_outcome_of_a_request_is_the_same_in_rust_and_in_sql() {
+        let f = seeded("sec-outcome");
+        f.grant_security();
+        let c = f.tenant();
+        // (execution_id, status, redirect_to, halted_callback, outcome)
+        type Case = (&'static str, i64, Option<&'static str>, Option<&'static str>, &'static str);
+        let cases: [Case; 16] = [
+            ("ok", 200, None, None, "served"),
+            ("created", 201, None, None, "served"),
+            ("not-modified", 304, None, None, "served"),
+            ("signin", 302, Some("https://a.example/sign_in"), None, "redirected_to_auth"),
+            ("signin-halted", 302, Some("https://a.example/users/sign_in?x=1"), Some("authenticate"), "redirected_to_auth"),
+            ("login-upper", 303, Some("https://a.example/LOGIN"), None, "redirected_to_auth"),
+            ("session-new", 302, Some("/session/new"), None, "redirected_to_auth"),
+            ("sso", 302, Some("https://sso.example.com/start"), None, "redirected_to_auth"),
+            // "auth" only in the query string is not a sign-in page.
+            ("auth-in-query", 302, Some("https://a.example/orders?next=/auth"), None, "redirected"),
+            ("elsewhere", 301, Some("https://a.example/orders/1"), None, "redirected"),
+            ("halted-elsewhere", 302, Some("https://a.example/"), Some("require_admin"), "refused"),
+            // A LIKE wildcard in the location is a literal (signXin is not sign_in).
+            ("underscore", 302, Some("https://a.example/signXin"), None, "redirected"),
+            ("forbidden", 403, None, None, "refused"),
+            ("not-found", 404, Some("https://a.example/sign_in"), None, "refused"),
+            ("boom", 500, None, None, "error"),
+            ("unavailable", 503, None, Some("x"), "error"),
+        ];
+        for (i, (id, status, redirect, halted, _)) in cases.iter().enumerate() {
+            let mut detail = d("192.0.2.1", &format!("/p{i}"), "t");
+            if let Some(r) = redirect {
+                detail["redirect_to"] = json!(r);
+            }
+            if let Some(h) = halted {
+                detail["halted_callback"] = json!(h);
+            }
+            req(&c, id, 5 + i as i64, "GET", "/p(.:format)", *status, None, detail);
+        }
+        for (id, status, redirect, halted, want) in cases {
+            assert_eq!(crate::dashboard::request_scan::outcome(Some(status), redirect, halted), Some(want), "{id} (Rust)");
+            let sql = crate::dashboard::request_scan::outcome_sql("executions");
+            let got: String = c.query_row(&format!("SELECT {sql} FROM executions WHERE execution_id = ?1"), [id], |r| r.get(0)).unwrap();
+            assert_eq!(got, want, "{id} (SQL)");
+        }
+        drop(c);
+        // The filter and the group agree with each other on every outcome.
+        let g = f.tool("query_requests", json!({"group_by": ["outcome"], "window": "24h", "sort": "key"}));
+        for row in g["rows"].as_array().unwrap() {
+            let o = row["outcome"].as_str().unwrap();
+            let want: Vec<String> = {
+                let mut v: Vec<String> = cases.iter().filter(|c| c.4 == o).map(|c| c.0.to_string()).collect();
+                v.sort();
+                v
+            };
+            assert_eq!(search(&f, row["q"].as_str().unwrap()), want, "{o}");
+        }
+        assert_eq!(search(&f, "outcome:refused|error").len(), 5);
+        assert_eq!(crate::dashboard::request_scan::outcome(None, None, None), None, "no status, no outcome");
+    }
+
+    /// halted:, rate_limited: and unpermitted: take a name, and each has a
+    /// group_by key whose rows' q selects the same requests.
+    #[test]
+    fn named_callbacks_rate_limits_and_parameters_are_keys_and_filters() {
+        let f = planted("sec-names");
+        f.grant_security();
+        let c = f.tenant();
+        let mut login = d("10.1.0.9", "/session", "Mozilla/5.0 (X11; Linux) Firefox/131.0");
+        login["halted_callback"] = json!("require_login");
+        req(&c, "login1", 3, "GET", "/reports(.:format)", 302, None, login.clone());
+        login["redirect_to"] = json!("https://shop.example/sign_in");
+        req(&c, "login2", 3, "GET", "/reports(.:format)", 302, None, login);
+        let mut unnamed = d("192.0.2.45", "/api/search", "Go-http-client/1.1");
+        unnamed["rate_limited"] = json!({"name": "", "count": 61, "to": 60});
+        req(&c, "rl-unnamed", 9, "GET", "/api/search(.:format)", 429, None, unnamed);
+        let mut mass = d("10.1.0.6", "/users/2", "Mozilla/5.0");
+        mass["unpermitted_parameters"] = json!(["role"]);
+        req(&c, "mass", 6, "PATCH", "/users/:id(.:format)", 302, Some("grace"), mass);
+        drop(c);
+        assert_eq!(search(&f, "halted:require_admin"), vec!["halted"]);
+        assert_eq!(search(&f, "halted:require_login"), vec!["login1", "login2"]);
+        assert_eq!(search(&f, "halted:require_admin|require_login").len(), 3);
+        assert!(search(&f, "halted:require").is_empty(), "a name is exact");
+        assert_eq!(search(&f, "rate_limited:search"), range("rl", 6));
+        assert_eq!(search(&f, "unpermitted:role"), vec!["halted", "mass"]);
+        assert_eq!(search(&f, "unpermitted:admin"), vec!["halted"]);
+        assert!(search(&f, "unpermitted:rol").is_empty(), "a key is exact");
+        let q = |group: &str, q: &str| f.tool("query_requests", json!({"group_by": [group], "q": q, "window": "24h", "sort": "key"}))["rows"].clone();
+        let rows = q("halted", "halted:true");
+        assert_eq!(
+            rows.as_array().unwrap().iter().map(|r| (r["halted"].as_str().unwrap(), r["count"].as_i64().unwrap())).collect::<Vec<_>>(),
+            [("require_admin", 1), ("require_login", 2)]
+        );
+        for r in rows.as_array().unwrap() {
+            assert_eq!(search(&f, r["q"].as_str().unwrap()).len() as i64, r["count"].as_i64().unwrap(), "{r}");
+        }
+        let rows = q("rate_limit", "rate_limited:true");
+        assert_eq!(rows.as_array().unwrap().len(), 2, "{rows}");
+        assert_eq!((rows[0]["rate_limit"].as_str(), rows[0]["q"].as_str()), (Some(""), Some("rate_limited:true")), "unnamed: no name to drill by");
+        assert_eq!((rows[1]["rate_limit"].as_str(), rows[1]["count"].as_i64()), (Some("search"), Some(6)));
+        assert_eq!(search(&f, rows[1]["q"].as_str().unwrap()), range("rl", 6));
+        let rows = q("unpermitted", "unpermitted:true");
+        assert_eq!(
+            rows.as_array().unwrap().iter().map(|r| r["unpermitted"].as_str().unwrap().to_string()).collect::<Vec<_>>(),
+            ["admin,role", "role"],
+            "the keys, sorted"
+        );
+        assert_eq!(search(&f, rows[1]["q"].as_str().unwrap()), vec!["halted", "mass"], "role selects both (a superset of the group)");
+        // A request without any of them is the null group.
+        let all = q("halted", "");
+        assert!(all.as_array().unwrap().iter().any(|r| r["halted"].is_null()));
+        // The summary breaks each count down by name and drills by the top one.
+        let v = f.tool("security_summary", json!({"window": "24h"}));
+        let find = |kind: &str| v["findings"].as_array().unwrap().iter().find(|x| x["kind"] == kind).cloned().unwrap();
+        let halted = find("halted_callbacks");
+        assert_eq!(halted["by_name"], json!([{"name": "require_login", "count": 2}, {"name": "require_admin", "count": 1}]));
+        assert_eq!(halted["next"][1]["arguments"]["q"], "halted:require_login");
+        assert_eq!(find("rate_limited")["by_name"], json!([{"name": "search", "count": 6}, {"name": "", "count": 1}]));
+        assert_eq!(find("unpermitted_parameters")["by_name"], json!([{"name": "role", "count": 2}, {"name": "admin", "count": 1}]));
+        for finding in v["findings"].as_array().unwrap() {
+            for call in finding["next"].as_array().unwrap() {
+                let r = f.tool(call["tool"].as_str().unwrap(), call["arguments"].clone());
+                assert!(r.get("error").is_none(), "{call}: {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn ip_activity_shows_one_address_session_in_order_and_what_it_reached() {
+        let f = planted("sec-ipact");
+        f.grant_security();
+        let v = f.tool("ip_activity", json!({"ip": "198.51.100.7", "window": "24h", "limit": 5}));
+        assert_eq!(v["requests"], 31);
+        let e = &v["exposure"];
+        assert_eq!(e["first_seen"], crate::time::iso8601_6(NOW - 129 * MIN));
+        assert_eq!(e["last_seen"], crate::time::iso8601_6(NOW - 99 * MIN));
+        assert_eq!(e["statuses"], json!({"404": 30, "200": 1}));
+        assert_eq!(e["outcomes"], json!({"served": 1, "redirected_to_auth": 0, "redirected": 0, "refused": 30, "error": 0}));
+        assert_eq!(e["distinct_paths"], 30, "/.env twice");
+        assert_eq!(e["user_agents"], json!([{"user_agent": "curl/8.1", "count": 31}]));
+        assert_eq!(e["served"], 1);
+        assert_eq!(e["served_routes"], json!([{"route": "GET /:slug(.:format)", "count": 1}]));
+        assert_eq!(e["signed_in_requests"], 0);
+        assert!(e["reading"].as_str().unwrap().contains("served_routes"), "{e}");
+        // The newest 5, oldest first; the rest counted and said.
+        let t = v["timeline"].as_array().unwrap();
+        assert_eq!(t.len(), 5);
+        let ats: Vec<&str> = t.iter().map(|r| r["at"].as_str().unwrap()).collect();
+        assert!(ats.windows(2).all(|w| w[0] <= w[1]), "oldest first: {ats:?}");
+        assert_eq!(t[4]["execution_id"], "scan-env-200");
+        assert_eq!((t[4]["outcome"].as_str(), t[4]["path"].as_str(), t[4]["status"].as_i64()), (Some("served"), Some("/.env"), Some(200)));
+        assert_eq!(t[4]["exception"], "ScrapeTrapHit::Hit");
+        assert!(t[4].get("response_size").is_none(), "none recorded, none shown");
+        assert!(v["timeline_note"].as_str().unwrap().contains("26 older"), "{v}");
+        // The brute forcer: users it tried, nothing served, every row 401.
+        let v = f.tool("ip_activity", json!({"ip": "203.0.113.9", "window": "24h"}));
+        let users: Vec<&str> = v["exposure"]["users"].as_array().unwrap().iter().map(|u| u["user"].as_str().unwrap()).collect();
+        assert_eq!(users, ["alice", "bob", "carol", "dave"]);
+        assert_eq!(v["exposure"]["served"], 0);
+        assert!(v["exposure"]["reading"].as_str().unwrap().starts_with("Nothing it sent"));
+        assert!(v["timeline"].as_array().unwrap().iter().all(|r| r["status"] == 401 && r["outcome"] == "refused"));
+        assert!(v.get("timeline_note").is_none());
+        // A signed-in, served request says so.
+        let v = f.tool("ip_activity", json!({"ip": "10.1.0.0", "window": "24h"}));
+        assert!(v["exposure"]["signed_in_requests"].as_i64().unwrap() > 0);
+        assert!(v["exposure"]["reading"].as_str().unwrap().contains("signed-in"));
+        // q narrows it; an unknown address is empty, not an error.
+        assert_eq!(f.tool("ip_activity", json!({"ip": "198.51.100.7", "window": "24h", "q": "status:2xx"}))["requests"], 1);
+        let none = f.tool("ip_activity", json!({"ip": "192.0.2.250", "window": "24h"}));
+        assert_eq!((none["requests"].as_i64(), none.get("exposure")), (Some(0), None));
+        for bad in ["", "10.0.0.0/8", "10.*", "1.2.3.4|5.6.7.8"] {
+            assert!(f.tool("ip_activity", json!({"ip": bad}))["error"].as_str().unwrap().contains("one address"), "{bad}");
+        }
+    }
+
+    /// Every surface this change added, without the security scope: the
+    /// address-level ones refused, the rest answer and leak no address or
+    /// user agent.
+    #[test]
+    fn the_new_surfaces_keep_addresses_and_user_agents_behind_the_security_scope() {
+        let f = planted("sec-gate2");
+        let v = f.tool("ip_activity", json!({"ip": "198.51.100.7", "window": "24h"}));
+        assert!(v["error"].as_str().unwrap().contains("needs security access"), "{v}");
+        assert_eq!(v["access"]["client_fields"], false);
+        assert!(!v.to_string().contains("curl"), "{v}");
+        let text = |tool: &str, args: Value| f.text(tool, args);
+        for (group, q) in [("outcome", "probe:true"), ("halted", "halted:true"), ("rate_limit", "rate_limited:search"), ("unpermitted", "unpermitted:role")] {
+            let t = text("query_requests", json!({"group_by": [group], "q": q, "window": "24h", "metrics": ["outcomes", "served", "distinct_ips"]}));
+            assert!(!t.contains("198.51.100") && !t.contains("203.0.113") && !t.contains("192.0.2.44") && !t.contains("10.1.0."), "{group}: {t}");
+            assert!(!t.contains("curl/") && !t.contains("Firefox"), "{group}: {t}");
+            assert!(serde_json::from_str::<Value>(&t).unwrap().get("error").is_none(), "{group}: {t}");
+        }
+        let s = text("security_summary", json!({"window": "24h"}));
+        assert!(!s.contains("198.51.100") && !s.contains("203.0.113") && !s.contains("192.0.2.44") && !s.contains("curl/"), "{s}");
+        assert!(!s.contains("ip_activity"), "no address to drill into without the scope: {s}");
+        // The request index holds the address: reading it through the new
+        // keys does not hand it out either.
+        let rows = text("search_requests", json!({"q": "outcome:served probe:true", "window": "24h"}));
+        assert!(rows.contains("scan-env-200") && !rows.contains("198.51.100.7") && !rows.contains("curl/"), "{rows}");
+        f.grant_security();
+        assert_eq!(f.tool("ip_activity", json!({"ip": "198.51.100.7", "window": "24h"}))["requests"], 31);
     }
 
     #[test]
