@@ -141,13 +141,16 @@ differential harnesses. Report vulnerabilities privately:
 Railwatch (railwatch-rs) is under the **Functional Source License 1.1,
 Apache 2.0 future license** (`FSL-1.1-ALv2`, [LICENSE](LICENSE)).
 Use, change and self-host it freely, including inside your company to
-monitor your own applications. What it does not allow is offering Railwatch,
-or something substantially like it, to others as a commercial product or
-service. Each release becomes available under the Apache License 2.0 two
-years after it is published.
+monitor your own applications. What it does not allow is a Competing Use:
+making Railwatch available to others in a commercial product or service
+that substitutes for Railwatch, offers substantially similar functionality,
+or substitutes for another product or service Rebulk offers using Railwatch
+(one that existed when that version was released). LICENSE has the exact
+terms. Each version released under FSL also becomes available under the
+Apache License 2.0 two years after its release.
 
 Releases up to and including v0.2.12 were published under AGPL-3.0-only and
-stay available under it. The server still links every page and response to
+stay available under it alone; the Apache-2.0 grant does not apply to them. The server still links every page and response to
 its source (`SOURCE_URL` in `crates/server/src/lib.rs`, overridable at build
 time with `RAILWATCH_SOURCE_URL`; `/source` redirects there).
 
