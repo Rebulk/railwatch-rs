@@ -35,6 +35,9 @@ const SHAPE_SAMPLE: usize = 100;
 pub const MIN_SAMPLES: usize = 20;
 /// A change smaller than this (percent) is not called better or worse.
 const NOISE_PCT: f64 = 10.0;
+/// How far the whole environment's traffic mix may move (mix_shift, 0-100)
+/// before the verdict compares route by route instead of the blend.
+const MIX_PCT: f64 = 15.0;
 
 /// One side of the comparison: which executions, and how to name them.
 struct Side {
@@ -248,11 +251,46 @@ impl Mcp<'_> {
                 worse.push(100.0);
             }
         }
-        let worst = worse.iter().copied().fold(0.0f64, f64::max);
+        let mut worst = worse.iter().copied().fold(0.0f64, f64::max);
         let low = b.count < MIN_SAMPLES || f.count < MIN_SAMPLES;
         let shapes = shape_diff(&b.shapes, &f.shapes, b.sampled, f.sampled);
         let n1 = n_plus_one_diff(&b.n_plus_ones, &f.n_plus_ones);
-        let verdict = verdict(b, f, &deltas, worst, &n1, low);
+        // The whole environment blends every route: when the mix moved (a
+        // burst of sign-in redirects one side, dashboard loads the other),
+        // the blend moves with it although no route changed. Then the
+        // verdict holds each route to itself, weighted by the after side.
+        let shift = if group.is_none() && b.count > 0 && f.count > 0 { mix_shift(b, f) } else { 0.0 };
+        let adjusted = (shift >= MIX_PCT).then(|| mix_adjusted(b, f)).flatten();
+        let mix = adjusted.map(|l| {
+            let ((ab, af), (qb, qf), (db, df)) = (l.avg, l.queries, l.db_ms);
+            let adj = crate::obj! {
+                "p95_pct" => Value::Null, "avg_pct" => opt(pct(Some(ab), Some(af))),
+                "queries_per_request_pct" => opt(pct(qb, qf)), "db_ms_per_request_pct" => opt(pct(db, df)),
+                "error_rate_pts" => deltas["error_rate_pts"].clone(),
+            };
+            let mut w: Vec<f64> = ["avg_pct", "queries_per_request_pct", "db_ms_per_request_pct"].iter().filter_map(|k| adj[*k].as_f64()).collect();
+            for (x, y) in [(qb, qf), (db, df)] {
+                if let (Some(x), Some(y)) = (x, y)
+                    && x <= 0.0
+                    && y >= 1.0
+                {
+                    w.push(100.0);
+                }
+            }
+            (adj, w.into_iter().fold(0.0f64, f64::max), l)
+        });
+        let verdict = match &mix {
+            Some((adj, w, nums)) => {
+                worst = *w;
+                let mut v = verdict(b, f, adj, worst, &n1, low, Some(*nums));
+                v.push_str(&format!(
+                    " The traffic mix moved {}% between the sides, so these are like-for-like (each route against itself, weighted by the after side's traffic); the blended totals are in before/after and deltas.",
+                    shift.round() as i64
+                ));
+                v
+            }
+            None => verdict(b, f, &deltas, worst, &n1, low, None),
+        };
         let what = match group {
             Some(_) => {
                 crate::obj! { "kind" => if kind == "request" { "route" } else { "job" }, "name" => f.name.clone().or_else(|| b.name.clone()).or_else(|| rb::present(Some(name)).then(|| name.to_string())), "group_hash" => group }
@@ -284,6 +322,21 @@ impl Mcp<'_> {
             "before" => bj, "after" => fj, "deltas" => deltas,
             "n_plus_ones" => n1, "query_shapes" => shapes,
         };
+        if group.is_none() && b.count > 0 && f.count > 0 {
+            let mut m = crate::obj! { "shift_pct" => jf(rb::round(shift, 1)), "moved_most" => mix_movers(b, f), "statuses" => status_shares(b, f) };
+            if let Some((adj, _, l)) = &mix {
+                db::merge_into(
+                    &mut m,
+                    "like_for_like",
+                    crate::obj! {
+                        "avg_ms" => crate::obj! { "before" => jf(rb::round(l.avg.0, 1)), "after" => jf(rb::round(l.avg.1, 1)) },
+                        "queries_per_request" => crate::obj! { "before" => opt(l.queries.0.map(|x| rb::round(x, 1))), "after" => opt(l.queries.1.map(|x| rb::round(x, 1))) },
+                        "deltas" => adj.clone(),
+                    },
+                );
+            }
+            db::merge_into(&mut v, "traffic_mix", m);
+        }
         if low {
             db::merge_into(
                 &mut v,
@@ -487,6 +540,24 @@ struct Measured {
     shapes: HashMap<String, (usize, f64, String, Option<String>)>,
     /// (group_hash, source) -> (sql, executions it fired in)
     n_plus_ones: NPlusOnes,
+    /// "group_hash status-class" for requests, group_hash for jobs -> its
+    /// executions on this side, for the traffic mix.
+    groups: HashMap<String, Group>,
+    /// Requests by status class ("2xx", "3xx", ...): a shift between
+    /// sides (sign-in redirects turning into page loads) moves the blend.
+    statuses: HashMap<&'static str, usize>,
+}
+
+/// One route's or job class's executions on a side.
+#[derive(Default, Clone)]
+struct Group {
+    name: Option<String>,
+    count: usize,
+    duration_ms: f64,
+    queries: f64,
+    queries_n: usize,
+    db_ms: f64,
+    db_n: usize,
 }
 
 impl Measured {
@@ -535,7 +606,7 @@ fn measure_count(conn: &Connection, kind: &str, group: Option<&str>, side: &Side
 
 fn measure(conn: &Connection, kind: &str, group: Option<&str>, side: &Side) -> rusqlite::Result<Measured> {
     let mut sql = String::from(
-        "SELECT \"executions\".\"execution_id\", \"executions\".\"name\", \"executions\".\"duration\", \"executions\".\"status\", \"executions\".\"outcome\", \
+        "SELECT \"executions\".\"execution_id\", \"executions\".\"name\", \"executions\".\"group_hash\", \"executions\".\"duration\", \"executions\".\"status\", \"executions\".\"outcome\", \
          CASE WHEN \"executions\".\"counters\" IS NULL THEN NULL ELSE COALESCE(json_extract(\"executions\".\"counters\", '$.queries'), 0) END AS queries, \
          json_extract(\"executions\".\"detail\", '$.db_runtime') AS db FROM \"executions\" WHERE \"executions\".\"kind\" = ?",
     );
@@ -571,6 +642,35 @@ fn measure(conn: &Connection, kind: &str, group: Option<&str>, side: &Side) -> r
     let db_ms = mean(rows.iter().filter_map(|r| r.f("db")).collect());
     let ids: Vec<String> = rows.iter().take(SHAPE_SAMPLE).filter_map(|r| r.s("execution_id").map(str::to_string)).collect();
     let (shapes, n_plus_ones) = sample_shapes(conn, &ids)?;
+    let mut groups: HashMap<String, Group> = HashMap::new();
+    let mut statuses: HashMap<&'static str, usize> = HashMap::new();
+    for r in &rows {
+        // By route and status class: one route that answers a sign-in
+        // redirect one side and a full page the other changed its traffic,
+        // not its code (rebulk-system's org root: 2 queries vs 69).
+        let key = if kind == "request" {
+            format!("{} {}", r.s("group_hash").unwrap_or(""), status_class(r.i("status")))
+        } else {
+            r.s("group_hash").unwrap_or("").to_string()
+        };
+        let g = groups.entry(key).or_default();
+        if g.name.is_none() {
+            g.name = r.s("name").map(str::to_string);
+        }
+        g.count += 1;
+        g.duration_ms += r.i("duration").unwrap_or(0) as f64 / 1000.0;
+        if let Some(q) = r.i("queries").map(|q| q as f64).or_else(|| r.f("queries")) {
+            g.queries += q;
+            g.queries_n += 1;
+        }
+        if let Some(d) = r.f("db") {
+            g.db_ms += d;
+            g.db_n += 1;
+        }
+        if kind == "request" {
+            *statuses.entry(status_class(r.i("status"))).or_default() += 1;
+        }
+    }
     Ok(Measured {
         name: rows.first().and_then(|r| r.s("name")).map(str::to_string),
         count: rows.len(),
@@ -584,7 +684,95 @@ fn measure(conn: &Connection, kind: &str, group: Option<&str>, side: &Side) -> r
         sampled: ids.len(),
         shapes,
         n_plus_ones,
+        groups,
+        statuses,
     })
+}
+
+fn status_class(status: Option<i64>) -> &'static str {
+    match status.unwrap_or(0) {
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    }
+}
+
+/// How far the traffic moved between the sides, 0 (same mix) to 100
+/// (nothing in common): half the summed difference of each route-and-
+/// status-class's (or job class's) share of its side. The total variation
+/// distance.
+fn mix_shift(b: &Measured, f: &Measured) -> f64 {
+    let (nb, nf) = (b.count.max(1) as f64, f.count.max(1) as f64);
+    let keys: std::collections::BTreeSet<&String> = b.groups.keys().chain(f.groups.keys()).collect();
+    keys.into_iter().map(|k| (b.groups.get(k).map_or(0, |g| g.count) as f64 / nb - f.groups.get(k).map_or(0, |g| g.count) as f64 / nf).abs()).sum::<f64>()
+        * 50.0
+}
+
+/// Per-request numbers with each route held to its own before and after,
+/// weighted by the after side's traffic (mix_adjusted).
+#[derive(Clone, Copy)]
+struct LikeForLike {
+    avg: (f64, f64),
+    queries: (Option<f64>, Option<f64>),
+    db_ms: (Option<f64>, Option<f64>),
+}
+
+/// Per-request avg ms, queries and db ms with each route held to its own
+/// before and after, weighted by the after side's traffic: what changed in
+/// the code rather than in what was asked of it. Only routes on both sides
+/// count; None when none are.
+fn mix_adjusted(b: &Measured, f: &Measured) -> Option<LikeForLike> {
+    let mut w = 0.0;
+    let (mut ab, mut af, mut qb, mut qf, mut qw, mut db, mut df, mut dw) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for (k, gf) in &f.groups {
+        let Some(gb) = b.groups.get(k) else { continue };
+        let n = gf.count as f64;
+        w += n;
+        ab += n * gb.duration_ms / gb.count as f64;
+        af += n * gf.duration_ms / gf.count as f64;
+        if gb.queries_n > 0 && gf.queries_n > 0 {
+            qw += n;
+            qb += n * gb.queries / gb.queries_n as f64;
+            qf += n * gf.queries / gf.queries_n as f64;
+        }
+        if gb.db_n > 0 && gf.db_n > 0 {
+            dw += n;
+            db += n * gb.db_ms / gb.db_n as f64;
+            df += n * gf.db_ms / gf.db_n as f64;
+        }
+    }
+    let per = |x: f64, n: f64| (n > 0.0).then(|| x / n);
+    (w > 0.0).then(|| LikeForLike { avg: (ab / w, af / w), queries: (per(qb, qw), per(qf, qw)), db_ms: (per(db, dw), per(df, dw)) })
+}
+
+/// The routes whose share of traffic moved most, for the mix note.
+fn mix_movers(b: &Measured, f: &Measured) -> Vec<Value> {
+    let (nb, nf) = (b.count.max(1) as f64, f.count.max(1) as f64);
+    let keys: std::collections::BTreeSet<&String> = b.groups.keys().chain(f.groups.keys()).collect();
+    let mut rows: Vec<(f64, Value)> = keys
+        .into_iter()
+        .map(|k| {
+            let (gb, gf) = (b.groups.get(k), f.groups.get(k));
+            let (cb, cf) = (gb.map_or(0, |g| g.count), gf.map_or(0, |g| g.count));
+            let share = |c: usize, n: f64| rb::round(c as f64 * 100.0 / n, 1);
+            let per_q = |g: Option<&Group>| g.filter(|g| g.queries_n > 0).map(|g| rb::round(g.queries / g.queries_n as f64, 1));
+            let moved = (cb as f64 / nb - cf as f64 / nf).abs();
+            let name = gf.and_then(|g| g.name.clone()).or_else(|| gb.and_then(|g| g.name.clone()));
+            let (hash, class) = k.split_once(' ').map_or((k.as_str(), None), |(h, c)| (h, Some(c)));
+            (
+                moved,
+                crate::obj! {
+                    "name" => name, "group_hash" => hash, "status" => class,
+                    "before_share_pct" => jf(share(cb, nb)), "after_share_pct" => jf(share(cf, nf)),
+                    "before_queries_per_request" => opt(per_q(gb)), "after_queries_per_request" => opt(per_q(gf)),
+                },
+            )
+        })
+        .collect();
+    rows.sort_by(|x, y| y.0.total_cmp(&x.0));
+    rows.into_iter().take(3).map(|r| r.1).collect()
 }
 
 type Shapes = HashMap<String, (usize, f64, String, Option<String>)>;
@@ -695,7 +883,26 @@ fn n_plus_one_diff(b: &NPlusOnes, f: &NPlusOnes) -> Value {
 
 /// "Better: p95 -38% (3669 -> 480 ms), queries per request 826 -> 80, N+1
 /// at customer_documents.rb:511 gone."
-fn verdict(b: &Measured, f: &Measured, d: &Value, worst: f64, n1: &Value, low: bool) -> String {
+/// Each status class's share of the side's requests, before and after.
+fn status_shares(b: &Measured, f: &Measured) -> Value {
+    let (nb, nf) = (b.count.max(1) as f64, f.count.max(1) as f64);
+    let mut out = serde_json::Map::new();
+    for c in ["2xx", "3xx", "4xx", "5xx", "other"] {
+        let (x, y) = (b.statuses.get(c).copied().unwrap_or(0), f.statuses.get(c).copied().unwrap_or(0));
+        if x + y > 0 {
+            out.insert(
+                c.into(),
+                crate::obj! { "before_pct" => jf(rb::round(x as f64 * 100.0 / nb, 1)), "after_pct" => jf(rb::round(y as f64 * 100.0 / nf, 1)) },
+            );
+        }
+    }
+    Value::Object(out)
+}
+
+/// `adjusted`: the like-for-like numbers when the traffic mix moved; the
+/// verdict leads with avg then, since percentiles cannot be held route by
+/// route.
+fn verdict(b: &Measured, f: &Measured, d: &Value, worst: f64, n1: &Value, low: bool, adjusted: Option<LikeForLike>) -> String {
     if b.count == 0 || f.count == 0 {
         return format!(
             "Nothing to compare: the {} side has no executions{}.",
@@ -708,7 +915,11 @@ fn verdict(b: &Measured, f: &Measured, d: &Value, worst: f64, n1: &Value, low: b
     if let Some(p) = d["p95_pct"].as_f64() {
         parts.push(format!("p95 {}{p}% ({} -> {} ms)", if p > 0.0 { "+" } else { "" }, ms(b.p95), ms(f.p95)));
     }
-    if let (Some(x), Some(y)) = (b.queries, f.queries)
+    if let (Some(l), Some(p)) = (adjusted, d["avg_pct"].as_f64()) {
+        parts.push(format!("avg per request {}{p}% ({} -> {} ms)", if p > 0.0 { "+" } else { "" }, ms(Some(l.avg.0)), ms(Some(l.avg.1))));
+    }
+    let (qb, qf) = adjusted.map_or((b.queries, f.queries), |l| l.queries);
+    if let (Some(x), Some(y)) = (qb, qf)
         && (y - x).abs() >= 1.0
     {
         parts.push(format!("queries per request {} -> {}", x.round() as i64, y.round() as i64));
