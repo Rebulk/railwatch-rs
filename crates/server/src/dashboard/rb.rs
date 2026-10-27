@@ -361,12 +361,14 @@ pub fn string_to_f(s: &str) -> f64 {
         }
         *i > st
     };
-    if !digits(&mut i) {
-        return 0.0;
-    }
+    // ".5" and "-.5" are 0.5 and -0.5 in Ruby: the integer part is optional
+    // when a fraction follows.
+    let whole = digits(&mut i);
     if i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit() {
         i += 1;
         digits(&mut i);
+    } else if !whole {
+        return 0.0;
     }
     if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
         let mut j = i + 1;
@@ -378,7 +380,14 @@ pub fn string_to_f(s: &str) -> f64 {
             digits(&mut i);
         }
     }
-    t[..i].replace('_', "").parse().unwrap_or(0.0)
+    // Rust's f64 parse wants a digit before the point.
+    let n = t[..i].replace('_', "");
+    let n = match n.strip_prefix('-').or(n.strip_prefix('+')) {
+        Some(rest) if rest.starts_with('.') => format!("{}0{rest}", &n[..1]),
+        _ if n.starts_with('.') => format!("0{n}"),
+        _ => n,
+    };
+    n.parse().unwrap_or(0.0)
 }
 
 #[cfg(test)]

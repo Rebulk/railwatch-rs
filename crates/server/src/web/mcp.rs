@@ -2751,6 +2751,9 @@ mod tests {
         assert_eq!(rb::string_to_f(" 12abc"), 12.0);
         assert_eq!(rb::string_to_f("1_000"), 1000.0);
         assert_eq!(rb::string_to_f("abc"), 0.0);
+        // String#to_f takes a fraction without an integer part.
+        assert_eq!((rb::string_to_f(".5"), rb::string_to_f("-.5"), rb::string_to_f(" +.25ms")), (0.5, -0.5, 0.25));
+        assert_eq!((rb::string_to_f("."), rb::string_to_f("-.x"), rb::string_to_f("1.")), (0.0, 0.0, 1.0));
         assert_eq!(split_semicolons("x;y;;"), ["x", "y"]);
         // key.split("/", 3)
         assert_eq!(split_issue_key("a/b"), (Some("a".into()), None, "b".into()));

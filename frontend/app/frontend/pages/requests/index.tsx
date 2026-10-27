@@ -24,6 +24,8 @@ interface Props {
   sort: string
   dir: string
   q: string
+  // Present when q filters on what only the raw requests hold (ip:, path:, ...).
+  scan?: { scanned: number; capped: boolean; note?: string }
 }
 
 export default function Requests(p: Props) {
@@ -95,6 +97,11 @@ export default function Requests(p: Props) {
           onChange={(q) => visit({ q: q || undefined })}
           placeholder="method:GET status:5xx route:/widgets"
         />
+        {p.scan?.capped && (
+          <p className="text-muted-foreground text-xs" role="status">
+            {p.scan.note}
+          </p>
+        )}
         <div className="grid gap-4 lg:grid-cols-2">
           <VolumePanel label="Requests" data={p.series} deploys={p.deploys} />
           <DurationPanel

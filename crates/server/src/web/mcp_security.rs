@@ -207,7 +207,7 @@ impl Mcp<'_> {
                                 .iter()
                                 .take(10)
                                 .map(|(ip, s)| json!({"ip": ip, "client_errors": s.client_errors, "requests": s.count,
-                                     "distinct_paths": paths_json(&s.paths), "new": compared.then(|| !before.by_ip.contains_key(*ip))}))
+                                     "distinct_paths": paths_json(&s.paths), "new": (compared && !before.scanned.capped).then(|| !before.by_ip.contains_key(*ip))}))
                                 .collect::<Vec<_>>()
                         ),
                     );
@@ -287,7 +287,9 @@ impl Mcp<'_> {
                 findings.push(f);
             }
             // Traffic from addresses not seen in the previous window.
-            if access && compared {
+            // A capped previous window did not see every address it had: new
+            // would include ones it merely did not reach.
+            if access && compared && !before.scanned.capped {
                 let new: Vec<(&String, &IpStat)> = now.by_ip.iter().filter(|(ip, _)| !before.by_ip.contains_key(*ip)).collect();
                 if !new.is_empty() {
                     let requests: i64 = new.iter().map(|(_, s)| s.count).sum();
@@ -1116,6 +1118,27 @@ mod tests {
         assert!(!kinds.contains(&"new_ips"), "{kinds:?}");
         let auth = v["findings"].as_array().unwrap().iter().find(|x| x["kind"] == "auth_failures").unwrap();
         assert_eq!(auth["severity"], "low", "1,000 401s against an unread previous window are not a spike");
+    }
+
+    /// When only the previous window passed the cap, counts are compared
+    /// but no address is called new (the pass may not have reached it).
+    #[test]
+    fn a_capped_previous_window_names_no_new_addresses() {
+        let f = planted("sec-summary-prevcap");
+        f.grant_security();
+        let c = f.tenant();
+        c.execute_batch("BEGIN").unwrap();
+        for i in 0..super::SUMMARY_SCAN {
+            req(&c, &format!("prev{i}"), 24 * 60 + 5, "GET", "/orders(.:format)", 200, Some("x"), d("10.9.0.1", "/orders", "bulk"));
+        }
+        c.execute_batch("COMMIT").unwrap();
+        let v = f.tool("security_summary", json!({"window": "24h"}));
+        assert_eq!(v["scan"]["previous"]["capped"], true, "{}", v["scan"]);
+        assert_eq!(v["requests"], 71);
+        let kinds: Vec<&str> = v["findings"].as_array().unwrap().iter().map(|x| x["kind"].as_str().unwrap()).collect();
+        assert!(!kinds.contains(&"new_ips"), "{kinds:?}");
+        let scanners = v["findings"].as_array().unwrap().iter().find(|x| x["kind"] == "scanners").unwrap();
+        assert_eq!(scanners["ips"][0]["new"], json!(null));
     }
 
     #[test]
