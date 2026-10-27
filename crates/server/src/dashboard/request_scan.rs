@@ -982,7 +982,7 @@ mod per_day_tests {
         // A union reader attached throughout, as the server's pools are.
         let (reader, _) = crate::storage::reader::open(&env).unwrap();
         let pass = crate::tenants::add_missing_indexes(&tenants, now, std::time::Duration::ZERO);
-        assert_eq!((pass.built, pass.failed), (1, 0), "only 2026-10-24 was closed and without it");
+        assert_eq!((pass.built, pass.failed, pass.waiting), (1, 0, 2), "only 2026-10-24 was closed and without it; 25 and 26 wait");
         let has = |p: &std::path::Path| crate::schema::has_index(&rusqlite::Connection::open(p).unwrap(), "main", crate::schema::REQUEST_INDEX).unwrap();
         let day = |d: &str| crate::storage::layout::day_path(&env, crate::storage::layout::Tier::Core, d);
         // The build's WAL is checkpointed and emptied even with a reader holding the file open.
@@ -991,7 +991,45 @@ mod per_day_tests {
         assert!(has(&day("2026-10-24")));
         assert!(!has(&day("2026-10-25")) && !has(&day("2026-10-26")), "yesterday and today are left to ingest");
         assert!(!has(&single), "a single-file tenant is not altered");
-        assert_eq!(crate::tenants::add_missing_indexes(&tenants, now, std::time::Duration::ZERO), crate::tenants::IndexPass::default(), "nothing left");
+        let again = crate::tenants::add_missing_indexes(&tenants, now, std::time::Duration::ZERO);
+        assert_eq!((again.built, again.failed, again.waiting), (0, 0, 2), "the two open days still wait, so the loop goes on");
+        // A day later yesterday has closed: the next pass builds it, as the
+        // background loop's next pass would after a rollover.
+        let later = now + 86_400_000_000;
+        let pass = crate::tenants::add_missing_indexes(&tenants, later, std::time::Duration::ZERO);
+        assert_eq!((pass.built, pass.failed, pass.waiting), (1, 0, 1));
+        assert!(has(&day("2026-10-25")));
+        let done = crate::tenants::add_missing_indexes(&tenants, later + 86_400_000_000, std::time::Duration::ZERO);
+        assert_eq!((done.built, done.waiting, done.failed), (1, 0, 0), "nothing left: the loop stops");
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reader inside a read transaction keeps the TRUNCATE checkpoint
+    /// busy: the build still counts, the pass says it failed (so the loop
+    /// comes back), and the next pass, with the reader gone, empties the WAL.
+    #[test]
+    fn a_busy_checkpoint_after_the_build_is_tried_again() {
+        let dir = std::env::temp_dir().join(format!("rw-reqbusy-{}", crate::control::base58(8)));
+        let tenants = dir.join("telemetry");
+        let env = tenants.join("env");
+        crate::storage::layout::ensure(&env).unwrap();
+        let p = crate::storage::layout::day_path(&env, crate::storage::layout::Tier::Core, "2026-10-20");
+        let c = crate::storage::layout::open_or_create(&p).unwrap();
+        c.execute_batch(&format!("DROP INDEX {}", crate::schema::REQUEST_INDEX)).unwrap();
+        c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())).unwrap();
+        drop(c);
+        let reader = rusqlite::Connection::open(&p).unwrap();
+        reader.execute_batch("BEGIN; SELECT count(*) FROM executions;").unwrap();
+        let now = crate::time::parse_db_time("2026-10-26 08:00:00").unwrap();
+        let pass = crate::tenants::add_missing_indexes(&tenants, now, std::time::Duration::ZERO);
+        assert_eq!((pass.built, pass.failed), (1, 1), "built, but its WAL is still there");
+        let wal = || std::fs::metadata(format!("{}-wal", p.display())).map_or(0, |m| m.len());
+        assert!(wal() > 0);
+        reader.execute_batch("COMMIT").unwrap();
+        let pass = crate::tenants::add_missing_indexes(&tenants, now, std::time::Duration::ZERO);
+        assert_eq!((pass.built, pass.failed), (0, 0));
+        assert_eq!(wal(), 0, "the next pass checkpointed it");
         drop(reader);
         let _ = std::fs::remove_dir_all(&dir);
     }

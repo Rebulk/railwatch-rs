@@ -703,9 +703,13 @@ pages, not the JSON.
 The startup pass on the bench tenant: 29 closed core day files (54 MB each)
 in 19.3 s of building (pauses excluded), +9% of their size. A 500 MB core
 day file (10 bench days, 222k requests) built in 4.3 s cold, 2.3 s warm.
-Each build is one write transaction on that day file; ingest never writes a
-closed day, so ingest does not wait. The build goes through the WAL (about
-4x the index's size), which is checkpointed and truncated right after.
+Each build is one write transaction on that day file. Ingest writes a closed
+day only for a late record (accepted up to 30 days old), which then waits
+for the build inside busy_timeout (5 s), or is answered 503 and retried by
+the gem past it. The build goes through the WAL (about 4x the index's size),
+which is checkpointed and truncated right after; a checkpoint a reader keeps
+busy is tried again on the next pass (hourly while any day lacks the index,
+which also builds the days that were today and yesterday at the upgrade).
 
 Ingest with the index, the same 400 batches into a fresh server, twice:
 wall 137.0 -> 140.9 s and 138.5 -> 144.4 s, server CPU +2.3% and +2.7%.

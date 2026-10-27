@@ -111,8 +111,8 @@ The request fields are read from an index on each day file's requests
 and every `query_requests` call, still reads the window's requests in time
 order, so the cost follows the window's request count (about 2.5 µs a
 request warm), not the number of matches. Day files from before the upgrade
-get the index in the background after it; today's and yesterday's never do
-and read slower until they roll over. `query_requests` reads at most the newest 200,000
+get the index in the background after it, today's and yesterday's once they
+are two days old; until then they read slower. `query_requests` reads at most the newest 200,000
 requests of the window, and `security_summary` 100,000 per window. Past
 that, `scan.capped` is true and the result says how far it got. Narrow `q`
 (a status, a route, a method) or the window to see further back. Timings on

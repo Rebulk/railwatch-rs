@@ -140,6 +140,9 @@ def security_fields(p, route):
     roll = rng.random()
     path = "/" + route.split("(")[0].strip("/").replace(":id", str(rng.randrange(1, 900)))
     ip, ua = f"10.{rng.randrange(0, 4)}.{rng.randrange(0, 256)}.{rng.randrange(1, 255)}", rng.choice(UAS)
+    # The fixture's own redirect_to (null) and response_size (0); a probe
+    # below may set its own.
+    redirect, size = None, None
     if roll < 0.01:
         ip, ua, path = rng.choice(SCANNERS), rng.choice(["curl/8.4.0", "python-requests/2.31", "Go-http-client/1.1"]), rng.choice(PROBES)
         p["status_code"], p["route"], p["method"] = 404, "unmatched", "GET"
@@ -150,10 +153,10 @@ def security_fields(p, route):
             # 2,000 is served (the real alarm).
             p["route"], p["_group"] = "/:org_slug(.:format)", md5("GET", "/:org_slug(.:format)")
             if rng.random() < 0.0005:
-                p["status_code"], p["response_size"] = 200, rng.randrange(400, 4000)
+                p["status_code"], size = 200, rng.randrange(400, 4000)
             else:
                 p["status_code"], p["halted_callback"] = 302, "authenticate"
-                p["redirect_to"] = "https://shop.example/sign_in"
+                redirect = "https://shop.example/sign_in"
     elif roll < 0.02:
         ip, path = f"203.0.113.{rng.randrange(1, 6)}", "/session"
         p["status_code"], p["route"], p["method"] = 401, "/session(.:format)", "POST"
@@ -161,11 +164,6 @@ def security_fields(p, route):
     p["ip"], p["path"], p["user_agent"] = ip, path, ua
     p["url"] = f"https://shop.example{path}"
     p["headers"] = {"Host": "shop.example", "Referer": "https://shop.example/", "X-Forwarded-For": f"{ip}, 10.0.0.1", "Accept": "text/html"}
-    if a.prod_shape:
-        p["headers"].update(BROWSER_HEADERS)
-        if p["status_code"] == 302 and "redirect_to" not in p:
-            p["redirect_to"] = f"https://shop.example/widgets/{rng.randrange(1, 900)}"
-        p.setdefault("response_size", rng.randrange(800, 60000) if p["status_code"] == 200 else 0)
     if rng.random() < 0.003:
         p["rate_limited"] = {"name": "default", "count": 61, "to": 60}
         p["status_code"] = 429
@@ -173,6 +171,14 @@ def security_fields(p, route):
         p["halted_callback"] = "require_login"
     if rng.random() < 0.002:
         p["unpermitted_parameters"] = ["admin"]
+    # Last: the flags above may have changed the status.
+    if a.prod_shape:
+        p["headers"].update(BROWSER_HEADERS)
+        if redirect is None and p["status_code"] == 302:
+            redirect = f"https://shop.example/widgets/{rng.randrange(1, 900)}"
+        if size is None:
+            size = rng.randrange(800, 60000) if p["status_code"] == 200 else 0
+        p["redirect_to"], p["response_size"] = redirect, size
 
 def execution(ts):
     eid, trace = uid(), uid()
@@ -349,7 +355,7 @@ records = []
 if a.prod_shape:
     # A production-sized tenant does not fit in memory as one list: times
     # are drawn and sorted up front, and batches written every 20k executions.
-    times = sorted(a.now - SPAN * rng.random() for _ in range(a.executions))
+    times = sorted(a.now - SPAN * (rng.random() if a.uniform else rng.random() ** 1.6) for _ in range(a.executions))
     for i in range(0, len(times), 20_000):
         chunk = [r for ts in times[i:i + 20_000] for r in execution(ts)]
         chunk.sort(key=lambda r: r["timestamp"])

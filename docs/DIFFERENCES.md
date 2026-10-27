@@ -657,10 +657,13 @@ all of it (identical; 130/130).
 
     New files get it when created. Existing per-day files get it from a
     background thread once the server is up (`tenants::add_missing_indexes`):
-    closed days only (two UTC days old, which ingest no longer writes), one
-    file at a time, newest first, 0.5 s apart, each build a short write
-    transaction on that file alone. Today's and yesterday's files never get
-    it; they are replaced by files that have it within two days. A file
+    closed days only (two UTC days old), one file at a time, newest first,
+    0.5 s apart, each build a short write transaction on that file alone.
+    Today's and yesterday's files at the upgrade get it from a later pass:
+    the thread looks again every hour until no day lacks it, then stops. A
+    late record for a day being built (ingest takes records up to 30 days
+    old) waits for that build, seconds on a large file, inside the 5 s
+    busy_timeout; past it the batch is answered 503 and the gem retries. A file
     without it answers the same through `json_extract`: the per-day reader's
     hinted view leaves the hint off that file's branch. Single-file (Rails
     layout) tenants are not altered; they read without it until something
