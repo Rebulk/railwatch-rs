@@ -3696,6 +3696,69 @@ mod tests {
         assert_eq!(span("after"), h);
     }
 
+    /// `n` requests of one route on `deploy`, `queries` each, `ms` long.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_plain_requests(conn: &Connection, deploy: &str, route: &str, at: i64, n: i64, status: i64, ms: i64, queries: i64) {
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO executions (execution_id, kind, name, route, group_hash, status, occurred_at, duration, deploy, counters, detail)
+                 VALUES (?1, 'request', ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    format!("{deploy}-{route}-{i}"),
+                    route,
+                    format!("g{}", route.len()),
+                    status,
+                    qt(at - i * 10_000_000),
+                    ms * 1000,
+                    deploy,
+                    json!({"queries": queries}).to_string(),
+                    json!({"db_runtime": queries as f64 / 2.0}).to_string()
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn compare_holds_each_route_to_itself_when_the_traffic_mix_moves() {
+        let f = seeded("compare-mix");
+        let conn = f.tenant();
+        let (d1, d2) = (NOW - 2 * 3_600_000_000, NOW - 3_600_000_000);
+        f.c.with(|x| {
+            x.execute(
+                "INSERT INTO deploys (environment_id, deploy, ref, name, deployed_at, created_at, updated_at) VALUES
+                 (?1, 'mix1', NULL, 'shop@1', ?2, ?2, ?2), (?1, 'mix2', NULL, 'shop@2', ?3, ?3, ?3)",
+                params![f.env, qt(d1), qt(d2)],
+            )
+        })
+        .unwrap();
+        // Neither route changes: a 5 ms sign-in redirect with 2 queries, and
+        // a 200 ms dashboard with 69. Before is mostly redirects, after
+        // mostly dashboards (rebulk-system, 2026-10-27).
+        seed_plain_requests(&conn, "mix1", "GET /:org_slug(.:format)", d2 - 60_000_000, 60, 302, 5, 2);
+        seed_plain_requests(&conn, "mix1", "GET /dashboard", d2 - 30_000_000, 5, 200, 200, 69);
+        seed_plain_requests(&conn, "mix2", "GET /:org_slug(.:format)", NOW - 60_000_000, 5, 302, 5, 2);
+        seed_plain_requests(&conn, "mix2", "GET /dashboard", NOW - 30_000_000, 60, 200, 200, 69);
+        let v = f.tool("compare", json!({}));
+        // The blend says much worse; the like-for-like says no change.
+        assert!(v["deltas"]["queries_per_request_pct"].as_f64().unwrap() > 500.0, "{}", v["deltas"]);
+        assert!(v["traffic_mix"]["shift_pct"].as_f64().unwrap() > 80.0, "{}", v["traffic_mix"]);
+        assert_eq!(v["traffic_mix"]["like_for_like"]["deltas"]["queries_per_request_pct"].as_f64(), Some(0.0), "{}", v["traffic_mix"]);
+        assert_eq!(v["traffic_mix"]["statuses"]["3xx"]["after_pct"].as_f64(), Some(7.7));
+        let verdict = v["verdict"].as_str().unwrap();
+        assert!(verdict.starts_with("No clear change"), "{verdict}");
+        assert!(verdict.contains("traffic mix moved"), "{verdict}");
+        assert_eq!(v["worst_regression_pct"].as_f64(), Some(0.0), "a CI gate must not trip on a mix change");
+        // A real regression inside a route still shows through the mix.
+        conn.execute("UPDATE executions SET counters = '{\"queries\": 140}' WHERE deploy = 'mix2' AND name = 'GET /dashboard'", []).unwrap();
+        let r = f.tool("compare", json!({}));
+        assert!(r["verdict"].as_str().unwrap().starts_with("Worse"), "{}", r["verdict"]);
+        assert!(r["worst_regression_pct"].as_f64().unwrap() > 90.0, "{}", r["worst_regression_pct"]);
+        // One route: no mix to speak of.
+        let one = f.tool("compare", json!({"route": "GET /dashboard"}));
+        assert!(one.get("traffic_mix").is_none(), "{one}");
+    }
+
     #[test]
     fn compare_since_a_mark_cuts_development_requests_without_a_deploy() {
         let f = seeded("compare-mark");
