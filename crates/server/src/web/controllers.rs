@@ -1317,7 +1317,7 @@ async fn profile_show(cx: Ctx) -> Response {
     cx.render(
         "settings/profiles/show",
         json!({"mcp_token": cx.flash_value("generated_api_token"), "api_tokens": tokens, "token_targets": targets,
-               "token_scopes": ["api", "mcp", "read", "write"], "weekly_digest": user.weekly_digest,
+               "token_scopes": ["api", "mcp", "read", "write", "security"], "weekly_digest": user.weekly_digest,
                "mcp_url": format!("{}/mcp", cx.state.config.pages_url()), "deletion": {"blocking_accounts": blocking}}),
         None,
     )

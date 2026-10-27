@@ -27,6 +27,7 @@ pub mod models;
 pub mod pages;
 pub mod pool;
 pub mod rb;
+pub mod request_scan;
 pub mod rollup;
 pub mod tdigest_decode;
 pub mod tenant;

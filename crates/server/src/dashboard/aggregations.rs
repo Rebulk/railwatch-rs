@@ -297,7 +297,7 @@ impl Groups {
     }
 }
 
-fn grouped_row(group_hash: &str, name: Option<&str>, s: &rollup::Summary, sparkline: Value) -> Value {
+pub(crate) fn grouped_row(group_hash: &str, name: Option<&str>, s: &rollup::Summary, sparkline: Value) -> Value {
     crate::obj! {
         "group_hash" => group_hash, "name" => db::js(name),
         "count" => s.count, "errors" => s.errors, "client_errors" => s.client_errors,

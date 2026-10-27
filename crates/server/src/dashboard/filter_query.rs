@@ -29,27 +29,58 @@ impl Parsed {
 }
 
 /// `FilterQuery.parse`: TOKEN = /\A([a-z_]+):(\S+)\z/ per whitespace word.
+/// A value may be quoted to hold spaces (`ua:"Mozilla/5.0 (X11"`): from
+/// `key:"` to the next `"`, or to the end without one.
 pub fn parse(query: Option<&str>) -> Parsed {
     let mut p = Parsed::default();
     let mut text = Vec::new();
-    for word in query.unwrap_or("").split(|c: char| c.is_ascii_whitespace()) {
-        if word.is_empty() {
-            continue;
+    let mut rest = query.unwrap_or("");
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if rest.is_empty() {
+            break;
         }
+        let end = rest.find(|c: char| c.is_ascii_whitespace()).unwrap_or(rest.len());
+        let word = &rest[..end];
         if let Some((k, v)) = word.split_once(':')
             && !k.is_empty()
             && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
             && !v.is_empty()
         {
+            if let Some(after) = rest[k.len() + 1..].strip_prefix('"') {
+                let close = after.find('"').unwrap_or(after.len());
+                if close > 0 {
+                    p.fields.insert(k.to_string(), after[..close].to_string());
+                }
+                rest = after.get(close + 1..).unwrap_or("");
+                continue;
+            }
             p.fields.insert(k.to_string(), v.to_string());
+            rest = &rest[end..];
             continue;
         }
         if rb::present(Some(word)) {
             text.push(word);
         }
+        rest = &rest[end..];
     }
     p.text = text.join(" ");
     p
+}
+
+/// `parse`'s inverse for one field: quoted when the value holds whitespace
+/// (a value with a `"` in it cannot be written; it is cut there).
+pub fn token(key: &str, value: &str) -> String {
+    if value.contains(|c: char| c.is_ascii_whitespace()) { format!("{key}:\"{}\"", value.split('"').next().unwrap_or("")) } else { format!("{key}:{value}") }
+}
+
+/// A query from fields and free text, in `parse`'s grammar.
+pub fn unparse(p: &Parsed) -> String {
+    let mut out: Vec<String> = p.fields.iter().map(|(k, v)| token(k, v)).collect();
+    if !p.text.is_empty() {
+        out.push(p.text.clone());
+    }
+    out.join(" ")
 }
 
 /// "5xx" -> 500..=599, "404" -> 404..=404.
@@ -308,7 +339,276 @@ pub fn apply(conn: &Connection, resource: Resource, query: Option<&str>, from: i
             }
         }
     }
+    // A job's request is the one that enqueued it.
+    let column = if matches!(resource, Resource::Jobs) { "parent_id" } else { "execution_id" };
+    request_detail_of(&mut c, table, column, &parsed, range);
     Ok(c)
+}
+
+// -- Request fields (detail JSON) -------------------------------------------
+//
+// What the gem records of a request beyond the executions columns (path,
+// ip, user agent, headers, the security flags) is in its `detail` JSON, with
+// no index: these keys narrow the window's requests row by row
+// (json_extract), so their cost is the window's request count, not the
+// matches (docs/PERF.md, "Security filters").
+
+/// Keys that read a request's detail. On jobs, exceptions, logs and queries
+/// they select the records of matching requests (the request's
+/// execution_id; a job's parent_id).
+pub const REQUEST_KEYS: [&str; 7] = ["ip", "ua", "path", "probe", "rate_limited", "halted", "unpermitted"];
+
+/// Keys that read personal data (the client's address and browser): only
+/// with security access (a token's `security` scope, a dashboard session).
+pub const PERSONAL_KEYS: [&str; 2] = ["ip", "ua"];
+
+/// Path fragments of scanners and probes: dotfiles, other stacks' admin
+/// pages, traversal, shells. Matched case-insensitively anywhere in the
+/// recorded path (percent-encoded as the client sent it).
+pub const PROBE_PATTERNS: [&str; 20] = [
+    ".env",
+    ".git",
+    ".svn",
+    ".htaccess",
+    ".htpasswd",
+    ".aws",
+    ".ssh",
+    ".ds_store",
+    "/wp-",
+    "wordpress",
+    "xmlrpc",
+    "phpmyadmin",
+    ".php",
+    "/cgi-bin",
+    "../",
+    "..%2f",
+    "%2e%2e",
+    "/etc/passwd",
+    "/actuator",
+    "/server-status",
+];
+
+/// `json_extract` of a request field (`$.ip`, `$.headers."Referer"`).
+pub fn detail_sql(alias: &str, path: &str) -> String {
+    format!("json_extract(\"{alias}\".\"detail\", '{path}')")
+}
+
+/// The keys of `p` that need security access.
+pub fn personal_keys(p: &Parsed) -> Vec<&'static str> {
+    PERSONAL_KEYS.iter().copied().filter(|k| p.field(k).is_some()).collect()
+}
+
+/// Whether `p` has a request-detail key.
+pub fn has_request_keys(p: &Parsed) -> bool {
+    REQUEST_KEYS.iter().any(|k| p.field(k).is_some())
+}
+
+/// What is wrong with the request keys' values, for the caller to report
+/// (the conditions themselves match nothing on a bad value).
+pub fn check_request_keys(p: &Parsed) -> Option<String> {
+    for k in ["probe", "rate_limited", "halted", "unpermitted"] {
+        if let Some(v) = p.field(k)
+            && v != "true"
+            && v != "false"
+        {
+            return Some(format!("{k}: must be true or false, not {v:?}"));
+        }
+    }
+    if let Some(ip) = p.field("ip") {
+        for alt in ip.split('|') {
+            if let Err(e) = ip_condition(alt) {
+                return Some(format!("ip: {e}"));
+            }
+        }
+    }
+    None
+}
+
+/// One `ip:` alternative as (exact addresses, LIKE patterns): exact,
+/// `prefix*`, or an IPv4 CIDR as the dotted prefixes it covers (a /20 is
+/// 16 `a.b.c.%` patterns, a /28 the 16 addresses).
+fn ip_condition(v: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    if let Some(prefix) = v.strip_suffix('*') {
+        return Ok((vec![], vec![format!("{}%", rb::sanitize_sql_like(prefix))]));
+    }
+    let Some((net, bits)) = v.split_once('/') else { return Ok((vec![v.to_string()], vec![])) };
+    let addr: std::net::Ipv4Addr = net.parse().map_err(|_| format!("{v:?} is not an IPv4 CIDR (for IPv6 use a prefix, e.g. ip:2001:db8:*)"))?;
+    let bits: u32 = bits.parse().ok().filter(|b| (8..=32).contains(b)).ok_or_else(|| format!("{v:?}: the prefix length must be 8-32"))?;
+    let o = addr.octets();
+    let whole = (bits / 8) as usize;
+    let kept: Vec<String> = o[..whole].iter().map(u8::to_string).collect();
+    if whole == 4 {
+        return Ok((vec![kept.join(".")], vec![]));
+    }
+    // The partial octet's values (one when the length is a whole octet).
+    let spare = 8 - bits % 8;
+    let base = (o[whole] as u16) & !((1u16 << spare) - 1);
+    let values: Vec<u16> = if bits.is_multiple_of(8) { vec![] } else { (base..base + (1 << spare)).collect() };
+    if values.is_empty() {
+        return Ok((vec![], vec![format!("{}.%", kept.join("."))]));
+    }
+    let with = |x: u16| {
+        let mut parts = kept.clone();
+        parts.push(x.to_string());
+        parts.join(".")
+    };
+    if whole == 3 {
+        return Ok((values.into_iter().map(with).collect(), vec![]));
+    }
+    Ok((vec![], values.into_iter().map(|x| format!("{}.%", with(x))).collect()))
+}
+
+/// `a|b|c`: alternatives of one key, ORed.
+fn alternatives(v: &str) -> impl Iterator<Item = &str> {
+    v.split('|').filter(|a| !a.is_empty())
+}
+
+/// The request-detail keys of `p` as conditions on `alias` (an executions
+/// row of kind request). A bad value matches nothing (check_request_keys
+/// says why).
+pub fn request_detail(c: &mut Cond, alias: &str, p: &Parsed) {
+    if check_request_keys(p).is_some() {
+        c.none = true;
+        return;
+    }
+    if let Some(ip) = p.field("ip") {
+        let col = detail_sql(alias, "$.ip");
+        let mut ors = vec![];
+        let mut binds = vec![];
+        for alt in alternatives(ip) {
+            let (exact, likes) = ip_condition(alt).expect("checked");
+            for e in exact {
+                ors.push(format!("{col} = ?"));
+                binds.push(s(&e));
+            }
+            for l in likes {
+                ors.push(format!("{col} LIKE ? ESCAPE '\\'"));
+                binds.push(s(&l));
+            }
+        }
+        if ors.is_empty() {
+            c.none = true;
+        } else {
+            c.and(format!("({})", ors.join(" OR ")), binds);
+        }
+    }
+    for (key, path) in [("ua", "$.user_agent"), ("path", "$.path")] {
+        let Some(v) = p.field(key) else { continue };
+        let col = detail_sql(alias, path);
+        let mut ors = vec![];
+        let mut binds = vec![];
+        for alt in alternatives(v) {
+            // path:/admin* is a prefix; anything else a substring.
+            let pat = match alt.strip_suffix('*') {
+                Some(prefix) if key == "path" => format!("{}%", rb::sanitize_sql_like(prefix)),
+                _ => format!("%{}%", rb::sanitize_sql_like(alt)),
+            };
+            ors.push(format!("{col} LIKE ? ESCAPE '\\'"));
+            binds.push(s(&pat));
+        }
+        if ors.is_empty() {
+            c.none = true;
+        } else {
+            c.and(format!("({})", ors.join(" OR ")), binds);
+        }
+    }
+    if let Some(v) = p.field("probe") {
+        let col = detail_sql(alias, "$.path");
+        let ors = vec![format!("{col} LIKE ? ESCAPE '\\'"); PROBE_PATTERNS.len()].join(" OR ");
+        let binds = PROBE_PATTERNS.iter().map(|x| s(&format!("%{}%", rb::sanitize_sql_like(x)))).collect();
+        c.and(if v == "true" { format!("({ors})") } else { format!("(NOT ({ors}) OR {col} IS NULL)") }, binds);
+    }
+    let flag = |c: &mut Cond, key: &str, set: String| {
+        if let Some(v) = p.field(key) {
+            c.and(if v == "true" { set } else { format!("NOT ({set})") }, vec![]);
+        }
+    };
+    flag(c, "rate_limited", format!("COALESCE(json_type(\"{alias}\".\"detail\", '$.rate_limited') NOT IN ('null', 'false'), 0)"));
+    flag(c, "halted", format!("COALESCE({} != '', 0)", detail_sql(alias, "$.halted_callback")));
+    flag(c, "unpermitted", format!("COALESCE(json_array_length(\"{alias}\".\"detail\", '$.unpermitted_parameters') > 0, 0)"));
+}
+
+/// The request keys of `p` on a child record (or job): its execution_id
+/// (parent_id) among the matching requests' within an hour before the window
+/// (a request starts before the records it makes).
+fn request_detail_of(c: &mut Cond, table: &str, column: &str, p: &Parsed, (lo, hi, _): (i64, i64, bool)) {
+    if !has_request_keys(p) {
+        return;
+    }
+    let mut inner = Cond::new();
+    inner.and("\"req\".\"kind\" = 'request' AND \"req\".\"occurred_at\" BETWEEN ? AND ?", vec![s(&qt(lo - 3_600_000_000)), s(&qt(hi))]);
+    request_detail(&mut inner, "req", p);
+    if inner.none {
+        c.none = true;
+        return;
+    }
+    c.and(format!("\"{table}\".\"{column}\" IN (SELECT \"req\".\"execution_id\" FROM \"executions\" \"req\" WHERE {})", inner.sql()), inner.binds);
+}
+
+/// search_requests' conditions: requests in [from, to] (narrowed by
+/// after:/before:) matching the query's method, route, status (`401|403`
+/// for either), deploy, tenant, user, min_ms, request keys and free text
+/// (the route name).
+pub fn requests(conn: &Connection, p: &Parsed, from: i64, to: i64) -> rusqlite::Result<Cond> {
+    let f = |k: &str| p.field(k).map(str::to_string);
+    // The where(...) calls in Active Record's order: method first (it
+    // precedes the merged scopes), then requests.between, then the
+    // merges, then the rest.
+    let mut c = Cond::new();
+    if let Some(m) = f("method") {
+        c.eq("executions", "method", s(&m.to_uppercase()));
+    }
+    c.eq("executions", "kind", s("request"));
+    let range = bounded_time_range(p, from, to);
+    let (lo, hi, _) = range;
+    if range.2 {
+        c.and("\"executions\".\"occurred_at\" >= ? AND \"executions\".\"occurred_at\" < ?", vec![s(&qt(lo)), s(&qt(hi))]);
+    } else {
+        c.and("\"executions\".\"occurred_at\" BETWEEN ? AND ?", vec![s(&qt(lo)), s(&qt(hi))]);
+    }
+    c.range = Some((lo, hi));
+    if let Some(route) = f("route") {
+        let mut named = Cond::new();
+        named_like(conn, &mut named, "request", &route, range, false)?;
+        merge(&mut c, named);
+    }
+    if rb::present(Some(&p.text)) {
+        let mut named = Cond::new();
+        named_like(conn, &mut named, "request", &p.text, range, false)?;
+        merge(&mut c, named);
+    }
+    if let Some(d) = f("deploy") {
+        c.eq("executions", "deploy", s(&d));
+    }
+    if let Some(t) = f("tenant") {
+        c.eq("executions", "app_tenant", s(&t));
+    }
+    if let Some(u) = f("user") {
+        c.eq("executions", "user_ref", s(&u));
+    }
+    // status:401|403: any of them (an unreadable alternative is skipped,
+    // as an unreadable status is).
+    let ranges: Vec<(i64, i64)> = p.fields.get("status").map_or(vec![], |v| v.split('|').filter_map(|x| status_range(Some(x))).collect());
+    if !ranges.is_empty() {
+        let ors = vec!["\"executions\".\"status\" BETWEEN ? AND ?"; ranges.len()].join(" OR ");
+        let sql = if ranges.len() == 1 { ors } else { format!("({ors})") };
+        c.and(sql, ranges.iter().flat_map(|(lo, hi)| [Sql::from(*lo), Sql::from(*hi)]).collect());
+    }
+    if let Some(m) = f("min_ms") {
+        let us = rb::round0(rb::string_to_f(&m) * 1000.0);
+        c.and("\"executions\".\"duration\" >= ?", vec![us.into()]);
+    }
+    request_detail(&mut c, "executions", p);
+    Ok(c)
+}
+
+fn merge(c: &mut Cond, other: Cond) {
+    c.parts.extend(other.parts);
+    c.binds.extend(other.binds);
+    if other.from.is_some() {
+        c.from = other.from;
+    }
+    c.none |= other.none;
 }
 
 pub fn md5_hex(s: &str) -> String {

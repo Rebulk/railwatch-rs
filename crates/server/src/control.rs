@@ -815,7 +815,7 @@ pub fn issue_api_token(
     application_id: Option<i64>,
     expires_at: Option<String>,
 ) -> ModelResult<(i64, String)> {
-    const SCOPES: [&str; 4] = ["api", "mcp", "read", "write"];
+    const SCOPES: [&str; 5] = ["api", "mcp", "read", "write", "security"];
     if name.trim().is_empty() {
         return invalid("name", "can't be blank");
     }

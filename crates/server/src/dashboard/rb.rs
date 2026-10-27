@@ -346,6 +346,41 @@ pub fn sanitize_sql_like(s: &str) -> String {
     out
 }
 
+/// `String#to_f`: the leading float, else 0.0.
+pub fn string_to_f(s: &str) -> f64 {
+    let t = s.trim_start();
+    let b = t.as_bytes();
+    let mut i = 0;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+    let digits = |i: &mut usize| {
+        let st = *i;
+        while *i < b.len() && (b[*i].is_ascii_digit() || (b[*i] == b'_' && *i > st && *i + 1 < b.len() && b[*i + 1].is_ascii_digit())) {
+            *i += 1;
+        }
+        *i > st
+    };
+    if !digits(&mut i) {
+        return 0.0;
+    }
+    if i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit() {
+        i += 1;
+        digits(&mut i);
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        let mut j = i + 1;
+        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+            j += 1;
+        }
+        if j < b.len() && b[j].is_ascii_digit() {
+            i = j;
+            digits(&mut i);
+        }
+    }
+    t[..i].replace('_', "").parse().unwrap_or(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -41,6 +41,8 @@ mod answers;
 mod compare;
 #[path = "mcp_records.rs"]
 mod records;
+#[path = "mcp_security.rs"]
+mod security;
 use crate::control::Control;
 use crate::dashboard::cursor_page::{self, CursorKey, Order};
 use crate::dashboard::db::{self, Rec, jf, qt};
@@ -295,7 +297,9 @@ impl Token {
     /// A token for a user the trusted proxy names: the user and session
     /// proxy_auth::resolve gives the dashboard, with what that user can do
     /// in the dashboard (read, and write issues and comments; not deploys,
-    /// which api::run refuses it), limited to the account the proxy fronts.
+    /// which api::run refuses it; the request pages' client fields, which
+    /// the dashboard shows that user), limited to the account the proxy
+    /// fronts.
     /// Not a row: nothing to revoke or record.
     pub fn from_proxied(control: &Control, claims: &super::proxy_auth::Claims) -> rusqlite::Result<Option<Token>> {
         let resolved = control.tx(|tx| {
@@ -307,7 +311,7 @@ impl Token {
             Ok((user_id, account)) => Ok(Some(Token {
                 id: PROXIED_TOKEN_ID,
                 user_id,
-                scopes: ["mcp", "api", "read", "write"].map(String::from).to_vec(),
+                scopes: ["mcp", "api", "read", "write", "security"].map(String::from).to_vec(),
                 account_id: Some(account),
                 application_id: None,
                 name: super::proxy_auth::SESSION_AGENT.to_string(),
@@ -579,6 +583,8 @@ impl Mcp<'_> {
             "list_jobs" => self.list_jobs(&a),
             "get_job" => self.get_job(&a),
             "list_llm_calls" => self.list_llm_calls(&a),
+            "query_requests" => self.query_requests(&a),
+            "security_summary" => self.security_summary(&a),
             "update_issue" => self.update_issue(&a),
             "add_comment" => self.add_comment(&a),
             _ => unreachable!("known tool"),
@@ -1493,53 +1499,28 @@ impl Mcp<'_> {
         let q = if q.is_null() { None } else { Some(to_s(q)) };
         let parsed = filter_query::parse(q.as_deref());
         let limit = clamp(a.get("limit"), 50, 200)?;
+        if let Some(refused) = self.request_keys_refused(&parsed) {
+            return Ok(refused.to_string());
+        }
         self.with_telemetry(&env, |conn| {
-            use filter_query::{Cond, s};
-            let mut c = Cond::new();
-            let f = |k: &str| parsed.field(k).map(str::to_string);
-            // The where(...) calls in Active Record's order: method first (it
-            // precedes the merged scopes), then requests.between, then the
-            // merges, then the rest.
-            let mut head = Cond::new();
-            if let Some(m) = f("method") {
-                head.eq("executions", "method", s(&m.to_uppercase()));
-            }
-            c.eq("executions", "kind", s("request"));
-            c.and("\"executions\".\"occurred_at\" BETWEEN ? AND ?", vec![s(&qt(from)), s(&qt(to))]);
-            let range = (from, to, false);
-            if let Some(route) = f("route") {
-                filter_query::named_like(conn, &mut c, "request", &route, range, false)?;
-            }
-            if rb::present(Some(&parsed.text)) {
-                filter_query::named_like(conn, &mut c, "request", &parsed.text, range, false)?;
-            }
-            if let Some(d) = f("deploy") {
-                c.eq("executions", "deploy", s(&d));
-            }
-            if let Some(t) = f("tenant") {
-                c.eq("executions", "app_tenant", s(&t));
-            }
-            if let Some(u) = f("user") {
-                c.eq("executions", "user_ref", s(&u));
-            }
-            if let Some((lo, hi)) = filter_query::status_range(parsed.fields.get("status").map(String::as_str)) {
-                c.and("\"executions\".\"status\" BETWEEN ? AND ?", vec![lo.into(), hi.into()]);
-            }
-            if let Some(m) = f("min_ms") {
-                let us = rb::round0(ruby_string_to_f(&m) * 1000.0);
-                c.and("\"executions\".\"duration\" >= ?", vec![us.into()]);
-            }
-            let mut all = head;
-            all.parts.extend(c.parts);
-            all.binds.extend(c.binds);
-            all.from = c.from;
+            let all = filter_query::requests(conn, &parsed, from, to)?;
             let from_sql = all.from.clone().unwrap_or_else(|| "\"executions\"".into());
             let rows = db::query(
                 conn,
                 &format!("SELECT \"executions\".* FROM {from_sql} WHERE {} ORDER BY \"executions\".\"occurred_at\" DESC LIMIT {limit}", all.sql()),
                 params_from_iter(all.binds.iter()),
             )?;
-            Ok(Value::Array(rows.iter().map(|r| self.execution_row(&env, r)).collect()).to_string())
+            let access = self.security_access();
+            Ok(Value::Array(
+                rows.iter()
+                    .map(|r| {
+                        let mut v = self.execution_row(&env, r);
+                        security::merge_request_fields(&mut v, &r.json("detail"), access, false);
+                        v
+                    })
+                    .collect(),
+            )
+            .to_string())
         })
     }
 
@@ -1667,7 +1648,12 @@ impl Mcp<'_> {
             "status" => exe.i("status"), "outcome" => exe.s("outcome"), "occurred_at" => time_s(Some(start)),
             "url" => self.execution_url(env, kind, Some(&eid)),
         };
-        if let Some(path) = detail.get("path").filter(|p| p.is_string()) {
+        if kind == Some("request") {
+            security::merge_request_fields(&mut v, &detail, self.security_access(), true);
+            if !self.security_access() {
+                db::merge_into(&mut v, "access", security::access_json(false));
+            }
+        } else if let Some(path) = detail.get("path").filter(|p| p.is_string()) {
             db::merge_into(&mut v, "path", path.clone());
         }
         // The gem's per-execution buffer kept the earliest child records
@@ -1711,6 +1697,9 @@ impl Mcp<'_> {
         let (from, to) = self.window(a);
         let q = a.get("q");
         let q_s = if q.is_null() { None } else { Some(to_s(q)) };
+        if let Some(refused) = self.request_keys_refused(&filter_query::parse(q_s.as_deref())) {
+            return Ok(refused);
+        }
         let window = a.presence("window").unwrap_or_else(|| "24h".into());
         // FilterQuery.cursor_context(environment_id:, resource:, query:, window:)
         let context = {
@@ -2051,41 +2040,6 @@ fn profile_id(v: &Value) -> Option<i64> {
         Value::Bool(false) => Some(0),
         _ => None,
     }
-}
-
-/// `String#to_f`: the leading float, else 0.0.
-fn ruby_string_to_f(s: &str) -> f64 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    let digits = |i: &mut usize| {
-        let st = *i;
-        while *i < b.len() && (b[*i].is_ascii_digit() || (b[*i] == b'_' && *i > st && *i + 1 < b.len() && b[*i + 1].is_ascii_digit())) {
-            *i += 1;
-        }
-        *i > st
-    };
-    if !digits(&mut i) {
-        return 0.0;
-    }
-    if i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit() {
-        i += 1;
-        digits(&mut i);
-    }
-    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
-        let mut j = i + 1;
-        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
-            j += 1;
-        }
-        if j < b.len() && b[j].is_ascii_digit() {
-            i = j;
-            digits(&mut i);
-        }
-    }
-    t[..i].replace('_', "").parse().unwrap_or(0.0)
 }
 
 /// IssueExceptionPresenter#detail as JSON.generate writes it (MCP).
@@ -2610,7 +2564,9 @@ fn narrow_hint(tool: &str) -> &'static str {
         "search_telemetry" | "search_logs" => {
             "Pass a smaller limit, a narrower window, or more filters in q (e.g. level:error, source:app/models/order.rb). meta.next_cursor pages on."
         }
-        "search_requests" => "Pass a smaller limit or a narrower q (route:, status:, min_ms:) or window.",
+        "search_requests" => "Pass a smaller limit or a narrower q (route:, status:, min_ms:, ip:, path:) or window.",
+        "query_requests" => "Pass a smaller limit, min_count, fewer metrics, or a narrower q or window.",
+        "security_summary" => "Pass a narrower window; drill into one finding with its next calls.",
         "web_vitals" => "Pass a smaller limit, or component to read one component.",
         "release_health" => "Pass a narrower window.",
         "get_route" => "Pass a narrower window.",
@@ -2779,10 +2735,10 @@ mod tests {
 
     #[test]
     fn ruby_string_conversions() {
-        assert_eq!(ruby_string_to_f("1.5e3"), 1500.0);
-        assert_eq!(ruby_string_to_f(" 12abc"), 12.0);
-        assert_eq!(ruby_string_to_f("1_000"), 1000.0);
-        assert_eq!(ruby_string_to_f("abc"), 0.0);
+        assert_eq!(rb::string_to_f("1.5e3"), 1500.0);
+        assert_eq!(rb::string_to_f(" 12abc"), 12.0);
+        assert_eq!(rb::string_to_f("1_000"), 1000.0);
+        assert_eq!(rb::string_to_f("abc"), 0.0);
         assert_eq!(split_semicolons("x;y;;"), ["x", "y"]);
         // key.split("/", 3)
         assert_eq!(split_issue_key("a/b"), (Some("a".into()), None, "b".into()));
@@ -2865,11 +2821,11 @@ mod tests {
 
     // -- Agent-facing behaviour, over a seeded environment -------------------
 
-    const NOW: i64 = 1_792_000_000_000_000;
+    pub(super) const NOW: i64 = 1_792_000_000_000_000;
 
-    struct Seeded {
+    pub(super) struct Seeded {
         dir: std::path::PathBuf,
-        c: Control,
+        pub(super) c: Control,
         tenants: crate::tenants::Tenants,
         readers: crate::dashboard::pool::ReadPools,
         key: CursorKey,
@@ -2889,7 +2845,7 @@ mod tests {
 
     /// One account, one application ("shop"), one environment, and a token
     /// that sees only them: what an embedded server looks like.
-    fn seeded(name: &str) -> Seeded {
+    pub(super) fn seeded(name: &str) -> Seeded {
         let dir = std::env::temp_dir().join(format!("rw-mcp-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("telemetry")).unwrap();
@@ -2908,11 +2864,11 @@ mod tests {
     }
 
     impl Seeded {
-        fn tenant(&self) -> Connection {
+        pub(super) fn tenant(&self) -> Connection {
             crate::tenants::open_tenant(&self.dir.join("telemetry").join(format!("{}.sqlite3", self.slug))).unwrap()
         }
 
-        fn rpc(&self, base: &str, body: Value) -> Value {
+        pub(super) fn rpc(&self, base: &str, body: Value) -> Value {
             let env = Env { control: &self.c, tenants: &self.tenants, readers: &self.readers, cursor_key: &self.key };
             let (status, v) = call_at(&env, base, NOW, Some(&format!("Bearer {}", self.token)), &Bytes::from(body.to_string()));
             assert_eq!(status, StatusCode::OK, "{v}");
@@ -2920,7 +2876,7 @@ mod tests {
         }
 
         /// A tool's result text, as the client gets it.
-        fn text(&self, name: &str, args: Value) -> String {
+        pub(super) fn text(&self, name: &str, args: Value) -> String {
             let v = self.rpc(
                 "https://rw.example.com/railwatch",
                 json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}),
@@ -2928,8 +2884,13 @@ mod tests {
             v["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{name}: {v}")).to_string()
         }
 
-        fn tool(&self, name: &str, args: Value) -> Value {
+        pub(super) fn tool(&self, name: &str, args: Value) -> Value {
             serde_json::from_str(&self.text(name, args)).unwrap()
+        }
+
+        /// Gives the fixture's token the security scope.
+        pub(super) fn grant_security(&self) {
+            self.c.with(|x| x.execute("UPDATE api_tokens SET scopes = '[\"mcp\",\"read\",\"write\",\"security\"]'", [])).unwrap();
         }
     }
 
@@ -3993,21 +3954,26 @@ mod tests {
             )
             .unwrap();
         }
-        // Many requests, routes and tenants.
+        // Many requests, routes and tenants, each from its own address with
+        // a long path and user agent.
         for i in 0..300i64 {
+            let detail = json!({"ip": format!("10.0.{}.{}", i / 256, i % 256), "path": format!("/{i}/{}", "p".repeat(2_000)),
+                                "user_agent": format!("agent-{i}-{}", "u".repeat(2_000)), "headers": {"Referer": "r".repeat(2_000)}});
             conn.execute(
-                "INSERT INTO executions (execution_id, kind, name, group_hash, status, occurred_at, duration, app_tenant, method)
-                 VALUES (?1, 'request', ?2, ?3, 200, ?4, 5000, ?5, 'GET')",
+                "INSERT INTO executions (execution_id, kind, name, group_hash, status, occurred_at, duration, app_tenant, method, detail)
+                 VALUES (?1, 'request', ?2, ?3, 200, ?4, 5000, ?5, 'GET', ?6)",
                 params![
                     format!("r{i}"),
                     format!("GET /{}", "p".repeat(200 + i as usize)),
                     format!("gr{i}"),
                     qt(NOW - 120_000_000 - i),
-                    format!("tenant-{i}-{}", "t".repeat(200))
+                    format!("tenant-{i}-{}", "t".repeat(200)),
+                    detail.to_string()
                 ],
             )
             .unwrap();
         }
+        f.grant_security();
         conn.execute_batch("COMMIT").unwrap();
         for h in crate::rollup::rollup_job::hours_with_rows(&conn).unwrap() {
             crate::rollup::rollup_job::perform(&conn, &conn, h, &mut crate::rollup::rollup_job::Rng::PerGroup).unwrap();
@@ -4025,6 +3991,23 @@ mod tests {
             ("issue_id", json!(id)),
             ("frames", json!("all")),
             ("window", json!("30d")),
+            ("group_by", json!(["ip", "path"])),
+            (
+                "metrics",
+                json!([
+                    "errors",
+                    "client_errors",
+                    "statuses",
+                    "distinct_ips",
+                    "distinct_users",
+                    "distinct_paths",
+                    "distinct_user_agents",
+                    "exceptions",
+                    "duration",
+                    "first_seen",
+                    "last_seen"
+                ]),
+            ),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
