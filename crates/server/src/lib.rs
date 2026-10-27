@@ -16,7 +16,7 @@ pub const REPO: &str = match option_env!("RAILWATCH_REPO") {
     None => "Rebulk/railwatch-rs",
 };
 
-/// Where this server's source is, for AGPL-3.0 section 13: every page links
+/// Where this server's source is: every page links
 /// to it (web::document) and every response names it (serve.rs's `Link`
 /// header). A fork that changes the code should point this at its own source
 /// (`RAILWATCH_SOURCE_URL` at build time).

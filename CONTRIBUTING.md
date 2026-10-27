@@ -69,4 +69,4 @@ the output; `docs/DIFFERENCES.md` lists every known difference and why.
   the command line contains that string; use `pkill -x railwatch`.
 
 By contributing you agree that your contribution is licensed under the
-project's license, AGPL-3.0-only.
+project's license, FSL-1.1-ALv2 (LICENSE).

@@ -206,7 +206,7 @@ fn hsts_with_built_in_tls_only() {
     assert_eq!(res.headers().get("strict-transport-security").and_then(|v| v.to_str().ok()), Some("max-age=31536000"));
 }
 
-/// AGPL-3.0 section 13: a user of the network service can find the source.
+/// A user of the network service can find the source.
 /// Every response carries a `Link` to it, every HTML page names it in the
 /// head, and /source redirects there.
 #[test]

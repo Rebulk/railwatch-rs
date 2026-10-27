@@ -6,7 +6,7 @@ members = ["crates/server", "crates/load"]
 edition = "2024"
 rust-version = "1.88"
 publish = false
-license = "AGPL-3.0-only"
+license = "FSL-1.1-ALv2"
 
 [workspace.dependencies]
 # The Inertia.js protocol (Phase 3): the inertia-omega fork, pinned by rev.

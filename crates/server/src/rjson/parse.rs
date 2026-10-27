@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only AND BSD-2-Clause
+// SPDX-License-Identifier: FSL-1.1-ALv2 AND BSD-2-Clause
 //
 // Follows Ruby's json gem 2.21.2 parser (ext/json/ext/parser/parser.c) and
 // its error messages, Copyright (C) 1993-2013 Yukihiro Matsumoto and the

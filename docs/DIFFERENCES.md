@@ -1188,7 +1188,7 @@ security audits. Regression tests: `crates/server/tests/security_*.rs`.
    and `trust_proxy` is on (a proxy that forwards only https, as the
    installer sets up). Never on a plain-http url. Rails sends it from
    `force_ssl`; the API diff already ignores the header.
-8. **AGPL-3.0 section 13 source pointers.** Every response carries
+8. **Source pointers.** Every response carries
    `Link: <https://github.com/Rebulk/railwatch-rs>; rel="license source"`,
    every HTML page's head has `<meta name="source">` and
    `<link rel="license">`, and `GET /source` redirects to the repository.

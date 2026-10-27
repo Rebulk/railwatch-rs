@@ -5,7 +5,7 @@
 #
 #   bin/release v0.2.0            -> dist/v0.2.0/
 #
-#   railwatch-v0.2.0-x86_64-linux-musl.tar.gz    railwatch (static), LICENSE (AGPL-3.0-only),
+#   railwatch-v0.2.0-x86_64-linux-musl.tar.gz    railwatch (static), LICENSE (FSL-1.1-ALv2),
 #                                                 THIRD-PARTY-LICENSES, SELF-HOST.md
 #   railwatch-v0.2.0-aarch64-linux-musl.tar.gz
 #   install.sh                                    the one-command installer

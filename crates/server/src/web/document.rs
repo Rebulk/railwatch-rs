@@ -52,7 +52,7 @@ pub fn render(view: &omega::View<'_>) -> String {
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <meta name="application-name" content="Railwatch">
     <meta name="source" content="{source}">
-    <link rel="license" href="{source}/blob/main/LICENSE" title="AGPL-3.0-only: source at {source}">
+    <link rel="license" href="{source}/blob/main/LICENSE" title="FSL-1.1-ALv2: source at {source}">
     <meta name="csrf-param" content="authenticity_token">
     <meta name="csrf-token" content="{csrf}">
     <link rel="icon" href="{base}/icon.png" type="image/png">
