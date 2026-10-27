@@ -32,30 +32,30 @@ indexmap = "2"
 # The C zlib backend, so inflate errors carry zlib's own messages, as Ruby's Zlib does.
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
 libz-sys = { version = "1", default-features = false, features = ["static", "libc"] }
-sha2 = "0.10"
+sha2 = "0.11"
 # import-rails: Rails Active Record encryption (PBKDF2 + AES-256-GCM), already in the tree via rustls.
 ring = "0.17"
-md-5 = "0.10"
-base64 = "0.22"
+md-5 = "0.11"
+base64 = "0.23"
 uuid = { version = "1", features = ["v4", "v7"] }
-getrandom = "0.3"
+getrandom = "0.4"
 mimalloc = { version = "0.1", default-features = false }
 tracing = "0.1"
 # Alerts (Phase 2): signed webhooks, Slack, optional SMTP, title_pattern regexes.
-hmac = "0.12"
+hmac = "0.13"
 regex = { version = "1", default-features = false, features = ["std", "unicode"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 # Solid Queue schedules (fugit's cron and "every ..." forms) for CheckScheduledTasksJob.
-croner = "3"
+croner = "4"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
 # Phase 3: the web app (control DB, auth, Inertia shell, assets, cable).
 omega.workspace = true
-bcrypt = "0.17"
+bcrypt = "0.19"
 subtle = "2"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 include_dir = "0.7"
-toml = "0.9"
+toml = "1.1"
 rpassword = "7"
 libc = "0.2"
 form_urlencoded = "1"
