@@ -532,6 +532,79 @@ rollup, or folding hours into days when they age) would return 2.5x fewer rows. 
 stored digests (a merge of hourly t-digests is not byte-identical to one over the raw rows) and
 needs its own plan; not done here.
 
+## Security filters (branch security-agent, from main 32ee2be)
+
+What the gem records of a request beyond the executions columns (path, ip,
+user agent, headers, rate_limited, halted_callback, unpermitted_parameters)
+is in `executions.detail` JSON, with no index. `ip:`, `ua:`, `path:`,
+`probe:`, `rate_limited:`, `halted:`, `unpermitted:`, every
+`query_requests` call and `security_summary` read the window's requests
+row by row (`json_extract`), so they cost the window's request count, not
+the matches.
+
+### Method
+
+Tenant: `gen_tenant.py --spread-days 30 --executions 400000 --seed 5
+--records-per-batch 2000 --shapes 2000 --tenants 50 --uniform --by-time
+--few-logs --security` (the new `--security` flag gives requests ip, path,
+user agent, headers and flags, with ~2% planted scanner and brute-force
+traffic), posted to a fresh per-day server: 3.35M records, 320k requests
+(10.7k a day; rebulk-system production does ~20k), 3.2 GB over 93 files.
+mcp-dump and api-dump on CPUs 8-11, release build, a token with the
+security scope. Warm: the median of 5 calls after one dropped, median of
+2 rounds. Cold: the tenant's files evicted (`posix_fadvise(DONTNEED)`), a
+fresh process, one call.
+
+### Results (ms, warm)
+
+| case | 1h | 24h | 7d | 30d |
+|---|---:|---:|---:|---:|
+| security_summary | 3.7 | 70.8 | 509.3 | 347.4 (capped at 100k) |
+| query_requests ip by 401 | 0.5 | 3.5 | 25.5 | 112.0 |
+| query_requests ip x path, `path:../\|.env` | 1.6 | 12.3 | 79.5 | 343.9 |
+| query_requests user_agent, `path:/admin*` | 1.4 | 11.2 | 66.6 | 286.1 |
+| query_requests user, `status:403` | 0.5 | 3.4 | 23.2 | 97.7 |
+| query_requests minute, `status:401 route:session` | 48.9 | 62.5 | 32.1 | 128.1 |
+| query_requests ip by distinct_users, `status:4xx` | 0.7 | 8.4 | 56.8 | 249.6 |
+| query_requests ip, every metric, no filter | 2.2 | 54.5 | 417.9 | 1155.6 (capped at 200k) |
+| search_requests `ip:` | 0.7 | 9.8 | 65.8 | 189.7 |
+| search_requests `probe:true status:2xx` (no match) | 3.5 | 29.8 | 192.9 | 816.5 |
+| search_requests `ua:curl` | 1.5 | 12.2 | 18.7 | 28.7 |
+| search_requests (no filter, as before) | 0.9 | 0.9 | 0.9 | 1.1 |
+| search_telemetry exceptions `ip:` | 1.2 | 10.7 | 65.6 | 275.2 |
+| API requests `ip:` | | 9.8 | 65.9 | 283.8 |
+| API requests `probe:true` | | 37.3 | 247.0 | 1055.6 |
+| API exceptions `ip:` | | 11.7 | 68.3 | 283.2 |
+
+Cold at 7d: security_summary 1518, query_requests every metric 1221,
+exceptions `ip:` 1155, probe search 938, ip x path 836; summary@24h 845.
+
+- A filter is as fast as the requests it has to read: `ua:curl` at 30d is
+  29 ms because the scanner's rows are near the top (newest first, LIMIT 50),
+  and a filter that matches nothing reads the whole window. `status:`,
+  `method:` and `route:` narrow on columns first.
+- security_summary@7d reads two weeks (the window and the one before):
+  ~150k requests, 509 ms. At 30d the window alone passes its 100k cap, so it
+  reads the newest 100k, compares nothing and says so (`scan`), which is why
+  30d is faster than 7d.
+- `query_requests` stops at 200k requests (the 30d no-filter case, 1.16 s;
+  `scan.capped`). The 30d API `probe:true` table (1.06 s) is the other case
+  over 1 s: it ORs 20 LIKEs over each of 320k paths.
+- **Records of matching requests** (exceptions, logs, queries, jobs by
+  `ip:`, ...): the request ids are read first and bound as one JSON array
+  (`IN (SELECT value FROM json_each(?))`), at most 20,000 (`capped`, and a
+  note in the result). As a correlated `IN (SELECT ... FROM executions)` the
+  per-day views ran the subquery once per day file: exceptions by `ip:` at 30d
+  took 8306 ms, now 275.
+- **No index added.** An expression index on `json_extract(detail, '$.ip')`
+  (or a generated column) would make `ip:` a seek, but every existing day file
+  lacks it, and an `INDEXED BY` that names a missing index is an error. If
+  `ip:` over 30 days needs to be fast on a much busier tenant, that is the
+  index to add (with a migration path for existing files); substring `ua:`
+  and `path:` would not use it anyway.
+- Not measured against production data. Production requests carry more
+  headers (bigger `detail`), so `json_extract` per row costs a little more.
+
 ## Proposals
 
 None of these is implemented.

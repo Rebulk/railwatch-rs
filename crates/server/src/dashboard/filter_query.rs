@@ -147,6 +147,9 @@ pub struct Cond {
     /// The occurred_at range `apply` filtered on (epoch micros), so a
     /// per-day read can tell which day files it covers whole.
     pub range: Option<(i64, i64)>,
+    /// A request-key filter on child records kept only the newest
+    /// MAX_REQUEST_IDS matching requests.
+    pub capped: bool,
 }
 
 impl Cond {
@@ -161,14 +164,16 @@ impl Cond {
     pub fn eq(&mut self, table: &str, col: &str, v: impl Into<Sql>) -> &mut Cond {
         self.and(format!("\"{table}\".\"{col}\" = ?"), vec![v.into()])
     }
+    /// The WHERE clause. A `none` relation keeps its parts (their `?`s are
+    /// what `binds` fills) and adds `1=0`: an empty `1=0` with binds left
+    /// over failed as "wrong number of parameters" (search_logs with an
+    /// unusable text query, a request key matching no request).
     pub fn sql(&self) -> String {
-        if self.none {
-            return "1=0".into();
-        }
         if self.parts.is_empty() {
-            return "1=1".into();
+            return if self.none { "1=0" } else { "1=1" }.into();
         }
-        self.parts.join(" AND ")
+        let all = self.parts.join(" AND ");
+        if self.none { format!("1=0 AND {all}") } else { all }
     }
 }
 
@@ -341,7 +346,7 @@ pub fn apply(conn: &Connection, resource: Resource, query: Option<&str>, from: i
     }
     // A job's request is the one that enqueued it.
     let column = if matches!(resource, Resource::Jobs) { "parent_id" } else { "execution_id" };
-    request_detail_of(&mut c, table, column, &parsed, range);
+    request_detail_of(conn, &mut c, table, column, &parsed, range)?;
     Ok(c)
 }
 
@@ -528,21 +533,51 @@ pub fn request_detail(c: &mut Cond, alias: &str, p: &Parsed) {
     flag(c, "unpermitted", format!("COALESCE(json_array_length(\"{alias}\".\"detail\", '$.unpermitted_parameters') > 0, 0)"));
 }
 
+/// Matching requests a child-record filter resolves at most: their ids are
+/// the filter, as a list of values.
+pub const MAX_REQUEST_IDS: usize = 20_000;
+
 /// The request keys of `p` on a child record (or job): its execution_id
 /// (parent_id) among the matching requests' within an hour before the window
-/// (a request starts before the records it makes).
-fn request_detail_of(c: &mut Cond, table: &str, column: &str, p: &Parsed, (lo, hi, _): (i64, i64, bool)) {
+/// (a request starts before the records it makes). The requests are read
+/// first and their ids bound as a list: as a subquery the per-day views
+/// ran it once per day file (exceptions by ip:, 30 days: 8.3 s -> see
+/// docs/PERF.md, "Security filters"). Past MAX_REQUEST_IDS matching
+/// requests, the newest are kept and `capped` is set.
+fn request_detail_of(conn: &Connection, c: &mut Cond, table: &str, column: &str, p: &Parsed, (lo, hi, _): (i64, i64, bool)) -> rusqlite::Result<()> {
     if !has_request_keys(p) {
-        return;
+        return Ok(());
     }
     let mut inner = Cond::new();
-    inner.and("\"req\".\"kind\" = 'request' AND \"req\".\"occurred_at\" BETWEEN ? AND ?", vec![s(&qt(lo - 3_600_000_000)), s(&qt(hi))]);
-    request_detail(&mut inner, "req", p);
+    inner.and("\"executions\".\"kind\" = 'request' AND \"executions\".\"occurred_at\" BETWEEN ? AND ?", vec![s(&qt(lo - 3_600_000_000)), s(&qt(hi))]);
+    request_detail(&mut inner, "executions", p);
     if inner.none {
         c.none = true;
-        return;
+        return Ok(());
     }
-    c.and(format!("\"{table}\".\"{column}\" IN (SELECT \"req\".\"execution_id\" FROM \"executions\" \"req\" WHERE {})", inner.sql()), inner.binds);
+    let rows = db::query(
+        conn,
+        &format!(
+            "SELECT \"executions\".\"execution_id\" FROM \"executions\" WHERE {} AND \"executions\".\"execution_id\" IS NOT NULL \
+             ORDER BY \"executions\".\"occurred_at\" DESC LIMIT {}",
+            inner.sql(),
+            MAX_REQUEST_IDS + 1
+        ),
+        rusqlite::params_from_iter(inner.binds.iter()),
+    )?;
+    if rows.len() > MAX_REQUEST_IDS {
+        c.capped = true;
+    }
+    let ids: Vec<Sql> = rows.iter().take(MAX_REQUEST_IDS).filter_map(|r| r.s("execution_id").map(s)).collect();
+    if ids.is_empty() {
+        c.none = true;
+        return Ok(());
+    }
+    // json_each over one bound array: one statement whatever the count
+    // (SQLite caps bound parameters at 32,766).
+    let list = serde_json::to_string(&ids.iter().map(|v| if let Sql::Text(t) = v { t.as_str() } else { "" }).collect::<Vec<_>>()).expect("json");
+    c.and(format!("\"{table}\".\"{column}\" IN (SELECT value FROM json_each(?))"), vec![s(&list)]);
+    Ok(())
 }
 
 /// search_requests' conditions: requests in [from, to] (narrowed by
@@ -806,6 +841,44 @@ mod tests {
         let got = fts_snippets(&t, &[4, 1, 3], "complet").unwrap();
         assert_eq!(got.keys().collect::<Vec<_>>(), vec!["1", "4"]);
         assert_eq!(got["4"], Value::String(format!("{SNIPPET_MARK}Completed{SNIPPET_MARK} 302")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past MAX_REQUEST_IDS matching requests a child-record filter keeps
+    /// the newest ones and says so; at the limit it does not.
+    #[test]
+    fn child_records_of_too_many_requests_keep_the_newest_and_say_so() {
+        let dir = std::env::temp_dir().join(format!("rw-reqids-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = crate::tenants::open_tenant(&dir.join("t.sqlite3")).unwrap();
+        let now = crate::time::parse_db_time("2026-10-16 12:00:00").unwrap();
+        t.execute_batch("BEGIN").unwrap();
+        for i in 0..=MAX_REQUEST_IDS as i64 {
+            let at = qt(now - 1_000_000 - i * 1_000);
+            t.execute(
+                "INSERT INTO executions (execution_id, kind, name, occurred_at, duration, detail) VALUES (?1, 'request', 'GET /', ?2, 1, '{\"ip\":\"1.2.3.4\"}')",
+                rusqlite::params![format!("e{i}"), at],
+            )
+            .unwrap();
+            t.execute("INSERT INTO logs (execution_id, level, message, occurred_at) VALUES (?1, 'info', 'x', ?2)", rusqlite::params![format!("e{i}"), at])
+                .unwrap();
+        }
+        t.execute_batch("COMMIT").unwrap();
+        let count = |c: &Cond| db::count(&t, &format!("SELECT COUNT(*) FROM \"logs\" WHERE {}", c.sql()), rusqlite::params_from_iter(c.binds.iter())).unwrap();
+        let c = apply(&t, Resource::Logs, Some("ip:1.2.3.4"), now - 3_600_000_000, now, &[]).unwrap();
+        assert!(c.capped);
+        assert_eq!(count(&c), MAX_REQUEST_IDS as i64);
+        let oldest = db::count(
+            &t,
+            &format!("SELECT COUNT(*) FROM \"logs\" WHERE {} AND execution_id = 'e{MAX_REQUEST_IDS}'", c.sql()),
+            rusqlite::params_from_iter(c.binds.iter()),
+        )
+        .unwrap();
+        assert_eq!(oldest, 0, "the oldest request is the one left out");
+        t.execute("DELETE FROM executions WHERE execution_id = ?1", [format!("e{MAX_REQUEST_IDS}")]).unwrap();
+        let c = apply(&t, Resource::Logs, Some("ip:1.2.3.4"), now - 3_600_000_000, now, &[]).unwrap();
+        assert!(!c.capped, "exactly at the limit");
+        assert_eq!(count(&c), MAX_REQUEST_IDS as i64);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -624,6 +624,10 @@ fn cast_id_str(s: &str) -> Option<i64> {
     Some(if neg { -n } else { n })
 }
 
+/// What a list says when its request keys matched more requests than a
+/// child-record filter resolves (filter_query::MAX_REQUEST_IDS).
+const REQUEST_IDS_NOTE: &str = "More than 20,000 requests match the request keys: only the records of the newest 20,000 are here. Narrow q or the window.";
+
 // ---------------------------------------------------------------------------
 // Controllers
 
@@ -967,13 +971,19 @@ impl Api<'_> {
         self.check_request_keys(&filter_query::parse(q.as_deref()))?;
         let (page, queues) = self.telemetry(e, |conn| {
             let cond = filter_query::apply(conn, Resource::Jobs, q.as_deref(), from, to, &[])?;
+            let capped = cond.capped;
             let page = self.cursor_page(conn, e, "jobs", "executions", "Railwatch::Telemetry::Execution", "\"executions\".*", cond, Order::Recent)?;
-            Ok((page, pages::queue_stats(conn, from, to)?))
+            Ok(((page, capped), pages::queue_stats(conn, from, to)?))
         })?;
-        ok(crate::obj! {
+        let (page, capped) = page;
+        let mut body = crate::obj! {
             "data" => items, "meta" => meta, "results" => page.rows.iter().map(models::execution_row).collect::<Vec<_>>(),
             "results_meta" => page.meta, "queues" => queues,
-        })
+        };
+        if capped {
+            db::merge_into(&mut body, "request_filter_note", Value::from(REQUEST_IDS_NOTE));
+        }
+        ok(body)
     }
 
     /// The grouped table, the slowest-queries page, which groups have an
@@ -997,7 +1007,8 @@ impl Api<'_> {
             let page = s.spawn(|| {
                 self.telemetry(e, |conn| {
                     let cond = filter_query::apply(conn, Resource::Queries, q.as_deref(), from, to, &[])?;
-                    self.cursor_page(conn, e, "queries", "queries", "Railwatch::Telemetry::Query", models::QUERY_WITH_SQL, cond, Order::Slowest)
+                    let capped = cond.capped;
+                    Ok((self.cursor_page(conn, e, "queries", "queries", "Railwatch::Telemetry::Query", models::QUERY_WITH_SQL, cond, Order::Slowest)?, capped))
                 })
             });
             let n_plus_ones = s.spawn(|| self.telemetry(e, |conn| Ok(pages::n_plus_ones(conn, from, to)?)));
@@ -1008,7 +1019,7 @@ impl Api<'_> {
             )
         });
         let (items, meta, explained) = grouped?;
-        let (page, n_plus_ones) = (page?, n_plus_ones?);
+        let ((page, capped), n_plus_ones) = (page?, n_plus_ones?);
         let items: Vec<Value> = items
             .into_iter()
             .map(|mut i| {
@@ -1017,10 +1028,14 @@ impl Api<'_> {
                 i
             })
             .collect();
-        ok(crate::obj! {
+        let mut body = crate::obj! {
             "data" => items, "meta" => meta, "results" => page.rows.iter().map(models::query_row).collect::<Vec<_>>(),
             "results_meta" => page.meta, "n_plus_ones" => n_plus_ones,
-        })
+        };
+        if capped {
+            db::merge_into(&mut body, "request_filter_note", Value::from(REQUEST_IDS_NOTE));
+        }
+        ok(body)
     }
 
     /// The exceptions and logs actions: a page/per_page slice and a cursor
@@ -1035,8 +1050,10 @@ impl Api<'_> {
         let (want_offset, want_cursor) = (offset_asked || !cursor_asked, cursor_asked || !offset_asked);
         let q = self.params.opt("q");
         self.check_request_keys(&filter_query::parse(q.as_deref()))?;
+        let mut capped = false;
         let (offset_page, cursor) = self.telemetry(e, |conn| {
             let cond = filter_query::apply(conn, resource, q.as_deref(), from, to, &[])?;
+            capped = cond.capped;
             let offset_page = if want_offset {
                 let from_sql = cond.from.clone().unwrap_or_else(|| format!("\"{table}\""));
                 let total = db::count(conn, &format!("SELECT COUNT(*) FROM {from_sql} WHERE {}", cond.sql()), params_from_iter(cond.binds.iter()))?;
@@ -1064,6 +1081,9 @@ impl Api<'_> {
         if let Some(cursor) = cursor {
             body.insert("results".into(), cursor.rows.iter().map(row).collect::<Vec<_>>().into());
             body.insert("results_meta".into(), cursor.meta);
+        }
+        if capped {
+            body.insert("request_filter_note".into(), Value::from(REQUEST_IDS_NOTE));
         }
         ok(Value::Object(body))
     }
@@ -2438,5 +2458,12 @@ mod tests {
         assert!(none["data"].as_array().unwrap().is_empty());
         // Without a request key the table is the rollups' as before (no scan).
         assert!(get(&f, &format!("{base}/requests"), "read_only").1.get("scan").is_none());
+    }
+
+    #[test]
+    fn the_request_ids_note_names_the_real_limit() {
+        let n = filter_query::MAX_REQUEST_IDS.to_string();
+        let grouped = format!("{},{}", &n[..n.len() - 3], &n[n.len() - 3..]);
+        assert_eq!(REQUEST_IDS_NOTE.matches(&grouped).count(), 2, "{REQUEST_IDS_NOTE}");
     }
 }

@@ -716,6 +716,31 @@ mod per_day_tests {
             assert_eq!(a, b, "{q}");
             assert!(a.0 > 0, "{q} matched something");
         }
+        // A filter that matches no request (or an unusable text query) is an
+        // empty page on a per-day tenant, not an error.
+        for (res, table, q) in
+            [(Resource::Exceptions, "exceptions", "ip:192.0.2.250"), (Resource::Logs, "logs", "***"), (Resource::Logs, "logs", "ip:192.0.2.250")]
+        {
+            let label = q;
+            let cond = apply(&days, res, Some(q), from, to, &[]).unwrap();
+            assert!(cond.none, "{label}");
+            let select = format!("\"{table}\".*");
+            let page = crate::dashboard::cursor_page::call(
+                &days,
+                &crate::dashboard::CursorKey(b"k".to_vec()),
+                table,
+                "M",
+                &select,
+                cond,
+                None,
+                None,
+                crate::dashboard::cursor_page::Order::Recent,
+                "c",
+            )
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(page.rows.is_empty());
+        }
         // The exceptions of 23:59:59 requests are in the next day's file.
         let ex = apply(&days, Resource::Exceptions, Some("ip:198.51.100.7"), from, to, &[]).unwrap();
         let n = db::count(&days, &format!("SELECT COUNT(*) FROM \"exceptions\" WHERE {}", ex.sql()), rusqlite::params_from_iter(ex.binds.iter())).unwrap();

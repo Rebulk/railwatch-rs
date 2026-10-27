@@ -56,7 +56,11 @@ const SECURITY_EXCEPTIONS: [&str; 9] = [
 ];
 
 /// Requests security_summary reads per window.
+#[cfg(not(test))]
 const SUMMARY_SCAN: usize = 100_000;
+/// Small in tests, so one can pass it.
+#[cfg(test)]
+const SUMMARY_SCAN: usize = 1_000;
 
 impl Mcp<'_> {
     /// Whether this caller may read client addresses and user agents.
@@ -124,7 +128,12 @@ impl Mcp<'_> {
         let window = crate::dashboard::window::Window::preset(Some(&a.s("window")), self.now).key;
         self.with_telemetry(&env, |conn| {
             let now = Pass::read(conn, from, to)?;
-            let before = Pass::read(conn, from - span, from - 1)?;
+            // When the window's own pass stopped at the cap it covers less
+            // than the window, and the previous window is not what it is
+            // compared against: no comparison then.
+            let compared = !now.scanned.capped;
+            let before = if compared { Pass::read(conn, from - span, from - 1)? } else { Pass::empty() };
+            let severity = |n: i64, nb: i64, floor: i64| if compared { severity(n, nb, floor) } else { "low" };
             let exceptions = security_exceptions(conn, from, to, from - span)?;
             let mut findings = vec![];
             let w = |q: &str| json!({"window": window, "q": q});
@@ -198,7 +207,7 @@ impl Mcp<'_> {
                                 .iter()
                                 .take(10)
                                 .map(|(ip, s)| json!({"ip": ip, "client_errors": s.client_errors, "requests": s.count,
-                                     "distinct_paths": paths_json(&s.paths), "new": !before.by_ip.contains_key(*ip)}))
+                                     "distinct_paths": paths_json(&s.paths), "new": compared.then(|| !before.by_ip.contains_key(*ip))}))
                                 .collect::<Vec<_>>()
                         ),
                     );
@@ -278,7 +287,7 @@ impl Mcp<'_> {
                 findings.push(f);
             }
             // Traffic from addresses not seen in the previous window.
-            if access {
+            if access && compared {
                 let new: Vec<(&String, &IpStat)> = now.by_ip.iter().filter(|(ip, _)| !before.by_ip.contains_key(*ip)).collect();
                 if !new.is_empty() {
                     let requests: i64 = new.iter().map(|(_, s)| s.count).sum();
@@ -302,11 +311,18 @@ impl Mcp<'_> {
             findings.sort_by_key(|f| rank(f["severity"].as_str().unwrap_or("")));
             let mut v = crate::obj! {
                 "window" => window_json(from, to),
-                "requests" => now.scanned.rows as i64, "previous_requests" => before.scanned.rows as i64,
+                "requests" => now.scanned.rows as i64, "previous_requests" => if compared { Value::from(before.scanned.rows as i64) } else { Value::Null },
                 "status_classes" => status_classes(&now.status_classes),
                 "findings" => findings,
             };
-            if now.scanned.capped || before.scanned.capped {
+            if !compared {
+                db::merge_into(
+                    &mut v,
+                    "scan",
+                    json!({"current": now.scanned.to_json(),
+                           "previous": "not read: the window alone passed the cap, so counts are of its newest requests and nothing is compared (no previous counts, no new_ips). Use a shorter window."}),
+                );
+            } else if before.scanned.capped {
                 db::merge_into(&mut v, "scan", json!({"current": now.scanned.to_json(), "previous": before.scanned.to_json()}));
             }
             db::merge_into(
@@ -402,7 +418,12 @@ fn parse_query(a: &Args, access: bool) -> Result<Query, Value> {
         group_by.push(key);
     }
     let mut metrics: Vec<&'static str> = match a.get("metrics") {
-        Value::Null => request_scan::DEFAULT_METRICS.to_vec(),
+        // A default distinct count of the group's own key is always 1.
+        Value::Null => request_scan::DEFAULT_METRICS
+            .iter()
+            .copied()
+            .filter(|m| !(*m == "distinct_ips" && group_by.contains(&Key::Ip)) && !(*m == "distinct_users" && group_by.contains(&Key::User)))
+            .collect(),
         Value::Array(xs) => {
             let mut out = vec![];
             for x in xs {
@@ -553,9 +574,8 @@ pub(crate) fn is_probe(path: &str) -> bool {
 }
 
 impl Pass {
-    fn read(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<Pass> {
-        let cond = filter_query::requests(conn, &Parsed::default(), from, to)?;
-        let mut p = Pass {
+    fn empty() -> Pass {
+        Pass {
             scanned: request_scan::Scanned { rows: 0, capped: false, cap: SUMMARY_SCAN },
             auth: Auth::default(),
             by_ip: HashMap::new(),
@@ -564,7 +584,12 @@ impl Pass {
             halted: 0,
             unpermitted: 0,
             status_classes: HashMap::new(),
-        };
+        }
+    }
+
+    fn read(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<Pass> {
+        let cond = filter_query::requests(conn, &Parsed::default(), from, to)?;
+        let mut p = Pass::empty();
         p.scanned = request_scan::scan(conn, &cond, SUMMARY_SCAN, |r| {
             let status = r.status.unwrap_or(0);
             *p.status_classes.entry(status / 100).or_default() += 1;
@@ -809,6 +834,8 @@ mod tests {
         assert_eq!(search(&f, "path:/session*"), range("bf", 12));
         assert!(search(&f, "path:session*").is_empty(), "a prefix anchors at the start");
         assert_eq!(search(&f, "path:.env"), vec!["scan-env-200", "scan0"]);
+        assert_eq!(search(&f, "path:../|.env"), vec!["scan-env-200", "scan0", "scan3"], "alternatives of path:");
+        assert_eq!(search(&f, "ua:curl|python").len(), 31 + 12, "alternatives of ua:");
         // probe:
         assert_eq!(search(&f, "probe:true"), vec!["scan-env-200", "scan0", "scan1", "scan2", "scan3", "scan4"]);
         assert_eq!(search(&f, "probe:false").len(), 12 + 6 + 1 + 1 + 20 + 25);
@@ -886,6 +913,7 @@ mod tests {
         assert_eq!(v["rows"][0]["q"], "status:401 ip:203.0.113.9");
         assert_eq!(v["matched"], 12, "the previous day's 401 is outside the window");
         assert_eq!(v["scan"], json!({"scanned": 12, "capped": false}));
+        assert!(v["rows"][0].get("distinct_ips").is_none(), "an ip group's own distinct count is left out by default");
         // Probe paths grouped by ip.
         let v = q(json!({"group_by": ["ip", "path"], "q": "probe:true", "sort": "key"}));
         let rows: Vec<(String, String, i64)> = v["rows"]
@@ -1065,6 +1093,29 @@ mod tests {
         assert_eq!(users["groups"], 4);
         let probe_rows = f.tool(probes["next"][0]["tool"].as_str().unwrap(), probes["next"][0]["arguments"].clone());
         assert_eq!(ids(&probe_rows), vec!["scan-env-200"], "the probe that was not refused");
+    }
+
+    /// A window with more requests than the summary reads: it counts the
+    /// newest, says so, and compares nothing (no previous counts, no new
+    /// addresses, nothing above low on a comparison).
+    #[test]
+    fn a_capped_summary_says_so_and_does_not_compare() {
+        let f = planted("sec-summary-cap");
+        f.grant_security();
+        let c = f.tenant();
+        c.execute_batch("BEGIN").unwrap();
+        for i in 0..super::SUMMARY_SCAN {
+            req(&c, &format!("bulk{i}"), 1, "GET", "/orders(.:format)", 401, Some("x"), d("10.9.0.1", "/orders", "bulk"));
+        }
+        c.execute_batch("COMMIT").unwrap();
+        let v = f.tool("security_summary", json!({"window": "24h"}));
+        assert_eq!(v["scan"]["current"]["capped"], true, "{}", v["scan"]);
+        assert!(v["scan"]["previous"].as_str().unwrap().contains("nothing is compared"));
+        assert_eq!(v["previous_requests"], json!(null));
+        let kinds: Vec<&str> = v["findings"].as_array().unwrap().iter().map(|x| x["kind"].as_str().unwrap()).collect();
+        assert!(!kinds.contains(&"new_ips"), "{kinds:?}");
+        let auth = v["findings"].as_array().unwrap().iter().find(|x| x["kind"] == "auth_failures").unwrap();
+        assert_eq!(auth["severity"], "low", "1,000 401s against an unread previous window are not a spike");
     }
 
     #[test]

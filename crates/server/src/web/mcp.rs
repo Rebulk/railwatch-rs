@@ -1723,6 +1723,7 @@ impl Mcp<'_> {
                 _ => (Resource::Queries, "queries", "Railwatch::Telemetry::Query", models::QUERY_WITH_SQL, Order::Slowest),
             };
             let cond = filter_query::apply(conn, res, q_s.as_deref(), from, to, &[])?;
+            let capped = cond.capped;
             let page = match cursor_page::call(conn, self.env.cursor_key, table, model, select, cond, cursor.as_deref(), limit_s.as_deref(), order, &context) {
                 Ok(p) => p?,
                 Err(e) => return Err(Fail::Invalid(e.to_string())),
@@ -1749,7 +1750,18 @@ impl Mcp<'_> {
                     v
                 })
                 .collect();
-            Ok(json!({"data": data, "meta": page.meta}))
+            let mut meta = page.meta;
+            if capped {
+                db::merge_into(
+                    &mut meta,
+                    "note",
+                    Value::from(format!(
+                        "More than {} requests match the request keys: only the records of the newest {0} are here. Narrow q or the window.",
+                        filter_query::MAX_REQUEST_IDS
+                    )),
+                );
+            }
+            Ok(json!({"data": data, "meta": meta}))
         })
     }
 
