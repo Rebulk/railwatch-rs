@@ -596,14 +596,119 @@ exceptions `ip:` 1155, probe search 938, ip x path 836; summary@24h 845.
   note in the result). As a correlated `IN (SELECT ... FROM executions)` the
   per-day views ran the subquery once per day file: exceptions by `ip:` at 30d
   took 8306 ms, now 275.
-- **No index added.** An expression index on `json_extract(detail, '$.ip')`
-  (or a generated column) would make `ip:` a seek, but every existing day file
-  lacks it, and an `INDEXED BY` that names a missing index is an error. If
-  `ip:` over 30 days needs to be fast on a much busier tenant, that is the
-  index to add (with a migration path for existing files); substring `ua:`
-  and `path:` would not use it anyway.
+- **No index added.** Superseded: see "Security reads" below.
 - Not measured against production data. Production requests carry more
   headers (bigger `detail`), so `json_extract` per row costs a little more.
+
+## Security reads (branch security-speed, from main 0d69f42)
+
+Production (rebulk-system, v0.2.12) was slower than the bench above:
+security_summary 1.9 s at 24h and 3.4 s at 7d, `query_requests` probe paths
+at 7d 13.8 s on the first call. It sends ~2x the bench's requests a day (60%
+one IoT ingest route), with bigger `detail` (browser headers).
+
+### What changed
+
+One partial covering index on `executions` (`idx_executions_requests`,
+`WHERE kind = 'request'`, docs/DIFFERENCES.md #14): `occurred_at` first, the
+columns a request read returns, and the request fields as index expressions
+(`json_extract(detail, '$.ip')`, the user agent, path, Cf-Ipcountry,
+`json_type` of rate_limited and its name, the halted callback, the
+unpermitted parameters and their count, the redirect, the response size;
+the name, the parameters, the redirect and the size are for the reads that
+classify outcomes, which come in the next change).
+`filter_query::requests` (with a request key), the child-record id lookup and
+`request_scan::scan` name it with `INDEXED BY`. SQLite then reads every
+field from the index and never the row's `detail` (`a_request_scan_reads_no_detail_where_the_index_exists`
+checks the bytecode; an expression written differently from the index's
+would quietly parse the JSON again). The kind filter is a literal (`kind =
+'request'`): a bound kind cannot use a partial index.
+
+Not done, and why:
+
+- **Promoted columns.** Real `ip`/`path` columns would need `ALTER TABLE` on
+  every file and a backfill rewriting every request row; the index gets the
+  same reads with no row rewritten, and Rails' schema stays intact.
+- **An `(ip, occurred_at)` index.** `ip:` was 130 ms at 7d with the
+  covering index's range read alone 11 ms; a second index is another B-tree
+  per request insert for little.
+- **A probe flag at ingest.** The 20 LIKEs over the path, read from the
+  index, cost ~1 µs a request; the scan of the window is what cost.
+- **An hourly security rollup.** The covering index brought the common
+  shapes under 0.5 s at 30d; a rollup adds a write path, a backfill and a
+  second answer to keep equal, for the remaining 2x on unfiltered scans.
+
+### Method
+
+Tenant: `gen_tenant.py --spread-days 30 --executions 830000 --seed 5
+--records-per-batch 2000 --shapes 2000 --tenants 50 --uniform --by-time
+--few-logs --prod-shape` (`--prod-shape`: 60% of requests are one hot POST
+ingest route with one query each, probes split between `unmatched` 404s and
+a catch-all `GET /:org_slug` that sends them 302 to sign-in, browser-sized
+headers), posted to a fresh per-day server: 4.4M records, 22k requests a day
+(rebulk-system: ~32k on 2026-10-27), 4.4 GB over 93 files, core day files
+~54 MB. The same data before (main 0d69f42) and after: the after copy was
+migrated by the server's own startup pass, then the two newest days (which
+that pass leaves alone) indexed too, to measure the steady state. mcp-dump on
+CPUs 8-11, release build, a security-scope token. Warm: median of 5 after one
+dropped. Cold: files evicted (`posix_fadvise(DONTNEED)`), a fresh process,
+one call. The box was loaded (other work on it), so cold numbers moved by up
+to 2x run to run: the summary and `ip:` exceptions cases, which first came
+out slower after, were rerun twice interleaved with before, and the second
+round is shown.
+
+### Results (ms, warm, before -> after)
+
+| case | 24h | 7d | 30d |
+|---|---:|---:|---:|
+| security_summary | 154 -> 67 | 332 -> 158 | 340 -> 186 |
+| ip by 401 | 8.4 -> 2.2 | 55 -> 12 | 232 -> 53 |
+| ip x path, `path:../\|.env` | 24 -> 4.0 | 163 -> 20 | 698 -> 76 |
+| user_agent, `path:/admin*` | 21 -> 3.2 | 135 -> 15 | 590 -> 57 |
+| user, `status:403` | 8.2 -> 2.0 | 51 -> 11 | 218 -> 45 |
+| minute, `status:401 route:session` | 58 -> 74 | 65 -> 20 | 287 -> 76 |
+| ip by distinct_users, `status:4xx` | 12 -> 3.9 | 80 -> 33 | 369 -> 106 |
+| path, `probe:true` | 70 -> 17 | 484 -> 101 | 2011 -> 406 |
+| path x status, `probe:true` | 73 -> 18 | 472 -> 98 | 2033 -> 414 |
+| ip, 7 metrics, no filter | 92 -> 53 | 621 -> 365 | 841 -> 498 (capped at 200k) |
+| search_requests `probe:true status:2xx` | 65 -> 16 | 430 -> 91 | 1843 -> 379 |
+| search_requests `ip:` | 19 -> 2.1 | 130 -> 11 | 400 -> 32 |
+| search_telemetry exceptions `ip:` | 21 -> 4.7 | 134 -> 23 | 556 -> 98 |
+| search_logs `path:/session` | 35 -> 15 | 220 -> 92 | 1107 -> 414 |
+
+Between the upgrade and the second day after it, today's and yesterday's
+files have no index: 24h is unchanged from before (summary 156 ms), 7d is
+between (summary 256, probe paths 202), 30d mostly the index's (probe paths
+506, `ip:` search 66).
+
+Cold, 7d: probe paths 1416 -> 529, ip x path 1142 -> 425, every metric 1557
+-> 850, `ip:` exceptions 1906 -> 1546, summary 1793 -> 1687. 30d: probe paths
+4314 -> 902, `probe:true status:2xx` 4222 -> 986, ip by 401 2779 -> 555,
+summary 2670 -> 2484, exceptions `ip:` 3470 -> 1931. The cold summary barely
+moves: it reads 100k requests per window either way, and cold that is the
+pages, not the JSON.
+
+- `minute, status:401 route:session` at 24h is 58 -> 74: `route:` brings its
+  own plan (`named_like`, group hash), so it does not use the index, and the
+  per-row work grew (more fields read). It is a case where the window is one
+  day file and the route already narrows.
+- What stays slow is what reads most of the window: the summary (up to 100k
+  requests per window) and an unfiltered `query_requests` (up to 200k).
+  ~2.5 µs a request warm.
+- search_logs `path:` at 30d (414 ms) is mostly the logs, not the requests:
+  the request ids are read from the index in ~30 ms and bound as a list.
+
+### Migration cost
+
+The startup pass on the bench tenant: 29 closed core day files (54 MB each)
+in 19.3 s of building (pauses excluded), +9% of their size. A 500 MB core
+day file (10 bench days, 222k requests) built in 4.3 s cold, 2.3 s warm.
+Each build is one write transaction on that day file; ingest never writes a
+closed day, so ingest does not wait. The build goes through the WAL (about
+4x the index's size), which is checkpointed and truncated right after.
+
+Ingest with the index, the same 400 batches into a fresh server, twice:
+wall 137.0 -> 140.9 s and 138.5 -> 144.4 s, server CPU +2.3% and +2.7%.
 
 ## Proposals
 

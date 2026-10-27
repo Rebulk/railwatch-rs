@@ -164,6 +164,55 @@ pub fn add_missing_columns(conn: &Connection) -> rusqlite::Result<usize> {
     Ok(added)
 }
 
+/// Indexes this server adds to the exported Rails tables (docs/DIFFERENCES.md),
+/// created after Rails' own, so Rails opens the file with 0 pending migrations.
+///
+/// `idx_executions_requests`: what the gem keeps of a request in `detail`
+/// (client address, user agent, path, the security flags, the redirect and
+/// response size) as index expressions, beside the columns a request scan
+/// reads, for requests only. The security reads (filter_query::requests,
+/// request_scan::scan) name it with INDEXED BY and read every field from the
+/// index, never parsing `detail` (docs/PERF.md, "Security reads"). The
+/// expressions are the text those reads use: SQLite matches an expression
+/// to an index column by its parse tree, so one written differently would
+/// read the row's JSON again (request_scan's tests check none does).
+///
+/// New files get it in `create_tenant`. Existing ones get it from
+/// `tenants::add_missing_indexes_in_background` after the server starts:
+/// building it takes the file's write lock, and a file without it answers
+/// the same through `json_extract` (storage::reader builds each day file's
+/// branch of the hinted view with the hint only where the index exists).
+pub const ADDED_INDEXES: &[(&str, &str)] = &[(
+    "idx_executions_requests",
+    "CREATE INDEX \"idx_executions_requests\" ON \"executions\" (\"occurred_at\", \"status\", \"method\", \"name\", \"group_hash\", \"duration\", \
+     \"user_ref\", \"app_tenant\", \"execution_id\", \"exception_preview\", json_extract(\"detail\", '$.ip'), json_extract(\"detail\", '$.user_agent'), \
+     json_extract(\"detail\", '$.path'), json_extract(\"detail\", '$.headers.\"Cf-Ipcountry\"'), json_type(\"detail\", '$.rate_limited'), \
+     json_extract(\"detail\", '$.rate_limited.name'), json_extract(\"detail\", '$.halted_callback'), \
+     json_array_length(\"detail\", '$.unpermitted_parameters'), json_extract(\"detail\", '$.unpermitted_parameters'), \
+     json_extract(\"detail\", '$.redirect_to'), json_extract(\"detail\", '$.response_size')) WHERE kind = 'request'",
+)];
+
+/// The request index's name (ADDED_INDEXES).
+pub const REQUEST_INDEX: &str = "idx_executions_requests";
+
+/// Creates every ADDED_INDEXES index `conn`'s main database lacks. Returns
+/// how many it created.
+pub fn add_missing_indexes(conn: &Connection) -> rusqlite::Result<usize> {
+    let mut added = 0;
+    for (name, sql) in ADDED_INDEXES {
+        if !has_index(conn, "main", name)? {
+            conn.execute_batch(sql)?;
+            added += 1;
+        }
+    }
+    Ok(added)
+}
+
+/// Whether schema `db` (main, or an attached alias) has index `name`.
+pub fn has_index(conn: &Connection, db: &str, name: &str) -> rusqlite::Result<bool> {
+    conn.query_row(&format!("SELECT EXISTS (SELECT 1 FROM \"{db}\".sqlite_master WHERE type = 'index' AND name = ?1)"), [name], |r| r.get(0))
+}
+
 /// ar_internal_metadata.schema_sha1 in a tenant Rails created (railwatch-cloud @ 464f0fd).
 pub const SCHEMA_SHA1: &str = "753f328f08a840b845caf27796ec5dd56d02db42";
 
@@ -236,5 +285,6 @@ pub fn create_tenant(conn: &mut Connection, now: &str) -> rusqlite::Result<()> {
     // inserted into and emptied export_deliveries.
     tx.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('export_deliveries', 0)", [])?;
     add_missing_columns(&tx)?;
+    add_missing_indexes(&tx)?;
     tx.commit()
 }

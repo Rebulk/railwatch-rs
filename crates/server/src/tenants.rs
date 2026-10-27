@@ -332,6 +332,100 @@ pub fn widen_until_done(mut paths: Vec<PathBuf>, every: Duration) {
     }
 }
 
+/// Builds schema::ADDED_INDEXES in the existing core day files that lack
+/// them, on a thread of its own, one file at a time, newest day first.
+/// Returns at once.
+///
+/// Only closed days (storage::backup::closed: two UTC days old, which no
+/// ingest writes to again): a build holds the file's write lock, and on
+/// today's or yesterday's file ingest would wait for it, answering 503
+/// past busy_timeout. Those two keep reading their requests through
+/// `json_extract` until they close, two days at most; every file created
+/// after the upgrade has the index from the start (schema::create_tenant).
+/// Single-file (Rails layout) tenants are never altered here: their one
+/// file is always being written, and they read without the index.
+///
+/// A file that fails (its lock held past busy_timeout by an exemplar copy,
+/// or deleted by retention meanwhile) is logged and left for the next
+/// start; it answers the same without the index.
+pub fn add_missing_indexes_in_background(tenants_dir: PathBuf) -> Option<std::thread::JoinHandle<IndexPass>> {
+    std::thread::Builder::new()
+        .name("request-index".into())
+        .spawn(move || {
+            let pass = add_missing_indexes(&tenants_dir, crate::time::now_micros(), INDEX_PAUSE);
+            if pass.built > 0 || pass.failed > 0 {
+                tracing::info!(built = pass.built, failed = pass.failed, seconds = pass.seconds, "built the request index in existing day files");
+            }
+            pass
+        })
+        .ok()
+}
+
+/// The pause between two files' builds, so a long pass does not hold the
+/// disk or a core for minutes on end.
+const INDEX_PAUSE: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct IndexPass {
+    pub built: usize,
+    pub failed: usize,
+    /// Seconds spent building (pauses excluded).
+    pub seconds: f64,
+}
+
+/// `add_missing_indexes_in_background`'s pass, run in the calling thread.
+pub fn add_missing_indexes(tenants_dir: &Path, now_micros: i64, pause: Duration) -> IndexPass {
+    let mut files = Vec::new();
+    for (path, kind) in regular_entries(tenants_dir) {
+        if !matches!(kind, Kind::Dir) {
+            continue;
+        }
+        let mut all = Vec::new();
+        per_day_files(&path, &mut all);
+        let core = path.join(crate::storage::layout::Tier::Core.dir());
+        files.extend(all.into_iter().filter(|f| {
+            f.parent() == Some(core.as_path()) && f.file_stem().and_then(|s| s.to_str()).is_some_and(|day| crate::storage::backup::closed(day, now_micros))
+        }));
+    }
+    // Newest first: the days a short window reads.
+    files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    let mut pass = IndexPass::default();
+    for path in files {
+        // Never create: a day retention just deleted must not come back empty.
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let started = Instant::now();
+        let result = Connection::open_with_flags(&path, flags).and_then(|c| {
+            schema::configure(&c)?;
+            let built = schema::add_missing_indexes(&c)?;
+            // The build went through the WAL (about four times the index's
+            // size), and the readers that keep the file open stop closing
+            // this connection from checkpointing it: copy it back and empty
+            // it now, or every built day keeps that WAL until it is deleted.
+            if built > 0 {
+                c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+            }
+            Ok(built)
+        });
+        match result {
+            Ok(0) => continue,
+            Ok(_) => {
+                pass.built += 1;
+                pass.seconds += started.elapsed().as_secs_f64();
+                // Readers attached before the build rebuild their views with
+                // the hint on this file's branch.
+                crate::storage::reader::schema_changed();
+            }
+            Err(_) if !path.exists() => continue,
+            Err(e) => {
+                pass.failed += 1;
+                tracing::warn!(file = %path.display(), error = %e, "cannot build the request index yet; that day reads without it until the next start");
+            }
+        }
+        std::thread::sleep(pause);
+    }
+    pass
+}
+
 enum Kind {
     File,
     Dir,

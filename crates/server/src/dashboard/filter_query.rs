@@ -395,7 +395,15 @@ pub const PROBE_PATTERNS: [&str; 20] = [
 
 /// `json_extract` of a request field (`$.ip`, `$.headers."Referer"`).
 pub fn detail_sql(alias: &str, path: &str) -> String {
-    format!("json_extract(\"{alias}\".\"detail\", '{path}')")
+    detail_fn(alias, "json_extract", path)
+}
+
+/// `f("alias"."detail", 'path')`: a JSON function of a request field, in the
+/// form the request index holds it (schema::ADDED_INDEXES). SQLite reads an
+/// expression from the index only when it is the index's own expression
+/// (the table alias aside), so every request field read goes through here.
+pub fn detail_fn(alias: &str, f: &str, path: &str) -> String {
+    format!("{f}(\"{alias}\".\"detail\", '{path}')")
 }
 
 /// The keys of `p` that need security access.
@@ -528,9 +536,9 @@ pub fn request_detail(c: &mut Cond, alias: &str, p: &Parsed) {
             c.and(if v == "true" { set } else { format!("NOT ({set})") }, vec![]);
         }
     };
-    flag(c, "rate_limited", format!("COALESCE(json_type(\"{alias}\".\"detail\", '$.rate_limited') NOT IN ('null', 'false'), 0)"));
+    flag(c, "rate_limited", format!("COALESCE({} NOT IN ('null', 'false'), 0)", detail_fn(alias, "json_type", "$.rate_limited")));
     flag(c, "halted", format!("COALESCE({} != '', 0)", detail_sql(alias, "$.halted_callback")));
-    flag(c, "unpermitted", format!("COALESCE(json_array_length(\"{alias}\".\"detail\", '$.unpermitted_parameters') > 0, 0)"));
+    flag(c, "unpermitted", format!("COALESCE({} > 0, 0)", detail_fn(alias, "json_array_length", "$.unpermitted_parameters")));
 }
 
 /// Matching requests a child-record filter resolves at most: their ids are
@@ -555,10 +563,11 @@ fn request_detail_of(conn: &Connection, c: &mut Cond, table: &str, column: &str,
         c.none = true;
         return Ok(());
     }
+    let from = request_index(conn)?.unwrap_or_else(|| "\"executions\"".into());
     let rows = db::query(
         conn,
         &format!(
-            "SELECT \"executions\".\"execution_id\" FROM \"executions\" WHERE {} AND \"executions\".\"execution_id\" IS NOT NULL \
+            "SELECT \"executions\".\"execution_id\" FROM {from} WHERE {} AND \"executions\".\"execution_id\" IS NOT NULL \
              ORDER BY \"executions\".\"occurred_at\" DESC LIMIT {}",
             inner.sql(),
             MAX_REQUEST_IDS + 1
@@ -593,7 +602,9 @@ pub fn requests(conn: &Connection, p: &Parsed, from: i64, to: i64) -> rusqlite::
     if let Some(m) = f("method") {
         c.eq("executions", "method", s(&m.to_uppercase()));
     }
-    c.eq("executions", "kind", s("request"));
+    // A literal, so the planner can prove the request index's `WHERE kind =
+    // 'request'` (a bound kind cannot use a partial index).
+    c.and("\"executions\".\"kind\" = 'request'", vec![]);
     let range = bounded_time_range(p, from, to);
     let (lo, hi, _) = range;
     if range.2 {
@@ -634,7 +645,23 @@ pub fn requests(conn: &Connection, p: &Parsed, from: i64, to: i64) -> rusqlite::
         c.and("\"executions\".\"duration\" >= ?", vec![us.into()]);
     }
     request_detail(&mut c, "executions", p);
+    // The request keys read their fields from the request index; a route or
+    // text filter has picked its own plan (named_like), and without request
+    // keys a column filter (user:, deploy:) keeps the planner's index.
+    if c.from.is_none() && has_request_keys(p) {
+        c.from = request_index(conn)?;
+    }
     Ok(c)
+}
+
+/// `"executions" INDEXED BY idx_executions_requests` where the reader can
+/// use it: a per-day reader always (its hinted view leaves the hint off the
+/// day files that lack the index), a single file once it has the index.
+/// With it a request read takes every field it filters on or returns from
+/// the index, without parsing `detail` (schema::ADDED_INDEXES).
+pub fn request_index(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    let usable = crate::storage::reader::is_union(conn) || crate::schema::has_index(conn, "main", crate::schema::REQUEST_INDEX)?;
+    Ok(usable.then(|| format!("\"executions\" INDEXED BY {}", crate::schema::REQUEST_INDEX)))
 }
 
 fn merge(c: &mut Cond, other: Cond) {
