@@ -3754,6 +3754,12 @@ mod tests {
         let r = f.tool("compare", json!({}));
         assert!(r["verdict"].as_str().unwrap().starts_with("Worse"), "{}", r["verdict"]);
         assert!(r["worst_regression_pct"].as_f64().unwrap() > 90.0, "{}", r["worst_regression_pct"]);
+        // From no db time to some, under a moved mix, still trips the gate.
+        conn.execute("UPDATE executions SET counters = '{\"queries\": 69}', detail = '{\"db_runtime\": 0}' WHERE deploy = 'mix1'", []).unwrap();
+        conn.execute("UPDATE executions SET counters = '{\"queries\": 69}', detail = '{\"db_runtime\": 40}' WHERE deploy = 'mix2'", []).unwrap();
+        let z = f.tool("compare", json!({}));
+        assert!(z["traffic_mix"]["like_for_like"]["deltas"]["db_ms_per_request_pct"].is_null(), "{}", z["traffic_mix"]);
+        assert_eq!(z["worst_regression_pct"].as_f64(), Some(100.0), "{}", z["traffic_mix"]);
         // One route: no mix to speak of.
         let one = f.tool("compare", json!({"route": "GET /dashboard"}));
         assert!(one.get("traffic_mix").is_none(), "{one}");

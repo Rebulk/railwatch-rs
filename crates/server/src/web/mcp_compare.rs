@@ -269,11 +269,13 @@ impl Mcp<'_> {
                 "error_rate_pts" => deltas["error_rate_pts"].clone(),
             };
             let mut w: Vec<f64> = ["avg_pct", "queries_per_request_pct", "db_ms_per_request_pct"].iter().filter_map(|k| adj[*k].as_f64()).collect();
-            if let (Some(x), Some(y)) = (qb, qf)
-                && x <= 0.0
-                && y >= 1.0
-            {
-                w.push(100.0);
+            for (x, y) in [(qb, qf), (db, df)] {
+                if let (Some(x), Some(y)) = (x, y)
+                    && x <= 0.0
+                    && y >= 1.0
+                {
+                    w.push(100.0);
+                }
             }
             (adj, w.into_iter().fold(0.0f64, f64::max), l)
         });
