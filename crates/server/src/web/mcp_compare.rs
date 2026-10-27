@@ -538,7 +538,8 @@ struct Measured {
     shapes: HashMap<String, (usize, f64, String, Option<String>)>,
     /// (group_hash, source) -> (sql, executions it fired in)
     n_plus_ones: NPlusOnes,
-    /// group_hash -> its executions on this side, for the traffic mix.
+    /// "group_hash status-class" for requests, group_hash for jobs -> its
+    /// executions on this side, for the traffic mix.
     groups: HashMap<String, Group>,
     /// Requests by status class ("2xx", "3xx", ...): a shift between
     /// sides (sign-in redirects turning into page loads) moves the blend.
@@ -642,7 +643,15 @@ fn measure(conn: &Connection, kind: &str, group: Option<&str>, side: &Side) -> r
     let mut groups: HashMap<String, Group> = HashMap::new();
     let mut statuses: HashMap<&'static str, usize> = HashMap::new();
     for r in &rows {
-        let g = groups.entry(r.s("group_hash").unwrap_or("").to_string()).or_default();
+        // By route and status class: one route that answers a sign-in
+        // redirect one side and a full page the other changed its traffic,
+        // not its code (rebulk-system's org root: 2 queries vs 69).
+        let key = if kind == "request" {
+            format!("{} {}", r.s("group_hash").unwrap_or(""), status_class(r.i("status")))
+        } else {
+            r.s("group_hash").unwrap_or("").to_string()
+        };
+        let g = groups.entry(key).or_default();
         if g.name.is_none() {
             g.name = r.s("name").map(str::to_string);
         }
@@ -689,8 +698,9 @@ fn status_class(status: Option<i64>) -> &'static str {
 }
 
 /// How far the traffic moved between the sides, 0 (same mix) to 100
-/// (nothing in common): half the summed difference of each route's (or
-/// job class's) share of its side. The total variation distance.
+/// (nothing in common): half the summed difference of each route-and-
+/// status-class's (or job class's) share of its side. The total variation
+/// distance.
 fn mix_shift(b: &Measured, f: &Measured) -> f64 {
     let (nb, nf) = (b.count.max(1) as f64, f.count.max(1) as f64);
     let keys: std::collections::BTreeSet<&String> = b.groups.keys().chain(f.groups.keys()).collect();
@@ -748,10 +758,11 @@ fn mix_movers(b: &Measured, f: &Measured) -> Vec<Value> {
             let per_q = |g: Option<&Group>| g.filter(|g| g.queries_n > 0).map(|g| rb::round(g.queries / g.queries_n as f64, 1));
             let moved = (cb as f64 / nb - cf as f64 / nf).abs();
             let name = gf.and_then(|g| g.name.clone()).or_else(|| gb.and_then(|g| g.name.clone()));
+            let (hash, class) = k.split_once(' ').map_or((k.as_str(), None), |(h, c)| (h, Some(c)));
             (
                 moved,
                 crate::obj! {
-                    "name" => name, "group_hash" => k.as_str(),
+                    "name" => name, "group_hash" => hash, "status" => class,
                     "before_share_pct" => jf(share(cb, nb)), "after_share_pct" => jf(share(cf, nf)),
                     "before_queries_per_request" => opt(per_q(gb)), "after_queries_per_request" => opt(per_q(gf)),
                 },

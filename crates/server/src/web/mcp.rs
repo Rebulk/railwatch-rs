@@ -3760,6 +3760,44 @@ mod tests {
     }
 
     #[test]
+    fn compare_treats_one_route_answering_redirects_then_pages_as_a_mix_change() {
+        let f = seeded("compare-mix-status");
+        let conn = f.tenant();
+        let (d1, d2) = (NOW - 2 * 3_600_000_000, NOW - 3_600_000_000);
+        f.c.with(|x| {
+            x.execute(
+                "INSERT INTO deploys (environment_id, deploy, ref, name, deployed_at, created_at, updated_at) VALUES
+                 (?1, 'st1', NULL, 'shop@1', ?2, ?2, ?2), (?1, 'st2', NULL, 'shop@2', ?3, ?3, ?3)",
+                params![f.env, qt(d1), qt(d2)],
+            )
+        })
+        .unwrap();
+        // The same route both sides, unchanged: signed out it redirects (2
+        // queries), signed in it renders the dashboard (69). Before, mostly
+        // signed-out visitors; after, a signed-in user at work. An API route
+        // carries steady traffic on both sides.
+        let r = "GET /:org_slug(.:format)";
+        seed_plain_requests(&conn, "st1", r, d2 - 60_000_000, 60, 302, 5, 2);
+        seed_plain_requests(&conn, "st1", "POST /api/ingest", d2 - 50_000_000, 40, 200, 50, 7);
+        conn.execute(
+            "INSERT INTO executions (execution_id, kind, name, route, group_hash, status, occurred_at, duration, deploy, counters, detail)
+             SELECT 'st1-page', kind, name, route, group_hash, 200, occurred_at, 200000, deploy, '{\"queries\": 69}', '{\"db_runtime\": 34.5}' FROM executions WHERE execution_id = 'st1-GET /:org_slug(.:format)-0'",
+            [],
+        )
+        .unwrap();
+        seed_plain_requests(&conn, "st2", r, NOW - 60_000_000, 25, 200, 200, 69);
+        seed_plain_requests(&conn, "st2", "POST /api/ingest", NOW - 50_000_000, 40, 200, 50, 7);
+        let v = f.tool("compare", json!({}));
+        let verdict = v["verdict"].as_str().unwrap();
+        assert!(verdict.starts_with("No clear change"), "{verdict}");
+        assert_eq!(v["worst_regression_pct"].as_f64(), Some(0.0), "{}", v["traffic_mix"]);
+        assert_eq!(v["traffic_mix"]["like_for_like"]["deltas"]["queries_per_request_pct"].as_f64(), Some(0.0), "{}", v["traffic_mix"]);
+        let moved = &v["traffic_mix"]["moved_most"][0];
+        assert_eq!(moved["name"], r, "{}", v["traffic_mix"]);
+        assert!(matches!(moved["status"].as_str(), Some("3xx") | Some("2xx")), "{moved}");
+    }
+
+    #[test]
     fn compare_since_a_mark_cuts_development_requests_without_a_deploy() {
         let f = seeded("compare-mark");
         let conn = f.tenant();
