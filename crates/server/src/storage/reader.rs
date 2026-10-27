@@ -155,11 +155,16 @@ fn attach_all(conn: &Connection, dir: &Path) -> rusqlite::Result<Attached> {
             Tier::Detail => detail_aliases.iter().chain(&core_aliases).collect(),
         };
         let h = hint.map_or("NOT INDEXED".to_string(), |i| format!("INDEXED BY {i}"));
-        let parts: Vec<String> = if sources.is_empty() {
-            vec![format!("SELECT * FROM m.\"{table}\" {h}")]
-        } else {
-            sources.iter().map(|a| format!("SELECT * FROM {a}.\"{table}\" {h}")).collect()
+        // An index this server adds (schema::ADDED_INDEXES) is missing from
+        // files made before it and not yet migrated: their branch goes
+        // without the hint (INDEXED BY a missing index is an error) and
+        // reads the same rows through its own plan.
+        let added = hint.is_some_and(|i| crate::schema::ADDED_INDEXES.iter().any(|(n, _)| *n == i));
+        let branch = |a: &str| -> rusqlite::Result<String> {
+            let hinted = !added || crate::schema::has_index(conn, a, hint.unwrap_or_default())?;
+            Ok(if hinted { format!("SELECT * FROM {a}.\"{table}\" {h}") } else { format!("SELECT * FROM {a}.\"{table}\"") })
         };
+        let parts: Vec<String> = if sources.is_empty() { vec![branch("m")?] } else { sources.iter().map(|a| branch(a)).collect::<rusqlite::Result<_>>()? };
         conn.execute_batch(&format!("CREATE TEMP VIEW \"{}\" AS {}", hinted_view(table, *hint), parts.join(" UNION ALL ")))?;
     }
     let fts_sources: Vec<&String> = detail_aliases.iter().chain(&core_aliases).collect();
@@ -371,12 +376,14 @@ pub fn aggregate_hinted(
 /// queries by duration to find a window, which pays in one big file but, in
 /// every day file, costs more than each file's own occurred_at plan (queries@1h
 /// 1.9 -> 9.9 ms with it). `idx_queries_explained` is the API's explained groups.
+/// `idx_executions_requests` is the security reads' (schema::ADDED_INDEXES).
 const HINTED: &[(&str, Option<&str>)] = &[
     ("executions", Some("index_executions_on_group_hash_and_occurred_at")),
     ("executions", Some("idx_executions_with_preview")),
     ("executions", Some("idx_executions_tenant_summary")),
     ("executions", None),
     ("queries", Some("idx_queries_explained")),
+    ("executions", Some(crate::schema::REQUEST_INDEX)),
 ];
 
 fn hinted_view(table: &str, hint: Option<&str>) -> String {

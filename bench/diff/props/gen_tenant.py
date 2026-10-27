@@ -26,6 +26,13 @@ or two of rollups instead of all of them, which makes ingest 20x faster),
 agent, Referer/X-Forwarded-For headers, rate_limited, halted_callback,
 unpermitted_parameters) with ~2% planted attack traffic: scanners hitting
 probe paths, 401 bursts on a sign-in route (docs/PERF.md, "Security filters").
+
+--prod-shape (implies --security): requests shaped like rebulk-system's
+production: 60% are one hot IoT ingest route (POST /api/v1/ingest/scale_live
+from a few gateways, one query each, no logs or views); the probes split
+between `unmatched` 404s and a catch-all `GET /:org_slug` route that answers
+them 302 to /sign_in (halted by `authenticate`), with a rare probe served
+200; request headers as big as a browser's (docs/PERF.md, "Security reads").
 """
 import argparse, base64, copy, gzip, hashlib, json, os, random, uuid
 
@@ -43,7 +50,9 @@ ap.add_argument("--uniform", action="store_true")
 ap.add_argument("--by-time", action="store_true")
 ap.add_argument("--few-logs", action="store_true")
 ap.add_argument("--security", action="store_true")
+ap.add_argument("--prod-shape", action="store_true")
 a = ap.parse_args()
+a.security = a.security or a.prod_shape
 
 fixtures = json.load(open(a.fixtures))
 rng = random.Random(a.seed)
@@ -110,15 +119,44 @@ UAS = ["Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/605.1.15 Safari
 SCANNERS = [f"198.51.100.{i}" for i in range(1, 40)]
 PROBES = ["/.env", "/.git/config", "/wp-login.php", "/wp-admin/setup-config.php", "/phpmyadmin/", "/cgi-bin/luci", "/static/../../etc/passwd", "/xmlrpc.php"]
 
+BROWSER_HEADERS = {"Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "gzip, deflate, br, zstd", "Cf-Ipcountry": "US",
+                   "Sec-Ch-Ua": "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"", "Sec-Fetch-Mode": "navigate",
+                   "Sec-Fetch-Site": "same-origin", "Cookie": "[FILTERED]", "X-Request-Id": "6f1c2a9e-0d1b-4c55-9a77-3c2f9b8e4d10"}
+GATEWAYS = [f"100.64.{i}.{i * 7 % 250 + 1}" for i in range(6)]
+
+def hot_ingest(p):
+    """rebulk-system's busiest route: a scale gateway posting readings."""
+    p["method"], p["route"], p["status_code"] = "POST", "/api/v1/ingest/scale_live(.:format)", 200
+    p["_group"] = md5("POST", "/api/v1/ingest/scale_live(.:format)")
+    p["ip"], p["path"], p["user_agent"] = rng.choice(GATEWAYS), "/api/v1/ingest/scale_live", "ESP32HTTPClient"
+    p["url"] = "https://shop.example/api/v1/ingest/scale_live"
+    p["headers"] = {"Host": "shop.example", "Content-Type": "application/json", "X-Forwarded-For": f"{p['ip']}, 10.0.0.1", "Cf-Ipcountry": "US"}
+    p["response_size"], p["inertia"], p["exception_preview"] = 2, None, None
+    p["duration"] = int(rng.lognormvariate(8, 0.5))
+    p["user"], p["tenant"] = None, None
+
 def security_fields(p, route):
     """ip, path, user agent and flags on a request; a few are attacks."""
     roll = rng.random()
     path = "/" + route.split("(")[0].strip("/").replace(":id", str(rng.randrange(1, 900)))
     ip, ua = f"10.{rng.randrange(0, 4)}.{rng.randrange(0, 256)}.{rng.randrange(1, 255)}", rng.choice(UAS)
+    # The fixture's own redirect_to (null) and response_size (0); a probe
+    # below may set its own.
+    redirect, size = None, None
     if roll < 0.01:
         ip, ua, path = rng.choice(SCANNERS), rng.choice(["curl/8.4.0", "python-requests/2.31", "Go-http-client/1.1"]), rng.choice(PROBES)
         p["status_code"], p["route"], p["method"] = 404, "unmatched", "GET"
         p["_group"] = md5("GET", "unmatched")
+        if a.prod_shape and "/" not in path.strip("/"):
+            # A one-segment probe (/.env, /config.php) matches the app's
+            # catch-all org slug route, which sends it to sign in; one in
+            # 2,000 is served (the real alarm).
+            p["route"], p["_group"] = "/:org_slug(.:format)", md5("GET", "/:org_slug(.:format)")
+            if rng.random() < 0.0005:
+                p["status_code"], size = 200, rng.randrange(400, 4000)
+            else:
+                p["status_code"], p["halted_callback"] = 302, "authenticate"
+                redirect = "https://shop.example/sign_in"
     elif roll < 0.02:
         ip, path = f"203.0.113.{rng.randrange(1, 6)}", "/session"
         p["status_code"], p["route"], p["method"] = 401, "/session(.:format)", "POST"
@@ -133,6 +171,14 @@ def security_fields(p, route):
         p["halted_callback"] = "require_login"
     if rng.random() < 0.002:
         p["unpermitted_parameters"] = ["admin"]
+    # Last: the flags above may have changed the status.
+    if a.prod_shape:
+        p["headers"].update(BROWSER_HEADERS)
+        if redirect is None and p["status_code"] == 302:
+            redirect = f"https://shop.example/widgets/{rng.randrange(1, 900)}"
+        if size is None:
+            size = rng.randrange(800, 60000) if p["status_code"] == 200 else 0
+        p["redirect_to"], p["response_size"] = redirect, size
 
 def execution(ts):
     eid, trace = uid(), uid()
@@ -150,6 +196,12 @@ def execution(ts):
         p["inertia"] = rng.choice([None, {"component": "Widgets/Show", "partial_only": []}])
         if p["status_code"] >= 500:
             p["exception_preview"] = rng.choice(["ArgumentError: kaboom", "NoMethodError: undefined method `x' for nil"])
+        if a.prod_shape and rng.random() < 0.6:
+            hot_ingest(p)
+            q = stamp(base("query", ts + 0.001, eid, trace), None, None)
+            q["connection"], q["sql"], q["_group"] = SHAPES[0]
+            q["duration"], q["row_count"], q["source"], q["role"] = int(rng.lognormvariate(6, 0.5)), 1, None, "writing"
+            return [p, q]
         if a.security:
             security_fields(p, route)
     elif kind == "job_attempt":
@@ -287,8 +339,28 @@ def execution(ts):
         out.append(se)
     return out
 
+manifest = []
+
+def write_batches(records):
+    for b in range(0, len(records), a.records_per_batch):
+        chunk = records[b:b + a.records_per_batch]
+        name = f"{len(manifest):04d}.ndjson.gz"
+        body = "".join(json.dumps(r) + "\n" for r in chunk).encode()
+        with open(os.path.join(a.out, name), "wb") as f:
+            f.write(gzip.compress(body))
+        manifest.append({"file": name, "headers": {}})
+
 # health/process records near now (the processes page reads the last 10 min)
 records = []
+if a.prod_shape:
+    # A production-sized tenant does not fit in memory as one list: times
+    # are drawn and sorted up front, and batches written every 20k executions.
+    times = sorted(a.now - SPAN * (rng.random() if a.uniform else rng.random() ** 1.6) for _ in range(a.executions))
+    for i in range(0, len(times), 20_000):
+        chunk = [r for ts in times[i:i + 20_000] for r in execution(ts)]
+        chunk.sort(key=lambda r: r["timestamp"])
+        write_batches(chunk)
+    a.executions = 0
 for i in range(a.executions):
     ts = a.now - SPAN * (rng.random() if a.uniform else rng.random() ** 1.6)  # denser near now
     records.extend(execution(ts))
@@ -306,16 +378,9 @@ if a.by_time:
     records.sort(key=lambda r: r["timestamp"])
 else:
     rng.shuffle(records)
-manifest = []
-for b in range(0, len(records), a.records_per_batch):
-    chunk = records[b:b + a.records_per_batch]
-    name = f"{b // a.records_per_batch:04d}.ndjson.gz"
-    body = "".join(json.dumps(r) + "\n" for r in chunk).encode()
-    with open(os.path.join(a.out, name), "wb") as f:
-        f.write(gzip.compress(body))
-    manifest.append({"file": name, "headers": {}})
+write_batches(records)
 json.dump(manifest, open(os.path.join(a.out, "manifest.json"), "w"))
 json.dump([{"deploy": d, "ref": hashlib.sha1(d.encode()).hexdigest(), "name": f"Release {i}", "timestamp": __import__("datetime").datetime.fromtimestamp(at, __import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"), "server": "web-1",
             "performer": "cole", "commits": [{"sha": hashlib.sha1(f"{d}{j}".encode()).hexdigest(), "message": f"commit {j}"} for j in range(3)]}
            for i, (at, d) in enumerate(DEPLOYS)], open(os.path.join(a.out, "deploys.json"), "w"))
-print(f"{len(records)} records in {len(manifest)} batches, {len(DEPLOYS)} deploys")
+print(f"{len(manifest)} batches, {len(DEPLOYS)} deploys")

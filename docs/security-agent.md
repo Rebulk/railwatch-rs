@@ -106,14 +106,18 @@ address's requests raised.
 
 ### Cost and limits
 
-The request fields live in each request's `detail` JSON, which has no index.
-A filter on them, and every `query_requests` call, reads the window's
-requests one by one, so the cost follows the window's request count, not
-the number of matches. `query_requests` reads at most the newest 200,000
+The request fields are read from an index on each day file's requests
+(`idx_executions_requests`), not parsed from their JSON. A filter on them,
+and every `query_requests` call, still reads the window's requests in time
+order, so the cost follows the window's request count (about 2.5 µs a
+request warm), not the number of matches. Day files from before the upgrade
+get the index in the background after it, today's and yesterday's once they
+are two days old; until then they read slower. `query_requests` reads at most the newest 200,000
 requests of the window, and `security_summary` 100,000 per window. Past
 that, `scan.capped` is true and the result says how far it got. Narrow `q`
 (a status, a route, a method) or the window to see further back. Timings on
-a 3.3M-record tenant are in [PERF.md](PERF.md#security-filters).
+a 4.4M-record tenant shaped like a production app are in
+[PERF.md](PERF.md#security-reads-branch-security-speed-from-main-0d69f42).
 
 Results are capped at about 60 KB, as every MCP result is. Distinct counts
 stop at 10,000 per group and report `">=10000"`.

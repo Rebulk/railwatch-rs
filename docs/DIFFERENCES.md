@@ -642,6 +642,33 @@ all of it (identical; 130/130).
     the four columns from every widened file
     (`ALTER TABLE visits DROP COLUMN redirect_ms` and the other three) with
     the server stopped. Single-file tenants are unaffected either way.
+14. **`executions` has one more index**, `idx_executions_requests`
+    (`schema::ADDED_INDEXES`): partial (`WHERE kind = 'request'`), on the
+    columns a security read returns plus what the gem keeps of a request in
+    `detail` (ip, user agent, path, the Cf-Ipcountry header, rate limit,
+    halted callback, unpermitted parameters, redirect, response size) as
+    expressions. The security reads name it (`INDEXED BY`) and take those
+    fields from the index instead of parsing every request's JSON
+    (docs/PERF.md, "Security reads"). It is created after every Rails row,
+    so Rails opens the file with 0 pending migrations and its writes keep it
+    up to date like any index; Rails' own reads never use it. It costs about
+    9% of a core day file and ~3% more ingest CPU (measured: 400 batches,
+    6,808 vs 6,655 and 7,166 vs 6,978 CPU ticks).
+
+    New files get it when created. Existing per-day files get it from a
+    background thread once the server is up (`tenants::add_missing_indexes`):
+    closed days only (two UTC days old), one file at a time, newest first,
+    0.5 s apart, each build a short write transaction on that file alone.
+    Today's and yesterday's files at the upgrade get it from a later pass:
+    the thread looks again every hour until no day lacks it, then stops. A
+    late record for a day being built (ingest takes records up to 30 days
+    old) waits for that build, seconds on a large file, inside the 5 s
+    busy_timeout; past it the batch is answered 503 and the gem retries. A file
+    without it answers the same through `json_extract`: the per-day reader's
+    hinted view leaves the hint off that file's branch. Single-file (Rails
+    layout) tenants are not altered; they read without it until something
+    adds it (it is used as soon as it exists). Rolling back is safe: an older
+    release ignores an index it does not name.
 
 ## Process
 

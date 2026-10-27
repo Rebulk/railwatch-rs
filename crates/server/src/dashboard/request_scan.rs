@@ -87,22 +87,7 @@ pub fn scan(conn: &Connection, cond: &Cond, cap: usize, mut f: impl FnMut(&Row<'
     if cond.none {
         return Ok(Scanned { rows: 0, capped: false, cap });
     }
-    let from = cond.from.clone().unwrap_or_else(|| "\"executions\"".into());
-    let d = |p: &str| filter_query::detail_sql("executions", p);
-    let sql = format!(
-        "SELECT \"executions\".\"occurred_at\", \"executions\".\"execution_id\", \"executions\".\"name\", \"executions\".\"group_hash\", \
-         \"executions\".\"method\", \"executions\".\"status\", \"executions\".\"duration\", \"executions\".\"user_ref\", \"executions\".\"app_tenant\", \
-         \"executions\".\"exception_preview\", {ip}, {ua}, {path}, {country}, \
-         json_type(\"executions\".\"detail\", '$.rate_limited'), {halted}, json_array_length(\"executions\".\"detail\", '$.unpermitted_parameters') \
-         FROM {from} WHERE {cond} ORDER BY \"executions\".\"occurred_at\" DESC LIMIT {limit}",
-        ip = d("$.ip"),
-        ua = d("$.user_agent"),
-        path = d("$.path"),
-        country = d("$.headers.\"Cf-Ipcountry\""),
-        halted = d("$.halted_callback"),
-        cond = cond.sql(),
-        limit = cap + 1,
-    );
+    let sql = scan_sql(conn, cond, cap)?;
     let mut stmt = db::prepare(conn, &sql)?;
     let mut rows = stmt.query(rusqlite::params_from_iter(cond.binds.iter()))?;
     let mut n = 0;
@@ -158,6 +143,34 @@ pub fn scan(conn: &Connection, cond: &Cond, cap: usize, mut f: impl FnMut(&Row<'
         f(&row);
     }
     Ok(Scanned { rows: n, capped: false, cap })
+}
+
+/// `scan`'s statement, newest first, `cap + 1` rows at most.
+pub fn scan_sql(conn: &Connection, cond: &Cond, cap: usize) -> rusqlite::Result<String> {
+    // Every field below is in the request index (schema::ADDED_INDEXES): with
+    // it a pass reads no row's `detail`. A route or text filter brought its
+    // own plan.
+    let from = match &cond.from {
+        Some(f) => f.clone(),
+        None => filter_query::request_index(conn)?.unwrap_or_else(|| "\"executions\"".into()),
+    };
+    let d = |p: &str| filter_query::detail_sql("executions", p);
+    let func = |f: &str, p: &str| filter_query::detail_fn("executions", f, p);
+    Ok(format!(
+        "SELECT \"executions\".\"occurred_at\", \"executions\".\"execution_id\", \"executions\".\"name\", \"executions\".\"group_hash\", \
+         \"executions\".\"method\", \"executions\".\"status\", \"executions\".\"duration\", \"executions\".\"user_ref\", \"executions\".\"app_tenant\", \
+         \"executions\".\"exception_preview\", {ip}, {ua}, {path}, {country}, {rl_type}, {halted}, {unpermitted} \
+         FROM {from} WHERE {cond} ORDER BY \"executions\".\"occurred_at\" DESC LIMIT {limit}",
+        ip = d("$.ip"),
+        ua = d("$.user_agent"),
+        path = d("$.path"),
+        country = d("$.headers.\"Cf-Ipcountry\""),
+        rl_type = func("json_type", "$.rate_limited"),
+        halted = d("$.halted_callback"),
+        unpermitted = func("json_array_length", "$.unpermitted_parameters"),
+        cond = cond.sql(),
+        limit = cap + 1,
+    ))
 }
 
 // -- query_requests: group, count, rank --------------------------------------
@@ -745,6 +758,279 @@ mod per_day_tests {
         let ex = apply(&days, Resource::Exceptions, Some("ip:198.51.100.7"), from, to, &[]).unwrap();
         let n = db::count(&days, &format!("SELECT COUNT(*) FROM \"exceptions\" WHERE {}", ex.sql()), rusqlite::params_from_iter(ex.binds.iter())).unwrap();
         assert_eq!(n, 16, "every request of the address has its exception");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Requests with every field the request index holds, in all their
+    /// shapes (missing, null, false, empty, named, unnamed, nested).
+    fn varied_requests(t: &Connection, days: &[&str]) {
+        let mut id = 0;
+        for day in days {
+            for i in 0..40i64 {
+                id += 1;
+                let ip = ["198.51.100.7", "203.0.113.9", "10.0.0.1", "2001:db8::1"][(id % 4) as usize];
+                let path = ["/.env", "/session", "/orders", "/wp-login.php", "/config.php", "/admin/users/1"][(id % 6) as usize];
+                let country = ["NL", "US"][(id % 2) as usize];
+                let mut d = serde_json::json!({"ip": ip, "path": path, "user_agent": format!("ua{}", id % 3), "headers": {"Cf-Ipcountry": country}});
+                match id % 7 {
+                    0 => d["rate_limited"] = serde_json::json!({"name": "search", "count": 61, "to": 60}),
+                    1 => d["rate_limited"] = serde_json::json!({"name": "", "count": 61, "to": 60}),
+                    2 => d["rate_limited"] = Value::Bool(false),
+                    _ => {}
+                }
+                match id % 5 {
+                    0 => d["halted_callback"] = Value::from("authenticate"),
+                    1 => d["halted_callback"] = Value::from("require_admin"),
+                    2 => d["halted_callback"] = Value::from(""),
+                    _ => {}
+                }
+                match id % 4 {
+                    0 => d["unpermitted_parameters"] = serde_json::json!(["role", "admin"]),
+                    1 => d["unpermitted_parameters"] = serde_json::json!([]),
+                    _ => {}
+                }
+                match id % 6 {
+                    0 => d["redirect_to"] = Value::from("https://a.example/sign_in?return_to=%2F"),
+                    1 => d["redirect_to"] = Value::from("https://a.example/orders"),
+                    2 => d["redirect_to"] = Value::Null,
+                    _ => {}
+                }
+                d["response_size"] = Value::from(id * 13 % 900);
+                if id % 11 == 0 {
+                    d = serde_json::json!({});
+                }
+                t.execute(
+                    "INSERT INTO executions (id, execution_id, kind, name, method, group_hash, status, occurred_at, duration, user_ref, detail) \
+                     VALUES (?1, ?2, 'request', 'GET /x', 'GET', ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        id,
+                        format!("r{id}"),
+                        format!("g{}", id % 3),
+                        [200, 302, 301, 401, 404, 500, 304][(id % 7) as usize],
+                        format!("{day} {:02}:{:02}:00.{id:06}", i % 24, i % 60),
+                        1000 + id,
+                        (id % 3 == 0).then(|| format!("u{}", id % 4)),
+                        d.to_string()
+                    ],
+                )
+                .unwrap();
+                t.execute(
+                    "INSERT INTO logs (execution_id, level, message, occurred_at) VALUES (?1, 'info', 'x', ?2)",
+                    rusqlite::params![format!("r{id}"), format!("{day} {:02}:{:02}:01", i % 24, i % 60)],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Everything a security read returns for each query, as one string.
+    fn security_reads(c: &Connection, from: i64, to: i64) -> Vec<String> {
+        let queries = [
+            "",
+            "ip:198.51.100.7",
+            "ip:203.0.113.0/24|2001:db8:*",
+            "ua:ua1",
+            "path:/session*",
+            "probe:true",
+            "probe:false",
+            "rate_limited:true",
+            "rate_limited:false",
+            "halted:true",
+            "halted:false",
+            "unpermitted:true",
+            "unpermitted:false",
+        ];
+        let all: Vec<Key> = KEYS.iter().filter_map(|k| Key::parse(k)).collect();
+        let mut out = vec![];
+        for q in queries {
+            let p = parse(Some(q));
+            let cond = requests(c, &p, from, to).unwrap();
+            for pair in all.chunks(2) {
+                let query = Query { group_by: pair.to_vec(), metrics: METRICS.to_vec(), sort: "key", asc: true, limit: 200, min_count: 1 };
+                let (s, v) = super::query(c, &cond, &p, &query, MAX_SCAN).unwrap();
+                out.push(format!("{q} {pair:?}: {} {v}", s.rows));
+            }
+            let mut rows = vec![];
+            scan(c, &cond, MAX_SCAN, |r| {
+                rows.push(format!(
+                    "{} {:?} {:?} {:?} {:?} {:?} {} {:?} {}",
+                    r.execution_id, r.ip, r.user_agent, r.path, r.country, r.status, r.rate_limited, r.halted, r.unpermitted
+                ))
+            })
+            .unwrap();
+            out.push(format!("{q} rows: {}", rows.join("; ")));
+            let logs = apply(c, Resource::Logs, Some(q), from, to, &[]).unwrap();
+            let n = db::count(c, &format!("SELECT COUNT(*) FROM \"logs\" WHERE {}", logs.sql()), rusqlite::params_from_iter(logs.binds.iter())).unwrap();
+            out.push(format!("{q} logs: {n}"));
+        }
+        out
+    }
+
+    /// The request index changes plans, never answers: a per-day tenant
+    /// whose files have it, one where none has it, and one where only some
+    /// have it (the state between an upgrade and the background build)
+    /// answer every security read as the single file without it does, and
+    /// a single file with it answers the same too.
+    #[test]
+    fn the_request_index_gives_the_same_answers_as_json_with_some_files_without_it() {
+        let dir = std::env::temp_dir().join(format!("rw-reqidx-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t.sqlite3");
+        let t = crate::tenants::open_tenant(&file).unwrap();
+        // A file made before the index (an older server's).
+        t.execute_batch(&format!("DROP INDEX {}", crate::schema::REQUEST_INDEX)).unwrap();
+        t.execute_batch("BEGIN").unwrap();
+        varied_requests(&t, &["2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16"]);
+        t.execute_batch("COMMIT").unwrap();
+        drop(t);
+        let now = crate::time::parse_db_time("2026-10-16 23:59:59").unwrap();
+        let (from, to) = (now - 7 * 86_400_000_000, now);
+        let single = crate::dashboard::pool::open_reader(&file).unwrap();
+        assert!(filter_query::request_index(&single).unwrap().is_none(), "a single file without the index reads without the hint");
+        let want = security_reads(&single, from, to);
+        drop(single);
+        let split = |name: &str, indexed: &[&str]| {
+            let d = dir.join(name);
+            crate::storage::export::split(&file, &d).unwrap();
+            for day in crate::storage::layout::days(&d, crate::storage::layout::Tier::Core) {
+                let p = crate::storage::layout::day_path(&d, crate::storage::layout::Tier::Core, &day);
+                let c = rusqlite::Connection::open(&p).unwrap();
+                let has = crate::schema::has_index(&c, "main", crate::schema::REQUEST_INDEX).unwrap();
+                match (indexed.contains(&day.as_str()), has) {
+                    (true, false) => assert_eq!(crate::schema::add_missing_indexes(&c).unwrap(), 1),
+                    (false, true) => c.execute_batch(&format!("DROP INDEX {}", crate::schema::REQUEST_INDEX)).unwrap(),
+                    _ => {}
+                }
+            }
+            crate::storage::reader::open(&d).unwrap().0
+        };
+        let all = split("all", &["2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16"]);
+        let none = split("none", &[]);
+        let some = split("some", &["2026-10-13", "2026-10-15"]);
+        for (name, c) in [("indexed", &all), ("unindexed", &none), ("half", &some)] {
+            let got = security_reads(c, from, to);
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(g, w, "{name}");
+            }
+        }
+        // And the single file once it has the index.
+        crate::schema::add_missing_indexes(&rusqlite::Connection::open(&file).unwrap()).unwrap();
+        let single = crate::dashboard::pool::open_reader(&file).unwrap();
+        assert!(filter_query::request_index(&single).unwrap().is_some());
+        assert_eq!(security_reads(&single, from, to), want, "single file with the index");
+        // The answers are not trivially empty.
+        assert!(want.iter().any(|l| l.starts_with("probe:true rows: r")), "probes exist");
+        assert!(want.iter().any(|l| l.starts_with("rate_limited:true rows: r")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scan reads every request field from the request index, none
+    /// from the row's `detail`: an expression written differently from the
+    /// index's (another alias form, another function) would make SQLite
+    /// parse the JSON of every row again, silently.
+    #[test]
+    fn a_request_scan_reads_no_detail_where_the_index_exists() {
+        let dir = std::env::temp_dir().join(format!("rw-reqplan-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = crate::tenants::open_tenant(&dir.join("t.sqlite3")).unwrap();
+        // The detail column's position in executions.
+        let detail: i64 = t.query_row("SELECT cid FROM pragma_table_info('executions') WHERE name = 'detail'", [], |r| r.get(0)).unwrap();
+        for q in ["", "ip:1.2.3.4", "ua:curl path:/admin* probe:true", "rate_limited:true halted:true unpermitted:false"] {
+            let p = parse(Some(q));
+            let cond = requests(&t, &p, 0, i64::MAX / 2).unwrap();
+            // scan's own statement, as EXPLAIN: no Column read of the table's detail.
+            let sql = crate::dashboard::request_scan::scan_sql(&t, &cond, 10).unwrap();
+            assert!(sql.contains(&format!("INDEXED BY {}", crate::schema::REQUEST_INDEX)), "{q}: {sql}");
+            let mut stmt = t.prepare(&format!("EXPLAIN {sql}")).unwrap();
+            let ops: Vec<(String, i64, i64, String)> = stmt
+                .query_map(rusqlite::params_from_iter(cond.binds.iter()), |r| {
+                    Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, Option<String>>(7)?.unwrap_or_default()))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let table_cursor = ops.iter().find(|o| o.0 == "OpenRead" && o.3.is_empty() && o.2 != 0).map(|o| o.1);
+            let reads_detail = ops.iter().any(|o| o.0 == "Column" && Some(o.1) == table_cursor && o.2 == detail);
+            assert!(!reads_detail, "{q}: {ops:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A new tenant file has the index; the background build adds it to a
+    /// closed day file without it, never to today's or yesterday's (ingest
+    /// writes those) nor to a single-file tenant.
+    #[test]
+    fn the_background_build_indexes_closed_days_only() {
+        let dir = std::env::temp_dir().join(format!("rw-reqbuild-{}", crate::control::base58(8)));
+        let tenants = dir.join("telemetry");
+        let env = tenants.join("env");
+        crate::storage::layout::ensure(&env).unwrap();
+        let single = tenants.join("single.sqlite3");
+        for (i, day) in ["2026-10-20", "2026-10-24", "2026-10-25", "2026-10-26"].iter().enumerate() {
+            let p = crate::storage::layout::day_path(&env, crate::storage::layout::Tier::Core, day);
+            let c = crate::storage::layout::open_or_create(&p).unwrap();
+            assert!(crate::schema::has_index(&c, "main", crate::schema::REQUEST_INDEX).unwrap(), "a new day file has it");
+            if i != 0 {
+                c.execute_batch(&format!("DROP INDEX {}", crate::schema::REQUEST_INDEX)).unwrap();
+            }
+        }
+        let s = crate::tenants::open_tenant(&single).unwrap();
+        s.execute_batch(&format!("DROP INDEX {}", crate::schema::REQUEST_INDEX)).unwrap();
+        drop(s);
+        let now = crate::time::parse_db_time("2026-10-26 08:00:00").unwrap();
+        // A union reader attached throughout, as the server's pools are.
+        let (reader, _) = crate::storage::reader::open(&env).unwrap();
+        let pass = crate::tenants::add_missing_indexes(&tenants, now, std::time::Duration::ZERO);
+        assert_eq!((pass.built, pass.failed, pass.waiting), (1, 0, 2), "only 2026-10-24 was closed and without it; 25 and 26 wait");
+        let has = |p: &std::path::Path| crate::schema::has_index(&rusqlite::Connection::open(p).unwrap(), "main", crate::schema::REQUEST_INDEX).unwrap();
+        let day = |d: &str| crate::storage::layout::day_path(&env, crate::storage::layout::Tier::Core, d);
+        // The build's WAL is checkpointed and emptied even with a reader holding the file open.
+        let wal = |d: &str| std::fs::metadata(format!("{}-wal", day(d).display())).map_or(0, |m| m.len());
+        assert_eq!(wal("2026-10-24"), 0, "checkpointed");
+        assert!(has(&day("2026-10-24")));
+        assert!(!has(&day("2026-10-25")) && !has(&day("2026-10-26")), "yesterday and today are left to ingest");
+        assert!(!has(&single), "a single-file tenant is not altered");
+        let again = crate::tenants::add_missing_indexes(&tenants, now, std::time::Duration::ZERO);
+        assert_eq!((again.built, again.failed, again.waiting), (0, 0, 2), "the two open days still wait, so the loop goes on");
+        // A day later yesterday has closed: the next pass builds it, as the
+        // background loop's next pass would after a rollover.
+        let later = now + 86_400_000_000;
+        let pass = crate::tenants::add_missing_indexes(&tenants, later, std::time::Duration::ZERO);
+        assert_eq!((pass.built, pass.failed, pass.waiting), (1, 0, 1));
+        assert!(has(&day("2026-10-25")));
+        let done = crate::tenants::add_missing_indexes(&tenants, later + 86_400_000_000, std::time::Duration::ZERO);
+        assert_eq!((done.built, done.waiting, done.failed), (1, 0, 0), "nothing left: the loop stops");
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reader inside a read transaction keeps the TRUNCATE checkpoint
+    /// busy: the build still counts, the pass says it failed (so the loop
+    /// comes back), and the next pass, with the reader gone, empties the WAL.
+    #[test]
+    fn a_busy_checkpoint_after_the_build_is_tried_again() {
+        let dir = std::env::temp_dir().join(format!("rw-reqbusy-{}", crate::control::base58(8)));
+        let tenants = dir.join("telemetry");
+        let env = tenants.join("env");
+        crate::storage::layout::ensure(&env).unwrap();
+        let p = crate::storage::layout::day_path(&env, crate::storage::layout::Tier::Core, "2026-10-20");
+        let c = crate::storage::layout::open_or_create(&p).unwrap();
+        c.execute_batch(&format!("DROP INDEX {}", crate::schema::REQUEST_INDEX)).unwrap();
+        c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())).unwrap();
+        drop(c);
+        let reader = rusqlite::Connection::open(&p).unwrap();
+        reader.execute_batch("BEGIN; SELECT count(*) FROM executions;").unwrap();
+        let now = crate::time::parse_db_time("2026-10-26 08:00:00").unwrap();
+        let pass = crate::tenants::add_missing_indexes(&tenants, now, std::time::Duration::ZERO);
+        assert_eq!((pass.built, pass.failed), (1, 1), "built, but its WAL is still there");
+        let wal = || std::fs::metadata(format!("{}-wal", p.display())).map_or(0, |m| m.len());
+        assert!(wal() > 0);
+        reader.execute_batch("COMMIT").unwrap();
+        let pass = crate::tenants::add_missing_indexes(&tenants, now, std::time::Duration::ZERO);
+        assert_eq!((pass.built, pass.failed), (0, 0));
+        assert_eq!(wal(), 0, "the next pass checkpointed it");
+        drop(reader);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

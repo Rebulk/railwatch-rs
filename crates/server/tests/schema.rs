@@ -1,9 +1,10 @@
 //! A tenant file we create must be the file Rails creates: same sqlite_master
 //! rows in the same order (Rails opens it, sees no pending migrations),
 //! except the two `queries` indexes in schema::PARTIAL_INDEXES, which are
-//! the same index made partial, and the nullable columns in
+//! the same index made partial, the nullable columns in
 //! schema::ADDED_COLUMNS, appended the way ALTER TABLE ADD COLUMN appends
-//! them (docs/DIFFERENCES.md).
+//! them, and schema::ADDED_INDEXES after everything else
+//! (docs/DIFFERENCES.md).
 
 use std::path::{Path, PathBuf};
 
@@ -37,6 +38,10 @@ fn created_tenant_has_the_exported_sqlite_master() {
     }
     assert_eq!(partial, 2, "both partial indexes exist in the exported Rails DDL");
     assert_eq!(widened, 1, "the added columns all belong to visits");
+    // schema::ADDED_INDEXES come last, after every row of Rails' own.
+    for (name, sql) in schema::ADDED_INDEXES {
+        expected.push(("index".into(), name.to_string(), "executions".into(), Some(sql.to_string())));
+    }
     assert_eq!(rows, expected, "every other row is Rails' own, in Rails' order");
     let versions: i64 = conn.query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0)).unwrap();
     assert_eq!(versions as usize, schema::schema().schema_migrations.len());
