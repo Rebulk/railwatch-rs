@@ -585,6 +585,7 @@ impl Mcp<'_> {
             "list_llm_calls" => self.list_llm_calls(&a),
             "query_requests" => self.query_requests(&a),
             "security_summary" => self.security_summary(&a),
+            "ip_activity" => self.ip_activity(&a),
             "update_issue" => self.update_issue(&a),
             "add_comment" => self.add_comment(&a),
             _ => unreachable!("known tool"),
@@ -1697,7 +1698,10 @@ impl Mcp<'_> {
         let (from, to) = self.window(a);
         let q = a.get("q");
         let q_s = if q.is_null() { None } else { Some(to_s(q)) };
-        if let Some(refused) = self.request_keys_refused(&filter_query::parse(q_s.as_deref())) {
+        let parsed = filter_query::parse(q_s.as_deref());
+        // A job's outcome: (processed, failed) is its own field, not a request key.
+        let parsed = if resource == "jobs" { filter_query::without_job_keys(&parsed) } else { parsed };
+        if let Some(refused) = self.request_keys_refused(&parsed) {
             return Ok(refused);
         }
         let window = a.presence("window").unwrap_or_else(|| "24h".into());
@@ -2579,6 +2583,7 @@ fn narrow_hint(tool: &str) -> &'static str {
         "search_requests" => "Pass a smaller limit or a narrower q (route:, status:, min_ms:, ip:, path:) or window.",
         "query_requests" => "Pass a smaller limit, min_count, fewer metrics, or a narrower q or window.",
         "security_summary" => "Pass a narrower window; drill into one finding with its next calls.",
+        "ip_activity" => "Pass a smaller limit, a narrower window, or after:/before: in q.",
         "web_vitals" => "Pass a smaller limit, or component to read one component.",
         "release_health" => "Pass a narrower window.",
         "get_route" => "Pass a narrower window.",

@@ -344,8 +344,8 @@ pub fn apply(conn: &Connection, resource: Resource, query: Option<&str>, from: i
             }
         }
     }
-    // A job's request is the one that enqueued it.
-    let column = if matches!(resource, Resource::Jobs) { "parent_id" } else { "execution_id" };
+    // A job's request is the one that enqueued it; a job's outcome: is its own.
+    let (column, parsed) = if matches!(resource, Resource::Jobs) { ("parent_id", without_job_keys(&parsed)) } else { ("execution_id", parsed) };
     request_detail_of(conn, &mut c, table, column, &parsed, range)?;
     Ok(c)
 }
@@ -361,7 +361,15 @@ pub fn apply(conn: &Connection, resource: Resource, query: Option<&str>, from: i
 /// Keys that read a request's detail. On jobs, exceptions, logs and queries
 /// they select the records of matching requests (the request's
 /// execution_id; a job's parent_id).
-pub const REQUEST_KEYS: [&str; 7] = ["ip", "ua", "path", "probe", "rate_limited", "halted", "unpermitted"];
+pub const REQUEST_KEYS: [&str; 8] = ["ip", "ua", "path", "probe", "rate_limited", "halted", "unpermitted", "outcome"];
+
+/// `p` as a job query reads it: `outcome:` is the job's own (processed,
+/// failed), not its request's.
+pub fn without_job_keys(p: &Parsed) -> Parsed {
+    let mut p = p.clone();
+    p.fields.shift_remove("outcome");
+    p
+}
 
 /// Keys that read personal data (the client's address and browser): only
 /// with security access (a token's `security` scope, a dashboard session).
@@ -419,13 +427,24 @@ pub fn has_request_keys(p: &Parsed) -> bool {
 /// What is wrong with the request keys' values, for the caller to report
 /// (the conditions themselves match nothing on a bad value).
 pub fn check_request_keys(p: &Parsed) -> Option<String> {
-    for k in ["probe", "rate_limited", "halted", "unpermitted"] {
+    if let Some(v) = p.field("probe")
+        && v != "true"
+        && v != "false"
+    {
+        return Some(format!("probe: must be true or false, not {v:?}"));
+    }
+    // true, false, or names (halted:require_admin|authenticate).
+    for k in ["rate_limited", "halted", "unpermitted"] {
         if let Some(v) = p.field(k)
-            && v != "true"
-            && v != "false"
+            && v.split('|').any(|a| (a == "true" || a == "false") && a != v)
         {
-            return Some(format!("{k}: must be true or false, not {v:?}"));
+            return Some(format!("{k}: true or false stands alone, not among names ({v:?})"));
         }
+    }
+    if let Some(v) = p.field("outcome")
+        && let Some(bad) = v.split('|').find(|a| !super::request_scan::OUTCOMES.contains(a))
+    {
+        return Some(format!("outcome: {bad:?} is not one of {}", super::request_scan::OUTCOMES.join(", ")));
     }
     if let Some(ip) = p.field("ip") {
         for alt in ip.split('|') {
@@ -531,14 +550,33 @@ pub fn request_detail(c: &mut Cond, alias: &str, p: &Parsed) {
         let binds = PROBE_PATTERNS.iter().map(|x| s(&format!("%{}%", rb::sanitize_sql_like(x)))).collect();
         c.and(if v == "true" { format!("({ors})") } else { format!("(NOT ({ors}) OR {col} IS NULL)") }, binds);
     }
-    let flag = |c: &mut Cond, key: &str, set: String| {
-        if let Some(v) = p.field(key) {
-            c.and(if v == "true" { set } else { format!("NOT ({set})") }, vec![]);
-        }
+    // true / false, or the names (any of them with |): which rate_limit,
+    // which before_action, which dropped parameter.
+    let flag = |c: &mut Cond, key: &str, set: String, named: &dyn Fn(usize) -> String| {
+        let Some(v) = p.field(key) else { return };
+        match v {
+            "true" => c.and(set, vec![]),
+            "false" => c.and(format!("NOT ({set})"), vec![]),
+            names => {
+                let names: Vec<&str> = alternatives(names).collect();
+                c.and(format!("({set} AND {})", named(names.len())), names.into_iter().map(s).collect())
+            }
+        };
     };
-    flag(c, "rate_limited", format!("COALESCE({} NOT IN ('null', 'false'), 0)", detail_fn(alias, "json_type", "$.rate_limited")));
-    flag(c, "halted", format!("COALESCE({} != '', 0)", detail_sql(alias, "$.halted_callback")));
-    flag(c, "unpermitted", format!("COALESCE({} > 0, 0)", detail_fn(alias, "json_array_length", "$.unpermitted_parameters")));
+    let rl = detail_sql(alias, "$.rate_limited.name");
+    flag(c, "rate_limited", format!("COALESCE({} NOT IN ('null', 'false'), 0)", detail_fn(alias, "json_type", "$.rate_limited")), &|n| {
+        format!("{rl} IN ({})", vec!["?"; n].join(", "))
+    });
+    let halted = detail_sql(alias, "$.halted_callback");
+    flag(c, "halted", format!("COALESCE({halted} != '', 0)"), &|n| format!("{halted} IN ({})", vec!["?"; n].join(", ")));
+    let keys = detail_sql(alias, "$.unpermitted_parameters");
+    flag(c, "unpermitted", format!("COALESCE({} > 0, 0)", detail_fn(alias, "json_array_length", "$.unpermitted_parameters")), &|n| {
+        format!("EXISTS (SELECT 1 FROM json_each({keys}) WHERE value IN ({}))", vec!["?"; n].join(", "))
+    });
+    if let Some(v) = p.field("outcome") {
+        let outcomes: Vec<&str> = alternatives(v).collect();
+        c.and(format!("{} IN ({})", super::request_scan::outcome_sql(alias), vec!["?"; outcomes.len()].join(", ")), outcomes.into_iter().map(s).collect());
+    }
 }
 
 /// Matching requests a child-record filter resolves at most: their ids are

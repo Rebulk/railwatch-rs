@@ -968,7 +968,7 @@ impl Api<'_> {
         let classes = self.telemetry(e, |conn| Ok(aggregations::grouped(conn, "job_attempt", from, to, 200, sort.as_deref(), dir.as_deref())?))?;
         let (items, meta) = self.paginate(classes)?;
         let q = self.params.opt("q");
-        self.check_request_keys(&filter_query::parse(q.as_deref()))?;
+        self.check_request_keys(&filter_query::without_job_keys(&filter_query::parse(q.as_deref())))?;
         let (page, queues) = self.telemetry(e, |conn| {
             let cond = filter_query::apply(conn, Resource::Jobs, q.as_deref(), from, to, &[])?;
             let capped = cond.capped;

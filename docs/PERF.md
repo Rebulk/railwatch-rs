@@ -614,9 +614,7 @@ One partial covering index on `executions` (`idx_executions_requests`,
 columns a request read returns, and the request fields as index expressions
 (`json_extract(detail, '$.ip')`, the user agent, path, Cf-Ipcountry,
 `json_type` of rate_limited and its name, the halted callback, the
-unpermitted parameters and their count, the redirect, the response size;
-the name, the parameters, the redirect and the size are for the reads that
-classify outcomes, which come in the next change).
+unpermitted parameters and their count, the redirect, the response size).
 `filter_query::requests` (with a request key), the child-record id lookup and
 `request_scan::scan` name it with `INDEXED BY`. SQLite then reads every
 field from the index and never the row's `detail` (`a_request_scan_reads_no_detail_where_the_index_exists`
