@@ -624,6 +624,10 @@ fn cast_id_str(s: &str) -> Option<i64> {
     Some(if neg { -n } else { n })
 }
 
+/// What a list says when its request keys matched more requests than a
+/// child-record filter resolves (filter_query::MAX_REQUEST_IDS).
+const REQUEST_IDS_NOTE: &str = "More than 20,000 requests match the request keys: only the records of the newest 20,000 are here. Narrow q or the window.";
+
 // ---------------------------------------------------------------------------
 // Controllers
 
@@ -831,10 +835,37 @@ impl Api<'_> {
     fn requests(&self, e: &Scoped) -> R<Rendered> {
         let (from, to) = self.window().range();
         let (sort, dir) = (self.params.opt("sort"), self.params.opt("dir"));
+        let parsed = filter_query::parse(self.params.opt("q").as_deref());
+        self.check_request_keys(&parsed)?;
+        if filter_query::has_request_keys(&parsed) {
+            // Only the raw requests hold ip, path, ...: the table from them.
+            let (scanned, routes) = self.telemetry(e, |conn| {
+                let cond = filter_query::requests(conn, &parsed, from, to)?;
+                Ok(crate::dashboard::request_scan::grouped(conn, &cond, from, to, 200, sort.as_deref(), dir.as_deref())?)
+            })?;
+            let (items, meta) = self.paginate(routes)?;
+            return ok(crate::obj! { "data" => items, "meta" => meta, "scan" => scanned.to_json() });
+        }
         let routes = self.telemetry(e, |conn| Ok(aggregations::grouped(conn, "request", from, to, 200, sort.as_deref(), dir.as_deref())?))?;
         let routes = filter_query::filter_routes(routes, self.params.opt("q").as_deref());
         let (items, meta) = self.paginate(routes)?;
         ok(crate::obj! { "data" => items, "meta" => meta })
+    }
+
+    /// A query's request keys: a bad value is 422 with what is wrong; ip:
+    /// and ua: (personal data) need the token's security scope (403).
+    fn check_request_keys(&self, parsed: &filter_query::Parsed) -> R<()> {
+        if let Some(bad) = filter_query::check_request_keys(parsed) {
+            return Err(Halt::Json(StatusCode::UNPROCESSABLE_ENTITY, json!({"error": bad})));
+        }
+        let personal = filter_query::personal_keys(parsed);
+        if !personal.is_empty() && !self.token.allows("security") {
+            return Err(Halt::Json(
+                StatusCode::FORBIDDEN,
+                json!({"error": "insufficient_scope", "detail": format!("{} filters need a token with the security scope", personal.join(" and "))}),
+            ));
+        }
+        Ok(())
     }
 
     fn request_group(&self, e: &Scoped) -> R<Rendered> {
@@ -937,15 +968,22 @@ impl Api<'_> {
         let classes = self.telemetry(e, |conn| Ok(aggregations::grouped(conn, "job_attempt", from, to, 200, sort.as_deref(), dir.as_deref())?))?;
         let (items, meta) = self.paginate(classes)?;
         let q = self.params.opt("q");
+        self.check_request_keys(&filter_query::parse(q.as_deref()))?;
         let (page, queues) = self.telemetry(e, |conn| {
             let cond = filter_query::apply(conn, Resource::Jobs, q.as_deref(), from, to, &[])?;
+            let capped = cond.capped;
             let page = self.cursor_page(conn, e, "jobs", "executions", "Railwatch::Telemetry::Execution", "\"executions\".*", cond, Order::Recent)?;
-            Ok((page, pages::queue_stats(conn, from, to)?))
+            Ok(((page, capped), pages::queue_stats(conn, from, to)?))
         })?;
-        ok(crate::obj! {
+        let (page, capped) = page;
+        let mut body = crate::obj! {
             "data" => items, "meta" => meta, "results" => page.rows.iter().map(models::execution_row).collect::<Vec<_>>(),
             "results_meta" => page.meta, "queues" => queues,
-        })
+        };
+        if capped {
+            db::merge_into(&mut body, "request_filter_note", Value::from(REQUEST_IDS_NOTE));
+        }
+        ok(body)
     }
 
     /// The grouped table, the slowest-queries page, which groups have an
@@ -957,6 +995,7 @@ impl Api<'_> {
         let (from, to) = self.window().range();
         let (sort, dir) = (self.params.opt("sort"), self.params.opt("dir"));
         let q = self.params.opt("q");
+        self.check_request_keys(&filter_query::parse(q.as_deref()))?;
         let (grouped, page, n_plus_ones) = std::thread::scope(|s| {
             let grouped = s.spawn(|| -> R<(Vec<Value>, Value, Vec<String>)> {
                 let groups = self.telemetry(e, |conn| Ok(aggregations::grouped(conn, "query", from, to, 200, sort.as_deref(), dir.as_deref())?))?;
@@ -968,7 +1007,8 @@ impl Api<'_> {
             let page = s.spawn(|| {
                 self.telemetry(e, |conn| {
                     let cond = filter_query::apply(conn, Resource::Queries, q.as_deref(), from, to, &[])?;
-                    self.cursor_page(conn, e, "queries", "queries", "Railwatch::Telemetry::Query", models::QUERY_WITH_SQL, cond, Order::Slowest)
+                    let capped = cond.capped;
+                    Ok((self.cursor_page(conn, e, "queries", "queries", "Railwatch::Telemetry::Query", models::QUERY_WITH_SQL, cond, Order::Slowest)?, capped))
                 })
             });
             let n_plus_ones = s.spawn(|| self.telemetry(e, |conn| Ok(pages::n_plus_ones(conn, from, to)?)));
@@ -979,7 +1019,7 @@ impl Api<'_> {
             )
         });
         let (items, meta, explained) = grouped?;
-        let (page, n_plus_ones) = (page?, n_plus_ones?);
+        let ((page, capped), n_plus_ones) = (page?, n_plus_ones?);
         let items: Vec<Value> = items
             .into_iter()
             .map(|mut i| {
@@ -988,10 +1028,14 @@ impl Api<'_> {
                 i
             })
             .collect();
-        ok(crate::obj! {
+        let mut body = crate::obj! {
             "data" => items, "meta" => meta, "results" => page.rows.iter().map(models::query_row).collect::<Vec<_>>(),
             "results_meta" => page.meta, "n_plus_ones" => n_plus_ones,
-        })
+        };
+        if capped {
+            db::merge_into(&mut body, "request_filter_note", Value::from(REQUEST_IDS_NOTE));
+        }
+        ok(body)
     }
 
     /// The exceptions and logs actions: a page/per_page slice and a cursor
@@ -1005,8 +1049,11 @@ impl Api<'_> {
         let offset_asked = self.params.has("page") || self.params.has("per_page");
         let (want_offset, want_cursor) = (offset_asked || !cursor_asked, cursor_asked || !offset_asked);
         let q = self.params.opt("q");
+        self.check_request_keys(&filter_query::parse(q.as_deref()))?;
+        let mut capped = false;
         let (offset_page, cursor) = self.telemetry(e, |conn| {
             let cond = filter_query::apply(conn, resource, q.as_deref(), from, to, &[])?;
+            capped = cond.capped;
             let offset_page = if want_offset {
                 let from_sql = cond.from.clone().unwrap_or_else(|| format!("\"{table}\""));
                 let total = db::count(conn, &format!("SELECT COUNT(*) FROM {from_sql} WHERE {}", cond.sql()), params_from_iter(cond.binds.iter()))?;
@@ -1034,6 +1081,9 @@ impl Api<'_> {
         if let Some(cursor) = cursor {
             body.insert("results".into(), cursor.rows.iter().map(row).collect::<Vec<_>>().into());
             body.insert("results_meta".into(), cursor.meta);
+        }
+        if capped {
+            body.insert("request_filter_note".into(), Value::from(REQUEST_IDS_NOTE));
         }
         ok(Value::Object(body))
     }
@@ -1738,6 +1788,7 @@ mod tests {
             ("second_app", all.clone(), None, Some(second), None),
             ("revoked", all.clone(), None, None, None),
             ("expired", all.clone(), Some(account), None, Some("2026-01-01 00:00:00".to_string())),
+            ("security", s(&["api", "read", "security"]), None, None, None),
         ] {
             let (id, raw) = c.tx(|tx| issue_api_token(tx, ada, name, &scopes, acc, application, expires.clone())).unwrap();
             if name == "revoked" {
@@ -2361,5 +2412,58 @@ mod tests {
         f.c.with(|x| x.execute("UPDATE issues SET status = 'merged', merged_into_id = NULL WHERE id = ?", [f.issue])).unwrap();
         let r = req(&f, Method::PATCH, &format!("/api/v1/issues/{}", f.issue), Some("full"), Some(json!({"status": "open"})));
         assert_eq!(r.body.as_slice(), br#"{"errors":{"status":["cannot unmerge an issue that is not merged"]}}"#);
+    }
+
+    /// ip: and ua: need the security scope (403 without it, the same call
+    /// 200 with it); a bad request-key value is 422; the requests table
+    /// under a request key comes from the raw requests and says how many
+    /// were read; jobs, queries, exceptions and logs take the keys too.
+    #[test]
+    fn request_keys_on_the_api_need_the_security_scope_for_personal_data() {
+        let f = fixture("request-keys");
+        let slug: String = f.c.with(|x| x.query_row("SELECT slug FROM environments WHERE id = ?", [f.env], |r| r.get(0))).unwrap();
+        let conn = crate::tenants::open_tenant(&f.dir.join("telemetry").join(format!("{slug}.sqlite3"))).unwrap();
+        for (i, (ip, path, status)) in [("198.51.100.7", "/.env", 404), ("198.51.100.7", "/wp-login.php", 404), ("10.0.0.1", "/orders", 200)].iter().enumerate()
+        {
+            let detail = json!({"ip": ip, "path": path, "user_agent": "curl/8"}).to_string();
+            conn.execute(
+                "INSERT INTO executions (execution_id, kind, name, method, group_hash, status, occurred_at, duration, detail) VALUES (?1, 'request', ?2, 'GET', ?3, ?4, ?5, 1000, ?6)",
+                params![format!("e{i}"), format!("GET {path}"), format!("g{i}"), status, qt(NOW - 60_000_000), detail],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO exceptions (execution_id, execution_source, class_name, message, handled, occurred_at) VALUES ('e0', 'request', 'Trap', 'x', 1, ?1)",
+            [qt(NOW - 60_000_000)],
+        )
+        .unwrap();
+        let base = format!("/api/v1/applications/{}/environments/{}", f.app, f.env);
+        for path in ["requests", "jobs", "queries", "exceptions", "logs"] {
+            for q in ["ip:198.51.100.7", "ua:curl"] {
+                let (status, body) = get(&f, &format!("{base}/{path}?q={q}"), "read_only");
+                assert_eq!((status, body["error"].as_str()), (403, Some("insufficient_scope")), "{path} {q}");
+                assert!(body["detail"].as_str().unwrap().contains("security scope"));
+                assert_eq!(get(&f, &format!("{base}/{path}?q={q}"), "security").0, 200, "{path} {q}");
+            }
+            assert_eq!(get(&f, &format!("{base}/{path}?q=probe:maybe"), "read_only").0, 422, "{path}");
+        }
+        let (_, probes) = get(&f, &format!("{base}/requests?q=probe:true"), "read_only");
+        let names: Vec<&str> = probes["data"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names.len(), 2, "{probes}");
+        assert!(names.contains(&"GET /.env") && names.contains(&"GET /wp-login.php"));
+        assert_eq!(probes["scan"], json!({"scanned": 2, "capped": false}));
+        let (_, ex) = get(&f, &format!("{base}/exceptions?q=ip:198.51.100.7"), "security");
+        assert_eq!(ex["data"][0]["class_name"], "Trap");
+        let (_, none) = get(&f, &format!("{base}/exceptions?q=ip:10.0.0.1"), "security");
+        assert!(none["data"].as_array().unwrap().is_empty());
+        // Without a request key the table is the rollups' as before (no scan).
+        assert!(get(&f, &format!("{base}/requests"), "read_only").1.get("scan").is_none());
+    }
+
+    #[test]
+    fn the_request_ids_note_names_the_real_limit() {
+        let n = filter_query::MAX_REQUEST_IDS.to_string();
+        let grouped = format!("{},{}", &n[..n.len() - 3], &n[n.len() - 3..]);
+        assert_eq!(REQUEST_IDS_NOTE.matches(&grouped).count(), 2, "{REQUEST_IDS_NOTE}");
     }
 }

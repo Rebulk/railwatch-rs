@@ -51,7 +51,11 @@ beforeEach(() => {
   }
 })
 
-function renderRequests() {
+function renderRequests(scan?: {
+  scanned: number
+  capped: boolean
+  note?: string
+}) {
   render(
     <Requests
       routes={[route]}
@@ -60,9 +64,28 @@ function renderRequests() {
       sort="count"
       dir="desc"
       q="status:5xx"
+      scan={scan}
     />,
   )
 }
+
+describe("Requests filtered on raw request fields", () => {
+  it("says when the scan stopped early", () => {
+    renderRequests({
+      scanned: 200000,
+      capped: true,
+      note: "Stopped at the newest 200000 requests",
+    })
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Stopped at the newest 200000 requests",
+    )
+  })
+
+  it("says nothing when every request was read", () => {
+    renderRequests({ scanned: 12, capped: false })
+    expect(screen.queryByRole("status")).toBeNull()
+  })
+})
 
 describe("Requests with a custom range", () => {
   it("opens a route within the same range", () => {

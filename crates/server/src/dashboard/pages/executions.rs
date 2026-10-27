@@ -84,11 +84,32 @@ pub(crate) fn issue_row(i: &control::Issue) -> Value {
 // -- requests ----------------------------------------------------------------
 
 pub fn requests_index(conn: &Connection, ctx: &PageContext, control: &dyn ControlData) -> R {
+    let parsed = filter_query::parse(ctx.param("q"));
+    if filter_query::has_request_keys(&parsed) {
+        return requests_index_raw(conn, ctx, control, &parsed);
+    }
     let routes = grouped(conn, ctx, "request", 200, true)?;
     let routes = filter_query::filter_routes(routes, ctx.param("q"));
     Ok(crate::obj! {
         "routes" => routes, "series" => series(conn, ctx, "request", None)?, "deploys" => deploys_in_window(control, ctx),
         "sort" => sort_param(ctx, "count"), "dir" => dir_param(ctx), "q" => ctx.param_s("q"),
+    })
+}
+
+/// The requests page under a filter on what only the raw requests hold
+/// (ip:, ua:, path:, ...): the table from those requests (every key of the
+/// query applied), the chart unfiltered, and `scan` saying how many were
+/// read. A bad value is a 422 with what is wrong.
+fn requests_index_raw(conn: &Connection, ctx: &PageContext, control: &dyn ControlData, parsed: &filter_query::Parsed) -> R {
+    if let Some(bad) = filter_query::check_request_keys(parsed) {
+        return Err(PageError::Unprocessable(bad));
+    }
+    let (from, to) = ctx.range();
+    let cond = filter_query::requests(conn, parsed, from, to)?;
+    let (scanned, routes) = crate::dashboard::request_scan::grouped(conn, &cond, from, to, 200, ctx.param("sort"), ctx.param("dir"))?;
+    Ok(crate::obj! {
+        "routes" => routes, "series" => series(conn, ctx, "request", None)?, "deploys" => deploys_in_window(control, ctx),
+        "sort" => sort_param(ctx, "count"), "dir" => dir_param(ctx), "q" => ctx.param_s("q"), "scan" => scanned.to_json(),
     })
 }
 

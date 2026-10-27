@@ -21,6 +21,11 @@ groups; 40% of queries go to the first 200), --tenants 300 (app tenants plus
 --now) and --by-time (batches in time order, so each batch touches an hour
 or two of rollups instead of all of them, which makes ingest 20x faster),
 --few-logs (one log line for a quarter of executions, not two for each).
+
+--security: requests carry what a security reader filters on (ip, path, user
+agent, Referer/X-Forwarded-For headers, rate_limited, halted_callback,
+unpermitted_parameters) with ~2% planted attack traffic: scanners hitting
+probe paths, 401 bursts on a sign-in route (docs/PERF.md, "Security filters").
 """
 import argparse, base64, copy, gzip, hashlib, json, os, random, uuid
 
@@ -37,6 +42,7 @@ ap.add_argument("--tenants", type=int, default=0)
 ap.add_argument("--uniform", action="store_true")
 ap.add_argument("--by-time", action="store_true")
 ap.add_argument("--few-logs", action="store_true")
+ap.add_argument("--security", action="store_true")
 a = ap.parse_args()
 
 fixtures = json.load(open(a.fixtures))
@@ -98,6 +104,36 @@ def stamp(r, user, tenant):
         r["tenant"] = tenant
     return r
 
+UAS = ["Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/605.1.15 Safari/605.1.15",
+       "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36"]
+SCANNERS = [f"198.51.100.{i}" for i in range(1, 40)]
+PROBES = ["/.env", "/.git/config", "/wp-login.php", "/wp-admin/setup-config.php", "/phpmyadmin/", "/cgi-bin/luci", "/static/../../etc/passwd", "/xmlrpc.php"]
+
+def security_fields(p, route):
+    """ip, path, user agent and flags on a request; a few are attacks."""
+    roll = rng.random()
+    path = "/" + route.split("(")[0].strip("/").replace(":id", str(rng.randrange(1, 900)))
+    ip, ua = f"10.{rng.randrange(0, 4)}.{rng.randrange(0, 256)}.{rng.randrange(1, 255)}", rng.choice(UAS)
+    if roll < 0.01:
+        ip, ua, path = rng.choice(SCANNERS), rng.choice(["curl/8.4.0", "python-requests/2.31", "Go-http-client/1.1"]), rng.choice(PROBES)
+        p["status_code"], p["route"], p["method"] = 404, "unmatched", "GET"
+        p["_group"] = md5("GET", "unmatched")
+    elif roll < 0.02:
+        ip, path = f"203.0.113.{rng.randrange(1, 6)}", "/session"
+        p["status_code"], p["route"], p["method"] = 401, "/session(.:format)", "POST"
+        p["_group"] = md5("POST", "/session(.:format)")
+    p["ip"], p["path"], p["user_agent"] = ip, path, ua
+    p["url"] = f"https://shop.example{path}"
+    p["headers"] = {"Host": "shop.example", "Referer": "https://shop.example/", "X-Forwarded-For": f"{ip}, 10.0.0.1", "Accept": "text/html"}
+    if rng.random() < 0.003:
+        p["rate_limited"] = {"name": "default", "count": 61, "to": 60}
+        p["status_code"] = 429
+    if rng.random() < 0.002:
+        p["halted_callback"] = "require_login"
+    if rng.random() < 0.002:
+        p["unpermitted_parameters"] = ["admin"]
+
 def execution(ts):
     eid, trace = uid(), uid()
     user, tenant = rng.choice(USERS), rng.choice(TENANTS)
@@ -114,6 +150,8 @@ def execution(ts):
         p["inertia"] = rng.choice([None, {"component": "Widgets/Show", "partial_only": []}])
         if p["status_code"] >= 500:
             p["exception_preview"] = rng.choice(["ArgumentError: kaboom", "NoMethodError: undefined method `x' for nil"])
+        if a.security:
+            security_fields(p, route)
     elif kind == "job_attempt":
         name = rng.choice(JOBS)
         p["name"], p["_group"] = name, md5(name)

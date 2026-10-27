@@ -244,12 +244,17 @@ export default function Profile(p: Props) {
                           type="checkbox"
                           name="scopes[]"
                           value={scope}
-                          defaultChecked
+                          defaultChecked={scope !== "security"}
                         />
                         {scope}
                       </label>
                     ))}
                   </div>
+                  <p className="text-xs text-muted-foreground">
+                    security lets the token read requests&apos; client IP
+                    addresses and user agents (personal data) and filter or
+                    group by them.
+                  </p>
                   <InputError messages={errors.scopes} />
                 </fieldset>
 

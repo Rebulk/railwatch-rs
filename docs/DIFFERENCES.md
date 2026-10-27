@@ -914,6 +914,24 @@ AmbiguousIdentifier (the baseline has one account; the SQL is Rails'
     `queue_stats`, `jobs_klass`, `llm_calls_index`) reshaped for an agent.
     EXPECTED in `tools/list`.
 
+11. **Security reading** (2026-10-27): Rust-only tools `query_requests`
+    and `security_summary` (web/mcp_security.rs), EXPECTED in `tools/list`.
+    The filter grammar gains `ip:`, `ua:`, `path:`, `probe:`,
+    `rate_limited:`, `halted:` and `unpermitted:` (request `detail`; on
+    jobs, exceptions, logs and queries they select the records of matching
+    requests), `status:a|b` alternatives on requests, and quoted values
+    (`ua:"a b"`; Rails splits them at the space). search_requests rows add
+    `path`, the security flags and the referer/origin/country headers, and
+    with the new `security` token scope `ip`, `user_agent` and
+    `x_forwarded_for`; get_execution and last_execution add the same plus
+    `request_url` and `redirect_to` for a request. The MCP diff's
+    search_requests and get_execution cases on requests carrying a path are
+    EXPECTED. Tool descriptions for search_requests, search_telemetry,
+    get_execution and last_execution changed (EXPECTED in `tools/list`).
+    The requests page and `/api/v1/.../requests` under a request key build
+    their table from the raw requests (exact percentiles, a `scan` prop)
+    instead of the rollups.
+
 # Detectors diff (`bench/diff/detectors/`, 2026-10-15)
 
 What `run.sh` found and fixed in the ports (each was a Rust difference,

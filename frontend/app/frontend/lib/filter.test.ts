@@ -26,16 +26,25 @@ describe("parseFilter", () => {
     expect(parseFilter("Status:500").text).toBe("Status:500")
   })
 
-  it("keeps quote characters as part of the value, since TOKEN does not strip quotes", () => {
-    // The regex is `\S+` for the value half, so a quoted value with no
-    // internal space is captured quotes-and-all.
-    expect(parseFilter('key:"quoted"').fields).toEqual({ key: '"quoted"' })
+  it("strips the quotes of a quoted value", () => {
+    expect(parseFilter('key:"quoted"').fields).toEqual({ key: "quoted" })
   })
 
-  it("splits a quoted value containing a space into two tokens on whitespace", () => {
-    const parsed = parseFilter('key:"two words"')
-    expect(parsed.fields).toEqual({ key: '"two' })
-    expect(parsed.text).toBe('words"')
+  it("keeps a quoted value's spaces, as the server's parser does", () => {
+    const parsed = parseFilter('ua:"Mozilla/5.0 (X11; Linux)" status:401 slow')
+    expect(parsed.fields).toEqual({
+      ua: "Mozilla/5.0 (X11; Linux)",
+      status: "401",
+    })
+    expect(parsed.text).toBe("slow")
+  })
+
+  it("takes an unclosed quote to the end", () => {
+    expect(parseFilter('ua:"two words').fields).toEqual({ ua: "two words" })
+  })
+
+  it("keeps quotes inside an unquoted value", () => {
+    expect(parseFilter('path:/a"b').fields).toEqual({ path: '/a"b' })
   })
 
   it("treats a colon with no value as text", () => {
@@ -103,5 +112,10 @@ describe("parseFilter/serializeFilter round trip", () => {
 
   it("round trips the empty string", () => {
     expect(serializeFilter(parseFilter(""))).toBe("")
+  })
+
+  it("round trips a value with spaces by quoting it", () => {
+    const query = 'path:/admin* ua:"Mozilla/5.0 (X11; Linux)"'
+    expect(serializeFilter(parseFilter(query))).toBe(query)
   })
 })
