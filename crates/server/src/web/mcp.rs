@@ -1580,7 +1580,7 @@ impl Mcp<'_> {
             let mut v = if shape == Shape::Rows {
                 crate::obj! { "shape" => "rows", "rows" => Value::Array(rows) }
             } else {
-                self.compact_rows(rows, &self.execution_url_template(&env, "requests"))
+                self.compact_rows(rows, &[self.execution_url_template(&env, "requests")], "execution_id")
             };
             if let (Some(g), Some((listed, more, last, scanned))) = (&group, page_note) {
                 db::merge_into(&mut v, "group", Value::from(g.clone()));
@@ -1599,12 +1599,22 @@ impl Mcp<'_> {
         })
     }
 
-    /// Compact rows: no nulls, no per-row url (`url_template` instead),
-    /// what every row shares in `common`, long deploys in `deploys`.
-    fn compact_rows(&self, rows: Vec<Value>, url_template: &str) -> Value {
+    /// Compact rows: no nulls, a url only where `url_template` (the one of
+    /// `templates` most rows fit) does not rebuild it, what every row shares
+    /// in `common`, long deploys in `deploys`.
+    fn compact_rows(&self, rows: Vec<Value>, templates: &[String], key: &str) -> Value {
+        self.compact_into(rows, templates, key, "rows")
+    }
+
+    fn compact_into(&self, mut rows: Vec<Value>, templates: &[String], key: &str, field: &str) -> Value {
+        let url_template = compact::strip_urls(&mut rows, templates, key);
         let mut deploys = compact::Deploys::default();
-        let (rows, common) = compact::diet(rows, &["url"], &mut deploys);
-        let mut v = crate::obj! { "shape" => "compact", "url_template" => url_template, "rows" => Value::Array(rows) };
+        let (rows, common) = compact::diet(rows, &mut deploys);
+        let mut v = crate::obj! { "shape" => "compact" };
+        if let Some(t) = url_template {
+            db::merge_into(&mut v, "url_template", Value::from(t));
+        }
+        db::merge_into(&mut v, field, Value::Array(rows));
         if !common.is_empty() {
             db::merge_into(&mut v, "common", Value::Object(common));
         }
@@ -1880,9 +1890,10 @@ impl Mcp<'_> {
                 "queries" => r.s("group_hash").map_or(Value::Null, |g| self.url(&format!("/apps/{}/envs/{}/queries/{}", env.application_id, env.id, segment(g)))),
                 _ => self.execution_url(&env, r.s("execution_source"), r.s("execution_id")),
             };
-            let url_template = match resource.as_str() {
-                "queries" => format!("{}/apps/{}/envs/{}/queries/{{group_hash}}", self.base, env.application_id, env.id),
-                _ => self.execution_url_template(&env, "executions"),
+            // A record's link is its execution's page, by the execution's kind.
+            let (url_templates, url_key): (Vec<String>, &str) = match resource.as_str() {
+                "queries" => (vec![format!("{}/apps/{}/envs/{}/queries/{{group_hash}}", self.base, env.application_id, env.id)], "group_hash"),
+                _ => (["requests", "jobs", "scheduled_tasks", "commands", "executions"].iter().map(|s| self.execution_url_template(&env, s)).collect(), "execution_id"),
             };
             // Only a grouped read or one group's reads past a page: the
             // columns the fold reads (a log's context and tags, an
@@ -1989,16 +2000,7 @@ impl Mcp<'_> {
             let mut v = if shape == Shape::Rows {
                 crate::obj! { "shape" => "rows", "data" => Value::Array(data) }
             } else {
-                let mut deploys = compact::Deploys::default();
-                let (data, common) = compact::diet(data, &["url"], &mut deploys);
-                let mut v = crate::obj! { "shape" => "compact", "url_template" => url_template, "data" => Value::Array(data) };
-                if !common.is_empty() {
-                    db::merge_into(&mut v, "common", Value::Object(common));
-                }
-                if let Some(d) = deploys.into_json() {
-                    db::merge_into(&mut v, "deploys", d);
-                }
-                v
+                self.compact_into(data, &url_templates, url_key, "data")
             };
             db::merge_into(&mut v, "meta", meta);
             Ok(v)

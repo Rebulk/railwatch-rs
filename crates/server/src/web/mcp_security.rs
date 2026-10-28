@@ -2648,7 +2648,9 @@ mod tests {
                 if let Some(d) = m.get("deploy").and_then(Value::as_str).and_then(|d| c["deploys"].get(d)) {
                     m.insert("deploy".into(), d.clone());
                 }
-                m.insert("url".into(), json!(template.replace("{execution_id}", m["execution_id"].as_str().unwrap())));
+                if !m.contains_key("url") {
+                    m.insert("url".into(), json!(template.replace("{execution_id}", m["execution_id"].as_str().unwrap())));
+                }
                 Value::Object(m)
             })
             .collect();
@@ -2671,6 +2673,31 @@ mod tests {
             f.text("search_requests", json!({"window": "24h", "limit": 30, "shape": "rows"})).len(),
         );
         assert!(small * 3 < big * 2, "{small} vs {big}");
+        // Each record keeps the link of its own execution's page: a log of a
+        // job under /jobs/, of a request under /requests/. The template is
+        // the one most rows fit; the others keep their own url.
+        let c = f.tenant();
+        c.execute(
+            "INSERT INTO logs (execution_id, execution_source, occurred_at, level, message) VALUES ('job1', 'job', ?1, 'info', 'locked')",
+            [qt(NOW - 29 * MIN)],
+        )
+        .unwrap();
+        c.execute("UPDATE logs SET execution_source = 'request' WHERE execution_id IN ('bf0', 'ok0')", []).unwrap();
+        drop(c);
+        let logs = f.tool("search_telemetry", json!({"resource": "logs", "window": "24h"}));
+        let full = f.tool("search_telemetry", json!({"resource": "logs", "window": "24h", "shape": "rows"}));
+        assert!(logs["url_template"].as_str().unwrap().ends_with("/requests/{execution_id}"), "{logs}");
+        let job = logs["data"].as_array().unwrap().iter().find(|r| r["execution_id"] == "job1").unwrap();
+        assert!(job["url"].as_str().unwrap().ends_with("/jobs/job1"), "{job}");
+        assert_eq!(logs["data"].as_array().map(Vec::len), full["data"].as_array().map(Vec::len));
+        for (c, r) in logs["data"].as_array().unwrap().iter().zip(full["data"].as_array().unwrap()) {
+            let rebuilt = match (c.get("url"), logs.get("url_template")) {
+                (Some(u), _) => u.clone(),
+                (None, Some(tpl)) => json!(tpl.as_str().unwrap().replace("{execution_id}", c["execution_id"].as_str().unwrap())),
+                (None, None) => Value::Null,
+            };
+            assert_eq!(rebuilt, r["url"], "{c}");
+        }
     }
 
     #[test]

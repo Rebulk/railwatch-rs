@@ -537,7 +537,7 @@
           },
           "max_tokens": {
             "type": "integer",
-            "description": "Approximate token budget for the result (4 bytes a token): the biggest entries are listed until it is spent, the rest counted in more. Defaults to what fits under the result cap."
+            "description": "Approximate token budget for the rows (4 bytes a token): groups are listed until it is spent, the rest counted in tail. Defaults to what fits under the result cap."
           }
         },
         "required": [

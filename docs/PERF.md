@@ -799,8 +799,9 @@ each, the totals and exceptions the rest.
 ## Compact agent output (from main 4bcf959)
 
 Security reads were mostly repeats: on rebulk-system, `search_requests
-status:401 route:/api/mcp` over 24h was 59 KB for 113 rows (cut at the 60 KB
-cap, 87 more left out) that were one kind of request. Grouping folds alike
+status:401 route:/api/mcp` over 24h (read live on 2026-10-28) was 59 KB for
+113 rows, the 60 KB cap cutting 87 more, all one kind of request. The replay
+below, of that day's 338 such requests, shows 119 rows and cuts 81. Grouping folds alike
 rows into counted entries (docs/security-agent.md, "Grouped results").
 
 ### Method

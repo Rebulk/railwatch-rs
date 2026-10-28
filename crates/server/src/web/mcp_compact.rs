@@ -710,7 +710,7 @@ static MASK: LazyLock<regex::Regex> = LazyLock::new(|| {
           (?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})
         | (?P<email>[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)
         | (?P<ip>\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?)
-        | (?P<ip6>(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4})
+        | (?P<ip6>(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4})
         | (?P<hex>0x[0-9a-fA-F]+|[0-9a-fA-F]{8,})
         | (?P<num>\d+(?:\.\d+)?)
         ",
@@ -839,16 +839,38 @@ pub fn hoist(maps: &mut [Map<String, Value>], keep: &[&str]) -> Map<String, Valu
     common
 }
 
-/// Rows on a diet: null fields and `drop` keys removed, long deploys
-/// shortened through `deploys`, fields equal on every row moved to the
-/// returned `common` (ids, times and durations stay per row).
-pub fn diet(rows: Vec<Value>, drop: &[&str], deploys: &mut Deploys) -> (Vec<Value>, Map<String, Value>) {
+/// The url template, of `templates` (`{key}` where the row's `key` goes),
+/// that rebuilds the most rows' `url`; each of those rows loses its `url`,
+/// every other row keeps its own. A null url stays (as null) on a row that
+/// has a `key`, so the template is not read as its link, and goes on a row
+/// without one. None (every url kept) when no template rebuilds any.
+pub fn strip_urls(rows: &mut [Value], templates: &[String], key: &str) -> Option<String> {
+    let placeholder = format!("{{{key}}}");
+    let fill = |t: &str, r: &Value| r.get(key).and_then(Value::as_str).map(|id| t.replace(&placeholder, id));
+    let rebuilds = |t: &str, r: &Value| r.get("url").and_then(Value::as_str).is_some_and(|u| fill(t, r).as_deref() == Some(u));
+    let (best, n) = templates.iter().map(|t| (t, rows.iter().filter(|r| rebuilds(t, r)).count())).max_by_key(|(_, n)| *n)?;
+    if n == 0 {
+        return None;
+    }
+    for r in rows.iter_mut() {
+        let drop = rebuilds(best, r) || (r.get("url").is_some_and(Value::is_null) && fill(best, r).is_none());
+        if drop && let Value::Object(m) = r {
+            m.shift_remove("url");
+        }
+    }
+    Some(best.clone())
+}
+
+/// Rows on a diet: null fields removed (but `url`: see `strip_urls`), long
+/// deploys shortened through `deploys`, fields equal on every row moved to
+/// the returned `common` (ids, times and durations stay per row).
+pub fn diet(rows: Vec<Value>, deploys: &mut Deploys) -> (Vec<Value>, Map<String, Value>) {
     let mut maps: Vec<Map<String, Value>> = rows
         .into_iter()
         .map(|r| match r {
             Value::Object(m) => m
                 .into_iter()
-                .filter(|(k, v)| !v.is_null() && !drop.contains(&k.as_str()))
+                .filter(|(k, v)| !v.is_null() || k == "url")
                 .map(|(k, v)| match v {
                     Value::String(d) if k == "deploy" => (k, Value::from(deploys.short(&d))),
                     v => (k, v),
@@ -857,7 +879,7 @@ pub fn diet(rows: Vec<Value>, drop: &[&str], deploys: &mut Deploys) -> (Vec<Valu
             _ => Map::new(),
         })
         .collect();
-    let common = hoist(&mut maps, &["execution_id", "id", "occurred_at", "duration", "message"]);
+    let common = hoist(&mut maps, &["execution_id", "id", "occurred_at", "duration", "message", "url"]);
     (maps.into_iter().map(Value::Object).collect(), common)
 }
 
@@ -877,6 +899,9 @@ mod tests {
         assert_eq!(template("Please add 'image_processing' to your Gemfile"), "Please add '<str>' to your Gemfile");
         assert_eq!(template("undefined method `foo' for nil"), "undefined method `<str>' for nil");
         assert_eq!(template("from fe80::1 and 2001:db8::7, Net::OpenTimeout"), "from <ip> and <ip>, Net::OpenTimeout");
+        assert_eq!(template("full 2001:0db8:0000:0000:0000:ff00:0042:8329 address"), "full <ip> address");
+        // A clock time is numbers, not an IPv6 address.
+        assert_eq!(template("Job ran at 12:30:45"), "Job ran at <num>:<num>:<num>");
         assert_eq!(template("utf8 h264 v2 user5 overflow=67.86pt columns=4"), "utf8 h264 v2 user5 overflow=<num>pt columns=<num>");
         assert_eq!(template("deadbeef and facade42 and decade"), "deadbeef and <hex> and decade");
         // Stable: the values differ, the template does not.
@@ -1069,7 +1094,9 @@ mod tests {
             json!({"execution_id": "a", "status": 401, "deploy": "65878919f7586318fd83a3472fa299d872e4dab9", "user_ref": null, "url": "https://x/a"}),
             json!({"execution_id": "b", "status": 401, "deploy": "b1fb283f96e64b5d897e6ae5a00ef7991f4ca16b", "user_ref": null, "url": "https://x/b"}),
         ];
-        let (rows, common) = diet(rows, &["url"], &mut d);
+        let mut rows = rows;
+        assert_eq!(strip_urls(&mut rows, &["https://x/{execution_id}".to_string()], "execution_id").as_deref(), Some("https://x/{execution_id}"));
+        let (rows, common) = diet(rows, &mut d);
         assert_eq!(Value::Object(common), json!({"status": 401}));
         assert_eq!(rows[0], json!({"execution_id": "a", "deploy": "65878919f758"}));
         assert_eq!(d.into_json().unwrap()["b1fb283f96e6"], "b1fb283f96e64b5d897e6ae5a00ef7991f4ca16b");
@@ -1080,7 +1107,34 @@ mod tests {
         assert_eq!(d.short("aaaaaaaaaaaa1111111"), "aaaaaaaaaaaa");
         assert_eq!(d.short("short"), "short");
         // One row: nothing is common.
-        let (rows, common) = diet(vec![json!({"execution_id": "a", "status": 1})], &[], &mut Deploys::default());
+        let (rows, common) = diet(vec![json!({"execution_id": "a", "status": 1})], &mut Deploys::default());
         assert!(common.is_empty() && rows[0]["status"] == 1);
+        // The template most rows fit; the others keep their own url, a row
+        // with an id but no link keeps its null, one without an id loses it.
+        let t = |s: &str| s.to_string();
+        let mut rows = vec![
+            json!({"execution_id": "a", "url": "https://x/requests/a"}),
+            json!({"execution_id": "b", "url": "https://x/requests/b"}),
+            json!({"execution_id": "c", "url": "https://x/jobs/c"}),
+            json!({"execution_id": "d", "url": null}),
+            json!({"url": null}),
+        ];
+        let best = strip_urls(&mut rows, &[t("https://x/jobs/{execution_id}"), t("https://x/requests/{execution_id}")], "execution_id");
+        assert_eq!(best.as_deref(), Some("https://x/requests/{execution_id}"));
+        assert_eq!(
+            rows,
+            vec![
+                json!({"execution_id": "a"}),
+                json!({"execution_id": "b"}),
+                json!({"execution_id": "c", "url": "https://x/jobs/c"}),
+                json!({"execution_id": "d", "url": null}),
+                json!({})
+            ]
+        );
+        let (rows, _) = diet(rows, &mut Deploys::default());
+        assert_eq!(rows[3], json!({"execution_id": "d", "url": null}), "a null url survives the diet");
+        let mut none = vec![json!({"execution_id": "a", "url": "https://elsewhere/a"})];
+        assert_eq!(strip_urls(&mut none, &[t("https://x/{execution_id}")], "execution_id"), None);
+        assert_eq!(none[0]["url"], "https://elsewhere/a");
     }
 }
