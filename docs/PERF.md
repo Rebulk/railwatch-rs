@@ -586,7 +586,8 @@ exceptions `ip:` 1155, probe search 938, ip x path 836; summary@24h 845.
 - security_summary@7d reads two weeks (the window and the one before):
   ~150k requests, 509 ms. At 30d the window alone passes its 100k cap, so it
   reads the newest 100k, compares nothing and says so (`scan`), which is why
-  30d is faster than 7d.
+  30d is faster than 7d. Superseded: the summary has no such cap now, see
+  "Complete security_summary" below.
 - `query_requests` stops at 200k requests (the 30d no-filter case, 1.16 s;
   `scan.capped`). The 30d API `probe:true` table (1.06 s) is the other case
   over 1 s: it ORs 20 LIKEs over each of 320k paths.
@@ -711,6 +712,89 @@ which also builds the days that were today and yesterday at the upgrade).
 
 Ingest with the index, the same 400 batches into a fresh server, twice:
 wall 137.0 -> 140.9 s and 138.5 -> 144.4 s, server CPU +2.3% and +2.7%.
+
+## Complete security_summary (from main 2f5cf8f)
+
+security_summary folded one scan of the window capped at the newest 100k
+requests. rebulk-system (v0.2.13, 2026-10-28) sends ~300k requests a week,
+60% one ingest route: the 7d summary covered ~2.3 days, reported 355 probe
+requests where `query_requests q=probe:true` counted 4,105, and skipped the
+previous window. The cap was said only in a top-level `scan` note.
+
+### What changed
+
+Each finding reads only the requests it is about, on the request index:
+
+- the 4xx (auth failures: 401/403, and 422 on sign-in routes; scanner
+  candidates: each address's 4xx and their paths), one read for both;
+- `probe:true`;
+- rate-limited, halted or unpermitted, ORed in one read.
+
+Those are a small part of any window (on the bench below ~1,800 4xx,
+~180 probes and ~120 halted a day against 43k requests), so they fold
+whole. Each read still stops at 200,000 matching requests; a finding whose
+read did says so in its own `summary`, its count is a floor, and it is not
+graded on the comparison. The top-level `scan` note is gone.
+
+The rest is SQL, per day file (`storage::reader::aggregate_hinted`, which
+now leaves an added index's hint off a file without it, as the hinted
+views do):
+
+- the window's total and status classes: `SUM` columns (a `GROUP BY` sorts
+  every row);
+- every address's requests and 4xx, for `new_ips`: each file sorts its rows
+  by address and then groups them. A plain `GROUP BY` over ~16k addresses a
+  day built its temp B-tree row by row: 78 ms a day file against 16 ms
+  sorted first. The files' rows are added up in Rust (grouping them again
+  in SQL was slower: 7d 1.04 -> 1.20 s);
+- the shown scanners' (top 10) requests and served counts: one read of
+  their own requests (`ip IN (json_each(?))` on the index).
+
+Both windows are always read and compared.
+
+### Method
+
+Tenant: `gen_tenant.py --spread-days 29.5 --executions 1590000 --seed 5
+--records-per-batch 2000 --shapes 2000 --tenants 50 --uniform --by-time
+--few-logs --prod-shape`, posted to a fresh per-day server (main 2f5cf8f)
+and left to build the request index on every day: 43k requests a day
+(rebulk-system ~43k), 60% `POST /api/v1/ingest/scale_live`, 5.5 GB over 31
+core days. mcp-dump on CPUs 8-11, release build, a security-scope token
+(and one without it). Warm: median of 5 after one dropped, two rounds.
+Cold: files evicted (`posix_fadvise(DONTNEED)`), a fresh process, one
+call, two rounds interleaved. The 30d window's previous window is empty
+(the tenant holds 29.5 days).
+
+### Results (ms)
+
+| | 24h | 7d | 30d |
+|---|---:|---:|---:|
+| warm, before (7d and 30d: newest 100k, not compared) | 127 | 166 | 188 |
+| warm, after | 146-170 | 1040-1160 | 2200-2470 |
+| warm, after, no security scope | 97 | 662 | 1394 |
+| cold, before | 1281-2872 | 2791-3078 | 4705-4860 |
+| cold, after | 1126-1347 | 3859-3990 | 7623-7722 |
+
+Counts at 7d, before -> after, against `query_requests` on the same
+data: probe requests 412 -> 1,244 (query_requests 1,244), halted 272 ->
+820 (820), requests 100,000 -> 301,707, previous window not read ->
+302,620 requests and 1,228 probes. 24h answers are byte-identical
+before and after.
+
+Where 7d warm goes (both windows): probe paths ~360 ms (20 LIKEs over each
+of ~600k paths, read from the index, ~0.6 µs a request), the address read
+for `new_ips` ~400 ms (95k addresses at 7d: the bench draws client addresses
+from 260k; production's count is unmeasured, as the token reading it has no
+security scope), the 4xx and flag reads ~90 ms
+each, the totals and exceptions the rest.
+
+- 7d and 30d are over 1 s and 2 s with the security scope. Without it (no
+  address findings) they are 0.66 and 1.39 s. Capping `new_ips` alone
+  (allowed, if its summary said "of the newest N") would save most of the
+  difference; not done, as the counts it gives are exact now.
+- **No index added.** A probe flag (or a probe index expression) would
+  take the 20 LIKEs off every request; "Security reads" above weighed it
+  against a write path and kept the LIKEs.
 
 ## Proposals
 
