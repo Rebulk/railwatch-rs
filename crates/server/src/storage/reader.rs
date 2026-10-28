@@ -332,7 +332,9 @@ pub struct Hint<'a> {
 /// range is empty, but without ANALYZE stats the planner can take an index
 /// that does not lead with occurred_at and read it whole (the tenants' job
 /// counts, 23 files: 569 -> 56 ms cold). A hint picks a plan; every file is
-/// read either way.
+/// read either way. A file without an index this server adds
+/// (schema::ADDED_INDEXES) reads without the hint, as its branch of the
+/// hinted view does (attach_all).
 pub fn aggregate_hinted(
     conn: &Connection,
     table: &str,
@@ -355,15 +357,20 @@ pub fn aggregate_hinted(
         .iter()
         .enumerate()
         .map(|(k, f)| {
-            let hinted = match (&hint, &days) {
-                (Some(h), Some((from_day, to_day))) => format!(" INDEXED BY {}", if f.day >= *from_day && f.day <= *to_day { h.inside } else { h.outside }),
+            let index = match (&hint, &days) {
+                (Some(h), Some((from_day, to_day))) => Some(if f.day >= *from_day && f.day <= *to_day { h.inside } else { h.outside }),
+                _ => None,
+            };
+            let added = |i: &str| crate::schema::ADDED_INDEXES.iter().any(|(a, _)| *a == i);
+            let hinted = match index {
+                Some(i) if !added(i) || crate::schema::has_index(conn, &f.alias, i)? => format!(" INDEXED BY {i}"),
                 _ => String::new(),
             };
             // ?i -> this branch's own slot, in one pass over the SQL.
             let sql = renumber(&inner.replace("{t}", &format!("{}.\"{table}\" AS \"{table}\"{hinted}", f.alias)), k * n);
-            format!("SELECT * FROM ({sql})")
+            Ok(format!("SELECT * FROM ({sql})"))
         })
-        .collect();
+        .collect::<rusqlite::Result<_>>()?;
     let all: Vec<rusqlite::types::Value> = (0..files.len()).flat_map(|_| binds.iter().cloned()).collect();
     let sql = outer.replace("{u}", &format!("({})", parts.join(" UNION ALL ")));
     crate::dashboard::db::query_as_is(conn, &sql, rusqlite::params_from_iter(all.iter())).map(Some)

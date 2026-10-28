@@ -149,9 +149,16 @@ order, so the cost follows the window's request count (about 2.5 µs a
 request warm), not the number of matches. Day files from before the upgrade
 get the index in the background after it, today's and yesterday's once they
 are two days old; until then they read slower. `query_requests` reads at most the newest 200,000
-requests of the window, and `security_summary` 100,000 per window. Past
-that, `scan.capped` is true and the result says how far it got. Narrow `q`
-(a status, a route, a method) or the window to see further back. Timings on
+requests of the window. Past that, `scan.capped` is true and the result
+says how far it got. Narrow `q` (a status, a route, a method) or the window
+to see further back.
+
+`security_summary` counts each finding over the whole window and the one
+before it: the totals and every address's traffic are SQL aggregates, and
+each finding reads only the requests it is about (401/403/422, 4xx, probe
+paths, rate-limited, halted or unpermitted), which are few however busy the
+window. A finding whose own read passes 200,000 matching requests says so
+in its `summary` (its count is then a floor and is not compared). Timings on
 a 4.4M-record tenant shaped like a production app are in
 [PERF.md](PERF.md#security-reads-branch-security-speed-from-main-0d69f42).
 

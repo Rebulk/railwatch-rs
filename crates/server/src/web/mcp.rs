@@ -2912,6 +2912,31 @@ mod tests {
         pub(super) fn grant_security(&self) {
             self.c.with(|x| x.execute("UPDATE api_tokens SET scopes = '[\"mcp\",\"read\",\"write\",\"security\"]'", [])).unwrap();
         }
+
+        /// Moves the tenant into per-day files, as a server's own layout,
+        /// with the request index on the core days (oldest first) that
+        /// `indexed` picks by position: the state between an upgrade and its
+        /// background build. Call it before any tool reads the tenant (a
+        /// pooled reader keeps the file it opened), and do not call `tenant`
+        /// after. Returns how many core days there are.
+        pub(super) fn split_into_days(&self, indexed: impl Fn(usize) -> bool) -> usize {
+            use crate::storage::layout::{self, Tier};
+            let file = self.dir.join("telemetry").join(format!("{}.sqlite3", self.slug));
+            let days = self.dir.join("telemetry").join(&self.slug);
+            crate::storage::export::split(&file, &days).unwrap();
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", file.display()));
+            }
+            let core = layout::days(&days, Tier::Core);
+            for (i, day) in core.iter().enumerate() {
+                let c = Connection::open(layout::day_path(&days, Tier::Core, day)).unwrap();
+                assert!(crate::schema::has_index(&c, "main", crate::schema::REQUEST_INDEX).unwrap(), "a new day file has the index");
+                if !indexed(i) {
+                    c.execute_batch(&format!("DROP INDEX {}", crate::schema::REQUEST_INDEX)).unwrap();
+                }
+            }
+            core.len()
+        }
     }
 
     /// An execution shaped like the production invoicing request: 3.67 s,
