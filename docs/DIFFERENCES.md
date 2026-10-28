@@ -958,6 +958,18 @@ AmbiguousIdentifier (the baseline has one account; the SQL is Rails'
     The requests page and `/api/v1/.../requests` under a request key build
     their table from the raw requests (exact percentiles, a `scan` prop)
     instead of the rollups.
+12. **Compact agent output** (2026-10-28): search_requests with a filter,
+    search_logs and search_telemetry (logs and exceptions) with a filter
+    return grouped entries (`shape: "grouped"`; counts, first/last, varying
+    values, `expand`) instead of rows; without one, search_requests and
+    search_telemetry return compact rows (`shape: "compact"`: no nulls,
+    `url_template`, `common`, `deploys`). `shape: "rows"` is Rails' output
+    (search_requests: the bare array; search_telemetry: `{data, meta}`).
+    query_requests folds groups past 50 into `tail`; ip_activity's timeline
+    is runs (`shape: "rows"` for one row per request). New arguments
+    `shape`, `group`, `max_tokens`, `tail`. The MCP diff's search_requests,
+    search_logs and search_telemetry cases are EXPECTED unless they pass
+    `shape: "rows"`; tool descriptions changed (EXPECTED in `tools/list`).
 
 # Detectors diff (`bench/diff/detectors/`, 2026-10-15)
 

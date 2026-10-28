@@ -796,6 +796,118 @@ each, the totals and exceptions the rest.
   take the 20 LIKEs off every request; "Security reads" above weighed it
   against a write path and kept the LIKEs.
 
+## Compact agent output (from main 4bcf959)
+
+Security reads were mostly repeats: on rebulk-system, `search_requests
+status:401 route:/api/mcp` over 24h (read live on 2026-10-28) was 59 KB for
+113 rows, the 60 KB cap cutting 87 more, all one kind of request. The replay
+below, of that day's 338 such requests, shows 119 rows and cuts 81. Grouping folds alike
+rows into counted entries (docs/security-agent.md, "Grouped results").
+
+### Method
+
+Bytes: two tenants. **Replay**: the requests and warn log lines production
+returned for the baseline reads (rebulk-system, 2026-10-28 04:30Z; 5,479
+records: every `status:401 route:/api/mcp` and `status:4xx` request of 24h,
+every `probe:true` request of 7d, the 73 warn lines), paged out of the
+production MCP read-only and posted to a fresh server; read at the same
+instant without the security scope, as the baseline was. **Bench**:
+`gen_tenant.py --spread-days 8 --executions 220000 --seed 5
+--records-per-batch 2000 --shapes 2000 --tenants 50 --uniform --by-time
+--few-logs --prod-shape`, 1.2 GB over 9 day files, ~22k requests a day,
+security scope. mcp-dump, release build, CPUs 8-11, the main build and this
+one on the same data; warm is the median of 5 after one dropped.
+
+### Bytes
+
+Replay (production rows):
+
+| read | before | after | |
+|---|---:|---:|---:|
+| `search_requests` `status:401 route:/api/mcp`, 24h | 58,850 | 1,144 | 51.4x |
+| `search_requests` `status:4xx`, 24h | 58,798 | 18,979 | 3.1x |
+| `search_logs` level warn, 24h | 40,381 | 4,069 | 9.9x |
+| `query_requests` path x outcome, `probe:true`, 7d | 59,052 | 8,798 | 6.7x |
+| `security_summary`, 7d (unchanged) | 3,986 | 3,986 | 1.0x |
+| the 401 read with `shape: rows` | 58,850 | 58,850 | 1.0x |
+| `search_requests` `probe:true`, 24h | 18,976 | 1,897 | 10.0x |
+
+Bench:
+
+| case | before | after | |
+|---|---:|---:|---:|
+| r401@24h | 52,822 | 2,202 | 24.0x |
+| r4xx@24h | 58,705 | 51,370 | 1.1x |
+| rprobe@24h | 47,725 | 3,887 | 12.3x |
+| rlatest@24h | 29,834 | 19,161 | 1.6x |
+| logs@24h | 58,890 | 1,383 | 42.6x |
+| logs_path@24h | 20,959 | 3,020 | 6.9x |
+| exc_ip@24h | 67 | 435 | 0.2x |
+| qr_probe@24h | 3,082 | 3,082 | 1.0x |
+| qr_ip401@24h | 1,738 | 1,738 | 1.0x |
+| ip_activity@24h | 1,370 | 1,644 | 0.8x |
+| summary@24h | 5,156 | 5,156 | 1.0x |
+| r401@7d | 58,796 | 5,026 | 11.7x |
+| r4xx@7d | 58,705 | 50,465 | 1.2x |
+| rprobe@7d | 58,736 | 9,641 | 6.1x |
+| rlatest@7d | 29,834 | 19,161 | 1.6x |
+| logs@7d | 58,890 | 1,628 | 36.2x |
+| logs_path@7d | 20,959 | 3,865 | 5.4x |
+| exc_ip@7d | 1,173 | 1,212 | 1.0x |
+| qr_probe@7d | 3,996 | 3,996 | 1.0x |
+| qr_ip401@7d | 1,754 | 1,754 | 1.0x |
+| ip_activity@7d | 5,363 | 6,116 | 0.9x |
+| summary@7d | 5,357 | 5,357 | 1.0x |
+| last_execution | 4,648 | 4,648 | 1.0x |
+
+Before is cut at the 60 KB cap in every read over ~200 rows (the 401 read
+lost 81 rows to it). After, nothing is cut: entries past the ~52 KB budget
+are counted in `more` (bench r4xx: 35 entries, 162 requests at 24h). The
+bench's `status:4xx` barely shrinks: the generator gives each request a
+random user, address and tenant, so `varying` stays long (each entry's ten
+commonest values with counts); the same read over production rows is 3.1x
+smaller. `exc_ip@24h` grows (67 -> 435 B) for an empty result: the
+`how_to_read` text.
+
+### Time
+
+Grouping reads every request `q` matches, where the rows read one page. On
+the bench, warm:
+
+| case | before | after |
+|---|---:|---:|
+| r401@24h | 8.0 | 1.7 |
+| r4xx@24h | 5.6 | 4.7 |
+| rprobe@24h | 14.8 | 14.2 |
+| rlatest@24h | 0.7 | 0.7 |
+| logs@24h | 2.8 | 6.2 |
+| logs_path@24h | 8.9 | 8.8 |
+| exc_ip@24h | 2.7 | 3.2 |
+| qr_probe@24h | 13.6 | 14.0 |
+| qr_ip401@24h | 1.3 | 1.2 |
+| ip_activity@24h | 1.4 | 1.4 |
+| summary@24h | 73.0 | 74.5 |
+| r401@7d | 22.7 | 13.4 |
+| r4xx@7d | 6.0 | 29.0 |
+| rprobe@7d | 39.5 | 98.3 |
+| rlatest@7d | 0.7 | 0.8 |
+| logs@7d | 3.9 | 50.6 |
+| logs_path@7d | 63.9 | 63.8 |
+| exc_ip@7d | 25.3 | 25.4 |
+| qr_probe@7d | 91.9 | 98.3 |
+| qr_ip401@7d | 13.1 | 13.1 |
+| ip_activity@7d | 12.2 | 12.1 |
+| summary@7d | 303.9 | 313.9 |
+| last_execution | 1.6 | 1.4 |
+
+- The grouped reads cost what `query_requests` costs over the same `q`
+  (r4xx@7d grouped 29 ms, `query_requests group_by route` 20 ms;
+  probe:true@7d 100 vs 95 ms): the scan of the window, not the fold.
+- A grouped log read folds up to 20,000 lines (logs@7d: 20,000 info lines,
+  51 ms, against 4 ms for a page of 200).
+- The other tools are unchanged; get_execution and last_execution are not
+  touched.
+
 ## Proposals
 
 None of these is implemented.
