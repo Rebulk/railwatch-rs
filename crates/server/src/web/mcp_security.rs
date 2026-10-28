@@ -182,8 +182,8 @@ impl Mcp<'_> {
         self.with_telemetry(&env, |conn| {
             let now = Pass::read(conn, from, to)?;
             let before = Pass::read(conn, from - span, from - 1)?;
-            // Every address's requests in both windows, for the scanners'
-            // traffic and new_ips: only shown with security access.
+            // Every address's requests in both windows, for new_ips: only
+            // shown with security access.
             let (addrs, addrs_before) = if access { (addresses(conn, from, to)?, addresses(conn, from - span, from - 1)?) } else { Default::default() };
             // A count from a read that stopped at the cap is a floor: it is
             // not compared, and its finding says so.
@@ -205,7 +205,7 @@ impl Mcp<'_> {
             let failures = now.auth.total();
             let failures_before = before.auth.total();
             if failures > 0 {
-                let capped = (now.capped.auth, before.capped.auth);
+                let capped = (now.capped.client_errors, before.capped.client_errors);
                 let mut f = finding(
                     "auth_failures",
                     severity(failures, failures_before, 50, capped.0 || capped.1),
@@ -239,7 +239,7 @@ impl Mcp<'_> {
                         format!(
                             "{} address(es) failed auth as 3 or more different users: credential stuffing shape.{}",
                             stuffing.len(),
-                            cap_note((now.capped.auth, false))
+                            cap_note((now.capped.client_errors, false))
                         ),
                     );
                     db::merge_into(&mut f, "ips", json!(stuffing.iter().take(5).map(|(ip, n)| json!({"ip": ip, "distinct_users": n})).collect::<Vec<_>>()));
@@ -260,6 +260,9 @@ impl Mcp<'_> {
             let mut scanners: Vec<(&String, &ClientErrors)> = now.client_errors.iter().filter(|(_, s)| s.count >= 20 && s.paths.len() >= 10).collect();
             scanners.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
             if !scanners.is_empty() {
+                // The shown addresses' whole traffic, not only their 4xx.
+                let shown: Vec<&str> = if access { scanners.iter().take(10).map(|(_, s)| s.raw.as_str()).collect() } else { vec![] };
+                let traffic = traffic_of(conn, &shown, from, to)?;
                 let mut f = finding(
                     "scanners",
                     if scanners.len() > 3 { "medium" } else { "low" },
@@ -278,8 +281,8 @@ impl Mcp<'_> {
                                 .iter()
                                 .take(10)
                                 .map(|(ip, s)| {
-                                    let t = addrs.get(*ip).copied().unwrap_or_default();
-                                    json!({"ip": ip, "client_errors": s.count, "requests": t.requests, "served": t.served,
+                                    let (requests, served) = traffic.get(*ip).copied().unwrap_or_default();
+                                    json!({"ip": ip, "client_errors": s.count, "requests": requests, "served": served,
                                      "distinct_paths": paths_json(&s.paths), "new": !addrs_before.contains_key(*ip)})
                                 })
                                 .collect::<Vec<_>>()
@@ -787,6 +790,8 @@ impl Auth {
 /// One address's 4xx in a window: scanner candidates.
 #[derive(Default)]
 struct ClientErrors {
+    /// The address as recorded (the map's key is cut and cleaned).
+    raw: String,
     count: i64,
     paths: HashSet<String>,
 }
@@ -796,8 +801,6 @@ struct ClientErrors {
 struct Traffic {
     requests: i64,
     client_errors: i64,
-    /// Requests the app served (request_scan::outcome).
-    served: i64,
 }
 
 #[derive(Default)]
@@ -819,7 +822,7 @@ impl Probes {
 /// Which of a pass's reads stopped at SUMMARY_SCAN matching requests.
 #[derive(Default, Clone, Copy)]
 struct Capped {
-    auth: bool,
+    /// The 4xx read: auth failures and scanners.
     client_errors: bool,
     probes: bool,
     flags: bool,
@@ -869,46 +872,54 @@ impl Pass {
             unpermitted_keys: HashMap::new(),
             capped: Capped::default(),
         };
+        // One column per status class: a GROUP BY sorts every row first.
+        let status = "\"executions\".\"status\"";
+        let classes: Vec<String> = (0..=5)
+            .map(|c| match c {
+                0 => format!("SUM(COALESCE({status}, 0) < 100) AS c0"),
+                5 => format!("SUM({status} >= 500) AS c5"),
+                c => format!("SUM({status} BETWEEN {} AND {}) AS c{c}", c * 100, c * 100 + 99),
+            })
+            .collect();
+        let sums: Vec<String> = (0..=5).map(|c| format!("SUM(c{c}) AS c{c}")).collect();
         let rows = requests_aggregate(
             conn,
             (from, to),
-            "COALESCE(\"executions\".\"status\", 0) / 100 AS c, COUNT(*) AS n",
-            "",
-            "c",
-            "SELECT c, SUM(n) AS n FROM {u} GROUP BY c",
+            &format!("SELECT {} FROM {{t}} WHERE {WINDOW}", classes.join(", ")),
+            &format!("SELECT {} FROM {{u}}", sums.join(", ")),
         )?;
         for r in rows {
-            let n = r.i("n").unwrap_or(0);
-            p.requests += n;
-            *p.status_classes.entry(r.i("c").unwrap_or(0)).or_default() += n;
+            for c in 0..=5 {
+                let n = r.i(&format!("c{c}")).unwrap_or(0);
+                p.requests += n;
+                if n > 0 {
+                    *p.status_classes.entry(c).or_default() += n;
+                }
+            }
         }
         let only = |q: &str| filter_query::requests(conn, &filter_query::parse(Some(q)), from, to);
 
-        // Auth failures: 401/403 anywhere, 422 on sign-in style routes.
-        p.capped.auth = request_scan::scan(conn, &only("status:401|403|422")?, SUMMARY_SCAN, |r| {
+        // One read of the window's 4xx for two findings: auth failures
+        // (401/403 anywhere, 422 on sign-in style routes) and scanner
+        // candidates (each address's 4xx and the paths they were for).
+        let capped = request_scan::scan(conn, &only("status:4xx")?, SUMMARY_SCAN, |r| {
             let status = r.status.unwrap_or(0);
-            if status == 422 && !sign_in_route(r.name) {
-                return;
-            }
-            *p.auth.by_route.entry(untrusted(r.name, FIELD_CHARS)).or_default() += 1;
-            if let Some(ip) = r.ip {
-                *p.auth.by_ip.entry(untrusted(ip, 64)).or_default() += 1;
-                if let Some(u) = r.user {
-                    let users = p.auth.users_per_ip.entry(untrusted(ip, 64)).or_default();
-                    if users.len() < 1_000 {
-                        users.insert(u.to_string());
+            if status == 401 || status == 403 || (status == 422 && sign_in_route(r.name)) {
+                *p.auth.by_route.entry(untrusted(r.name, FIELD_CHARS)).or_default() += 1;
+                if let Some(ip) = r.ip {
+                    *p.auth.by_ip.entry(untrusted(ip, 64)).or_default() += 1;
+                    if let Some(u) = r.user {
+                        let users = p.auth.users_per_ip.entry(untrusted(ip, 64)).or_default();
+                        if users.len() < 1_000 {
+                            users.insert(u.to_string());
+                        }
                     }
                 }
             }
-        })?
-        .capped;
-
-        // Scanner candidates: each address's 4xx and the paths they were for.
-        p.capped.client_errors = request_scan::scan(conn, &only("status:4xx")?, SUMMARY_SCAN, |r| {
             if let Some(ip) = r.ip
                 && (p.client_errors.len() < IPS || p.client_errors.contains_key(ip))
             {
-                let s = p.client_errors.entry(untrusted(ip, 64)).or_default();
+                let s = p.client_errors.entry(untrusted(ip, 64)).or_insert_with(|| ClientErrors { raw: ip.to_string(), ..Default::default() });
                 s.count += 1;
                 if let Some(path) = r.path
                     && s.paths.len() < PATHS_PER_IP
@@ -918,6 +929,7 @@ impl Pass {
             }
         })?
         .capped;
+        p.capped.client_errors = capped;
 
         p.capped.probes = request_scan::scan(conn, &only("probe:true")?, SUMMARY_SCAN, |r| {
             let Some(path) = r.path else { return };
@@ -973,40 +985,42 @@ impl Pass {
     }
 }
 
-/// `select` over the window's requests grouped by `group`, with `extra`
-/// ANDed to the window (`?1`, `?2` are its bounds), on the request index.
-/// On a per-day tenant each day file groups its own rows and `outer`
-/// combines them (storage::reader::aggregate_hinted: through the views
-/// SQLite would group the union's rows); `outer` names the same columns as
-/// `select`. A file without the index reads without the hint.
-fn requests_aggregate(conn: &Connection, (from, to): (i64, i64), select: &str, extra: &str, group: &str, outer: &str) -> rusqlite::Result<Vec<db::Rec>> {
-    let inner = format!(
-        "SELECT {select} FROM {{t}} WHERE \"executions\".\"kind\" = 'request' AND \"executions\".\"occurred_at\" BETWEEN ?1 AND ?2{extra} GROUP BY {group}"
-    );
+/// A window's requests, on the request index (`?1` and `?2` its bounds).
+const WINDOW: &str = "\"executions\".\"kind\" = 'request' AND \"executions\".\"occurred_at\" BETWEEN ?1 AND ?2";
+
+/// `inner` (a statement over `{t}`, the requests table, filtered by
+/// WINDOW) over [from, to] on the request index. On a per-day tenant each
+/// day file runs it on its own rows and `outer` combines them over `{u}`
+/// (storage::reader::aggregate_hinted: through the views SQLite would
+/// aggregate the union's rows); on a single file `inner` alone runs, so
+/// `outer` names the same columns. A file without the index reads without
+/// the hint.
+fn requests_aggregate(conn: &Connection, (from, to): (i64, i64), inner: &str, outer: &str) -> rusqlite::Result<Vec<db::Rec>> {
     let binds: [rusqlite::types::Value; 2] = [qt(from).into(), qt(to).into()];
     let index = crate::schema::REQUEST_INDEX;
     let hint = crate::storage::reader::Hint { window: (from, to), inside: index, outside: index };
-    if let Some(rows) = crate::storage::reader::aggregate_hinted(conn, "executions", Some(hint), &inner, outer, &binds)? {
+    if let Some(rows) = crate::storage::reader::aggregate_hinted(conn, "executions", Some(hint), inner, outer, &binds)? {
         return Ok(rows);
     }
     let table = filter_query::request_index(conn)?.unwrap_or_else(|| "\"executions\"".into());
     db::query(conn, &inner.replace("{t}", &table), rusqlite::params_from_iter(binds.iter()))
 }
 
-/// Every address's requests in [from, to], from SQL: for new_ips, and the
-/// scanners' requests and served counts.
+/// Every address's requests and 4xx in [from, to], from SQL: for new_ips.
+/// Each file sorts its rows by address before grouping them: a GROUP BY
+/// over ~16k addresses a day built its temp B-tree row by row, 5x slower
+/// (docs/PERF.md, "Complete security_summary"). The files' rows are added
+/// up here rather than grouped again in SQL.
 fn addresses(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<HashMap<String, Traffic>> {
     let ip = filter_query::detail_sql("executions", "$.ip");
     let rows = requests_aggregate(
         conn,
         (from, to),
         &format!(
-            "{ip} AS ip, COUNT(*) AS n, SUM(\"executions\".\"status\" BETWEEN 400 AND 499) AS ce, SUM({} = 'served') AS served",
-            request_scan::outcome_sql("executions")
+            "SELECT ip, COUNT(*) AS n, SUM(ce) AS ce FROM (SELECT {ip} AS ip, \"executions\".\"status\" BETWEEN 400 AND 499 AS ce \
+             FROM {{t}} WHERE {WINDOW} AND {ip} != '' ORDER BY 1) GROUP BY ip"
         ),
-        &format!(" AND {ip} != ''"),
-        "1",
-        "SELECT ip, SUM(n) AS n, SUM(ce) AS ce, SUM(served) AS served FROM {u} GROUP BY ip",
+        "SELECT * FROM {u}",
     )?;
     let mut out: HashMap<String, Traffic> = HashMap::with_capacity(rows.len());
     for r in rows {
@@ -1014,8 +1028,27 @@ fn addresses(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<HashMap<
         let t = out.entry(untrusted(ip, 64)).or_default();
         t.requests += r.i("n").unwrap_or(0);
         t.client_errors += r.i("ce").unwrap_or(0);
-        t.served += r.i("served").unwrap_or(0);
     }
+    Ok(out)
+}
+
+/// The requests and served requests (request_scan::outcome) of `ips` (as
+/// recorded) in [from, to]: one read of their requests, keyed as the
+/// summary shows them.
+fn traffic_of(conn: &Connection, ips: &[&str], from: i64, to: i64) -> rusqlite::Result<HashMap<String, (i64, i64)>> {
+    let mut out: HashMap<String, (i64, i64)> = HashMap::new();
+    if ips.is_empty() {
+        return Ok(out);
+    }
+    let mut cond = filter_query::requests(conn, &Parsed::default(), from, to)?;
+    let list = serde_json::to_string(ips).expect("json");
+    cond.and(format!("{} IN (SELECT value FROM json_each(?))", filter_query::detail_sql("executions", "$.ip")), vec![filter_query::s(&list)]);
+    cond.from = filter_query::request_index(conn)?;
+    request_scan::scan(conn, &cond, request_scan::MAX_SCAN, |r| {
+        let t = out.entry(untrusted(r.ip.unwrap_or(""), 64)).or_default();
+        t.0 += 1;
+        t.1 += i64::from(r.outcome() == Some("served"));
+    })?;
     Ok(out)
 }
 
@@ -1661,6 +1694,27 @@ mod tests {
         assert_eq!(v["previous_requests"].as_i64(), Some(1 + super::SUMMARY_SCAN as i64 + 50));
         let probes = v["findings"].as_array().unwrap().iter().find(|x| x["kind"] == "probe_paths").cloned().unwrap();
         assert!(!probes["summary"].as_str().unwrap().contains("floor"), "{probes}");
+    }
+
+    /// Status classes are counted on their boundaries, and a request
+    /// without a status is 0xx (as query_requests' status_class groups it).
+    #[test]
+    fn status_classes_count_each_status_in_its_class() {
+        let f = seeded("sec-summary-classes");
+        f.grant_security();
+        let c = f.tenant();
+        for (i, status) in [99, 100, 199, 200, 299, 300, 399, 400, 499, 500, 599].iter().enumerate() {
+            req(&c, &format!("s{i}"), 5, "GET", "/x(.:format)", *status, None, d("10.0.0.1", "/x", "t"));
+        }
+        c.execute(
+            "INSERT INTO executions (execution_id, kind, name, occurred_at, duration) VALUES ('nostatus', 'request', 'GET /y', ?1, 1)",
+            [qt(NOW - 5 * MIN)],
+        )
+        .unwrap();
+        drop(c);
+        let v = f.tool("security_summary", json!({"window": "24h"}));
+        assert_eq!(v["status_classes"], json!({"0xx": 2, "1xx": 2, "2xx": 2, "3xx": 2, "4xx": 2, "5xx": 2}));
+        assert_eq!(v["requests"], 12);
     }
 
     /// Per-day files answer as the single file does, with the request index
