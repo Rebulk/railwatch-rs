@@ -262,14 +262,19 @@ impl Mcp<'_> {
             if !scanners.is_empty() {
                 // The shown addresses' whole traffic, not only their 4xx.
                 let shown: Vec<&str> = if access { scanners.iter().take(10).map(|(_, s)| s.raw.as_str()).collect() } else { vec![] };
-                let traffic = traffic_of(conn, &shown, from, to)?;
+                let (traffic, traffic_capped) = traffic_of(conn, &shown, from, to)?;
                 let mut f = finding(
                     "scanners",
                     if scanners.len() > 3 { "medium" } else { "low" },
                     format!(
-                        "{} address(es) drew 20+ 4xx across 10+ distinct paths: scanner shaped.{}",
+                        "{} address(es) drew 20+ 4xx across 10+ distinct paths: scanner shaped.{}{}",
                         scanners.len(),
-                        cap_note((now.capped.client_errors, false))
+                        cap_note((now.capped.client_errors, false)),
+                        if traffic_capped {
+                            format!(" The addresses shown sent more than {SUMMARY_SCAN} requests: their requests and served are of the newest {SUMMARY_SCAN} only.")
+                        } else {
+                            String::new()
+                        }
                     ),
                 );
                 if access {
@@ -1032,24 +1037,28 @@ fn addresses(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<HashMap<
     Ok(out)
 }
 
+/// Per address as the summary shows it: (requests, served).
+type RequestsServed = HashMap<String, (i64, i64)>;
+
 /// The requests and served requests (request_scan::outcome) of `ips` (as
-/// recorded) in [from, to]: one read of their requests, keyed as the
-/// summary shows them.
-fn traffic_of(conn: &Connection, ips: &[&str], from: i64, to: i64) -> rusqlite::Result<HashMap<String, (i64, i64)>> {
-    let mut out: HashMap<String, (i64, i64)> = HashMap::new();
+/// recorded) in [from, to]: one read of their requests, and whether it
+/// stopped at SUMMARY_SCAN.
+fn traffic_of(conn: &Connection, ips: &[&str], from: i64, to: i64) -> rusqlite::Result<(RequestsServed, bool)> {
+    let mut out = RequestsServed::new();
     if ips.is_empty() {
-        return Ok(out);
+        return Ok((out, false));
     }
     let mut cond = filter_query::requests(conn, &Parsed::default(), from, to)?;
     let list = serde_json::to_string(ips).expect("json");
     cond.and(format!("{} IN (SELECT value FROM json_each(?))", filter_query::detail_sql("executions", "$.ip")), vec![filter_query::s(&list)]);
     cond.from = filter_query::request_index(conn)?;
-    request_scan::scan(conn, &cond, request_scan::MAX_SCAN, |r| {
+    let capped = request_scan::scan(conn, &cond, SUMMARY_SCAN, |r| {
         let t = out.entry(untrusted(r.ip.unwrap_or(""), 64)).or_default();
         t.0 += 1;
         t.1 += i64::from(r.outcome() == Some("served"));
-    })?;
-    Ok(out)
+    })?
+    .capped;
+    Ok((out, capped))
 }
 
 /// Exceptions of security-relevant classes in [from, to], with their count
@@ -1694,6 +1703,30 @@ mod tests {
         assert_eq!(v["previous_requests"].as_i64(), Some(1 + super::SUMMARY_SCAN as i64 + 50));
         let probes = v["findings"].as_array().unwrap().iter().find(|x| x["kind"] == "probe_paths").cloned().unwrap();
         assert!(!probes["summary"].as_str().unwrap().contains("floor"), "{probes}");
+    }
+
+    /// A scanner shown with more requests than the traffic read takes
+    /// (SUMMARY_SCAN) says its requests and served are of the newest only;
+    /// its 4xx stay exact.
+    #[test]
+    fn a_scanner_with_more_traffic_than_the_read_takes_says_so() {
+        let f = planted("sec-summary-scanner-cap");
+        f.grant_security();
+        let c = f.tenant();
+        c.execute_batch("BEGIN").unwrap();
+        for i in 0..super::SUMMARY_SCAN + 10 {
+            req(&c, &format!("scan-ok{i}"), 1, "GET", "/orders(.:format)", 200, None, d("198.51.100.7", "/orders", "curl/8.1"));
+        }
+        c.execute_batch("COMMIT").unwrap();
+        let v = f.tool("security_summary", json!({"window": "24h"}));
+        let scanners = v["findings"].as_array().unwrap().iter().find(|x| x["kind"] == "scanners").cloned().unwrap();
+        assert!(scanners["summary"].as_str().unwrap().contains(&format!("newest {} only", super::SUMMARY_SCAN)), "{scanners}");
+        assert_eq!(scanners["ips"][0]["requests"].as_i64(), Some(super::SUMMARY_SCAN as i64));
+        assert_eq!(scanners["ips"][0]["client_errors"], 30, "the 4xx read is its own, whole");
+        // Under the read's size, nothing is said.
+        let v = planted("sec-summary-scanner-nocap").tool("security_summary", json!({"window": "24h"}));
+        let scanners = v["findings"].as_array().unwrap().iter().find(|x| x["kind"] == "scanners").cloned().unwrap();
+        assert!(!scanners["summary"].as_str().unwrap().contains("newest"), "{scanners}");
     }
 
     /// Status classes are counted on their boundaries, and a request
