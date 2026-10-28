@@ -49,6 +49,8 @@ pub struct Row<'a> {
     pub tenant: Option<&'a str>,
     /// The class of the first exception (`exception_preview` up to ": ").
     pub exception: Option<&'a str>,
+    /// The first exception's class and message.
+    pub exception_preview: Option<&'a str>,
     pub ip: Option<&'a str>,
     pub user_agent: Option<&'a str>,
     pub path: Option<&'a str>,
@@ -185,7 +187,8 @@ pub fn scan(conn: &Connection, cond: &Cond, cap: usize, mut f: impl FnMut(&Row<'
                 _ => None,
             })
         };
-        let exception = text(9)?.map(|p| p.split_once(": ").map_or(p, |(c, _)| c));
+        let exception_preview = text(9)?;
+        let exception = exception_preview.map(|p| p.split_once(": ").map_or(p, |(c, _)| c));
         let rate_limited = matches!(text(14)?, Some(t) if t != "null" && t != "false");
         // An unnamed rate_limit records name "" (text() reads it as None).
         let rate_limit = rate_limited.then(|| text(17)).transpose()?.map(|n| n.unwrap_or(""));
@@ -200,6 +203,7 @@ pub fn scan(conn: &Connection, cond: &Cond, cap: usize, mut f: impl FnMut(&Row<'
             user: text(7)?,
             tenant: text(8)?,
             exception,
+            exception_preview,
             ip: text(10)?,
             user_agent: text(11)?,
             path: text(12)?,
@@ -520,7 +524,19 @@ pub struct Query {
     pub asc: bool,
     pub limit: usize,
     pub min_count: i64,
+    /// Fold the groups past the first TAIL_TOP into `tail` when more than
+    /// TAIL_AT would be listed.
+    pub tail: bool,
+    /// List groups only while their JSON fits in this many bytes (the
+    /// first always); the rest go to `tail`.
+    pub budget: Option<usize>,
 }
+
+/// Past this many groups to list, `tail` folds all but the first TAIL_TOP.
+pub const TAIL_AT: usize = 50;
+pub const TAIL_TOP: usize = 25;
+/// Groups of the tail shown as examples.
+const TAIL_EXAMPLES: usize = 5;
 
 impl Query {
     fn wants(&self, m: &str) -> bool {
@@ -611,15 +627,68 @@ pub fn query(conn: &Connection, cond: &Cond, parsed: &Parsed, q: &Query, cap: us
         let primary = if q.asc { primary } else { primary.reverse() };
         primary.then_with(|| b.count.cmp(&a.count)).then_with(|| ka.cmp(kb))
     });
-    let rows: Vec<Value> = ranked.iter().take(q.limit).map(|(k, g)| group_json(q, parsed, k, g)).collect();
+    let listed = q.limit.min(ranked.len());
+    let shown = if q.tail && listed > TAIL_AT { TAIL_TOP } else { listed };
+    let mut rows: Vec<Value> = vec![];
+    let mut used = 0;
+    for (k, g) in ranked.iter().take(shown) {
+        let row = group_json(q, parsed, k, g);
+        used += row.to_string().len() + 1;
+        if q.budget.is_some_and(|b| used > b) && !rows.is_empty() {
+            break;
+        }
+        rows.push(row);
+    }
     let mut out = crate::obj! {
         "matched" => matched, "groups" => total as i64,
     };
     if q.min_count > 1 {
         db::merge_into(&mut out, "groups_with_min_count", Value::from(after_min as i64));
     }
+    let folded = rows.len() < listed;
     db::merge_into(&mut out, "rows", Value::Array(rows));
+    if folded || (q.tail && ranked.len() > listed) {
+        let at = out["rows"].as_array().map_or(0, Vec::len);
+        db::merge_into(&mut out, "tail", tail_json(q, parsed, &ranked[at..]));
+    }
     Ok((scanned, out))
+}
+
+/// The groups not listed, in one entry: how many, their requests, their
+/// requests by each group_by key's value (the ten commonest; `values` is how
+/// many there are), and the first few as examples with their `q`.
+fn tail_json(q: &Query, parsed: &Parsed, rest: &[(Vec<Option<String>>, Agg)]) -> Value {
+    let mut by = Map::new();
+    for (i, k) in q.group_by.iter().enumerate() {
+        let mut counts: HashMap<String, i64> = HashMap::new();
+        for (key, g) in rest {
+            *counts.entry(key[i].clone().unwrap_or_else(|| "(none)".into())).or_default() += g.count;
+        }
+        let mut top: Vec<(String, i64)> = counts.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let n = top.len();
+        let top: Map<String, Value> = top.into_iter().take(10).map(|(v, c)| (v, Value::from(c))).collect();
+        by.insert(k.name().into(), crate::obj! { "values" => n as i64, "top" => Value::Object(top) });
+    }
+    let examples: Vec<Value> = rest
+        .iter()
+        .take(TAIL_EXAMPLES)
+        .map(|(key, g)| {
+            let mut m = Map::new();
+            for (k, v) in q.group_by.iter().zip(key) {
+                m.insert(k.name().into(), k.json(v));
+            }
+            m.insert("count".into(), Value::from(g.count));
+            if let Value::Object(full) = group_json(q, parsed, key, g) {
+                m.insert("q".into(), full["q"].clone());
+            }
+            Value::Object(m)
+        })
+        .collect();
+    crate::obj! {
+        "groups" => rest.len() as i64, "requests" => rest.iter().map(|(_, g)| g.count).sum::<i64>(),
+        "by" => Value::Object(by), "examples" => Value::Array(examples),
+    }
 }
 
 fn group_json(q: &Query, parsed: &Parsed, key: &[Option<String>], g: &Agg) -> Value {
@@ -798,6 +867,7 @@ mod tests {
                 user: None,
                 tenant: None,
                 exception: None,
+                exception_preview: None,
                 ip: None,
                 user_agent: None,
                 path: None,
@@ -880,7 +950,16 @@ mod per_day_tests {
             let p = parse(Some(q));
             let run = |c: &Connection| {
                 let cond = requests(c, &p, from, to).unwrap();
-                let query = Query { group_by: vec![Key::Ip, Key::Path], metrics: METRICS.to_vec(), sort: "count", asc: false, limit: 50, min_count: 1 };
+                let query = Query {
+                    group_by: vec![Key::Ip, Key::Path],
+                    metrics: METRICS.to_vec(),
+                    sort: "count",
+                    asc: false,
+                    limit: 50,
+                    min_count: 1,
+                    tail: false,
+                    budget: None,
+                };
                 let (s, v) = super::query(c, &cond, &p, &query, MAX_SCAN).unwrap();
                 let (_, g) = grouped(c, &cond, from, to, 50, Some("p95"), None).unwrap();
                 let ex = apply(c, Resource::Exceptions, Some(q), from, to, &[]).unwrap();
@@ -1015,7 +1094,8 @@ mod per_day_tests {
             let p = parse(Some(q));
             let cond = requests(c, &p, from, to).unwrap();
             for pair in all.chunks(2) {
-                let query = Query { group_by: pair.to_vec(), metrics: METRICS.to_vec(), sort: "key", asc: true, limit: 200, min_count: 1 };
+                let query =
+                    Query { group_by: pair.to_vec(), metrics: METRICS.to_vec(), sort: "key", asc: true, limit: 200, min_count: 1, tail: false, budget: None };
                 let (s, v) = super::query(c, &cond, &p, &query, MAX_SCAN).unwrap();
                 out.push(format!("{q} {pair:?}: {} {v}", s.rows));
             }

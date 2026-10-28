@@ -184,6 +184,24 @@ pub fn call(
     Ok(Ok(Page { rows, meta: crate::obj! { "limit" => limit, "next_cursor" => next, "has_more" => has_more } }))
 }
 
+/// The newest `n` rows of `table` matching `cond` (by occurred_at, then id),
+/// read as a page is: per day file on a per-day tenant. For a fold over
+/// more rows than a page holds (MCP's grouped results).
+pub fn newest(conn: &Connection, table: &str, select: &str, cond: &Cond, n: i64) -> rusqlite::Result<Vec<Rec>> {
+    if cond.none {
+        return Ok(vec![]);
+    }
+    if let Some((sql, binds)) = per_file(conn, table, select, cond, Order::Recent, n)? {
+        return db::query_as_is(conn, &sql, rusqlite::params_from_iter(binds.iter()));
+    }
+    let from = cond.from.clone().unwrap_or_else(|| format!("\"{table}\""));
+    db::query(
+        conn,
+        &format!("SELECT {select} FROM {from} WHERE {} ORDER BY \"{table}\".\"occurred_at\" DESC, \"{table}\".\"id\" DESC LIMIT {n}", cond.sql()),
+        rusqlite::params_from_iter(cond.binds.iter()),
+    )
+}
+
 /// The page's statement over a per-day tenant as each day file's own top
 /// `n` (`ORDER BY col DESC, id DESC LIMIT n` inside the file, on its
 /// indexes), merged and cut to `n`. (col, id) is a total order and ids are

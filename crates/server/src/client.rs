@@ -654,6 +654,8 @@ fn tail(o: &Opts) -> Outcome {
     args.insert("q".into(), q.join(" ").into());
     args.insert("window".into(), "1h".into());
     args.insert("limit".into(), 50.into());
+    // The rows themselves (a filtered search is grouped by default).
+    args.insert("shape".into(), "rows".into());
     let mut seen: (HashSet<String>, VecDeque<String>) = Default::default();
     let mut first = true;
     loop {
