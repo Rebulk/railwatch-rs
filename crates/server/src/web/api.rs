@@ -837,8 +837,8 @@ impl Api<'_> {
         let (sort, dir) = (self.params.opt("sort"), self.params.opt("dir"));
         let parsed = filter_query::parse(self.params.opt("q").as_deref());
         self.check_request_keys("requests", &parsed)?;
-        if filter_query::has_request_keys(&parsed) {
-            // Only the raw requests hold ip, path, ...: the table from them.
+        if filter_query::needs_raw_requests(&parsed) {
+            // Only the raw requests hold ip, path, user, ...: the table from them.
             let (scanned, routes) = self.telemetry(e, |conn| {
                 let cond = filter_query::requests(conn, &parsed, from, to)?;
                 Ok(crate::dashboard::request_scan::grouped(conn, &cond, from, to, 200, sort.as_deref(), dir.as_deref())?)
@@ -2482,6 +2482,19 @@ mod tests {
         ] {
             assert_eq!(get(&f, &format!("{base}/{path}?q={q}"), "read_only"), (422, json!({"error": err})), "{path} {q}");
         }
+        // The route table under a key the route rollups do not hold (user:)
+        // comes from the raw requests rather than leaving the key out.
+        for (i, (route, user)) in [("GET /a", "ada"), ("GET /b", "bob")].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO executions (execution_id, kind, name, method, group_hash, status, user_ref, occurred_at, duration) VALUES (?1, 'request', ?2, 'GET', ?3, 200, ?4, ?5, 1000)",
+                params![format!("r{i}"), route, format!("g{i}"), user, qt(NOW - 60_000_000)],
+            )
+            .unwrap();
+        }
+        let (status, routes) = get(&f, &format!("{base}/requests?q=user:ada"), "read_only");
+        let names: Vec<&str> = routes["data"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!((status, names), (200, vec!["GET /a"]), "{routes}");
+        assert_eq!(routes["scan"], json!({"scanned": 1, "capped": false}));
         for (path, key) in [("logs", "queue:x"), ("queries", "level:error"), ("requests", "class:X")] {
             let (status, body) = get(&f, &format!("{base}/{path}?q={key}"), "read_only");
             assert_eq!(status, 422, "{path} {key}");

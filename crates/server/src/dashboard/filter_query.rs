@@ -565,6 +565,15 @@ pub fn check(resource: &str, p: &Parsed) -> Option<String> {
     if resource == "jobs" { check_request_keys(&without_job_keys(p)) } else { check_request_keys(p) }
 }
 
+/// Whether the requests table for `p` needs the raw requests: the route
+/// rollups (filter_routes) hold only the method, route and status class, so
+/// any other key (a request key, user:, tenant:, deploy:, min_ms:, after:,
+/// before:) or free text is read from the requests themselves rather than
+/// dropped.
+pub fn needs_raw_requests(p: &Parsed) -> bool {
+    rb::present(Some(&p.text)) || p.fields.keys().any(|k| !["method", "route", "status"].contains(&k.as_str()))
+}
+
 /// Whether `p` has a request-detail key.
 pub fn has_request_keys(p: &Parsed) -> bool {
     REQUEST_KEYS.iter().any(|k| p.field(k).is_some())
@@ -1317,6 +1326,10 @@ mod tests {
         };
         assert_eq!((n("method:get|post"), n("user:ada|cy"), n("method:get user:bob|cy")), (2, 2, 0));
         assert_eq!(n("level:error"), 0, "a key requests do not read matches nothing");
+        // Only method, route and status are in the route rollups.
+        let raw = |q: &str| needs_raw_requests(&parse(Some(q)));
+        assert!(!raw("method:get|post route:/a status:5xx"));
+        assert!(raw("user:ada") && raw("min_ms:5") && raw("after:2026-10-16") && raw("deploy:d") && raw("widgets") && raw("ip:192.0.2.1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

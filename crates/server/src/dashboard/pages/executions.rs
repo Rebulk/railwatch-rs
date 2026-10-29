@@ -86,7 +86,7 @@ pub(crate) fn issue_row(i: &control::Issue) -> Value {
 pub fn requests_index(conn: &Connection, ctx: &PageContext, control: &dyn ControlData) -> R {
     check_q(ctx, "requests")?;
     let parsed = filter_query::parse(ctx.param("q"));
-    if filter_query::has_request_keys(&parsed) {
+    if filter_query::needs_raw_requests(&parsed) {
         return requests_index_raw(conn, ctx, control, &parsed);
     }
     let routes = grouped(conn, ctx, "request", 200, true)?;
