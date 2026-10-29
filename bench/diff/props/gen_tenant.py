@@ -197,17 +197,21 @@ def security_fields(p, route):
 SESSIONS_LIVE = 4
 SESSION_SPAN = 1200
 
+def token(*parts):
+    """A synthetic id from parts (sha256: not a group hash, so not md5)."""
+    return hashlib.sha256(",".join(parts).encode()).hexdigest()
+
 def session_for(ts):
     """(session_id, tab_id or None, user) for a browser request at ts."""
     if rng.random() < 0.25:
-        sid = md5("s", "0", str(int(ts // 86400)))[:22]
+        sid = token("s", "0", str(int(ts // 86400)))[:22]
     else:
         slot = rng.randrange(1, SESSIONS_LIVE + 1)
-        sid = md5("s", str(slot), str(int((ts + slot * 97) // SESSION_SPAN)))[:22]
-    h = int(md5("t", sid), 16)
+        sid = token("s", str(slot), str(int((ts + slot * 97) // SESSION_SPAN)))[:22]
+    h = int(token("t", sid), 16)
     tabs = 1 + h % 3
     users = [u for u in USERS if u]
-    tab = None if rng.random() < 0.1 else md5("tab", sid, str(rng.randrange(tabs)))[:16]
+    tab = None if rng.random() < 0.1 else token("tab", sid, str(rng.randrange(tabs)))[:16]
     return sid, tab, users[h % len(users)]
 
 def execution(ts):
@@ -366,7 +370,7 @@ def execution(ts):
         vi["user"], vi["tenant"] = user, tenant
         if a.sessions:
             vi["session_id"], tab, vi["user"] = session_for(ts)
-            vi["tab_id"] = tab or md5("tab", vi["session_id"], "0")[:16]
+            vi["tab_id"] = tab or token("tab", vi["session_id"], "0")[:16]
         out.append(vi)
     if rng.random() < 0.02:
         se = base("session", ts)
