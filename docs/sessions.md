@@ -32,7 +32,7 @@ The browser client (railwatch gem 1.5 and later) sends both ids:
 |---|---|---|
 | request | `X-Railwatch-Session` and `X-Railwatch-Tab` headers on the requests it makes; the cookie on a full page load (no tab) | `session_id`, `tab_id` in the request's `detail` |
 | visit | the beacon | `session_id`, `tab_id` columns on `visits` |
-| browser error | the beacon | `context.browser.session` (no tab: the journey puts it in the lane of the tab whose page it names) |
+| browser error | the beacon | `context.browser.session` and `context.browser.tab` (from a gem without `tab`, the journey puts it in the lane of the tab that last visited the page it names) |
 
 Ids are 1-64 characters of `[A-Za-z0-9_-]`. A request whose app has no
 browser client (an API client, a job, a script) has no session, and

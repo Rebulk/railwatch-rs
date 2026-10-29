@@ -9,9 +9,10 @@
 //! (older gems, jobs, API clients) are in neither and never in a journey.
 //!
 //! Exceptions join through their request's execution_id. A browser error
-//! carries the session in its context (`context.browser.session`) and no
-//! tab: it goes in the lane of the tab whose visit it names (the latest
-//! visit at or before it with the same url), else in no lane.
+//! carries the session and tab in its context (`context.browser.session`,
+//! `.tab`); one from a gem without the tab goes in the lane of the tab
+//! whose visit it names (the latest visit at or before it with the same
+//! url), else in no lane.
 //!
 //! Lanes: tabs labelled t1, t2, ... in the order they were first seen. A
 //! request with a session and no tab (a full page load carries the cookie,
@@ -419,6 +420,9 @@ pub fn read_capped(conn: &Connection, session_id: &str, cap: usize) -> rusqlite:
         let browser_cx = context.get("browser");
         let bs = |k: &str| browser_cx.and_then(|b| b.get(k)).and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_string);
         let browser = r.s("source") == Some("browser");
+        // A browser error's own tab (gem 1.5+: `context.browser.tab`); an
+        // older one's is worked out from its page below.
+        let tab = if browser { bs("tab").filter(|t| filter_query::valid_session_id(t)) } else { tab };
         events.push(Event {
             at: r.t("occurred_at").unwrap_or(0),
             tab,
@@ -444,7 +448,7 @@ pub fn read_capped(conn: &Connection, session_id: &str, cap: usize) -> rusqlite:
     };
     events.sort_by(|a, b| a.at.cmp(&b.at).then(a.rank().cmp(&b.rank())).then_with(|| id_of(a).cmp(&id_of(b))));
 
-    // A browser error goes in the lane of the visit it names.
+    // A browser error without its tab goes in the lane of the visit it names.
     let mut last_visit_tab: HashMap<String, String> = HashMap::new();
     for e in events.iter_mut() {
         match &e.kind {
@@ -728,6 +732,33 @@ pub(crate) mod tests {
         assert_eq!((j.tabs[0].requests, j.tabs[0].visits, j.tabs[0].errors), (6, 1, 0));
         assert_eq!((j.tabs[1].requests, j.tabs[1].visits, j.tabs[1].errors), (1, 1, 3), "the 500, its exception, the browser error");
         assert_eq!(j.capped, Capped::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A browser error that says its tab is in that tab's lane, even when
+    /// another tab's visit has the page it names; one without falls back to
+    /// that visit's tab.
+    #[test]
+    fn a_browser_error_goes_in_the_lane_of_its_own_tab_else_of_its_page() {
+        let (dir, c) = tenant("errtab");
+        two_tabs(&c);
+        // tab-A opened /orders/7 too, after tab-B: the page alone would say tab-A.
+        visit(&c, T0 + 18 * S, "orders/show", "/orders/7", Some("s1"), Some("tab-A"));
+        for (at, tab) in [(T0 + 19 * S, Some("tab-B")), (T0 + 21 * S, None)] {
+            let mut browser = json!({"session": "s1", "visit": "/orders/7"});
+            if let Some(t) = tab {
+                browser["tab"] = json!(t);
+            }
+            c.execute(
+                "INSERT INTO exceptions (class_name, message, handled, occurred_at, source, context) VALUES ('RangeError', 'tab test', 0, ?1, 'browser', ?2)",
+                params![qt(at), json!({"browser": browser}).to_string()],
+            )
+            .unwrap();
+        }
+        let j = read(&c, "s1").unwrap();
+        let lanes: Vec<Option<&str>> =
+            j.events.iter().filter(|e| matches!(&e.kind, Kind::Error(x) if x.class_name == "RangeError")).map(|e| j.label(e.lane)).collect();
+        assert_eq!(lanes, [Some("t2"), Some("t1")], "its own tab; then the page's latest visit (tab-A)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

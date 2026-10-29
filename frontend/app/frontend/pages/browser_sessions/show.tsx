@@ -55,6 +55,20 @@ function spanText(first: string, last: string): string {
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
 }
 
+// A folded run's duration: the median, and the max when it differs.
+// Events without one (exceptions, or a visit the client did not time) are
+// left out; none at all shows nothing.
+export function runDuration(events: JourneyEvent[]): string {
+  const d = events
+    .map((x) => x.duration ?? 0)
+    .filter((x) => x > 0)
+    .sort((a, b) => a - b)
+  if (d.length === 0) return ""
+  const p50 = d[Math.floor((d.length - 1) / 2)]
+  const max = d[d.length - 1]
+  return max === p50 ? ms(p50) : `${ms(p50)} · max ${ms(max)}`
+}
+
 function clock(iso: string): string {
   return new Date(iso).toISOString().slice(11, 19)
 }
@@ -145,7 +159,7 @@ function JourneyRow({
         )}
       </span>
       <span className="text-right font-mono tabular-nums">
-        {e.duration != null && !folded ? ms(e.duration) : ""}
+        {folded ? runDuration(row.events) : e.duration ? ms(e.duration) : ""}
       </span>
     </>
   )

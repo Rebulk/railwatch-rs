@@ -3,7 +3,8 @@ import type { ReactNode } from "react"
 import { describe, expect, it, vi } from "vitest"
 
 import type { JourneyEvent } from "@/lib/journey"
-import BrowserSessionShow from "@/pages/browser_sessions/show"
+import { ms } from "@/lib/format"
+import BrowserSessionShow, { runDuration } from "@/pages/browser_sessions/show"
 
 vi.mock("@inertiajs/react", () => ({
   Link: ({
@@ -91,7 +92,7 @@ const events: JourneyEvent[] = [
     error: false,
     component: "orders/show",
     url: "/orders/7",
-    duration: 90,
+    duration: 0,
   },
   req(13, 1, 4, "GET /orders/7", 500),
   req(15, 0, 2, "GET /api/poll"),
@@ -120,6 +121,16 @@ function lanesOf(text: string): boolean[] {
   return Array.from(cells).map((c) => !c.className.includes("bg-muted"))
 }
 
+describe("runDuration", () => {
+  const d = (...xs: number[]) =>
+    xs.map((x, i) => ({ ...req(i, 0, 0, "x"), duration: x }))
+  it("is the median and the max of the timed events", () => {
+    expect(runDuration(d(1, 9, 3))).toBe(`${ms(3)} · max ${ms(9)}`)
+    expect(runDuration(d(2, 2))).toBe(ms(2))
+    expect(runDuration(d(0, 0))).toBe("")
+  })
+})
+
 describe("Session journey lanes", () => {
   it("marks each event in its own tab's lane, polls folded into one row", () => {
     render(<BrowserSessionShow {...props} />)
@@ -129,6 +140,15 @@ describe("Session journey lanes", () => {
     expect(lanesOf("GET /settings")).toEqual([false, false])
     expect(screen.getAllByText("GET /api/poll")).toHaveLength(1)
     expect(screen.getByText(/×3 over 20s/)).toBeTruthy()
+    // The folded polls show their duration (all 2 ms); a visit without one shows none.
+    const polls = screen
+      .getByText("GET /api/poll")
+      .closest("div[class*='grid']")!
+    expect(polls.textContent).toContain("2.0ms")
+    const untimed = screen
+      .getByText("orders/show /orders/7")
+      .closest("a, div[class*='grid']")!
+    expect(untimed.textContent).not.toContain("ms")
     expect(screen.getByText("no tab")).toBeTruthy()
   })
 
