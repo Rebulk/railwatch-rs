@@ -60,7 +60,10 @@ impl Mcp<'_> {
                         );
                     }
                     if !s.users.is_empty() {
-                        db::merge_into(&mut v, "users", json!(s.users.iter().collect::<Vec<_>>()));
+                        db::merge_into(&mut v, "users", json!(s.users.iter().take(LISTED).map(|u| untrusted(u, FIELD_CHARS)).collect::<Vec<_>>()));
+                        if s.users.len() > LISTED {
+                            db::merge_into(&mut v, "distinct_users", Value::from(s.users.len() as i64));
+                        }
                     }
                     db::merge_into(&mut v, "url", self.url(&session_path(&env, &s.session_id)));
                     v
@@ -665,6 +668,19 @@ mod tests {
         let shown = v["timeline"].as_array().unwrap();
         assert_eq!(shown.last().unwrap()["execution_id"], "h1999");
         assert_eq!(v["timeline_left_out"]["events"].as_i64().unwrap() + shown.len() as i64, 2_000);
+    }
+
+    /// A user ref is app-written text: list_sessions cuts it and replaces
+    /// control and bidi characters, as the journey's summary does.
+    #[test]
+    fn list_sessions_shows_users_as_untrusted_text() {
+        let f = seeded("journey-list-users");
+        let c = f.tenant();
+        crate::dashboard::session_journey::tests::request(&c, "u", T0, "/", 200, Some("su"), Some("t"));
+        c.execute("UPDATE executions SET user_ref = ?1 WHERE execution_id = 'u'", ["ev\u{202E}il\nx"]).unwrap();
+        let v = f.tool("list_sessions", json!({"window": "24h"}));
+        let users = v["sessions"][0]["users"][0].as_str().unwrap();
+        assert!(!users.contains('\u{202E}') && !users.contains('\n'), "{users:?}");
     }
 
     #[test]

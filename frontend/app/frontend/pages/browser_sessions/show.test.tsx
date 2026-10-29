@@ -203,5 +203,35 @@ describe("Session journey lanes", () => {
       "GET /api/poll",
       "GET /settings",
     ])
+    // The opened run's first row folds it again.
+    const collapse = screen.getByRole("button", {
+      name: "Collapse GET /api/poll (3 events)",
+      expanded: true,
+    })
+    fireEvent.click(collapse)
+    expect(screen.getAllByText("GET /api/poll")).toHaveLength(1)
+    expect(screen.queryByRole("button", { expanded: true })).toBeNull()
+  })
+
+  it("names the expand button of a single visit and its request", () => {
+    const pair: JourneyEvent[] = [
+      {
+        at: at(0),
+        type: "visit",
+        lane: 0,
+        run: 0,
+        error: false,
+        component: "journey/two",
+        url: "/two",
+        duration: 8,
+      },
+      { ...req(0, 0, 0, "GET /two"), duration: 4 },
+    ]
+    render(
+      <BrowserSessionShow {...props} tabs={[tabs[0]]} events={pair} runs={1} />,
+    )
+    expect(
+      screen.getByRole("button", { name: "Expand GET /two (2 events)" }),
+    ).toBeTruthy()
   })
 })

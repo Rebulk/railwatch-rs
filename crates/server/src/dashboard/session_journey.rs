@@ -252,8 +252,12 @@ const STEP_GAP: i64 = 5_000_000;
 
 /// The path of a visit's url (the browser client sends it absolute or not).
 fn url_path(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r.find('/').map_or("/", |i| &r[i..]));
-    rest.split(['?', '#']).next().unwrap_or(rest)
+    // Query and fragment off first: either may hold a "://" of its own.
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    match url.split_once("://") {
+        Some((_, rest)) => rest.find('/').map_or("/", |i| &rest[i..]),
+        None => url,
+    }
 }
 
 impl Journey {
@@ -621,7 +625,8 @@ pub fn list(conn: &Connection, (from, to): (i64, i64), user: Option<&str>, has_e
             db::query(conn, &inner.replace("{t}", &table), rusqlite::params_from_iter(binds.iter()))?
         }
     };
-    for r in rows {
+    // Only ids the session pages accept (ingest keeps whatever the gem sent).
+    for r in rows.into_iter().filter(|r| r.s("sid").is_some_and(filter_query::valid_session_id)) {
         let s = add(&mut by, &r);
         s.requests += r.i("n").unwrap_or(0);
         s.server_errors += r.i("errors").unwrap_or(0);
@@ -635,7 +640,8 @@ pub fn list(conn: &Connection, (from, to): (i64, i64), user: Option<&str>, has_e
         Some(rows) => rows,
         None => db::query(conn, &inner.replace("{t}", "\"visits\""), rusqlite::params_from_iter(binds.iter()))?,
     };
-    for r in rows {
+    // Only ids the session pages accept (ingest keeps whatever the gem sent).
+    for r in rows.into_iter().filter(|r| r.s("sid").is_some_and(filter_query::valid_session_id)) {
         let s = add(&mut by, &r);
         s.visits += r.i("n").unwrap_or(0);
         s.visit_errors += r.i("errors").unwrap_or(0);
@@ -940,6 +946,10 @@ pub(crate) mod tests {
         assert_eq!(url_path("http://localhost:3123/three?x=1#y"), "/three");
         assert_eq!(url_path("/three?page=2"), "/three");
         assert_eq!(url_path("https://shop.example"), "/");
+        // A "://" in the query or fragment is not the url's own.
+        assert_eq!(url_path("/login?return_to=https://app/x"), "/login");
+        assert_eq!(url_path("https://host?next=/a"), "/");
+        assert_eq!(url_path("https://host/p#https://x/y"), "/p");
     }
 
     #[test]
@@ -1017,6 +1027,29 @@ pub(crate) mod tests {
         let cond = filter_query::apply(&c, filter_query::Resource::Exceptions, Some("session:s1"), T0 - 86_400 * S, T0 + 3_600 * S, &[]).unwrap();
         let n = db::count(&c, &format!("SELECT COUNT(*) FROM \"exceptions\" WHERE {}", cond.sql()), rusqlite::params_from_iter(cond.binds.iter())).unwrap();
         assert_eq!(n, 1, "the exception of s1's 500 (not the browser error, which has no request)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ingest keeps a session id as the client sent it: a number, an
+    /// overlong or malformed string never lists as a session (the session
+    /// page would refuse it).
+    #[test]
+    fn listing_skips_session_ids_the_session_page_would_refuse() {
+        let (dir, c) = tenant("badids");
+        two_tabs(&c);
+        let window = (T0 - 3_600 * S, T0 + 3_600 * S);
+        let long = "x".repeat(65);
+        for (id, sid) in [("n", json!(42)), ("l", json!(long)), ("m", json!("a b/c"))] {
+            c.execute(
+                "INSERT INTO executions (execution_id, kind, name, status, occurred_at, duration, detail) VALUES (?1, 'request', 'GET /', 200, ?2, 1, ?3)",
+                params![id, qt(T0), json!({"session_id": sid}).to_string()],
+            )
+            .unwrap();
+        }
+        c.execute("INSERT INTO visits (occurred_at, duration, session_id) VALUES (?1, 1, 'bad id!')", [qt(T0)]).unwrap();
+        let (all, total) = list(&c, window, None, false, 10).unwrap();
+        let ids: Vec<&str> = all.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!((total, ids), (2, vec!["s1", "s2"]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

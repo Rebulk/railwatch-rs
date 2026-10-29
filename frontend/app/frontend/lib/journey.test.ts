@@ -39,6 +39,15 @@ describe("foldRuns", () => {
     expect(total({ 1: true })).toBe(events.length)
   })
 
+  it("numbers an opened run's rows in order and knows the run's size", () => {
+    const rows = foldRuns(events, { 1: true }).filter((r) => r.run === 1)
+    expect(rows.map((r) => [r.index, r.size])).toEqual([
+      [0, 3],
+      [1, 3],
+      [2, 3],
+    ])
+  })
+
   it("lists an opened run's events in time order among the others", () => {
     const rows = foldRuns(events, { 1: true })
     expect(rows.map((r) => r.events[0].at.slice(17, 19))).toEqual([

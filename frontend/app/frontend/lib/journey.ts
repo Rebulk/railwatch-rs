@@ -36,6 +36,8 @@ export interface Row {
   run: number
   // The row's place among its run's rows (0 for a folded run).
   index: number
+  // Events in the whole run (1: a run of one, nothing to fold).
+  size: number
   events: JourneyEvent[]
 }
 
@@ -53,13 +55,17 @@ export function foldRuns(
   }
   const rows: Row[] = []
   const seen = new Set<number>()
+  // An opened run's next row index: byRun lists each run in `events` order.
+  const next = new Map<number, number>()
   for (const e of events) {
     const all = byRun.get(e.run)!
     if (open[e.run] || all.length === 1) {
-      rows.push({ run: e.run, index: all.indexOf(e), events: [e] })
+      const index = next.get(e.run) ?? 0
+      next.set(e.run, index + 1)
+      rows.push({ run: e.run, index, size: all.length, events: [e] })
     } else if (!seen.has(e.run)) {
       seen.add(e.run)
-      rows.push({ run: e.run, index: 0, events: all })
+      rows.push({ run: e.run, index: 0, size: all.length, events: all })
     }
   }
   return rows

@@ -672,7 +672,14 @@ all of it (identical; 130/130).
 15. **Browser sessions across tabs** (docs/sessions.md). `visits` has two
     more `schema::ADDED_COLUMNS`, `session_id` and `tab_id` (nullable
     `varchar(64)`), added the way #13's are, with the same roll-forward-only
-    caveat for per-day tenants. A request's `session_id` and `tab_id` are
+    caveat for per-day tenants. To stay on a release before this one, with
+    the server stopped, run on every widened file (meta and every day file
+    of each per-day environment): `DROP INDEX IF EXISTS idx_visits_sessions;
+    DROP INDEX IF EXISTS idx_executions_sessions; ALTER TABLE visits DROP
+    COLUMN session_id; ALTER TABLE visits DROP COLUMN tab_id;`. The index
+    goes first: SQLite refuses to drop a column an index uses, its partial
+    `WHERE` included. Rolling back past #13 as well drops its four columns
+    after these. A request's `session_id` and `tab_id` are
     kept in `detail`, which Rails' mapper slices to its own keys and drops.
     Two more `schema::ADDED_INDEXES`: `idx_executions_sessions` (partial on
     `kind = 'request'` with a session id: the id, `occurred_at`, the tab,

@@ -151,7 +151,8 @@ function JourneyRow({
           <StatusBadge status={e.status} outcome={null} />
         )}
         <span className="truncate font-mono">{label(e)}</span>
-        {row.events.length > 1 && (
+        {/* On the folded row, and on an opened run's first row to fold it again. */}
+        {row.size > 1 && (folded || (open && row.index === 0)) && (
           <button
             type="button"
             onClick={(ev) => {
@@ -161,12 +162,13 @@ function JourneyRow({
             }}
             className="text-primary inline-flex shrink-0 items-center gap-0.5 font-mono text-[10px] hover:underline"
             aria-expanded={open}
+            aria-label={`${open ? "Collapse" : "Expand"} ${label(e)} (${row.size} events)`}
           >
             <ChevronRight
               className={cn("size-3 transition-transform", open && "rotate-90")}
             />
             {open
-              ? `×${row.events.length}`
+              ? `×${row.size}`
               : n > 1
                 ? `×${n} over ${spanText(shown[0].at, shown[n - 1].at)}`
                 : ""}
