@@ -70,6 +70,7 @@ free text (which matches the route name).
 | `halted:true`, `halted:require_admin` | a `before_action` rendered or redirected (`halted_callback`); with a name, that callback |
 | `unpermitted:true`, `unpermitted:role` | strong parameters dropped keys (`unpermitted_parameters`); with a key, requests that dropped it |
 | `outcome:served` | what came of it (below); `outcome:redirected_to_auth\|refused` either |
+| `session:<id>`, `tab:<id>` | the browser session the request came from, exactly ([sessions.md](sessions.md)); its tab, or `tab:none` for a request without one. A `session:` read is a seek on the session index. |
 
 Names are exact. `true`/`false` stand alone (`halted:true|authenticate` is
 an error). On `search_telemetry`'s jobs, `outcome:` keeps its old meaning

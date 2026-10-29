@@ -50,6 +50,8 @@ pub fn page_fn(component: &str) -> Option<PageFn> {
         "llm_calls/index" => llm_calls_index,
         "storage_ops/index" => storage_ops_index,
         "visits/index" => visits_index,
+        "browser_sessions/index" => sessions_index,
+        "browser_sessions/show" => sessions_show,
         "processes/index" => processes_index,
         "releases/index" => releases_index,
         "releases/show" => releases_show,

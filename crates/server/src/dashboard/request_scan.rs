@@ -1236,6 +1236,11 @@ mod per_day_tests {
             if i != 0 {
                 c.execute_batch(&format!("DROP INDEX {}", crate::schema::REQUEST_INDEX)).unwrap();
             }
+            // 2026-10-20 has the request index but not the session ones (a
+            // file the previous release built): the pass adds them.
+            if i == 0 {
+                c.execute_batch(&format!("DROP INDEX {}; DROP INDEX {};", crate::schema::SESSION_INDEX, crate::schema::VISIT_SESSION_INDEX)).unwrap();
+            }
         }
         let s = crate::tenants::open_tenant(&single).unwrap();
         s.execute_batch(&format!("DROP INDEX {}", crate::schema::REQUEST_INDEX)).unwrap();
@@ -1244,7 +1249,11 @@ mod per_day_tests {
         // A union reader attached throughout, as the server's pools are.
         let (reader, _) = crate::storage::reader::open(&env).unwrap();
         let pass = crate::tenants::add_missing_indexes(&tenants, now, std::time::Duration::ZERO);
-        assert_eq!((pass.built, pass.failed, pass.waiting), (1, 0, 2), "only 2026-10-24 was closed and without it; 25 and 26 wait");
+        assert_eq!((pass.built, pass.failed, pass.waiting), (2, 0, 2), "2026-10-20 and 24 were closed and lacked one; 25 and 26 wait");
+        let day20 = rusqlite::Connection::open(crate::storage::layout::day_path(&env, crate::storage::layout::Tier::Core, "2026-10-20")).unwrap();
+        for i in [crate::schema::SESSION_INDEX, crate::schema::VISIT_SESSION_INDEX] {
+            assert!(crate::schema::has_index(&day20, "main", i).unwrap(), "{i}");
+        }
         let has = |p: &std::path::Path| crate::schema::has_index(&rusqlite::Connection::open(p).unwrap(), "main", crate::schema::REQUEST_INDEX).unwrap();
         let day = |d: &str| crate::storage::layout::day_path(&env, crate::storage::layout::Tier::Core, d);
         // The build's WAL is checkpointed and emptied even with a reader holding the file open.

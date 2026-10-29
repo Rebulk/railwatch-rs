@@ -908,6 +908,65 @@ the bench, warm:
 - The other tools are unchanged; get_execution and last_execution are not
   touched.
 
+## Session journeys (from main 1d5ce91)
+
+A session journey (docs/sessions.md) reads one browser session's requests
+and visits, across every day file. Without an index that is a scan of every
+request of every day for a `json_extract(detail, '$.session_id')` match.
+
+### What changed
+
+Two partial indexes (docs/DIFFERENCES.md #15): `idx_executions_sessions`
+on `(json_extract(detail, '$.session_id'), occurred_at, json_extract(detail,
+'$.tab_id'), status, user_ref) WHERE kind = 'request' AND json_extract(detail,
+'$.session_id') IS NOT NULL`, and `idx_visits_sessions` on `(session_id,
+occurred_at) WHERE session_id IS NOT NULL`. A journey, `session:` in the
+filter grammar, and the child-record lookup name them with `INDEXED BY`; the
+per-day reader leaves the hint off a day file without them.
+`a_journey_reads_through_the_session_indexes` asserts the plans (`SEARCH ...
+USING INDEX idx_executions_sessions (<expr>=?)`, no temp B-tree for the
+ORDER BY).
+
+### Method
+
+Tenant: `gen_tenant.py --spread-days 8 --executions 220000 --seed 5
+--records-per-batch 2000 --shapes 2000 --tenants 50 --uniform --by-time
+--few-logs --prod-shape --sessions`, posted to a fresh per-day server: 1.2
+GB over 9 core day files, ~22k requests a day, ~8.7k of them carrying a
+session (the hot ingest route, jobs and probes carry none). `--sessions`:
+one day-long session (a dashboard left open: 2,153 requests) and ~290
+others a day of ~20 minutes (median 23 requests, two thirds with more than
+one tab). mcp-dump, release build, CPUs 8-11, security-scope token, warm
+median of 5. "Without" is the same data with the two indexes dropped from
+every day file: the state before the background build.
+
+### Results (ms, warm)
+
+| case | without the indexes | with |
+|---|---:|---:|
+| session_journey, typical session (23 requests) | 157.1 | 0.6 |
+| session_journey by execution_id | 158.0 | 0.7 |
+| session_journey, day-long session (2,153 requests) | 193.1 | 31.3 |
+| same, shape rows | 182.6 | 24.8 |
+| search_requests `session:<id>`, 30d | 157.3 | 0.4 |
+| list_sessions 24h | 32.0 | 12.1 |
+| list_sessions 7d, has_errors | 223.3 | 87.1 |
+| list_sessions 7d, one user | 2.0 | 2.0 |
+
+Every result was byte-identical with and without the indexes. The
+day-long session's time is building and folding 2.2k events (and
+`max_tokens`/the cap keeping the newest 116 entries), not reading them.
+`list_sessions` by user reads `idx_executions_people`, already there.
+
+### Costs
+
+- Size: `idx_executions_sessions` 6.75 MB and `idx_visits_sessions` 0.2 MB
+  over the 9 core files (485.3 MB against main's 472.2 MB, +2.8%; the
+  request index is 48.7 MB). Rows without a session are not in them.
+- Ingest: 593 batches posted to each build, the same machine and CPUs:
+  10,538 CPU ticks on main, 10,401 on this branch (201 s and 206 s wall),
+  within run-to-run noise.
+
 ## Proposals
 
 None of these is implemented.

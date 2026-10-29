@@ -510,6 +510,36 @@ export const applicationEnvironmentBroadcastsPath: ((
 
 /**
  * Generates rails route to
+ * /apps/:application_id/envs/:environment_id/sessions/:id(.:format)
+ * @param {any} applicationId
+ * @param {any} environmentId
+ * @param {any} id
+ * @param {object | undefined} options
+ * @returns {string} route path
+ */
+export const applicationEnvironmentBrowserSessionPath: ((
+  applicationId: RequiredRouteParameter,
+  environmentId: RequiredRouteParameter,
+  id: RequiredRouteParameter,
+  options?: {format?: OptionalRouteParameter} & RouteOptions
+) => string) & RouteHelperExtras;
+
+/**
+ * Generates rails route to
+ * /apps/:application_id/envs/:environment_id/sessions(.:format)
+ * @param {any} applicationId
+ * @param {any} environmentId
+ * @param {object | undefined} options
+ * @returns {string} route path
+ */
+export const applicationEnvironmentBrowserSessionsPath: ((
+  applicationId: RequiredRouteParameter,
+  environmentId: RequiredRouteParameter,
+  options?: {format?: OptionalRouteParameter} & RouteOptions
+) => string) & RouteHelperExtras;
+
+/**
+ * Generates rails route to
  * /apps/:application_id/envs/:environment_id/cache(.:format)
  * @param {any} applicationId
  * @param {any} environmentId

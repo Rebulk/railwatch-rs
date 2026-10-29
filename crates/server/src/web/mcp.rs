@@ -45,6 +45,8 @@ mod compare;
 mod records;
 #[path = "mcp_security.rs"]
 mod security;
+#[path = "mcp_sessions.rs"]
+mod sessions;
 use crate::control::Control;
 use crate::dashboard::cursor_page::{self, CursorKey, Order};
 use crate::dashboard::db::{self, Rec, jf, qt};
@@ -589,6 +591,8 @@ impl Mcp<'_> {
             "query_requests" => self.query_requests(&a),
             "security_summary" => self.security_summary(&a),
             "ip_activity" => self.ip_activity(&a),
+            "list_sessions" => self.list_sessions(&a),
+            "session_journey" => self.session_journey(&a),
             "update_issue" => self.update_issue(&a),
             "add_comment" => self.add_comment(&a),
             _ => unreachable!("known tool"),
@@ -2829,6 +2833,7 @@ fn narrow_hint(tool: &str) -> &'static str {
         "query_requests" => "Pass a smaller limit, min_count, fewer metrics, or a narrower q or window.",
         "security_summary" => "Pass a narrower window; drill into one finding with its next calls.",
         "ip_activity" => "Pass a smaller limit, a narrower window, or after:/before: in q.",
+        "session_journey" => "Pass max_tokens: the newest timeline entries are kept and the older counted in timeline_left_out.",
         "web_vitals" => "Pass a smaller limit, or component to read one component.",
         "release_health" => "Pass a narrower window.",
         "get_route" => "Pass a narrower window.",
@@ -3164,6 +3169,11 @@ mod tests {
         /// background build. Call it before any tool reads the tenant (a
         /// pooled reader keeps the file it opened), and do not call `tenant`
         /// after. Returns how many core days there are.
+        /// The per-day directory `split_into_days` makes.
+        pub(super) fn days_dir(&self) -> std::path::PathBuf {
+            self.dir.join("telemetry").join(&self.slug)
+        }
+
         pub(super) fn split_into_days(&self, indexed: impl Fn(usize) -> bool) -> usize {
             use crate::storage::layout::{self, Tier};
             let file = self.dir.join("telemetry").join(format!("{}.sqlite3", self.slug));

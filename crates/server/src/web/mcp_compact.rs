@@ -311,6 +311,23 @@ impl Runs {
     }
 }
 
+/// One run of requests that share a request key (a session journey's,
+/// oldest first): its entry, folded as `Runs` folds one, with the group id
+/// search_requests' `group` takes.
+pub fn request_entry(rows: &[Row<'_>], access: bool) -> Entry {
+    let key = request_key(&rows[0]);
+    let mut fold = Fold::default();
+    for r in rows {
+        fold_request(&mut fold, r, access, &[]);
+    }
+    finish(group_id(&key.each_ref().map(String::as_str)), request_key_json(&key), fold)
+}
+
+/// An entry of other records from its key fields and its fold.
+pub fn entry(id: String, key: Map<String, Value>, fold: Fold) -> Entry {
+    finish(id, key, fold)
+}
+
 /// An entry from its fold: the largest response size, and the template
 /// only when the messages differ.
 fn finish(id: String, mut key: Map<String, Value>, mut fold: Fold) -> Entry {

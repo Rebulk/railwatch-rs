@@ -1,6 +1,7 @@
 import {
   Activity,
   AlertTriangle,
+  AppWindow,
   ArrowUpRight,
   Bell,
   BellRing,
@@ -176,6 +177,12 @@ export function envPages(
       title: "Visits",
       href: R.applicationEnvironmentVisitsPath(a, e, w),
       icon: MonitorSmartphone,
+      group: "monitoring",
+    },
+    {
+      title: "Sessions",
+      href: R.applicationEnvironmentBrowserSessionsPath(a, e, w),
+      icon: AppWindow,
       group: "monitoring",
     },
     {

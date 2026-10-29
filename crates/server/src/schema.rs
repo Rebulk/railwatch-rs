@@ -107,7 +107,7 @@ fn load() -> Schema {
         tables.get_mut(*table).expect("added column's table is exported").push(Column {
             name: name.to_string(),
             ty: *ty,
-            limit: None,
+            limit: (*ty == ColType::String).then_some(ADDED_STRING_LIMIT),
             null: true,
             default: None,
         });
@@ -139,12 +139,20 @@ impl Schema {
 /// visits: the initial load's TTFB split into phases (gem 1.2's browser
 /// client). `redirect_count` is NULL when the browser showed no redirect,
 /// which includes a cross-origin chain it hid; `redirect_ms` still holds it.
+/// `session_id` and `tab_id`: the browser session the visit belongs to and
+/// the tab it happened in (docs/sessions.md), NULL from a client without them.
 pub const ADDED_COLUMNS: &[(&str, &str, ColType)] = &[
     ("visits", "redirect_ms", ColType::Integer),
     ("visits", "redirect_count", ColType::Integer),
     ("visits", "connect_ms", ColType::Integer),
     ("visits", "server_ms", ColType::Integer),
+    ("visits", "session_id", ColType::String),
+    ("visits", "tab_id", ColType::String),
 ];
+
+/// The length of an added string column (varchar), as the `sessions`
+/// table's own `session_id` is: the gem sends ids of 64 characters at most.
+pub const ADDED_STRING_LIMIT: usize = 64;
 
 /// Adds every ADDED_COLUMNS column `conn`'s main database lacks. Returns
 /// how many it added (0 on a file that already has them all).
@@ -154,7 +162,8 @@ pub fn add_missing_columns(conn: &Connection) -> rusqlite::Result<usize> {
         let present: bool = conn.query_row("SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)", [*table, *name], |r| r.get(0))?;
         if !present {
             let sql_type = match ty {
-                ColType::Integer => "integer",
+                ColType::Integer => "integer".to_string(),
+                ColType::String => format!("varchar({ADDED_STRING_LIMIT})"),
                 other => unreachable!("no added column is {other:?}"),
             };
             conn.execute_batch(&format!("ALTER TABLE \"{table}\" ADD COLUMN \"{name}\" {sql_type}"))?;
@@ -177,23 +186,43 @@ pub fn add_missing_columns(conn: &Connection) -> rusqlite::Result<usize> {
 /// to an index column by its parse tree, so one written differently would
 /// read the row's JSON again (request_scan's tests check none does).
 ///
-/// New files get it in `create_tenant`. Existing ones get it from
+/// `idx_executions_sessions` and `idx_visits_sessions`: one browser
+/// session's requests and visits (docs/sessions.md), so a journey is an
+/// index seek, not a scan of every day. Partial on the session id being
+/// set: a request or visit without one (every row before the gem sent it,
+/// a job, an API client without the cookie) is not in them at all. The
+/// requests' carries the tab and what session discovery counts (status,
+/// user), so listing a window's sessions reads only the index
+/// (docs/PERF.md, "Session journeys").
+///
+/// New files get them in `create_tenant`. Existing ones get them from
 /// `tenants::add_missing_indexes_in_background` after the server starts:
-/// building it takes the file's write lock, and a file without it answers
+/// building one takes the file's write lock, and a file without it answers
 /// the same through `json_extract` (storage::reader builds each day file's
 /// branch of the hinted view with the hint only where the index exists).
-pub const ADDED_INDEXES: &[(&str, &str)] = &[(
-    "idx_executions_requests",
-    "CREATE INDEX \"idx_executions_requests\" ON \"executions\" (\"occurred_at\", \"status\", \"method\", \"name\", \"group_hash\", \"duration\", \
-     \"user_ref\", \"app_tenant\", \"execution_id\", \"exception_preview\", json_extract(\"detail\", '$.ip'), json_extract(\"detail\", '$.user_agent'), \
-     json_extract(\"detail\", '$.path'), json_extract(\"detail\", '$.headers.\"Cf-Ipcountry\"'), json_type(\"detail\", '$.rate_limited'), \
-     json_extract(\"detail\", '$.rate_limited.name'), json_extract(\"detail\", '$.halted_callback'), \
-     json_array_length(\"detail\", '$.unpermitted_parameters'), json_extract(\"detail\", '$.unpermitted_parameters'), \
-     json_extract(\"detail\", '$.redirect_to'), json_extract(\"detail\", '$.response_size')) WHERE kind = 'request'",
-)];
+pub const ADDED_INDEXES: &[(&str, &str)] = &[
+    (
+        "idx_executions_requests",
+        "CREATE INDEX \"idx_executions_requests\" ON \"executions\" (\"occurred_at\", \"status\", \"method\", \"name\", \"group_hash\", \"duration\", \
+         \"user_ref\", \"app_tenant\", \"execution_id\", \"exception_preview\", json_extract(\"detail\", '$.ip'), json_extract(\"detail\", '$.user_agent'), \
+         json_extract(\"detail\", '$.path'), json_extract(\"detail\", '$.headers.\"Cf-Ipcountry\"'), json_type(\"detail\", '$.rate_limited'), \
+         json_extract(\"detail\", '$.rate_limited.name'), json_extract(\"detail\", '$.halted_callback'), \
+         json_array_length(\"detail\", '$.unpermitted_parameters'), json_extract(\"detail\", '$.unpermitted_parameters'), \
+         json_extract(\"detail\", '$.redirect_to'), json_extract(\"detail\", '$.response_size')) WHERE kind = 'request'",
+    ),
+    (
+        "idx_executions_sessions",
+        "CREATE INDEX \"idx_executions_sessions\" ON \"executions\" (json_extract(\"detail\", '$.session_id'), \"occurred_at\", \
+         json_extract(\"detail\", '$.tab_id'), \"status\", \"user_ref\") WHERE kind = 'request' AND json_extract(\"detail\", '$.session_id') IS NOT NULL",
+    ),
+    ("idx_visits_sessions", "CREATE INDEX \"idx_visits_sessions\" ON \"visits\" (\"session_id\", \"occurred_at\") WHERE session_id IS NOT NULL"),
+];
 
 /// The request index's name (ADDED_INDEXES).
 pub const REQUEST_INDEX: &str = "idx_executions_requests";
+/// The session indexes' names (ADDED_INDEXES).
+pub const SESSION_INDEX: &str = "idx_executions_sessions";
+pub const VISIT_SESSION_INDEX: &str = "idx_visits_sessions";
 
 /// Creates every ADDED_INDEXES index `conn`'s main database lacks. Returns
 /// how many it created.

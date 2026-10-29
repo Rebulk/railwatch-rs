@@ -358,7 +358,7 @@ pub fn add_missing_indexes_in_background(tenants_dir: PathBuf) -> Option<std::th
             loop {
                 let pass = add_missing_indexes(&tenants_dir, crate::time::now_micros(), INDEX_PAUSE);
                 if pass.built > 0 || pass.failed > 0 {
-                    tracing::info!(built = pass.built, failed = pass.failed, seconds = pass.seconds, "built the request index in existing day files");
+                    tracing::info!(built = pass.built, failed = pass.failed, seconds = pass.seconds, "built the added indexes in existing day files");
                 }
                 if pass.failed == 0 && pass.waiting == 0 {
                     return;
@@ -403,7 +403,16 @@ pub fn add_missing_indexes(tenants_dir: &Path, now_micros: i64, pause: Duration)
     let mut pass = IndexPass::default();
     let lacks = |p: &Path| {
         let ro = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        Connection::open_with_flags(p, ro).and_then(|c| Ok(!schema::has_index(&c, "main", schema::REQUEST_INDEX)?)).unwrap_or(false)
+        Connection::open_with_flags(p, ro)
+            .and_then(|c| {
+                for (name, _) in schema::ADDED_INDEXES {
+                    if !schema::has_index(&c, "main", name)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
+            .unwrap_or(false)
     };
     let (files, open): (Vec<PathBuf>, Vec<PathBuf>) =
         files.into_iter().partition(|f| f.file_stem().and_then(|s| s.to_str()).is_some_and(|day| crate::storage::backup::closed(day, now_micros)));
