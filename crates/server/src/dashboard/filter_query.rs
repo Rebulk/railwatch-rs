@@ -11,8 +11,15 @@ use super::db::{self, qt};
 use super::rb;
 use super::window::parse_time;
 
-pub const EXECUTION_KINDS: [&str; 4] = ["request", "job", "scheduled_task", "command"];
+/// What a record ran in (`kind:`, and `source:` naming one of them): the
+/// gem's execution sources.
+pub const EXECUTION_KINDS: [&str; 5] = ["request", "job", "scheduled_task", "command", "channel_action"];
 pub const LOG_LEVELS: [&str; 7] = ["debug", "info", "warn", "error", "fatal", "event", "unknown"];
+/// A job attempt's outcome (`outcome:`/`status:` on jobs), as the gem
+/// records it.
+pub const JOB_OUTCOMES: [&str; 4] = ["processed", "failed", "released", "aborted"];
+/// An exception's severity (Rails.error's and Railwatch.report's).
+pub const SEVERITIES: [&str; 4] = ["fatal", "error", "warning", "info"];
 pub const FRESH_NAMES: i64 = 5 * 60 * 1_000_000;
 pub const DENSE_MATCHES: i64 = 1_000;
 
@@ -103,20 +110,21 @@ pub fn filter_routes(routes: Vec<Value>, query: Option<&str>) -> Vec<Value> {
     let p = parse(query);
     let mut routes = routes;
     if let Some(m) = p.field("method") {
-        let prefix = format!("{} ", m.to_uppercase());
-        routes.retain(|r| r["name"].as_str().is_some_and(|n| n.starts_with(&prefix)));
+        let prefixes: Vec<String> = alternatives(m).map(|m| format!("{} ", m.to_uppercase())).collect();
+        routes.retain(|r| r["name"].as_str().is_some_and(|n| prefixes.iter().any(|p| n.starts_with(p))));
     }
     if let Some(route) = p.field("route") {
-        routes.retain(|r| r["name"].as_str().is_some_and(|n| n.contains(route)));
+        routes.retain(|r| r["name"].as_str().is_some_and(|n| alternatives(route).any(|a| n.contains(a))));
     }
-    if let Some((lo, _)) = status_range(p.fields.get("status").map(String::as_str)) {
+    let statuses: Vec<i64> = p.fields.get("status").map_or(vec![], |v| alternatives(v).filter_map(|x| status_range(Some(x)).map(|r| r.0)).collect());
+    if !statuses.is_empty() {
         routes.retain(|r| {
             let (c, e, ce) = (r["count"].as_i64().unwrap_or(0), r["errors"].as_i64().unwrap_or(0), r["client_errors"].as_i64().unwrap_or(0));
-            match lo {
+            statuses.iter().any(|lo| match lo {
                 500..=599 => e > 0,
                 400..=499 => ce > 0,
                 _ => c - e - ce > 0,
-            }
+            })
         });
     }
     routes
@@ -164,6 +172,19 @@ impl Cond {
     pub fn eq(&mut self, table: &str, col: &str, v: impl Into<Sql>) -> &mut Cond {
         self.and(format!("\"{table}\".\"{col}\" = ?"), vec![v.into()])
     }
+    /// `col` equal to any of `a|b|c` (`= ?` for one value). No value at all
+    /// (`level:|`) matches nothing; `check` reports it.
+    pub fn any_of(&mut self, table: &str, col: &str, v: &str) -> &mut Cond {
+        let alts: Vec<&str> = alternatives(v).collect();
+        match alts.len() {
+            0 => {
+                self.none = true;
+                self
+            }
+            1 => self.eq(table, col, s(alts[0])),
+            n => self.and(format!("\"{table}\".\"{col}\" IN ({})", vec!["?"; n].join(", ")), alts.into_iter().map(s).collect()),
+        }
+    }
     /// The WHERE clause. A `none` relation keeps its parts (their `?`s are
     /// what `binds` fills) and adds `1=0`: an empty `1=0` with binds left
     /// over failed as "wrong number of parameters" (search_logs with an
@@ -208,6 +229,16 @@ pub enum Resource {
 }
 
 impl Resource {
+    /// The resource's name, as `check` and the MCP tools take it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Resource::Jobs => "jobs",
+            Resource::Exceptions => "exceptions",
+            Resource::Logs => "logs",
+            Resource::Queries => "queries",
+        }
+    }
+
     fn table(&self) -> &'static str {
         match self {
             Resource::Jobs => "executions",
@@ -236,47 +267,75 @@ pub fn apply(conn: &Connection, resource: Resource, query: Option<&str>, from: i
         c.eq(table, "kind", s("job_attempt"));
     }
     time_range(&mut c, table, range);
+    // Callers report what is wrong (check); a query they did not check
+    // matches nothing rather than less than it says.
+    if check(resource.name(), &parsed).is_some() {
+        c.none = true;
+        return Ok(c);
+    }
     // apply_common
     if let Some(v) = parsed.field("user") {
-        c.eq(table, "user_ref", s(v));
+        c.any_of(table, "user_ref", v);
     }
     if let Some(v) = parsed.field("tenant") {
-        c.eq(table, "app_tenant", s(v));
+        c.any_of(table, "app_tenant", v);
     }
     if let Some(v) = parsed.field("deploy") {
-        c.eq(table, "deploy", s(v));
+        c.any_of(table, "deploy", v);
     }
     if let Some(v) = parsed.field("source") {
-        if EXECUTION_KINDS.contains(&v) && has_column(table, "execution_source") {
-            c.eq(table, "execution_source", s(v));
-        } else if has_column(table, "source") {
-            c.and(format!("\"{table}\".\"source\" LIKE ?"), vec![s(&format!("{}%", rb::sanitize_sql_like(v)))]);
+        // An execution kind is the record's execution_source; anything else
+        // a prefix of its source file.
+        let mut ors = vec![];
+        let mut binds = vec![];
+        for alt in alternatives(v) {
+            if EXECUTION_KINDS.contains(&alt) && has_column(table, "execution_source") {
+                ors.push(format!("\"{table}\".\"execution_source\" = ?"));
+                binds.push(s(alt));
+            } else if has_column(table, "source") {
+                ors.push(format!("\"{table}\".\"source\" LIKE ?"));
+                binds.push(s(&format!("{}%", rb::sanitize_sql_like(alt))));
+            }
+        }
+        match ors.len() {
+            0 => {}
+            1 => {
+                c.and(ors.remove(0), binds);
+            }
+            _ => {
+                c.and(format!("({})", ors.join(" OR ")), binds);
+            }
         }
     }
-    if let Some(k) = parsed.fields.get("kind")
-        && EXECUTION_KINDS.contains(&k.as_str())
+    if let Some(k) = parsed.field("kind")
         && has_column(table, "execution_source")
     {
-        c.eq(table, "execution_source", s(k));
+        c.any_of(table, "execution_source", k);
     }
     let text = parsed.text.clone();
     match resource {
         Resource::Jobs => {
             if let Some(q) = parsed.field("queue") {
-                c.eq(table, "queue", s(q));
+                c.any_of(table, "queue", q);
             }
             if let Some(o) = parsed.field("outcome").or(parsed.field("status")) {
-                c.eq(table, "outcome", s(o));
+                c.any_of(table, "outcome", o);
             }
-            if let Some(name) = parsed.field("class") {
+            if let Some(class) = parsed.field("class") {
+                let names: Vec<&str> = alternatives(class).collect();
                 let (lo, hi, _) = range;
-                let rollup_cond = "\"rollups\".\"record_type\" = 'job_attempt' AND \"rollups\".\"bucket\" BETWEEN ?1 AND ?2 AND \"rollups\".\"name\" = ?3";
-                let binds = rusqlite::params![qt(rb::beginning_of_hour(lo)), qt(hi), name];
-                let sum = db::count(conn, &format!("SELECT SUM(\"rollups\".\"count\") FROM \"rollups\" WHERE {rollup_cond}"), binds)?;
+                let rollup_cond = format!(
+                    "\"rollups\".\"record_type\" = 'job_attempt' AND \"rollups\".\"bucket\" BETWEEN ? AND ? AND \"rollups\".\"name\" IN ({})",
+                    vec!["?"; names.len()].join(", ")
+                );
+                let mut binds = vec![s(&qt(rb::beginning_of_hour(lo))), s(&qt(hi))];
+                binds.extend(names.iter().map(|n| s(n)));
+                let binds = rusqlite::params_from_iter(binds.iter());
+                let sum = db::count(conn, &format!("SELECT SUM(\"rollups\".\"count\") FROM \"rollups\" WHERE {rollup_cond}"), binds.clone())?;
                 if sum >= DENSE_MATCHES {
-                    c.eq(table, "name", s(name));
+                    c.any_of(table, "name", class);
                 } else {
-                    let mut groups: Vec<String> = vec![md5_hex(name)];
+                    let mut groups: Vec<String> = names.iter().map(|n| md5_hex(n)).collect();
                     for r in db::query(conn, &format!("SELECT DISTINCT \"rollups\".\"group_hash\" FROM \"rollups\" WHERE {rollup_cond}"), binds)? {
                         if let Some(g) = r.s("group_hash")
                             && !groups.iter().any(|x| x == g)
@@ -285,30 +344,32 @@ pub fn apply(conn: &Connection, resource: Resource, query: Option<&str>, from: i
                         }
                     }
                     in_groups_or_fresh(&mut c, "job_attempt", &groups, range);
-                    c.eq(table, "name", s(name));
+                    c.any_of(table, "name", class);
                 }
             }
             if let Some(j) = parsed.field("job_id") {
-                c.eq(table, "job_id", s(j));
+                c.any_of(table, "job_id", j);
             }
             if rb::present(Some(&text)) {
                 named_like(conn, &mut c, "job_attempt", &text, range, true)?;
             }
         }
         Resource::Exceptions => {
-            let handled = parsed.fields.get("handled").cloned().or_else(|| match parsed.fields.get("status").map(String::as_str) {
-                Some("handled") => Some("true".into()),
-                Some("unhandled") => Some("false".into()),
-                _ => None,
-            });
+            // handled:true|false, or status:handled|unhandled: both is all.
+            let handled: Vec<bool> = match parsed.field("handled") {
+                Some(h) => alternatives(h).map(|h| h == "true").collect(),
+                None => parsed.field("status").map_or(vec![], |st| alternatives(st).map(|st| st == "handled").collect()),
+            };
             if let Some(cl) = parsed.field("class") {
-                c.eq(table, "class_name", s(cl));
+                c.any_of(table, "class_name", cl);
             }
-            if let Some(h) = handled.as_deref().filter(|h| *h == "true" || *h == "false") {
-                c.eq(table, "handled", Sql::Integer((h == "true") as i64));
+            if let Some(h) = handled.first()
+                && handled.iter().all(|x| x == h)
+            {
+                c.eq(table, "handled", Sql::Integer(*h as i64));
             }
             if let Some(sv) = parsed.field("severity") {
-                c.eq(table, "severity", s(sv));
+                c.any_of(table, "severity", sv);
             }
             if rb::present(Some(&text)) {
                 let pat = format!("%{}%", rb::sanitize_sql_like(&text));
@@ -316,9 +377,8 @@ pub fn apply(conn: &Connection, resource: Resource, query: Option<&str>, from: i
             }
         }
         Resource::Logs => {
-            let level = parsed.field("level").or(parsed.field("status"));
-            if let Some(l) = level.filter(|l| LOG_LEVELS.contains(l)) {
-                c.eq(table, "level", s(l));
+            if let Some(l) = parsed.field("level").or(parsed.field("status")) {
+                c.any_of(table, "level", l);
             }
             if rb::present(Some(&text)) {
                 match match_expression(&text) {
@@ -332,7 +392,7 @@ pub fn apply(conn: &Connection, resource: Resource, query: Option<&str>, from: i
         Resource::Queries => {
             for f in ["adapter", "connection", "role"] {
                 if let Some(v) = parsed.field(f) {
-                    c.eq(table, f, s(v));
+                    c.any_of(table, f, v);
                 }
             }
             if rb::present(Some(&text)) {
@@ -417,6 +477,101 @@ pub fn detail_fn(alias: &str, f: &str, path: &str) -> String {
 /// The keys of `p` that need security access.
 pub fn personal_keys(p: &Parsed) -> Vec<&'static str> {
     PERSONAL_KEYS.iter().copied().filter(|k| p.field(k).is_some()).collect()
+}
+
+/// The keys every record resource (jobs, exceptions, logs, queries) takes.
+const COMMON_KEYS: [&str; 6] = ["after", "before", "user", "tenant", "deploy", "kind"];
+
+/// The keys `resource` (requests, jobs, exceptions, logs, queries) reads:
+/// any other is an error, not a filter quietly left out.
+pub fn keys_of(resource: &str) -> Vec<&'static str> {
+    let own: &[&'static str] = match resource {
+        "requests" => &["after", "before", "user", "tenant", "deploy", "method", "route", "status", "min_ms"],
+        "jobs" => &["class", "job_id", "outcome", "queue", "status"],
+        "exceptions" => &["source", "class", "handled", "severity", "status"],
+        "logs" => &["source", "level", "status"],
+        "queries" => &["source", "adapter", "connection", "role"],
+        _ => &[],
+    };
+    let mut keys: Vec<&'static str> = if resource == "requests" { vec![] } else { COMMON_KEYS.to_vec() };
+    keys.extend(own);
+    for k in REQUEST_KEYS {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
+/// What is wrong with `p` as a query of `resource`, for the caller to
+/// report: a key the resource does not read, a value an enum-like key does
+/// not take (with the values it does), a key with no value, a time or a
+/// number that does not parse, and the request keys' own checks. `apply`
+/// and `requests` match nothing on such a query; nothing is dropped.
+pub fn check(resource: &str, p: &Parsed) -> Option<String> {
+    let keys = keys_of(resource);
+    if let Some(k) = p.fields.keys().find(|k| !keys.contains(&k.as_str())) {
+        return Some(format!("{k}: is not a key of {resource} (its keys: {})", keys.join(", ")));
+    }
+    for (k, v) in &p.fields {
+        if alternatives(v).next().is_none() {
+            return Some(format!("{k}: has no value"));
+        }
+    }
+    let one_of = |k: &str, valid: &[&str]| -> Option<String> {
+        let v = p.field(k)?;
+        let bad = alternatives(v).find(|a| !valid.contains(a))?;
+        Some(format!("{k}: {bad:?} is not one of {}", valid.join(", ")))
+    };
+    // status: is the resource's own word for its outcome (on requests, a
+    // code or class, below); outcome: on anything but a job is the request
+    // key (check_request_keys).
+    let (status, outcome): (&[&str], &[&str]) = match resource {
+        "jobs" => (&JOB_OUTCOMES, &JOB_OUTCOMES),
+        "exceptions" => (&["handled", "unhandled"], &[]),
+        "logs" => (&LOG_LEVELS, &[]),
+        _ => (&[], &[]),
+    };
+    let enums: [(&str, &[&str]); 6] = [
+        ("kind", &EXECUTION_KINDS),
+        ("level", &LOG_LEVELS),
+        ("severity", &SEVERITIES),
+        ("handled", &["true", "false"]),
+        ("status", status),
+        ("outcome", outcome),
+    ];
+    if let Some(bad) = enums.iter().filter(|(_, valid)| !valid.is_empty()).find_map(|(k, valid)| one_of(k, valid)) {
+        return Some(bad);
+    }
+    if resource == "requests"
+        && let Some(v) = p.field("status")
+        && let Some(bad) = alternatives(v).find(|a| status_range(Some(a)).is_none())
+    {
+        return Some(format!("status: {bad:?} is not a status (a code, 404, or a class, 4xx)"));
+    }
+    if let Some(v) = p.field("min_ms")
+        && v.parse::<f64>().ok().filter(|ms| ms.is_finite() && *ms >= 0.0).is_none()
+    {
+        return Some(format!("min_ms: {v:?} is not a number of milliseconds"));
+    }
+    for k in ["after", "before"] {
+        if let Some(v) = p.field(k)
+            && parse_time(v).is_none()
+        {
+            return Some(format!("{k}: {v:?} is not a time (2026-10-29, 2026-10-29T14:00:00Z)"));
+        }
+    }
+    // A job's outcome: is its own (processed, failed), not its request's.
+    if resource == "jobs" { check_request_keys(&without_job_keys(p)) } else { check_request_keys(p) }
+}
+
+/// Whether the requests table for `p` needs the raw requests: the route
+/// rollups (filter_routes) hold only the method, route and status class, so
+/// any other key (a request key, user:, tenant:, deploy:, min_ms:, after:,
+/// before:) or free text is read from the requests themselves rather than
+/// dropped.
+pub fn needs_raw_requests(p: &Parsed) -> bool {
+    rb::present(Some(&p.text)) || p.fields.keys().any(|k| !["method", "route", "status"].contains(&k.as_str()))
 }
 
 /// Whether `p` has a request-detail key.
@@ -512,6 +667,8 @@ fn alternatives(v: &str) -> impl Iterator<Item = &str> {
 /// row of kind request). A bad value matches nothing (check_request_keys
 /// says why).
 pub fn request_detail(c: &mut Cond, alias: &str, p: &Parsed) {
+    // Only the request keys' own checks: a child-record caller has checked
+    // the rest against its resource.
     if check_request_keys(p).is_some() {
         c.none = true;
         return;
@@ -666,8 +823,11 @@ pub fn requests(conn: &Connection, p: &Parsed, from: i64, to: i64) -> rusqlite::
     // precedes the merged scopes), then requests.between, then the
     // merges, then the rest.
     let mut c = Cond::new();
+    // Callers report what is wrong (check); an unchecked bad query matches
+    // nothing rather than more than it says.
+    c.none = check("requests", p).is_some();
     if let Some(m) = f("method") {
-        c.eq("executions", "method", s(&m.to_uppercase()));
+        c.any_of("executions", "method", &m.to_uppercase());
     }
     // A literal, so the planner can prove the request index's `WHERE kind =
     // 'request'` (a bound kind cannot use a partial index).
@@ -681,9 +841,22 @@ pub fn requests(conn: &Connection, p: &Parsed, from: i64, to: i64) -> rusqlite::
     }
     c.range = Some((lo, hi));
     if let Some(route) = f("route") {
-        let mut named = Cond::new();
-        named_like(conn, &mut named, "request", &route, range, false)?;
-        merge(&mut c, named);
+        // route:a|b: a route name containing either.
+        let mut either = Cond::new();
+        let mut parts = vec![];
+        for alt in alternatives(&route) {
+            let mut named = Cond::new();
+            named_like(conn, &mut named, "request", alt, range, false)?;
+            parts.push(named.parts.join(" AND "));
+            either.binds.extend(named.binds);
+            either.from = named.from.or(either.from);
+        }
+        if parts.len() == 1 {
+            either.parts = parts;
+        } else if !parts.is_empty() {
+            either.parts = vec![format!("(({}))", parts.join(") OR ("))];
+        }
+        merge(&mut c, either);
     }
     if rb::present(Some(&p.text)) {
         let mut named = Cond::new();
@@ -691,16 +864,15 @@ pub fn requests(conn: &Connection, p: &Parsed, from: i64, to: i64) -> rusqlite::
         merge(&mut c, named);
     }
     if let Some(d) = f("deploy") {
-        c.eq("executions", "deploy", s(&d));
+        c.any_of("executions", "deploy", &d);
     }
     if let Some(t) = f("tenant") {
-        c.eq("executions", "app_tenant", s(&t));
+        c.any_of("executions", "app_tenant", &t);
     }
     if let Some(u) = f("user") {
-        c.eq("executions", "user_ref", s(&u));
+        c.any_of("executions", "user_ref", &u);
     }
-    // status:401|403: any of them (an unreadable alternative is skipped,
-    // as an unreadable status is).
+    // status:401|403: any of them (check rejects an unreadable one).
     let ranges: Vec<(i64, i64)> = p.fields.get("status").map_or(vec![], |v| v.split('|').filter_map(|x| status_range(Some(x))).collect());
     if !ranges.is_empty() {
         let ors = vec!["\"executions\".\"status\" BETWEEN ? AND ?"; ranges.len()].join(" OR ");
@@ -995,6 +1167,169 @@ mod tests {
         let c = apply(&t, Resource::Logs, Some("ip:1.2.3.4"), now - 3_600_000_000, now, &[]).unwrap();
         assert!(!c.capped, "exactly at the limit");
         assert_eq!(count(&c), MAX_REQUEST_IDS as i64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tenant with records of every resource: logs at three levels,
+    /// exceptions of three classes and two severities, jobs on three
+    /// queues with two outcomes, queries on two connections.
+    fn mixed(name: &str) -> (std::path::PathBuf, Connection, i64) {
+        let dir = std::env::temp_dir().join(format!("rw-alts-{name}-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = crate::tenants::open_tenant(&dir.join("t.sqlite3")).unwrap();
+        let now = crate::time::parse_db_time("2026-10-16 12:00:00").unwrap();
+        let at = qt(now - 60_000_000);
+        for (level, n) in [("error", 3), ("warn", 2), ("info", 7)] {
+            for _ in 0..n {
+                t.execute("INSERT INTO logs (level, message, occurred_at) VALUES (?1, 'x', ?2)", rusqlite::params![level, at]).unwrap();
+            }
+        }
+        for (class, severity, handled, n) in [("A::Hit", "warning", 1, 1), ("Inertia", "error", 0, 2), ("Other", "error", 0, 4)] {
+            for _ in 0..n {
+                t.execute(
+                    "INSERT INTO exceptions (class_name, message, severity, handled, occurred_at) VALUES (?1, 'm', ?2, ?3, ?4)",
+                    rusqlite::params![class, severity, handled, at],
+                )
+                .unwrap();
+            }
+        }
+        for (i, (queue, outcome)) in [("default", "processed"), ("mailers", "processed"), ("mailers", "failed"), ("low", "processed")].iter().enumerate() {
+            t.execute(
+                "INSERT INTO executions (execution_id, kind, name, queue, outcome, occurred_at, duration) VALUES (?1, 'job_attempt', ?2, ?3, ?4, ?5, 1)",
+                rusqlite::params![format!("j{i}"), format!("Job{i}"), queue, outcome, at],
+            )
+            .unwrap();
+        }
+        for (conn_name, n) in [("primary", 2), ("cache", 3), ("queue", 1)] {
+            for _ in 0..n {
+                t.execute(
+                    "INSERT INTO queries (sql, name, connection, occurred_at, duration) VALUES ('SELECT 1', 'q', ?1, ?2, 1)",
+                    rusqlite::params![conn_name, at],
+                )
+                .unwrap();
+            }
+        }
+        (dir, t, now)
+    }
+
+    fn matched(t: &Connection, resource: Resource, q: &str, now: i64) -> i64 {
+        let table = resource.table();
+        let c = apply(t, resource, Some(q), now - 3_600_000_000, now, &[]).unwrap();
+        let from = c.from.clone().unwrap_or_else(|| format!("\"{table}\""));
+        db::count(t, &format!("SELECT COUNT(*) FROM {from} WHERE {}", c.sql()), rusqlite::params_from_iter(c.binds.iter())).unwrap()
+    }
+
+    /// `a|b` on an exact or enum key is either value, on every resource:
+    /// level:error|warn is the errors and the warnings (it used to be
+    /// every log), class:A|B both classes (it used to be none).
+    #[test]
+    fn alternatives_match_any_of_their_values_on_every_resource() {
+        let (dir, t, now) = mixed("any");
+        for (resource, q, n) in [
+            (Resource::Logs, "level:error", 3),
+            (Resource::Logs, "level:error|warn", 5),
+            (Resource::Logs, "status:warn|info", 9),
+            (Resource::Exceptions, "class:A::Hit|Inertia", 3),
+            (Resource::Exceptions, "severity:error|warning", 7),
+            (Resource::Exceptions, "severity:warning", 1),
+            (Resource::Exceptions, "handled:true|false", 7),
+            (Resource::Exceptions, "status:unhandled", 6),
+            (Resource::Jobs, "queue:default|mailers", 3),
+            (Resource::Jobs, "outcome:processed|failed queue:mailers", 2),
+            (Resource::Jobs, "class:Job0|Job3", 2),
+            (Resource::Queries, "connection:primary|queue", 3),
+        ] {
+            assert_eq!(matched(&t, resource, q, now), n, "{q}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A value an enum key does not take is an error naming the ones it
+    /// does; `apply` matches nothing on it rather than everything.
+    #[test]
+    fn an_unknown_enum_value_is_an_error_listing_the_valid_ones() {
+        let (dir, t, now) = mixed("enum");
+        let cases = [
+            ("logs", "level:bogus", "level: \"bogus\" is not one of debug, info, warn, error, fatal, event, unknown"),
+            ("logs", "level:error|warning", "level: \"warning\" is not one of debug, info, warn, error, fatal, event, unknown"),
+            ("logs", "status:failed", "status: \"failed\" is not one of debug, info, warn, error, fatal, event, unknown"),
+            ("exceptions", "severity:warn", "severity: \"warn\" is not one of fatal, error, warning, info"),
+            ("exceptions", "handled:yes", "handled: \"yes\" is not one of true, false"),
+            ("exceptions", "status:open", "status: \"open\" is not one of handled, unhandled"),
+            ("jobs", "outcome:ok", "outcome: \"ok\" is not one of processed, failed, released, aborted"),
+            ("jobs", "kind:mail", "kind: \"mail\" is not one of request, job, scheduled_task, command, channel_action"),
+            ("requests", "status:oops", "status: \"oops\" is not a status (a code, 404, or a class, 4xx)"),
+            ("requests", "outcome:fine", "outcome: \"fine\" is not one of served, redirected_to_auth, redirected, refused, error"),
+            ("logs", "level:|", "level: has no value"),
+            ("logs", "after:yesterday", "after: \"yesterday\" is not a time (2026-10-29, 2026-10-29T14:00:00Z)"),
+            ("requests", "min_ms:fast", "min_ms: \"fast\" is not a number of milliseconds"),
+        ];
+        for (resource, q, err) in cases {
+            assert_eq!(check(resource, &parse(Some(q))).as_deref(), Some(err), "{resource} {q}");
+        }
+        assert_eq!(matched(&t, Resource::Logs, "level:bogus", now), 0, "nothing, not every log");
+        assert_eq!(matched(&t, Resource::Logs, "", now), 12);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key the resource does not read is an error, not a filter left out
+    /// (queue: on logs used to match every log).
+    #[test]
+    fn a_key_the_resource_does_not_read_is_an_error() {
+        let (dir, t, now) = mixed("keys");
+        let err = check("logs", &parse(Some("queue:x"))).unwrap();
+        assert!(err.starts_with("queue: is not a key of logs (its keys: after, before, user, tenant, deploy, kind, source, level, status, ip,"), "{err}");
+        for (resource, q) in
+            [("exceptions", "level:error"), ("jobs", "severity:error"), ("queries", "class:X"), ("requests", "level:error"), ("requests", "queue:x")]
+        {
+            assert!(check(resource, &parse(Some(q))).unwrap().contains(&format!("is not a key of {resource}")), "{resource} {q}");
+        }
+        assert_eq!(matched(&t, Resource::Logs, "queue:x", now), 0);
+        // Every key a resource reads passes, request keys included.
+        for (resource, q) in [
+            ("logs", "after:2026-10-16 before:2026-10-16T12:00:00Z user:u tenant:t deploy:d kind:job source:app/ level:info status:warn tab:none"),
+            ("exceptions", "class:A severity:error handled:true status:handled source:job path:/x"),
+            ("jobs", "class:A job_id:1 outcome:failed queue:q status:processed ip:192.0.2.1"),
+            ("queries", "source:app/models adapter:sqlite connection:primary role:reading session:s1"),
+            ("requests", "method:get|post route:/a|/b status:401|5xx min_ms:250 deploy:d outcome:served|refused probe:true"),
+        ] {
+            assert_eq!(check(resource, &parse(Some(q))), None, "{resource} {q}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The requests page's grouped table (filter_routes) and the raw reads
+    /// (requests) take alternatives too.
+    #[test]
+    fn route_rows_and_requests_take_alternatives() {
+        let rows = vec![
+            serde_json::json!({"name": "GET /a", "count": 3, "errors": 0, "client_errors": 1}),
+            serde_json::json!({"name": "POST /b", "count": 2, "errors": 1, "client_errors": 0}),
+            serde_json::json!({"name": "DELETE /c", "count": 1, "errors": 0, "client_errors": 0}),
+        ];
+        let names = |q: &str| filter_routes(rows.clone(), Some(q)).iter().map(|r| r["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(names("method:get|post"), ["GET /a", "POST /b"]);
+        assert_eq!(names("route:/b|/c"), ["POST /b", "DELETE /c"]);
+        assert_eq!(names("status:4xx|5xx"), ["GET /a", "POST /b"]);
+
+        let (dir, t, now) = mixed("reqs");
+        for (i, (m, user)) in [("GET", "ada"), ("POST", "bob"), ("DELETE", "cy")].iter().enumerate() {
+            t.execute(
+                "INSERT INTO executions (execution_id, kind, name, method, user_ref, status, occurred_at, duration) VALUES (?1, 'request', ?2, ?3, ?4, 200, ?5, 1)",
+                rusqlite::params![format!("r{i}"), format!("{m} /r"), m, user, qt(now - 60_000_000)],
+            )
+            .unwrap();
+        }
+        let n = |q: &str| {
+            let c = requests(&t, &parse(Some(q)), now - 3_600_000_000, now).unwrap();
+            db::count(&t, &format!("SELECT COUNT(*) FROM \"executions\" WHERE {}", c.sql()), rusqlite::params_from_iter(c.binds.iter())).unwrap()
+        };
+        assert_eq!((n("method:get|post"), n("user:ada|cy"), n("method:get user:bob|cy")), (2, 2, 0));
+        assert_eq!(n("level:error"), 0, "a key requests do not read matches nothing");
+        // Only method, route and status are in the route rollups.
+        let raw = |q: &str| needs_raw_requests(&parse(Some(q)));
+        assert!(!raw("method:get|post route:/a status:5xx"));
+        assert!(raw("user:ada") && raw("min_ms:5") && raw("after:2026-10-16") && raw("deploy:d") && raw("widgets") && raw("ip:192.0.2.1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

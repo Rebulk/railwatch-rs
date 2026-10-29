@@ -1257,3 +1257,28 @@ security audits. Regression tests: `crates/server/tests/security_*.rs`.
    Not a visible link in the dashboard UI: that is the railwatch gem's
    frontend (a follow-up there). The diff harnesses call the router
    directly, below the layer that adds the header, so they are unaffected.
+
+## Filter grammar fails visibly (2026-10-29)
+
+The gem's FilterQuery ignored a key a resource does not read ("Unknown
+fields are inert"), ignored an unknown `level:`, and compared every other
+value with `=`, so `level:error|warn` matched every log, `level:bogus` every
+log, `queue:x` on logs every log, and `class:A|B` or `severity:a|b` nothing.
+Here (`dashboard/filter_query.rs`, `check` and `Cond::any_of`):
+
+1. **`a|b|c` is any of them** on every exact or enum key of every resource
+   (requests, jobs, exceptions, logs, queries), and on the requests page's
+   grouped table (`filter_routes`). `route:` alternatives are ORed substring
+   matches.
+2. **An unknown key, an enum value a key does not take, an empty value, an
+   unparsable `after:`/`before:` or `min_ms:` is an error** that says what is
+   valid: an MCP `error` with a `hint`, a 422 from `/api/v1` and from the
+   dashboard pages (the requests page already answered a bad request key
+   so). `apply` and `requests` match nothing on such a query, so a caller
+   that does not check it gets no rows rather than all of them.
+3. `EXECUTION_KINDS` gains `channel_action` (the gem's fifth execution
+   source), and the job outcomes are the gem's four (processed, failed,
+   released, aborted).
+4. **`get_execution` without an environment** looks the execution id up in
+   each environment the token can see (within the application, when one is
+   named) instead of answering "environment not found".

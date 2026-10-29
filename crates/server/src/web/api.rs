@@ -836,9 +836,9 @@ impl Api<'_> {
         let (from, to) = self.window().range();
         let (sort, dir) = (self.params.opt("sort"), self.params.opt("dir"));
         let parsed = filter_query::parse(self.params.opt("q").as_deref());
-        self.check_request_keys(&parsed)?;
-        if filter_query::has_request_keys(&parsed) {
-            // Only the raw requests hold ip, path, ...: the table from them.
+        self.check_request_keys("requests", &parsed)?;
+        if filter_query::needs_raw_requests(&parsed) {
+            // Only the raw requests hold ip, path, user, ...: the table from them.
             let (scanned, routes) = self.telemetry(e, |conn| {
                 let cond = filter_query::requests(conn, &parsed, from, to)?;
                 Ok(crate::dashboard::request_scan::grouped(conn, &cond, from, to, 200, sort.as_deref(), dir.as_deref())?)
@@ -852,10 +852,11 @@ impl Api<'_> {
         ok(crate::obj! { "data" => items, "meta" => meta })
     }
 
-    /// A query's request keys: a bad value is 422 with what is wrong; ip:
-    /// and ua: (personal data) need the token's security scope (403).
-    fn check_request_keys(&self, parsed: &filter_query::Parsed) -> R<()> {
-        if let Some(bad) = filter_query::check_request_keys(parsed) {
+    /// A query of `resource`: an unknown key or a bad value is 422 with what
+    /// is wrong (filter_query::check); ip: and ua: (personal data) need the
+    /// token's security scope (403).
+    fn check_request_keys(&self, resource: &str, parsed: &filter_query::Parsed) -> R<()> {
+        if let Some(bad) = filter_query::check(resource, parsed) {
             return Err(Halt::Json(StatusCode::UNPROCESSABLE_ENTITY, json!({"error": bad})));
         }
         let personal = filter_query::personal_keys(parsed);
@@ -968,7 +969,7 @@ impl Api<'_> {
         let classes = self.telemetry(e, |conn| Ok(aggregations::grouped(conn, "job_attempt", from, to, 200, sort.as_deref(), dir.as_deref())?))?;
         let (items, meta) = self.paginate(classes)?;
         let q = self.params.opt("q");
-        self.check_request_keys(&filter_query::without_job_keys(&filter_query::parse(q.as_deref())))?;
+        self.check_request_keys("jobs", &filter_query::parse(q.as_deref()))?;
         let (page, queues) = self.telemetry(e, |conn| {
             let cond = filter_query::apply(conn, Resource::Jobs, q.as_deref(), from, to, &[])?;
             let capped = cond.capped;
@@ -995,7 +996,7 @@ impl Api<'_> {
         let (from, to) = self.window().range();
         let (sort, dir) = (self.params.opt("sort"), self.params.opt("dir"));
         let q = self.params.opt("q");
-        self.check_request_keys(&filter_query::parse(q.as_deref()))?;
+        self.check_request_keys("queries", &filter_query::parse(q.as_deref()))?;
         let (grouped, page, n_plus_ones) = std::thread::scope(|s| {
             let grouped = s.spawn(|| -> R<(Vec<Value>, Value, Vec<String>)> {
                 let groups = self.telemetry(e, |conn| Ok(aggregations::grouped(conn, "query", from, to, 200, sort.as_deref(), dir.as_deref())?))?;
@@ -1049,7 +1050,7 @@ impl Api<'_> {
         let offset_asked = self.params.has("page") || self.params.has("per_page");
         let (want_offset, want_cursor) = (offset_asked || !cursor_asked, cursor_asked || !offset_asked);
         let q = self.params.opt("q");
-        self.check_request_keys(&filter_query::parse(q.as_deref()))?;
+        self.check_request_keys(name, &filter_query::parse(q.as_deref()))?;
         let mut capped = false;
         let (offset_page, cursor) = self.telemetry(e, |conn| {
             let cond = filter_query::apply(conn, resource, q.as_deref(), from, to, &[])?;
@@ -2458,6 +2459,47 @@ mod tests {
         assert!(none["data"].as_array().unwrap().is_empty());
         // Without a request key the table is the rollups' as before (no scan).
         assert!(get(&f, &format!("{base}/requests"), "read_only").1.get("scan").is_none());
+    }
+
+    /// The API takes `a|b` and answers a key or value the resource does not
+    /// read with a 422 that says which, instead of an unfiltered 200.
+    #[test]
+    fn filters_take_alternatives_and_a_bad_key_or_value_is_a_422() {
+        let f = fixture("filter-422");
+        let slug: String = f.c.with(|x| x.query_row("SELECT slug FROM environments WHERE id = ?", [f.env], |r| r.get(0))).unwrap();
+        let conn = crate::tenants::open_tenant(&f.dir.join("telemetry").join(format!("{slug}.sqlite3"))).unwrap();
+        for level in ["error", "warn", "info", "info"] {
+            conn.execute("INSERT INTO logs (level, message, occurred_at) VALUES (?1, 'x', ?2)", params![level, qt(NOW - 60_000_000)]).unwrap();
+        }
+        let base = format!("/api/v1/applications/{}/environments/{}", f.app, f.env);
+        let (status, logs) = get(&f, &format!("{base}/logs?q=level:error%7Cwarn"), "read_only");
+        assert_eq!((status, logs["data"].as_array().map(Vec::len)), (200, Some(2)), "{logs}");
+        for (path, q, err) in [
+            ("logs", "level:bogus", "level: \"bogus\" is not one of debug, info, warn, error, fatal, event, unknown"),
+            ("exceptions", "severity:warn", "severity: \"warn\" is not one of fatal, error, warning, info"),
+            ("jobs", "outcome:ok", "outcome: \"ok\" is not one of processed, failed, released, aborted"),
+            ("requests", "status:oops", "status: \"oops\" is not a status (a code, 404, or a class, 4xx)"),
+        ] {
+            assert_eq!(get(&f, &format!("{base}/{path}?q={q}"), "read_only"), (422, json!({"error": err})), "{path} {q}");
+        }
+        // The route table under a key the route rollups do not hold (user:)
+        // comes from the raw requests rather than leaving the key out.
+        for (i, (route, user)) in [("GET /a", "ada"), ("GET /b", "bob")].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO executions (execution_id, kind, name, method, group_hash, status, user_ref, occurred_at, duration) VALUES (?1, 'request', ?2, 'GET', ?3, 200, ?4, ?5, 1000)",
+                params![format!("r{i}"), route, format!("g{i}"), user, qt(NOW - 60_000_000)],
+            )
+            .unwrap();
+        }
+        let (status, routes) = get(&f, &format!("{base}/requests?q=user:ada"), "read_only");
+        let names: Vec<&str> = routes["data"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!((status, names), (200, vec!["GET /a"]), "{routes}");
+        assert_eq!(routes["scan"], json!({"scanned": 1, "capped": false}));
+        for (path, key) in [("logs", "queue:x"), ("queries", "level:error"), ("requests", "class:X")] {
+            let (status, body) = get(&f, &format!("{base}/{path}?q={key}"), "read_only");
+            assert_eq!(status, 422, "{path} {key}");
+            assert!(body["error"].as_str().unwrap().contains(&format!("is not a key of {path}")), "{body}");
+        }
     }
 
     #[test]

@@ -53,8 +53,9 @@ description. Your agent's prompt should say it too (see below). A path like
 ## The filter grammar
 
 `search_requests`, `query_requests`, `search_telemetry`, `/api/v1` and the
-dashboard's Requests filter bar share one grammar: `key:value` words plus
-free text (which matches the route name).
+dashboard's filter bars share one grammar: `key:value` words plus free text
+(which matches the route name; on `search_telemetry`, the message, class,
+job or SQL).
 
 | Key | Matches |
 |---|---|
@@ -76,6 +77,41 @@ Names are exact. `true`/`false` stand alone (`halted:true|authenticate` is
 an error). On `search_telemetry`'s jobs, `outcome:` keeps its old meaning
 (the job's own processed/failed); on exceptions, logs and queries it selects
 the records of requests with that outcome.
+
+### Several values, and what is an error
+
+Any key that matches a value exactly takes several with `|` and matches any
+of them, on every resource: `status:401|403`, `method:GET|POST`,
+`user:42|43`, and on `search_telemetry` `level:error|warn`,
+`class:ScrapeTrapHit::Hit|InertiaInvalidResponse`, `severity:error|warning`,
+`queue:default|mailers`, `outcome:processed|failed`. A substring key takes
+them too (`route:session|password`, `path:/admin*|/.env`).
+
+A filter is never silently dropped. Each of these is an error (a tool's
+`error` with a `hint`; `422` from `/api/v1` and the dashboard) that says what
+is wrong:
+
+- a key the resource does not read (`queue:` on logs, `level:` on requests),
+  listing the keys it does;
+- a value an enum key does not take, listing the ones it does: `level`
+  (debug, info, warn, error, fatal, event, unknown), `severity` (fatal,
+  error, warning, info), `handled` (true, false), `kind` (request, job,
+  scheduled_task, command, channel_action), `outcome` on jobs (processed,
+  failed, released, aborted) and on requests (below), and `status`, which is
+  the resource's own word: a code or class on requests, the level on logs,
+  handled/unhandled on exceptions, the outcome on jobs;
+- an empty value (`level:|`), an `after:`/`before:` that is not a time, a
+  `min_ms:` that is not a number.
+
+Keys by resource (the request keys above work on all of them):
+
+| Resource | Keys |
+|---|---|
+| requests | `after`, `before`, `user`, `tenant`, `deploy`, `method`, `route`, `status`, `min_ms` |
+| jobs | `after`, `before`, `user`, `tenant`, `deploy`, `kind`, `class`, `job_id`, `outcome`, `queue`, `status` |
+| exceptions | `after`, `before`, `user`, `tenant`, `deploy`, `kind`, `source`, `class`, `handled`, `severity`, `status` |
+| logs | `after`, `before`, `user`, `tenant`, `deploy`, `kind`, `source`, `level`, `status` |
+| queries | `after`, `before`, `user`, `tenant`, `deploy`, `kind`, `source`, `adapter`, `connection`, `role` |
 
 ### Outcomes
 
