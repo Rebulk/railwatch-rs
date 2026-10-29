@@ -60,6 +60,7 @@ fn tally_sorted(items: impl Iterator<Item = String>, first: Option<usize>) -> Ve
 // -- queries -----------------------------------------------------------------
 
 pub fn queries_index(conn: &Connection, ctx: &PageContext, _control: &dyn ControlData) -> R {
+    check_q(ctx, "queries")?;
     let (from, to) = ctx.range();
     let cond = filter_query::apply(conn, Resource::Queries, ctx.param("q"), from, to, &[])?;
     let page = cursor_page::call(
@@ -527,6 +528,7 @@ pub mod n_plus_one {
 // -- exceptions --------------------------------------------------------------
 
 pub fn exceptions_index(conn: &Connection, ctx: &PageContext, control: &dyn ControlData) -> R {
+    check_q(ctx, "exceptions")?;
     let (from, to) = ctx.range();
     let cond = filter_query::apply(conn, Resource::Exceptions, ctx.param("q"), from, to, &[])?;
     let page = cursor_page::call(
@@ -622,6 +624,7 @@ fn exception_series(conn: &Connection, ctx: &PageContext) -> rusqlite::Result<Va
 // -- logs --------------------------------------------------------------------
 
 pub fn logs_index(conn: &Connection, ctx: &PageContext, _control: &dyn ControlData) -> R {
+    check_q(ctx, "logs")?;
     let (from, to) = ctx.range();
     let cond = filter_query::apply(conn, Resource::Logs, ctx.param("q"), from, to, &[])?;
     let page = cursor_page::call(
@@ -1549,6 +1552,7 @@ pub fn visits_index(conn: &Connection, ctx: &PageContext, _control: &dyn Control
 /// with delta, series, n+1s, the cursor page) on separate read connections.
 /// Same props, same key order.
 pub fn queries_index_parallel(pools: &crate::dashboard::pool::ReadPools, slug: &str, ctx: &PageContext, _control: &(dyn ControlData + Sync)) -> R {
+    check_q(ctx, "queries")?;
     let (from, to) = ctx.range();
     let run = |f: &(dyn Fn(&Connection) -> R + Sync)| -> R {
         let conn = pools.get(slug)?;
@@ -1760,18 +1764,25 @@ mod per_day_tests {
             vec![("window", "7d"), ("sort", "p95"), ("dir", "asc")],
         ] {
             let c = ctx(&params);
-            let a = logs_index(&single, &c, &StaticControl::default()).unwrap();
-            let b = logs_index(&days, &c, &StaticControl::default()).unwrap();
-            assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap(), "logs {params:?}");
-            let a = queries_index(&single, &c, &StaticControl::default()).unwrap();
-            let b = queries_index(&days, &c, &StaticControl::default()).unwrap();
-            assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap(), "queries {params:?}");
+            // The props, or the 422 a page gives a key it does not read
+            // (level: on queries): the same from both layouts.
+            let out = |r: R| match r {
+                Ok(v) => serde_json::to_string(&v).unwrap(),
+                Err(PageError::Unprocessable(m)) => format!("422 {m}"),
+                Err(e) => panic!("{params:?}: {e}"),
+            };
+            let a = out(logs_index(&single, &c, &StaticControl::default()));
+            let b = out(logs_index(&days, &c, &StaticControl::default()));
+            assert_eq!(a, b, "logs {params:?}");
+            let a = out(queries_index(&single, &c, &StaticControl::default()));
+            let b = out(queries_index(&days, &c, &StaticControl::default()));
+            assert_eq!(a, b, "queries {params:?}");
             for page in
                 [crate::dashboard::pages::jobs_index as fn(&Connection, &PageContext, &dyn ControlData) -> R, people_index, profiles_index, tenants_index]
             {
-                let a = page(&single, &c, &StaticControl::default()).unwrap();
-                let b = page(&days, &c, &StaticControl::default()).unwrap();
-                assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap(), "{params:?}");
+                let a = out(page(&single, &c, &StaticControl::default()));
+                let b = out(page(&days, &c, &StaticControl::default()));
+                assert_eq!(a, b, "{params:?}");
             }
         }
         let tenants = tenants_index(&days, &ctx(&[("window", "7d")]), &StaticControl::default()).unwrap();
@@ -1782,6 +1793,68 @@ mod per_day_tests {
         assert_eq!(queues.as_array().unwrap().len(), 2, "{queues}");
         let counts = logs_index(&days, &ctx(&[("window", "7d")]), &StaticControl::default()).unwrap()["counts"].clone();
         assert_eq!(serde_json::to_string(&counts).unwrap(), r#"{"debug":5,"error":5,"info":15,"warn":5}"#);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every key and option the dashboard's filter bars offer (frontend
+    /// pages/*/index.tsx) is a query its page takes; a key the page does
+    /// not read, or a value it does not take, is a 422 saying which.
+    #[test]
+    fn the_filter_bars_choices_pass_and_anything_else_is_a_422() {
+        let dir = std::env::temp_dir().join(format!("rw-bars-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::tenants::open_tenant(&dir.join("t.sqlite3")).unwrap();
+        let ctx = |q: &str| {
+            let params = [("window", "24h"), ("q", q)].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            PageContext::new(1, crate::time::parse_db_time("2026-10-16 12:00:00").unwrap(), params, crate::dashboard::CursorKey(b"k".to_vec()))
+        };
+        type Page = fn(&Connection, &PageContext, &dyn ControlData) -> R;
+        let kinds = ["kind:request", "kind:job", "kind:scheduled_task", "kind:command"];
+        let common = ["after:2026-10-16T11:00", "before:2026-10-16", "user:u", "tenant:t", "deploy:d"];
+        let pages: [(&str, Page, Vec<&str>); 5] = [
+            ("logs", logs_index, [&common[..], &kinds, &["source:app/jobs/sync_job.rb:12", "level:debug|info|warn|error|fatal|event|unknown"]].concat()),
+            (
+                "exceptions",
+                exceptions_index,
+                [&common[..], &kinds, &["source:app/", "class:A", "handled:true", "handled:false", "severity:fatal|error|warning|info"]].concat(),
+            ),
+            (
+                "jobs",
+                crate::dashboard::pages::jobs_index,
+                [&common[..], &["kind:job", "queue:default", "class:A", "job_id:1", "outcome:processed", "outcome:failed"]].concat(),
+            ),
+            ("queries", queries_index, [&common[..], &kinds, &["source:app/models", "connection:primary", "role:reading", "adapter:sqlite"]].concat()),
+            (
+                "requests",
+                crate::dashboard::pages::requests_index,
+                vec![
+                    "method:GET|POST|PUT|PATCH|DELETE",
+                    "status:2xx|3xx|4xx|5xx",
+                    "route:/widgets",
+                    "path:/a",
+                    "probe:true",
+                    "rate_limited:true",
+                    "halted:true",
+                ],
+            ),
+        ];
+        for (name, page, choices) in pages {
+            for q in choices {
+                assert!(page(&conn, &ctx(q), &StaticControl::default()).is_ok(), "{name} {q}");
+            }
+            let bad = |q: &str| match page(&conn, &ctx(q), &StaticControl::default()) {
+                Err(PageError::Unprocessable(m)) => m,
+                other => panic!("{name} {q}: {other:?}"),
+            };
+            assert!(bad("nope:x").starts_with(&format!("nope: is not a key of {name}")), "{name}");
+        }
+        assert_eq!(
+            match logs_index(&conn, &ctx("level:error|warning"), &StaticControl::default()) {
+                Err(PageError::Unprocessable(m)) => m,
+                other => panic!("{other:?}"),
+            },
+            "level: \"warning\" is not one of debug, info, warn, error, fatal, event, unknown"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

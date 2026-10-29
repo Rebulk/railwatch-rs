@@ -40,6 +40,16 @@ pub(crate) fn select(conn: &Connection, table: &str, select: &str, cond: &Cond, 
     db::query(conn, &sql, rusqlite::params_from_iter(cond.binds.iter()))
 }
 
+/// The page's `q` as a query of `resource` (filter_query::check): a key
+/// the resource does not read or a value it does not take is a 422 saying
+/// which, not a filter quietly left out.
+pub(crate) fn check_q(ctx: &PageContext, resource: &str) -> Result<(), PageError> {
+    match super::filter_query::check(resource, &super::filter_query::parse(ctx.param("q"))) {
+        Some(bad) => Err(PageError::Unprocessable(bad)),
+        None => Ok(()),
+    }
+}
+
 /// `where(occurred_at: from..to)` on `table`.
 pub(crate) fn between(table: &str, from: i64, to: i64) -> Cond {
     let mut c = Cond::new();

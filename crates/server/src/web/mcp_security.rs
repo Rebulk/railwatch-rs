@@ -70,9 +70,11 @@ impl Mcp<'_> {
         self.token.allows(SECURITY_SCOPE)
     }
 
-    /// The refusal for a query using ip:/ua: without security access.
-    pub(super) fn request_keys_refused(&self, p: &Parsed) -> Option<Value> {
-        if let Some(bad) = filter_query::check_request_keys(p) {
+    /// The refusal for a query of `resource` (requests, jobs, exceptions,
+    /// logs, queries) that filter_query::check finds wrong, or that uses
+    /// ip:/ua: without security access.
+    pub(super) fn request_keys_refused(&self, resource: &str, p: &Parsed) -> Option<Value> {
+        if let Some(bad) = filter_query::check(resource, p) {
             return Some(json!({"error": bad, "hint": FILTER_HINT}));
         }
         let personal = filter_query::personal_keys(p);
@@ -90,7 +92,7 @@ impl Mcp<'_> {
             Err(e) => return Ok(e.to_string()),
         };
         let parsed = filter_query::parse(Some(&a.s("q")));
-        if let Some(refused) = self.request_keys_refused(&parsed) {
+        if let Some(refused) = self.request_keys_refused("requests", &parsed) {
             return Ok(refused.to_string());
         }
         let (from, to) = self.window(a);
@@ -127,7 +129,7 @@ impl Mcp<'_> {
         let limit = clamp(a.get("limit"), 100, 500)? as usize;
         let mut parsed = filter_query::parse(Some(&a.s("q")));
         parsed.fields.insert("ip".into(), ip.clone());
-        if let Some(refused) = self.request_keys_refused(&parsed) {
+        if let Some(refused) = self.request_keys_refused("requests", &parsed) {
             return Ok(refused.to_string());
         }
         let shape = match compact::shape(a, Shape::Grouped) {
@@ -556,7 +558,7 @@ pub(super) fn access_json(access: bool) -> Value {
     if access { json!({"client_fields": true}) } else { json!({"client_fields": false, "missing": MISSING}) }
 }
 
-const FILTER_HINT: &str = "Request keys: ip:1.2.3.4, ip:10.0.0.0/8 (IPv4 CIDR), ip:2001:db8:* (prefix); ua:curl (substring); path:.env (substring), path:/admin* (prefix); probe:true; rate_limited:true; halted:true; unpermitted:true. Several values of one key: status:401|403.";
+const FILTER_HINT: &str = "Request keys: ip:1.2.3.4, ip:10.0.0.0/8 (IPv4 CIDR), ip:2001:db8:* (prefix); ua:curl (substring); path:.env (substring), path:/admin* (prefix); probe:true; rate_limited:true; halted:true; unpermitted:true. Several values of one key: status:401|403, level:error|warn, class:A|B. A key the resource does not read, or a value an enum key (level, severity, handled, kind, outcome, status) does not take, is an error that lists what it does take.";
 
 const NEXT: &str = "Each row's q selects its requests: pass it to search_requests for the rows (with execution_id), or to query_requests with another group_by to pivot. get_execution on a sample_execution_id for one request.";
 

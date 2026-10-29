@@ -1507,7 +1507,7 @@ impl Mcp<'_> {
         let q = if q.is_null() { None } else { Some(to_s(q)) };
         let parsed = filter_query::parse(q.as_deref());
         let limit = clamp(a.get("limit"), 50, 200)?;
-        if let Some(refused) = self.request_keys_refused(&parsed) {
+        if let Some(refused) = self.request_keys_refused("requests", &parsed) {
             return Ok(refused.to_string());
         }
         let group = a.presence("group");
@@ -1718,18 +1718,64 @@ impl Mcp<'_> {
     }
 
     fn get_execution(&self, a: &Args) -> R<String> {
-        let Some(env) = self.resolve_environment(a)? else { return self.no_environment(a) };
         let eid = a.s("execution_id");
         if !a.present("execution_id") {
             return Ok(json!({"error": "execution_id is required", "hint": "Take one from search_requests, get_route's slowest_requests, an issue's sample_occurrence, or call last_execution for the newest request or job."}).to_string());
         }
+        let find =
+            |conn: &Connection| db::query_one(conn, "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"execution_id\" = ?1 LIMIT 1", [&eid]);
+        let env = match self.resolve_environment(a)? {
+            Some(env) => env,
+            // An execution id is a UUID: without an environment (get_issue
+            // hands ids out without one) it is looked up in each one this
+            // token can see, within the application when one is named.
+            None if !a.present("environment") => {
+                let mut found = vec![];
+                for env in self.environments_to_search(a)? {
+                    if self.env.tenants.layout(&env.slug).is_some() && self.with_telemetry(&env, |conn| Ok(find(conn)?.is_some()))? {
+                        found.push(env);
+                    }
+                }
+                match found.len() {
+                    1 => found.pop().expect("one"),
+                    // An application named that this token cannot see: say so.
+                    0 if Self::application_identity_given(a) && self.resolve_application(a)?.is_none() => return self.no_environment(a),
+                    0 => return Ok(json!({"error": "execution not found", "hint": "No environment this token can see has an execution with this id. Executions are kept for the environment's retention period, and only sampled-in ones are stored. Search recent ones with search_requests, or call last_execution."}).to_string()),
+                    _ => return self.no_environment(a),
+                }
+            }
+            None => return self.no_environment(a),
+        };
         self.with_telemetry(&env, |conn| {
-            let Some(exe) = db::query_one(conn, "SELECT \"executions\".* FROM \"executions\" WHERE \"executions\".\"execution_id\" = ?1 LIMIT 1", [&eid])?
-            else {
+            let Some(exe) = find(conn)? else {
                 return Ok(json!({"error": "execution not found", "hint": "Executions are kept for the environment's retention period, and only sampled-in ones are stored. Search recent ones with search_requests, or call last_execution."}).to_string());
             };
             Ok(self.execution_detail(conn, &env, &exe, a)?.to_string())
         })
+    }
+
+    /// The environments of the application `a` names, or of every
+    /// application this token can see when it names none.
+    fn environments_to_search(&self, a: &Args) -> R<Vec<EnvRow>> {
+        let apps = if Self::application_identity_given(a) { self.resolve_application(a)?.into_iter().collect() } else { self.accessible_applications()? };
+        if apps.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut out = vec![];
+        for app in apps {
+            for (name, slug, id) in self.environments_of(app.id)? {
+                out.push(EnvRow {
+                    id,
+                    name,
+                    slug,
+                    application_id: app.id,
+                    app_slug: app.slug.clone(),
+                    account_slug: app.account_slug.clone(),
+                    last_seen_at: None,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// The newest execution, optionally of one kind and matching a path or
@@ -1827,11 +1873,11 @@ impl Mcp<'_> {
         let q = a.get("q");
         let q_s = if q.is_null() { None } else { Some(to_s(q)) };
         let parsed = filter_query::parse(q_s.as_deref());
-        // A job's outcome: (processed, failed) is its own field, not a request key.
-        let parsed = if resource == "jobs" { filter_query::without_job_keys(&parsed) } else { parsed };
-        if let Some(refused) = self.request_keys_refused(&parsed) {
+        if let Some(refused) = self.request_keys_refused(&resource, &parsed) {
             return Ok(refused);
         }
+        // A job's outcome: (processed, failed) is its own field, not a request key.
+        let parsed = if resource == "jobs" { filter_query::without_job_keys(&parsed) } else { parsed };
         let window = a.presence("window").unwrap_or_else(|| "24h".into());
         // FilterQuery.cursor_context(environment_id:, resource:, query:, window:)
         let context = {
@@ -3381,6 +3427,139 @@ mod tests {
         assert!(apps["hint"].as_str().unwrap().starts_with("This token can see more than one application"), "{apps}");
         assert_eq!(apps["available"].as_array().unwrap().len(), 2);
         assert_eq!(f.tool("search_requests", json!({"application_slug": "shop", "environment": "development"}))["rows"][0]["execution_id"], "e1");
+    }
+
+    /// An execution id is a UUID: get_execution finds it without an
+    /// application or environment, in whichever of the token's
+    /// environments holds it (get_issue hands ids out without one).
+    #[test]
+    fn get_execution_finds_an_execution_id_in_any_environment_the_token_sees() {
+        let f = seeded("exec-anywhere");
+        let insert = |c: &Connection, eid: &str, name: &str| {
+            c.execute(
+                "INSERT INTO executions (execution_id, kind, name, occurred_at, duration) VALUES (?1, 'request', ?2, ?3, 1000)",
+                params![eid, name, qt(NOW - 1_000_000)],
+            )
+            .unwrap();
+        };
+        insert(&f.tenant(), "e-dev", "GET /dev");
+        // A second environment and a second application, each with its own.
+        let (prod, _) = f.c.tx(|tx| create_environment(tx, f.app, "production")).unwrap();
+        let account: i64 = f.c.with(|x| x.query_row("SELECT account_id FROM applications WHERE id = ?", [f.app], |r| r.get(0))).unwrap();
+        let admin = f.c.tx(|tx| insert_application(tx, account, "Admin", "admin", "ADM", None, "main")).unwrap();
+        let (admin_env, _) = f.c.tx(|tx| create_environment(tx, admin, "production")).unwrap();
+        for (env, eid, name) in [(prod, "e-prod", "GET /prod"), (admin_env, "e-admin", "GET /admin")] {
+            let slug: String = f.c.with(|x| x.query_row("SELECT slug FROM environments WHERE id = ?", [env], |r| r.get(0))).unwrap();
+            let c = crate::tenants::open_tenant(&f.dir.join("telemetry").join(format!("{slug}.sqlite3"))).unwrap();
+            insert(&c, eid, name);
+        }
+        for (eid, name) in [("e-dev", "GET /dev"), ("e-prod", "GET /prod"), ("e-admin", "GET /admin")] {
+            let v = f.tool("get_execution", json!({"execution_id": eid}));
+            assert_eq!(v["name"], name, "{v}");
+        }
+        // Within the application named, and only there.
+        assert_eq!(f.tool("get_execution", json!({"application_slug": "shop", "execution_id": "e-prod"}))["name"], "GET /prod");
+        let elsewhere = f.tool("get_execution", json!({"application_slug": "shop", "execution_id": "e-admin"}));
+        assert_eq!(elsewhere["error"], "execution not found", "{elsewhere}");
+        let missing = f.tool("get_execution", json!({"execution_id": "e-none"}));
+        assert_eq!(missing["error"], "execution not found");
+        assert!(missing["hint"].as_str().unwrap().starts_with("No environment this token can see"), "{missing}");
+        // A wrong environment is still said to be wrong.
+        assert_eq!(
+            f.tool("get_execution", json!({"application_slug": "shop", "environment": "staging", "execution_id": "e-dev"}))["error"],
+            "environment not found"
+        );
+    }
+
+    /// search_telemetry and search_logs (the table an agent hit in
+    /// production): alternatives match either value, and an unknown value or
+    /// key is an error saying what is valid, never every record or none.
+    #[test]
+    fn search_telemetry_takes_alternatives_and_refuses_what_it_cannot_filter_on() {
+        let f = seeded("alternatives");
+        let c = f.tenant();
+        let at = qt(NOW - 60_000_000);
+        for (level, n) in [("error", 3), ("warn", 2), ("info", 20)] {
+            for i in 0..n {
+                c.execute("INSERT INTO logs (level, message, occurred_at) VALUES (?1, ?2, ?3)", params![level, format!("{level} line {i}"), at]).unwrap();
+            }
+        }
+        for (class, severity, handled) in [("ScrapeTrapHit::Hit", "warning", 1), ("InertiaInvalidResponse", "error", 0), ("Other", "error", 0)] {
+            c.execute(
+                "INSERT INTO exceptions (class_name, message, severity, handled, occurred_at) VALUES (?1, 'm', ?2, ?3, ?4)",
+                params![class, severity, handled, at],
+            )
+            .unwrap();
+        }
+        for (i, queue) in ["default", "mailers", "low"].iter().enumerate() {
+            c.execute(
+                "INSERT INTO executions (execution_id, kind, name, queue, outcome, occurred_at, duration) VALUES (?1, 'job_attempt', 'J', ?2, 'processed', ?3, 1)",
+                params![format!("j{i}"), queue, at],
+            )
+            .unwrap();
+        }
+        drop(c);
+        let matched = |resource: &str, q: &str| {
+            let v = f.tool("search_telemetry", json!({"resource": resource, "q": q, "window": "24h", "shape": "rows", "limit": 200}));
+            assert!(v.get("error").is_none(), "{resource} {q}: {v}");
+            v["data"].as_array().unwrap().len()
+        };
+        assert_eq!(matched("logs", "level:error"), 3);
+        assert_eq!(matched("logs", "level:error|warn"), 5, "the errors and warnings, not every log");
+        assert_eq!(matched("exceptions", "class:ScrapeTrapHit::Hit|InertiaInvalidResponse"), 2);
+        assert_eq!(matched("exceptions", "severity:error|warning"), 3);
+        assert_eq!(matched("jobs", "queue:default|mailers"), 2);
+        let grouped = f.tool("search_logs", json!({"q": "level:error|warn"}));
+        assert_eq!(grouped["matched"], 5, "{grouped}");
+
+        let refused = |resource: &str, q: &str| {
+            let v = f.tool("search_telemetry", json!({"resource": resource, "q": q, "window": "24h"}));
+            assert!(v.get("data").is_none() && v.get("entries").is_none(), "{resource} {q}: {v}");
+            assert!(v["hint"].as_str().unwrap().contains("level:error|warn"), "{v}");
+            v["error"].as_str().unwrap().to_string()
+        };
+        assert_eq!(refused("logs", "level:bogus"), "level: \"bogus\" is not one of debug, info, warn, error, fatal, event, unknown");
+        assert_eq!(refused("exceptions", "severity:warn"), "severity: \"warn\" is not one of fatal, error, warning, info");
+        assert!(refused("logs", "queue:x").starts_with("queue: is not a key of logs (its keys: "));
+        assert!(refused("jobs", "level:error").starts_with("level: is not a key of jobs"));
+        // search_logs' level argument goes through the same check.
+        assert_eq!(
+            f.tool("search_logs", json!({"q": "", "level": "bogus"}))["error"],
+            "level: \"bogus\" is not one of debug, info, warn, error, fatal, event, unknown"
+        );
+        // The requests tools refuse a key they do not read too.
+        assert!(f.tool("search_requests", json!({"q": "level:error"}))["error"].as_str().unwrap().starts_with("level: is not a key of requests"));
+        assert!(
+            f.tool("query_requests", json!({"q": "queue:x", "group_by": ["route"]}))["error"].as_str().unwrap().starts_with("queue: is not a key of requests")
+        );
+    }
+
+    /// Each grouped entry's expand q (its filter plus after:/before:) is
+    /// taken by the tool it is for, including a filter with alternatives.
+    #[test]
+    fn every_expand_q_runs_without_an_error() {
+        let f = seeded("expand-alts");
+        let c = f.tenant();
+        for i in 0..6 {
+            let level = if i % 2 == 0 { "error" } else { "warn" };
+            c.execute(
+                "INSERT INTO logs (level, message, occurred_at) VALUES (?1, 'Payment failed', ?2)",
+                params![level, qt(NOW - (60 + i) * 1_000_000 - 123_456)],
+            )
+            .unwrap();
+        }
+        c.execute("INSERT INTO logs_fts (rowid, message) SELECT id, message FROM logs", []).unwrap();
+        drop(c);
+        for q in ["level:error|warn", "level:warn", "Payment"] {
+            let v = f.tool("search_telemetry", json!({"resource": "logs", "q": q, "window": "24h"}));
+            let entries = v["entries"].as_array().unwrap_or_else(|| panic!("{q}: {v}"));
+            assert!(!entries.is_empty(), "{q}: {v}");
+            for e in entries {
+                let page = f.tool("search_telemetry", e["expand"].clone());
+                assert!(page.get("error").is_none(), "{q} expand {}: {page}", e["expand"]);
+                assert_eq!(page["meta"]["group_rows"], e["count"], "{q}: {page}");
+            }
+        }
     }
 
     /// An exception issue whose sample is its latest occurrence, raised
