@@ -383,7 +383,8 @@ pub fn aggregate_hinted(
 /// queries by duration to find a window, which pays in one big file but, in
 /// every day file, costs more than each file's own occurred_at plan (queries@1h
 /// 1.9 -> 9.9 ms with it). `idx_queries_explained` is the API's explained groups.
-/// `idx_executions_requests` is the security reads' (schema::ADDED_INDEXES).
+/// `idx_executions_requests` is the security reads' (schema::ADDED_INDEXES),
+/// `idx_executions_sessions` and `idx_visits_sessions` a session journey's.
 const HINTED: &[(&str, Option<&str>)] = &[
     ("executions", Some("index_executions_on_group_hash_and_occurred_at")),
     ("executions", Some("idx_executions_with_preview")),
@@ -391,6 +392,8 @@ const HINTED: &[(&str, Option<&str>)] = &[
     ("executions", None),
     ("queries", Some("idx_queries_explained")),
     ("executions", Some(crate::schema::REQUEST_INDEX)),
+    ("executions", Some(crate::schema::SESSION_INDEX)),
+    ("visits", Some(crate::schema::VISIT_SESSION_INDEX)),
 ];
 
 fn hinted_view(table: &str, hint: Option<&str>) -> String {

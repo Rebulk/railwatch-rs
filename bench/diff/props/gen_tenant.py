@@ -27,6 +27,14 @@ agent, Referer/X-Forwarded-For headers, rate_limited, halted_callback,
 unpermitted_parameters) with ~2% planted attack traffic: scanners hitting
 probe paths, 401 bursts on a sign-in route (docs/PERF.md, "Security filters").
 
+--sessions: browser sessions across tabs (docs/sessions.md). Requests from a
+browser (not the hot ingest route, jobs or probes) and visits carry a
+`session_id` (one day-long session taking a quarter of them, the rest in
+one of 4 staggered ~20 min sessions live at the time, each session one
+user's) and a `tab_id` (1-3 tabs a session);
+one request in ten is a full page load with the session and no tab
+(docs/PERF.md, "Session journeys").
+
 --prod-shape (implies --security): requests shaped like rebulk-system's
 production: 60% are one hot IoT ingest route (POST /api/v1/ingest/scale_live
 from a few gateways, one query each, no logs or views); the probes split
@@ -51,6 +59,7 @@ ap.add_argument("--by-time", action="store_true")
 ap.add_argument("--few-logs", action="store_true")
 ap.add_argument("--security", action="store_true")
 ap.add_argument("--prod-shape", action="store_true")
+ap.add_argument("--sessions", action="store_true")
 a = ap.parse_args()
 a.security = a.security or a.prod_shape
 
@@ -180,6 +189,27 @@ def security_fields(p, route):
             size = rng.randrange(800, 60000) if p["status_code"] == 200 else 0
         p["redirect_to"], p["response_size"] = redirect, size
 
+# Browser sessions. Slot 0 is one long session a day (a dashboard left
+# open, polling, to its 24 h cap) with a quarter of the browser traffic.
+# The rest go to one of the SESSIONS_LIVE sessions going at that moment:
+# each ~20 minutes long, staggered, so a session collects a few dozen
+# requests. Each session is one user's.
+SESSIONS_LIVE = 4
+SESSION_SPAN = 1200
+
+def session_for(ts):
+    """(session_id, tab_id or None, user) for a browser request at ts."""
+    if rng.random() < 0.25:
+        sid = md5("s", "0", str(int(ts // 86400)))[:22]
+    else:
+        slot = rng.randrange(1, SESSIONS_LIVE + 1)
+        sid = md5("s", str(slot), str(int((ts + slot * 97) // SESSION_SPAN)))[:22]
+    h = int(md5("t", sid), 16)
+    tabs = 1 + h % 3
+    users = [u for u in USERS if u]
+    tab = None if rng.random() < 0.1 else md5("tab", sid, str(rng.randrange(tabs)))[:16]
+    return sid, tab, users[h % len(users)]
+
 def execution(ts):
     eid, trace = uid(), uid()
     user, tenant = rng.choice(USERS), rng.choice(TENANTS)
@@ -204,6 +234,10 @@ def execution(ts):
             return [p, q]
         if a.security:
             security_fields(p, route)
+        if a.sessions and p.get("route") != "unmatched":
+            p["session_id"], tab, p["user"] = session_for(ts)
+            if tab:
+                p["tab_id"] = tab
     elif kind == "job_attempt":
         name = rng.choice(JOBS)
         p["name"], p["_group"] = name, md5(name)
@@ -330,6 +364,9 @@ def execution(ts):
         vi["cls"] = rng.choice([None, 0.05, 0.2, 0.31])
         vi["status"] = rng.choice(["200", "200", "error"])
         vi["user"], vi["tenant"] = user, tenant
+        if a.sessions:
+            vi["session_id"], tab, vi["user"] = session_for(ts)
+            vi["tab_id"] = tab or md5("tab", vi["session_id"], "0")[:16]
         out.append(vi)
     if rng.random() < 0.02:
         se = base("session", ts)

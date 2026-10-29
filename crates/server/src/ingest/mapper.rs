@@ -414,10 +414,10 @@ fn mapped(t: &str, rec: &Value) -> R<Option<(&'static str, Attrs)>> {
                 "visits",
                 &["component", "url", "method", "duration", "status", "partial", "only", "props_bytes", "user_agent", "lcp", "cls", "inp", "ttfb"],
             )?;
-            // The TTFB phases (schema::ADDED_COLUMNS) only when the record
-            // carries them, so a record from a gem without them maps to
-            // exactly the row Rails' mapper makes.
-            for k in ["redirect_ms", "redirect_count", "connect_ms", "server_ms"] {
+            // The TTFB phases and the session and tab (schema::ADDED_COLUMNS)
+            // only when the record carries them, so a record from a gem
+            // without them maps to exactly the row Rails' mapper makes.
+            for k in ["redirect_ms", "redirect_count", "connect_ms", "server_ms", "session_id", "tab_id"] {
                 if !rec.get(k).is_nil() {
                     set(&mut attrs, k, take(rec, k));
                 }
@@ -516,6 +516,10 @@ fn execution(rec: &Value) -> R<(&'static str, Attrs)> {
             "gc_time",
             "dropped_records",
             "dropped_bytes",
+            // The browser session and tab (docs/sessions.md): read through
+            // schema::ADDED_INDEXES' idx_executions_sessions.
+            "session_id",
+            "tab_id",
         ],
         "command" => &["context", "gc_time", "interactive", "dropped_records", "dropped_bytes"],
         "channel_action" => &["channel", "context", "gc_time", "dropped_records", "dropped_bytes"],
@@ -964,8 +968,29 @@ mod tests {
 
         let old = row(&format!("{{{base}}}"));
         let names: Vec<&str> = old.iter().map(|(k, _)| *k).collect();
-        for k in ["redirect_ms", "redirect_count", "connect_ms", "server_ms"] {
+        for k in ["redirect_ms", "redirect_count", "connect_ms", "server_ms", "session_id", "tab_id"] {
             assert!(!names.contains(&k), "{k} absent from an older gem's row: {names:?}");
         }
+    }
+
+    // The session journey's wire fields (docs/sessions.md): a visit's
+    // become columns, a request's stay in detail, where the session index
+    // reads them.
+    #[test]
+    fn visits_and_requests_keep_their_session_and_tab() {
+        let row = |json: &str| {
+            let rec = rjson::parse(json.as_bytes()).unwrap();
+            row_for(&rec, &mut vec![]).unwrap().unwrap().row
+        };
+        let visit = row(r#"{"v":1,"t":"visit","timestamp":1767225600.0,"component":"orders/index","duration":1,"session_id":"s-1","tab_id":"tab_A"}"#);
+        let get = |k: &str| visit.iter().find(|(c, _)| *c == k).map(|(_, v)| v.clone());
+        assert_eq!(get("session_id"), Some(Bind::Text("s-1".into())));
+        assert_eq!(get("tab_id"), Some(Bind::Text("tab_A".into())));
+        let request = row(
+            r#"{"v":1,"t":"request","timestamp":1767225600.0,"execution_id":"e1","method":"GET","route":"/orders","status_code":200,"duration":5,"session_id":"s-1","tab_id":"tab_A"}"#,
+        );
+        let Some(Bind::Text(detail)) = request.iter().find(|(k, _)| *k == "detail").map(|(_, v)| v.clone()) else { panic!("no detail") };
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!((detail["session_id"].as_str(), detail["tab_id"].as_str()), (Some("s-1"), Some("tab_A")));
     }
 }

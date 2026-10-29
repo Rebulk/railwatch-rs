@@ -71,6 +71,9 @@ pub const PAGES: &[(&str, &str)] = &[
     ("/releases", "releases/index"),
     ("/releases/{id}", "releases/show"),
     ("/visits", "visits/index"),
+    // This server's own (docs/sessions.md); `sessions/` is the sign-in page.
+    ("/sessions", "browser_sessions/index"),
+    ("/sessions/{id}", "browser_sessions/show"),
     ("/processes", "processes/index"),
     ("/tenants", "tenants/index"),
     ("/tenants/{id}", "tenants/show"),

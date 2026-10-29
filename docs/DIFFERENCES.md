@@ -669,6 +669,22 @@ all of it (identical; 130/130).
     layout) tenants are not altered; they read without it until something
     adds it (it is used as soon as it exists). Rolling back is safe: an older
     release ignores an index it does not name.
+15. **Browser sessions across tabs** (docs/sessions.md). `visits` has two
+    more `schema::ADDED_COLUMNS`, `session_id` and `tab_id` (nullable
+    `varchar(64)`), added the way #13's are, with the same roll-forward-only
+    caveat for per-day tenants. A request's `session_id` and `tab_id` are
+    kept in `detail`, which Rails' mapper slices to its own keys and drops.
+    Two more `schema::ADDED_INDEXES`: `idx_executions_sessions` (partial on
+    `kind = 'request'` with a session id: the id, `occurred_at`, the tab,
+    status and user) and `idx_visits_sessions` (`session_id, occurred_at`,
+    partial on a session id). Both are built like #14's, new files at
+    creation and older closed days by the background pass, which now builds
+    every added index a day lacks. A file without them answers the same
+    through `json_extract` and a scan. The Sessions list and session
+    journey pages (`/sessions`, `/sessions/:id`), the `session:` and `tab:`
+    filter keys, and the `list_sessions` and `session_journey` MCP tools
+    are this server's own; railwatch-cloud has none of them. Cost:
+    docs/PERF.md, "Session journeys".
 
 ## Process
 

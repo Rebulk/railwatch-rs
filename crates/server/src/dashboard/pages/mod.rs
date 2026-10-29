@@ -9,10 +9,12 @@
 
 mod executions;
 mod misc;
+mod sessions;
 mod telemetry;
 
 pub use executions::*;
 pub use misc::*;
+pub use sessions::*;
 pub use telemetry::*;
 
 use rusqlite::Connection;

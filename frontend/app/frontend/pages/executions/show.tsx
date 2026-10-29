@@ -271,6 +271,18 @@ export default function ExecutionShow(p: Props) {
           <span className="flex flex-wrap gap-x-3 text-xs">
             <span>{when(x.occurred_at)}</span>
             {x.server && <span>server {x.server}</span>}
+            {typeof detail.session_id === "string" && (
+              <Link
+                href={R.applicationEnvironmentBrowserSessionPath(
+                  a,
+                  e,
+                  detail.session_id,
+                )}
+                className="text-primary hover:underline"
+              >
+                View session
+              </Link>
+            )}
             {x.deploy && <span>deploy {x.deploy.slice(0, 12)}</span>}
             {x.user_ref && (
               <span className="inline-flex items-center gap-1">

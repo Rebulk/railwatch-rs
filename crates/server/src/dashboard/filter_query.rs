@@ -361,7 +361,7 @@ pub fn apply(conn: &Connection, resource: Resource, query: Option<&str>, from: i
 /// Keys that read a request's detail. On jobs, exceptions, logs and queries
 /// they select the records of matching requests (the request's
 /// execution_id; a job's parent_id).
-pub const REQUEST_KEYS: [&str; 8] = ["ip", "ua", "path", "probe", "rate_limited", "halted", "unpermitted", "outcome"];
+pub const REQUEST_KEYS: [&str; 10] = ["ip", "ua", "path", "probe", "rate_limited", "halted", "unpermitted", "outcome", "session", "tab"];
 
 /// `p` as a job query reads it: `outcome:` is the job's own (processed,
 /// failed), not its request's.
@@ -453,7 +453,20 @@ pub fn check_request_keys(p: &Parsed) -> Option<String> {
             }
         }
     }
+    for k in ["session", "tab"] {
+        if let Some(v) = p.field(k)
+            && !(k == "tab" && v == "none")
+            && let Some(bad) = v.split('|').find(|id| !valid_session_id(id))
+        {
+            return Some(format!("{k}: {bad:?} is not a {k} id (letters, digits, - and _, 64 at most)"));
+        }
+    }
     None
+}
+
+/// A session or tab id as the gem sends one: 1-64 of [A-Za-z0-9_-].
+pub fn valid_session_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// One `ip:` alternative as (exact addresses, LIKE patterns): exact,
@@ -577,6 +590,22 @@ pub fn request_detail(c: &mut Cond, alias: &str, p: &Parsed) {
         let outcomes: Vec<&str> = alternatives(v).collect();
         c.and(format!("{} IN ({})", super::request_scan::outcome_sql(alias), vec!["?"; outcomes.len()].join(", ")), outcomes.into_iter().map(s).collect());
     }
+    // The browser session and tab (docs/sessions.md), exact ids; tab:none
+    // is a request without a tab (a full page load sends the session
+    // cookie, not the tab header). A session journey's expand names both.
+    if let Some(v) = p.field("session") {
+        let ids: Vec<&str> = alternatives(v).collect();
+        c.and(format!("{} IN ({})", detail_sql(alias, "$.session_id"), vec!["?"; ids.len()].join(", ")), ids.into_iter().map(s).collect());
+    }
+    if let Some(v) = p.field("tab") {
+        let col = detail_sql(alias, "$.tab_id");
+        if v == "none" {
+            c.and(format!("{col} IS NULL"), vec![]);
+        } else {
+            let ids: Vec<&str> = alternatives(v).collect();
+            c.and(format!("{col} IN ({})", vec!["?"; ids.len()].join(", ")), ids.into_iter().map(s).collect());
+        }
+    }
 }
 
 /// Matching requests a child-record filter resolves at most: their ids are
@@ -601,7 +630,7 @@ fn request_detail_of(conn: &Connection, c: &mut Cond, table: &str, column: &str,
         c.none = true;
         return Ok(());
     }
-    let from = request_index(conn)?.unwrap_or_else(|| "\"executions\"".into());
+    let from = if p.field("session").is_some() { session_index(conn)? } else { request_index(conn)? }.unwrap_or_else(|| "\"executions\"".into());
     let rows = db::query(
         conn,
         &format!(
@@ -683,10 +712,14 @@ pub fn requests(conn: &Connection, p: &Parsed, from: i64, to: i64) -> rusqlite::
         c.and("\"executions\".\"duration\" >= ?", vec![us.into()]);
     }
     request_detail(&mut c, "executions", p);
-    // The request keys read their fields from the request index; a route or
-    // text filter has picked its own plan (named_like), and without request
-    // keys a column filter (user:, deploy:) keeps the planner's index.
-    if c.from.is_none() && has_request_keys(p) {
+    // session: is a seek on the session index, whatever else the query
+    // has. Otherwise the request keys read their fields from the request
+    // index; a route or text filter has picked its own plan (named_like),
+    // and without request keys a column filter (user:, deploy:) keeps the
+    // planner's index.
+    if p.field("session").is_some() && !c.none {
+        c.from = session_index(conn)?;
+    } else if c.from.is_none() && has_request_keys(p) {
         c.from = request_index(conn)?;
     }
     Ok(c)
@@ -700,6 +733,24 @@ pub fn requests(conn: &Connection, p: &Parsed, from: i64, to: i64) -> rusqlite::
 pub fn request_index(conn: &Connection) -> rusqlite::Result<Option<String>> {
     let usable = crate::storage::reader::is_union(conn) || crate::schema::has_index(conn, "main", crate::schema::REQUEST_INDEX)?;
     Ok(usable.then(|| format!("\"executions\" INDEXED BY {}", crate::schema::REQUEST_INDEX)))
+}
+
+/// `"executions" INDEXED BY idx_executions_sessions` where the reader can
+/// use it, as `request_index`: one session's requests are a seek on it
+/// (schema::ADDED_INDEXES). The hint is only for a statement that has
+/// `filter_query`'s session condition, which the index's WHERE needs.
+pub fn session_index(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    added_index(conn, "executions", crate::schema::SESSION_INDEX)
+}
+
+/// `"visits" INDEXED BY idx_visits_sessions`, as `session_index`.
+pub fn visit_session_index(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    added_index(conn, "visits", crate::schema::VISIT_SESSION_INDEX)
+}
+
+fn added_index(conn: &Connection, table: &str, index: &str) -> rusqlite::Result<Option<String>> {
+    let usable = crate::storage::reader::is_union(conn) || crate::schema::has_index(conn, "main", index)?;
+    Ok(usable.then(|| format!("\"{table}\" INDEXED BY {index}")))
 }
 
 fn merge(c: &mut Cond, other: Cond) {

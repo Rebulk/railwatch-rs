@@ -29,6 +29,7 @@ pub mod pool;
 pub mod rb;
 pub mod request_scan;
 pub mod rollup;
+pub mod session_journey;
 pub mod tdigest_decode;
 pub mod tenant;
 pub mod window;

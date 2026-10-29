@@ -900,6 +900,27 @@ export const applicationEnvironmentBroadcastsPath = /*#__PURE__*/ __route({"appl
 
 /**
  * Generates rails route to
+ * /apps/:application_id/envs/:environment_id/sessions/:id(.:format)
+ * @param {any} applicationId
+ * @param {any} environmentId
+ * @param {any} id
+ * @param {object | undefined} options
+ * @returns {string} route path
+ */
+export const applicationEnvironmentBrowserSessionPath = /*#__PURE__*/ __route({"application_id":{"r":true},"environment_id":{"r":true},"id":{"r":true},"format":{}}, [2,[7,"/"],[2,[6,"apps"],[2,[7,"/"],[2,[3,"application_id"],[2,[7,"/"],[2,[6,"envs"],[2,[7,"/"],[2,[3,"environment_id"],[2,[7,"/"],[2,[6,"sessions"],[2,[7,"/"],[2,[3,"id"],[1,[2,[8,"."],[3,"format"]]]]]]]]]]]]]]]);
+
+/**
+ * Generates rails route to
+ * /apps/:application_id/envs/:environment_id/sessions(.:format)
+ * @param {any} applicationId
+ * @param {any} environmentId
+ * @param {object | undefined} options
+ * @returns {string} route path
+ */
+export const applicationEnvironmentBrowserSessionsPath = /*#__PURE__*/ __route({"application_id":{"r":true},"environment_id":{"r":true},"format":{}}, [2,[7,"/"],[2,[6,"apps"],[2,[7,"/"],[2,[3,"application_id"],[2,[7,"/"],[2,[6,"envs"],[2,[7,"/"],[2,[3,"environment_id"],[2,[7,"/"],[2,[6,"sessions"],[1,[2,[8,"."],[3,"format"]]]]]]]]]]]]]);
+
+/**
+ * Generates rails route to
  * /apps/:application_id/envs/:environment_id/cache(.:format)
  * @param {any} applicationId
  * @param {any} environmentId

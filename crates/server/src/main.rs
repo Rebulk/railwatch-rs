@@ -1325,7 +1325,7 @@ fn serve() -> ExitCode {
         if migrated > 0 {
             tracing::info!(files = migrated, "added the new telemetry columns");
         }
-        // The request index in older closed day files (schema::ADDED_INDEXES),
+        // The added indexes in older closed day files (schema::ADDED_INDEXES),
         // after serving starts; until then those days read without it.
         let _ = railwatch_server::tenants::add_missing_indexes_in_background(cfg.tenants_dir());
         let (followups_tx, followups_rx) = followups::channel();

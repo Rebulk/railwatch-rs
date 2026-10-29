@@ -13,7 +13,14 @@ use railwatch_server::storage::layout::{Tier, day_path, meta_path, open_or_creat
 
 /// The DDL text SQLite keeps for `table` once ADDED_COLUMNS were appended.
 fn with_added_columns(table: &str, sql: &str) -> String {
-    let added: Vec<String> = schema::ADDED_COLUMNS.iter().filter(|(t, _, _)| *t == table).map(|(_, name, _)| format!(", \"{name}\" integer")).collect();
+    let added: Vec<String> = schema::ADDED_COLUMNS
+        .iter()
+        .filter(|(t, _, _)| *t == table)
+        .map(|(_, name, ty)| match ty {
+            schema::ColType::String => format!(", \"{name}\" varchar({})", schema::ADDED_STRING_LIMIT),
+            _ => format!(", \"{name}\" integer"),
+        })
+        .collect();
     format!("{}{})", sql.strip_suffix(')').expect("CREATE TABLE ends with )"), added.concat())
 }
 
@@ -40,7 +47,8 @@ fn created_tenant_has_the_exported_sqlite_master() {
     assert_eq!(widened, 1, "the added columns all belong to visits");
     // schema::ADDED_INDEXES come last, after every row of Rails' own.
     for (name, sql) in schema::ADDED_INDEXES {
-        expected.push(("index".into(), name.to_string(), "executions".into(), Some(sql.to_string())));
+        let table = sql.split(" ON \"").nth(1).and_then(|t| t.split('"').next()).expect("CREATE INDEX ... ON \"table\"");
+        expected.push(("index".into(), name.to_string(), table.into(), Some(sql.to_string())));
     }
     assert_eq!(rows, expected, "every other row is Rails' own, in Rails' order");
     let versions: i64 = conn.query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0)).unwrap();
@@ -67,11 +75,15 @@ impl Drop for Scratch {
     }
 }
 
-/// A tenant file as every release before ADDED_COLUMNS made it (the
-/// exported Rails DDL, nothing appended), holding one visit.
+/// A tenant file as every release before ADDED_COLUMNS and ADDED_INDEXES
+/// made it (the exported Rails DDL, nothing appended), holding one visit.
 fn old_tenant(path: &Path) {
     let mut c = rusqlite::Connection::open(path).unwrap();
     schema::create_tenant(&mut c, "2026-10-13 00:00:00.000000").unwrap();
+    // Before the columns: an older release had neither (one covers session_id).
+    for (name, _) in schema::ADDED_INDEXES {
+        c.execute_batch(&format!("DROP INDEX \"{name}\"")).unwrap();
+    }
     for (table, name, _) in schema::ADDED_COLUMNS {
         c.execute_batch(&format!("ALTER TABLE \"{table}\" DROP COLUMN \"{name}\"")).unwrap();
     }
