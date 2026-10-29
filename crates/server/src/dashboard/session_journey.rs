@@ -26,6 +26,9 @@ use serde_json::Value;
 use super::db::{self, Rec, qt};
 use super::filter_query;
 
+/// The browser client's idle timeout (docs/sessions.md).
+pub const SESSION_IDLE: i64 = 30 * 60 * 1_000_000;
+
 /// Requests, and visits, a journey reads at most (the newest).
 pub const MAX_EVENTS: usize = 20_000;
 
@@ -182,6 +185,7 @@ impl Event {
         }
     }
 
+    /// Whether the event is drawn as an error (an exception included).
     pub fn is_error(&self) -> bool {
         match &self.kind {
             Kind::Request(r) => r.status.is_some_and(|s| s >= 500),
@@ -203,6 +207,22 @@ pub struct Tab {
     pub errors: i64,
 }
 
+/// A session's errors (Journey::errors).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ErrorCounts {
+    pub server: i64,
+    pub visits: i64,
+    pub browser: i64,
+    /// Exceptions the session's requests raised: not in `total`.
+    pub exceptions: i64,
+}
+
+impl ErrorCounts {
+    pub fn total(&self) -> i64 {
+        self.server + self.visits + self.browser
+    }
+}
+
 /// The newest MAX_EVENTS of a kind were read and older ones exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Capped {
@@ -219,33 +239,90 @@ pub struct Journey {
     pub capped: Capped,
 }
 
-/// Consecutive events of one lane with the same key: one run, its events'
-/// indexes into Journey::events.
+/// Consecutive steps of one lane with the same key: one run, its events'
+/// indexes into Journey::events (oldest first).
 #[derive(Debug, Clone)]
 pub struct Run {
     pub lane: Option<usize>,
     pub events: Vec<usize>,
 }
 
+/// How long after a visit starts its own request may arrive.
+const STEP_GAP: i64 = 5_000_000;
+
+/// The path of a visit's url (the browser client sends it absolute or not).
+fn url_path(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r.find('/').map_or("/", |i| &r[i..]));
+    rest.split(['?', '#']).next().unwrap_or(rest)
+}
+
 impl Journey {
-    /// The runs, by their first event (oldest first). A run only ends when
-    /// its own tab does something else, so a tab polling while another is
-    /// used stays one run.
+    /// The lane's steps: a page visit together with its own request (the
+    /// next request in the same tab, within STEP_GAP, to the visit's path),
+    /// or any other event alone. Each step is its events' indexes.
+    fn steps(&self) -> Vec<Vec<usize>> {
+        let mut steps: Vec<Vec<usize>> = vec![];
+        // lane -> (the step of a visit still waiting for its request, the visit's path, its time)
+        let mut waiting: HashMap<Option<usize>, (usize, String, i64)> = HashMap::new();
+        for (i, e) in self.events.iter().enumerate() {
+            match &e.kind {
+                Kind::Visit(v) => {
+                    waiting.insert(e.lane, (steps.len(), url_path(v.url.as_deref().unwrap_or("")).to_string(), e.at));
+                    steps.push(vec![i]);
+                }
+                Kind::Request(r) => match waiting.remove(&e.lane) {
+                    Some((step, path, at)) if e.at - at <= STEP_GAP && r.path.as_deref().map(url_path) == Some(path.as_str()) => steps[step].push(i),
+                    _ => steps.push(vec![i]),
+                },
+                Kind::Error(_) => {
+                    // An error ends the visit's wait: a request after it is not the visit's.
+                    waiting.remove(&e.lane);
+                    steps.push(vec![i]);
+                }
+            }
+        }
+        steps.sort_by_key(|s| s[0]);
+        steps
+    }
+
+    /// The runs, by their first event (oldest first): consecutive steps of
+    /// one lane alike in every event's key. A run only ends when its own tab
+    /// does something else, so a tab polling (an Inertia reload is a visit
+    /// and its request) while another is used stays one run.
     pub fn runs(&self) -> Vec<Run> {
-        let mut runs: Vec<(Vec<String>, Run)> = vec![];
+        let mut runs: Vec<(Vec<Vec<String>>, Run)> = vec![];
         // lane -> the index in `runs` of its open run.
         let mut open: HashMap<Option<usize>, usize> = HashMap::new();
-        for (i, e) in self.events.iter().enumerate() {
-            let key = e.key();
-            match open.get(&e.lane) {
-                Some(&r) if runs[r].0 == key => runs[r].1.events.push(i),
+        for step in self.steps() {
+            let lane = self.events[step[0]].lane;
+            let key: Vec<Vec<String>> = step.iter().map(|&i| self.events[i].key()).collect();
+            match open.get(&lane) {
+                Some(&r) if runs[r].0 == key => runs[r].1.events.extend(step),
                 _ => {
-                    open.insert(e.lane, runs.len());
-                    runs.push((key, Run { lane: e.lane, events: vec![i] }));
+                    open.insert(lane, runs.len());
+                    runs.push((key, Run { lane, events: step }));
                 }
             }
         }
         runs.into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// Error counts, one definition for the summary, the page and
+    /// list_sessions: 5xx requests, failed visits and browser errors. An
+    /// exception a request raised is part of that request's error, counted
+    /// apart (`exceptions`) and never added to the total.
+    pub fn errors(&self) -> ErrorCounts {
+        let mut c = ErrorCounts::default();
+        for e in &self.events {
+            match &e.kind {
+                Kind::Request(r) if r.status.is_some_and(|s| s >= 500) => c.server += 1,
+                Kind::Visit(v) if v.status.as_deref() == Some("error") => c.visits += 1,
+                Kind::Error(x) if x.browser => c.browser += 1,
+                Kind::Error(_) => c.exceptions += 1,
+                _ => {}
+            }
+        }
+        c
     }
 
     /// A lane's label (t1, t2, ...), from a label or a gem tab id.
@@ -401,9 +478,10 @@ pub fn read_capped(conn: &Connection, session_id: &str, cap: usize) -> rusqlite:
         }
     }
     if let (Some(lo), Some(hi)) = (events.iter().map(|e| e.at).min(), events.iter().map(|e| e.at).max()) {
-        // A browser error is beaconed after it happened, and may be all the
-        // session did in a tab for a while: five minutes either side.
-        let slack = 5 * 60 * 1_000_000;
+        // A browser error may be all the session did in a tab for a while,
+        // and is beaconed late: up to the idle timeout (30 min) either side,
+        // past which the browser would have started a new session.
+        let slack = SESSION_IDLE;
         let browser = db::query(
             conn,
             &format!(
@@ -480,7 +558,8 @@ pub fn read_capped(conn: &Connection, session_id: &str, cap: usize) -> rusqlite:
             Kind::Visit(_) => t.visits += 1,
             Kind::Error(_) => {}
         }
-        if e.is_error() {
+        // Journey::errors' definition: an exception is its request's error.
+        if e.is_error() && !matches!(&e.kind, Kind::Error(x) if !x.browser) {
             t.errors += 1;
         }
     }
@@ -517,36 +596,29 @@ impl Listed {
 
 /// The sessions active in [from, to] (a request, visit or browser error
 /// in it), newest activity first: at most `limit`, and how many there are
-/// in all. `user` keeps one user's; `has_errors` the ones with a 5xx, a
-/// failed visit or a browser error. Counts are of the window's activity.
+/// in all. `user` keeps the sessions any of whose records names that user,
+/// counted whole: a visit or browser error the beacon could not attribute
+/// is still its session's. `has_errors` keeps the ones with an error
+/// (Journey::errors' definition: a 5xx, a failed visit or a browser error).
+/// Counts are of the window's activity.
 pub fn list(conn: &Connection, (from, to): (i64, i64), user: Option<&str>, has_errors: bool, limit: usize) -> rusqlite::Result<(Vec<Listed>, usize)> {
     let mut by: HashMap<String, Listed> = HashMap::new();
     let sid = filter_query::detail_sql("executions", "$.session_id");
     let tab = filter_query::detail_sql("executions", "$.tab_id");
-    let user_cond = |t: &str| if user.is_some() { format!(" AND \"{t}\".\"user_ref\" = ?3") } else { String::new() };
-    let mut binds: Vec<rusqlite::types::Value> = vec![qt(from).into(), qt(to).into()];
-    if let Some(u) = user {
-        binds.push(u.to_string().into());
-    }
+    let binds: Vec<rusqlite::types::Value> = vec![qt(from).into(), qt(to).into()];
     // Requests: on the session index, which holds the tab, status and user,
-    // in the files the window touches; by user, on the user's own index.
-    let (inside, outside) = if user.is_some() {
-        ("idx_executions_people", "idx_executions_people")
-    } else {
-        (crate::schema::SESSION_INDEX, "index_executions_on_kind_and_occurred_at")
-    };
+    // in the files the window touches.
     let inner = format!(
         "SELECT {sid} AS \"sid\", {tab} AS \"tab\", MIN(\"executions\".\"occurred_at\") AS \"first\", MAX(\"executions\".\"occurred_at\") AS \"last\", \
-         COUNT(*) AS \"n\", SUM(\"executions\".\"status\" >= 500) AS \"errors\", MAX(\"executions\".\"user_ref\") AS \"user\" FROM {{t}} \
-         WHERE \"executions\".\"kind\" = 'request' AND {sid} IS NOT NULL AND \"executions\".\"occurred_at\" BETWEEN ?1 AND ?2{} GROUP BY 1, 2",
-        user_cond("executions")
+         COUNT(*) AS \"n\", SUM(\"executions\".\"status\" >= 500) AS \"errors\", group_concat(DISTINCT \"executions\".\"user_ref\") AS \"users\" FROM {{t}} \
+         WHERE \"executions\".\"kind\" = 'request' AND {sid} IS NOT NULL AND \"executions\".\"occurred_at\" BETWEEN ?1 AND ?2 GROUP BY 1, 2"
     );
-    let hint = crate::storage::reader::Hint { window: (from, to), inside, outside };
+    let hint = crate::storage::reader::Hint { window: (from, to), inside: crate::schema::SESSION_INDEX, outside: "index_executions_on_kind_and_occurred_at" };
     let rows = match crate::storage::reader::aggregate_hinted(conn, "executions", Some(hint), &inner, "SELECT * FROM {u}", &binds)? {
         Some(rows) => rows,
         None => {
-            let table = if user.is_some() { None } else { filter_query::session_index(conn)? };
-            db::query(conn, &inner.replace("{t}", &table.unwrap_or_else(|| "\"executions\"".into())), rusqlite::params_from_iter(binds.iter()))?
+            let table = filter_query::session_index(conn)?.unwrap_or_else(|| "\"executions\"".into());
+            db::query(conn, &inner.replace("{t}", &table), rusqlite::params_from_iter(binds.iter()))?
         }
     };
     for r in rows {
@@ -554,14 +626,12 @@ pub fn list(conn: &Connection, (from, to): (i64, i64), user: Option<&str>, has_e
         s.requests += r.i("n").unwrap_or(0);
         s.server_errors += r.i("errors").unwrap_or(0);
     }
-    let inner = format!(
-        "SELECT \"visits\".\"session_id\" AS \"sid\", \"visits\".\"tab_id\" AS \"tab\", MIN(\"visits\".\"occurred_at\") AS \"first\", \
-         MAX(\"visits\".\"occurred_at\") AS \"last\", COUNT(*) AS \"n\", SUM(\"visits\".\"status\" = 'error') AS \"errors\", MAX(\"visits\".\"user_ref\") AS \"user\" \
-         FROM {{t}} WHERE \"visits\".\"session_id\" IS NOT NULL AND \"visits\".\"occurred_at\" BETWEEN ?1 AND ?2{} GROUP BY 1, 2",
-        user_cond("visits")
-    );
+    let inner = "SELECT \"visits\".\"session_id\" AS \"sid\", \"visits\".\"tab_id\" AS \"tab\", MIN(\"visits\".\"occurred_at\") AS \"first\", \
+         MAX(\"visits\".\"occurred_at\") AS \"last\", COUNT(*) AS \"n\", SUM(\"visits\".\"status\" = 'error') AS \"errors\", \
+         group_concat(DISTINCT \"visits\".\"user_ref\") AS \"users\" \
+         FROM {t} WHERE \"visits\".\"session_id\" IS NOT NULL AND \"visits\".\"occurred_at\" BETWEEN ?1 AND ?2 GROUP BY 1, 2";
     let hint = crate::storage::reader::Hint { window: (from, to), inside: "index_visits_on_occurred_at", outside: "index_visits_on_occurred_at" };
-    let rows = match crate::storage::reader::aggregate_hinted(conn, "visits", Some(hint), &inner, "SELECT * FROM {u}", &binds)? {
+    let rows = match crate::storage::reader::aggregate_hinted(conn, "visits", Some(hint), inner, "SELECT * FROM {u}", &binds)? {
         Some(rows) => rows,
         None => db::query(conn, &inner.replace("{t}", "\"visits\""), rusqlite::params_from_iter(binds.iter()))?,
     };
@@ -573,12 +643,9 @@ pub fn list(conn: &Connection, (from, to): (i64, i64), user: Option<&str>, has_e
     // Browser errors are few: read them through the view.
     let browser = db::query(
         conn,
-        &format!(
-            "SELECT json_extract(\"exceptions\".\"context\", '$.browser.session') AS \"sid\", COUNT(*) AS \"n\", MIN(\"exceptions\".\"occurred_at\") AS \"first\", \
-             MAX(\"exceptions\".\"occurred_at\") AS \"last\", MAX(\"exceptions\".\"user_ref\") AS \"user\" FROM \"exceptions\" \
-             WHERE \"exceptions\".\"source\" = 'browser' AND \"exceptions\".\"occurred_at\" BETWEEN ?1 AND ?2{} GROUP BY 1",
-            user_cond("exceptions")
-        ),
+        "SELECT json_extract(\"exceptions\".\"context\", '$.browser.session') AS \"sid\", COUNT(*) AS \"n\", MIN(\"exceptions\".\"occurred_at\") AS \"first\", \
+         MAX(\"exceptions\".\"occurred_at\") AS \"last\", group_concat(DISTINCT \"exceptions\".\"user_ref\") AS \"users\" FROM \"exceptions\" \
+         WHERE \"exceptions\".\"source\" = 'browser' AND \"exceptions\".\"occurred_at\" BETWEEN ?1 AND ?2 GROUP BY 1",
         rusqlite::params_from_iter(binds.iter()),
     )?;
     for r in browser {
@@ -587,14 +654,14 @@ pub fn list(conn: &Connection, (from, to): (i64, i64), user: Option<&str>, has_e
             s.browser_errors += r.i("n").unwrap_or(0);
         }
     }
-    let mut all: Vec<Listed> = by.into_values().filter(|s| !has_errors || s.errors() > 0).collect();
+    let mut all: Vec<Listed> = by.into_values().filter(|s| !has_errors || s.errors() > 0).filter(|s| user.is_none_or(|u| s.users.contains(u))).collect();
     all.sort_by(|a, b| b.last.cmp(&a.last).then(a.session_id.cmp(&b.session_id)));
     let total = all.len();
     all.truncate(limit);
     Ok((all, total))
 }
 
-/// The session `r` (a grouped row: sid, tab, first, last, user) counts
+/// The session `r` (a grouped row: sid, tab, first, last, users) counts
 /// toward, with its times, tab and user added.
 fn add<'a>(by: &'a mut HashMap<String, Listed>, r: &Rec) -> &'a mut Listed {
     let sid = r.s("sid").unwrap_or("").to_string();
@@ -605,7 +672,9 @@ fn add<'a>(by: &'a mut HashMap<String, Listed>, r: &Rec) -> &'a mut Listed {
     if let Some(t) = r.s("tab").filter(|t| !t.is_empty()) {
         s.tabs.insert(t.to_string());
     }
-    if let Some(u) = r.s("user").filter(|u| !u.is_empty()) {
+    // group_concat's list (user refs hold no commas in practice; one that
+    // does is split, which only widens the user filter's match).
+    for u in r.s("users").unwrap_or("").split(',').filter(|u| !u.is_empty()) {
         s.users.insert(u.to_string());
     }
     s
@@ -685,6 +754,27 @@ pub(crate) mod tests {
         .unwrap();
     }
 
+    /// What the real browser client records when a tab reloads its page on
+    /// a timer (an Inertia poll): a visit from the beacon (absolute url, as
+    /// the client sends it after the first load) and, a few ms later, the
+    /// request it made. Session p1: tab-C polls /three 15 times, 3 s apart;
+    /// tab-D clicks /one then /two in between; an asset request (no tab)
+    /// lands right after one poll's visit.
+    pub fn polling(c: &Connection) {
+        visit(c, T0, "journey/three", "/three", Some("p1"), Some("tab-C"));
+        request(c, "first", T0 + 1_000, "/three", 200, Some("p1"), None);
+        for i in 0..15 {
+            let at = T0 + (3 + 3 * i) * S;
+            visit(c, at, "journey/three", "http://localhost:3123/three", Some("p1"), Some("tab-C"));
+            request(c, &format!("poll{i}"), at + 2_000, "/three", 200, Some("p1"), Some("tab-C"));
+        }
+        visit(c, T0 + 7 * S + 300_000, "journey/one", "http://localhost:3123/one", Some("p1"), Some("tab-D"));
+        request(c, "one", T0 + 7 * S + 302_000, "/one", 200, Some("p1"), Some("tab-D"));
+        request(c, "asset", T0 + 7 * S + 310_000, "/vite/one.js", 200, Some("p1"), None);
+        visit(c, T0 + 31 * S + 300_000, "journey/two", "http://localhost:3123/two", Some("p1"), Some("tab-D"));
+        request(c, "two", T0 + 31 * S + 302_000, "/two", 200, Some("p1"), Some("tab-D"));
+    }
+
     fn tenant(name: &str) -> (std::path::PathBuf, Connection) {
         let dir = std::env::temp_dir().join(format!("rw-journey-{name}-{}", crate::control::base58(8)));
         std::fs::create_dir_all(&dir).unwrap();
@@ -730,7 +820,7 @@ pub(crate) mod tests {
         );
         assert_eq!(j.tabs.iter().map(|t| (t.label.as_str(), t.id.as_str())).collect::<Vec<_>>(), [("t1", "tab-A"), ("t2", "tab-B")], "first seen first");
         assert_eq!((j.tabs[0].requests, j.tabs[0].visits, j.tabs[0].errors), (6, 1, 0));
-        assert_eq!((j.tabs[1].requests, j.tabs[1].visits, j.tabs[1].errors), (1, 1, 3), "the 500, its exception, the browser error");
+        assert_eq!((j.tabs[1].requests, j.tabs[1].visits, j.tabs[1].errors), (1, 1, 2), "the 500 and the browser error; the exception is the 500's");
         assert_eq!(j.capped, Capped::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -762,6 +852,26 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A browser error beaconed ten minutes after the session's last
+    /// request is still the session's (as list_sessions counts it); one
+    /// past the idle timeout is not.
+    #[test]
+    fn a_late_browser_error_is_in_the_journey_within_the_idle_timeout() {
+        let (dir, c) = tenant("late");
+        two_tabs(&c);
+        for (at, class) in [(T0 + 45 * S + 10 * 60 * S, "Late"), (T0 + 45 * S + 31 * 60 * S, "TooLate")] {
+            c.execute(
+                "INSERT INTO exceptions (class_name, message, handled, occurred_at, source, context) VALUES (?1, 'x', 0, ?2, 'browser', ?3)",
+                params![class, qt(at), json!({"browser": {"session": "s1", "tab": "tab-A"}}).to_string()],
+            )
+            .unwrap();
+        }
+        let j = read(&c, "s1").unwrap();
+        let classes: Vec<&str> = j.events.iter().filter_map(|e| if let Kind::Error(x) = &e.kind { Some(x.class_name.as_str()) } else { None }).collect();
+        assert!(classes.contains(&"Late") && !classes.contains(&"TooLate"), "{classes:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn other_sessions_and_rows_without_a_session_are_not_in_a_journey() {
         let (dir, c) = tenant("exclude");
@@ -785,12 +895,51 @@ pub(crate) mod tests {
             runs.iter().map(|r| format!("{} {}x{}", j.label(r.lane).unwrap_or("-"), j.events[r.events[0]].type_name(), r.events.len())).collect();
         assert_eq!(
             shown,
-            ["t1 visitx1", "t1 requestx1", "t1 requestx5", "t2 visitx1", "t2 requestx1", "t2 exceptionx1", "t2 browser_errorx1", "- requestx1"],
-            "the five polls are one run though t2 and the untabbed load happened between them"
+            ["t1 visitx2", "t1 requestx5", "t2 visitx2", "t2 exceptionx1", "t2 browser_errorx1", "- requestx1"],
+            "a visit and its own request are one step; the five polls are one run though t2 and the untabbed load happened between them"
         );
         let total: usize = runs.iter().map(|r| r.events.len()).sum();
         assert_eq!(total, j.events.len(), "every event is in exactly one run");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An Inertia poll is a visit and its request, alternating: the pairs
+    /// fold into one run per tab, the other tab's clicks and an asset
+    /// request between them do not break it, and nothing is lost.
+    #[test]
+    fn a_tab_reloading_its_page_on_a_timer_is_one_run_of_visit_and_request_pairs() {
+        let (dir, c) = tenant("polling");
+        polling(&c);
+        let j = read(&c, "p1").unwrap();
+        let runs = j.runs();
+        let shown: Vec<String> = runs
+            .iter()
+            .map(|r| {
+                let kinds: Vec<&str> = r.events.iter().map(|&i| j.events[i].type_name()).collect();
+                format!(
+                    "{} {}x{} {}",
+                    j.label(r.lane).unwrap_or("-"),
+                    j.events[r.events[0]].type_name(),
+                    r.events.len(),
+                    kinds.iter().filter(|k| **k == "request").count()
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            ["t1 visitx1 0", "- requestx1 1", "t1 visitx30 15", "t2 visitx2 1", "- requestx1 1", "t2 visitx2 1"],
+            "15 polls are one run of 30 events (15 visits, 15 requests); the first load's request has no tab"
+        );
+        let total: usize = runs.iter().map(|r| r.events.len()).sum();
+        assert_eq!(total, j.events.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_visits_path_matches_its_requests() {
+        assert_eq!(url_path("http://localhost:3123/three?x=1#y"), "/three");
+        assert_eq!(url_path("/three?page=2"), "/three");
+        assert_eq!(url_path("https://shop.example"), "/");
     }
 
     #[test]
@@ -888,6 +1037,12 @@ pub(crate) mod tests {
         let (none, _) = list(&c, window, Some("bob"), false, 10).unwrap();
         assert!(none.is_empty());
         assert_eq!(list(&c, window, Some("ada"), false, 10).unwrap().1, 2);
+        // The browser error and a visit carry no user_ref (the beacon could
+        // not attribute them): a user's session still counts them.
+        c.execute("UPDATE visits SET user_ref = NULL WHERE session_id = 's1' AND url = '/orders/7'", []).unwrap();
+        let (mine, _) = list(&c, window, Some("ada"), false, 10).unwrap();
+        let s1 = mine.iter().find(|s| s.session_id == "s1").unwrap();
+        assert_eq!((s1.visits, s1.browser_errors, s1.errors()), (2, 1, 2), "every visit and error of the user's session");
         let (one, total) = list(&c, window, None, false, 1).unwrap();
         assert_eq!((one.len(), total), (1, 2), "limited, and the total says so");
         let _ = std::fs::remove_dir_all(&dir);

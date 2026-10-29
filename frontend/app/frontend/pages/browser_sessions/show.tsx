@@ -33,6 +33,7 @@ interface Props {
   users: string[]
   ips: string[]
   user_agents: string[]
+  errors: number
   capped: boolean
   cap: number
 }
@@ -99,13 +100,21 @@ function JourneyRow({
   onToggle: () => void
   href: string | null
 }) {
-  const e = row.events[0]
-  const n = row.events.length
-  const folded = n > 1 && !open
+  const first = row.events[0]
+  const folded = row.events.length > 1 && !open
+  // A folded run of page visits each with its request (a page reloading on
+  // a timer) leads with the request: "GET /three ×15", the visits counted
+  // beside it. Otherwise the run's own events.
+  const requests = row.events.filter((x) => x.type === "request")
+  const paired =
+    folded && requests.length > 0 && requests.length < row.events.length
+  const e = paired ? requests[0] : first
+  const shown = paired ? requests : row.events
+  const n = shown.length
   const body = (
     <>
       <span className="text-muted-foreground font-mono tabular-nums">
-        {clock(e.at)}
+        {clock(first.at)}
       </span>
       <span
         className="flex items-center gap-1"
@@ -118,7 +127,9 @@ function JourneyRow({
             className={cn(
               "h-4 w-3 rounded-sm",
               l === e.lane ? laneTones[l % laneTones.length] : "bg-muted/40",
-              l === e.lane && e.error && "ring-danger ring-2",
+              l === e.lane &&
+                row.events.some((x) => x.error) &&
+                "ring-danger ring-2",
             )}
           />
         ))}
@@ -140,7 +151,7 @@ function JourneyRow({
           <StatusBadge status={e.status} outcome={null} />
         )}
         <span className="truncate font-mono">{label(e)}</span>
-        {n > 1 && (
+        {row.events.length > 1 && (
           <button
             type="button"
             onClick={(ev) => {
@@ -154,17 +165,27 @@ function JourneyRow({
             <ChevronRight
               className={cn("size-3 transition-transform", open && "rotate-90")}
             />
-            ×{n} over {spanText(e.at, row.events[n - 1].at)}
+            {open
+              ? `×${row.events.length}`
+              : n > 1
+                ? `×${n} over ${spanText(shown[0].at, shown[n - 1].at)}`
+                : ""}
           </button>
         )}
+        {paired && (
+          <span className="text-muted-foreground shrink-0 font-mono text-[10px]">
+            + {row.events.length - n} page{" "}
+            {row.events.length - n === 1 ? "visit" : "visits"}
+          </span>
+        )}
       </span>
-      <span className="text-right font-mono tabular-nums">
-        {folded ? runDuration(row.events) : e.duration ? ms(e.duration) : ""}
+      <span className="text-right font-mono whitespace-nowrap tabular-nums">
+        {folded ? runDuration(shown) : e.duration ? ms(e.duration) : ""}
       </span>
     </>
   )
   const className =
-    "grid grid-cols-[4.5rem_auto_1fr_4rem] items-center gap-x-3 border-b px-2 py-1.5 text-xs last:border-b-0"
+    "grid grid-cols-[4.5rem_auto_1fr_auto] items-center gap-x-3 border-b px-2 py-1.5 text-xs last:border-b-0"
   return href && !folded ? (
     <Link href={href} className={cn(className, "hover:bg-muted/40")}>
       {body}
@@ -182,7 +203,9 @@ export default function BrowserSessionShow(p: Props) {
   const rows = foldRuns(p.events, openRuns)
   const requests = p.events.filter((x) => x.type === "request").length
   const visits = p.events.filter((x) => x.type === "visit").length
-  const errors = p.events.filter((x) => x.error).length
+  // The server's count (5xx, failed visits, browser errors): an exception
+  // is drawn red on its request's row but is that request's error.
+  const errors = p.errors
   const hrefOf = (x: JourneyEvent) =>
     x.execution_id
       ? executionPath({

@@ -110,6 +110,7 @@ const props = {
   users: ["ada"],
   ips: [],
   user_agents: [],
+  errors: 1,
   capped: false,
   cap: 20000,
 }
@@ -128,6 +129,42 @@ describe("runDuration", () => {
     expect(runDuration(d(1, 9, 3))).toBe(`${ms(3)} · max ${ms(9)}`)
     expect(runDuration(d(2, 2))).toBe(ms(2))
     expect(runDuration(d(0, 0))).toBe("")
+  })
+})
+
+describe("A page reloading on a timer", () => {
+  // The real client: each poll is a visit and its request (one run).
+  const polls: JourneyEvent[] = Array.from({ length: 15 }, (_, i) => [
+    {
+      at: at(2 * i),
+      type: "visit" as const,
+      lane: 0,
+      run: 0,
+      error: false,
+      component: "journey/three",
+      url: "/three",
+      duration: 8,
+    },
+    { ...req(2 * i, 0, 0, "GET /three"), duration: 4 },
+  ]).flat()
+
+  it("is one row: the request ×15, its visits counted, the request's duration", () => {
+    render(
+      <BrowserSessionShow
+        {...props}
+        tabs={[tabs[0]]}
+        events={polls}
+        runs={1}
+      />,
+    )
+    expect(screen.getAllByText("GET /three")).toHaveLength(1)
+    expect(screen.getByText(/×15 over 28s/)).toBeTruthy()
+    expect(screen.getByText("+ 15 page visits")).toBeTruthy()
+    const row = screen.getByText("GET /three").closest("div[class*='grid']")!
+    expect(row.textContent).toContain(ms(4))
+    fireEvent.click(screen.getByRole("button", { expanded: false }))
+    expect(screen.getAllByText("GET /three")).toHaveLength(15)
+    expect(screen.getAllByText("journey/three /three")).toHaveLength(15)
   })
 })
 

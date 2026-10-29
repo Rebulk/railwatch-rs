@@ -75,6 +75,7 @@ fn journey_props(j: &Journey) -> Value {
         "events" => j.events.iter().enumerate().map(|(i, e)| event(e, run_of[i])).collect::<Vec<_>>(),
         "runs" => runs.len() as i64,
         "users" => users, "ips" => ips, "user_agents" => user_agents,
+        "errors" => j.errors().total(),
         "capped" => j.capped.requests || j.capped.visits, "cap" => journey::MAX_EVENTS as i64,
     }
 }

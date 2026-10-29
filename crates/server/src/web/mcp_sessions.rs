@@ -53,7 +53,11 @@ impl Mcp<'_> {
                         "requests" => s.requests, "visits" => s.visits, "tabs" => s.tabs.len() as i64,
                     };
                     if s.errors() > 0 {
-                        db::merge_into(&mut v, "errors", json!({"server": s.server_errors, "visits": s.visit_errors, "browser": s.browser_errors}));
+                        db::merge_into(
+                            &mut v,
+                            "errors",
+                            json!({"total": s.errors(), "server": s.server_errors, "visits": s.visit_errors, "browser": s.browser_errors}),
+                        );
                     }
                     if !s.users.is_empty() {
                         db::merge_into(&mut v, "users", json!(s.users.iter().collect::<Vec<_>>()));
@@ -206,12 +210,12 @@ fn session_path(env: &EnvRow, session_id: &str) -> String {
 fn summary(j: &Journey, access: bool) -> Value {
     let (first, last) = (j.first().unwrap_or(0), j.last().unwrap_or(0));
     let count = |t: &str| j.events.iter().filter(|e| e.type_name() == t).count() as i64;
-    let server_errors = j.events.iter().filter(|e| matches!(&e.kind, Kind::Request(r) if r.status.is_some_and(|s| s >= 500))).count() as i64;
+    let e = j.errors();
     let mut v = crate::obj! {
         "started" => compact::time(first), "last" => compact::time(last),
         "duration" => span(last - first), "tabs" => j.tabs.len() as i64,
         "requests" => count("request"), "visits" => count("visit"),
-        "errors" => json!({"server": server_errors, "exceptions": count("exception"), "browser": count("browser_error")}),
+        "errors" => json!({"total": e.total(), "server": e.server, "visits": e.visits, "browser": e.browser, "exceptions": e.exceptions}),
     };
     let untabbed = j.events.iter().filter(|e| e.lane.is_none()).count();
     if untabbed > 0 {
@@ -308,21 +312,28 @@ fn event_fields(e: &Event, access: bool) -> Vec<(&'static str, Value)> {
     out.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect()
 }
 
-/// A run as an entry: a request run through mcp_compact (the fold every
-/// grouped request read uses, with expand narrowed to the session, the
-/// tab and the run's times); a visit or error run with its count, times,
-/// cadence and the fields that varied.
+/// A run as an entry. Its requests through mcp_compact (the fold every
+/// grouped request read uses, with expand narrowed to the session, the tab
+/// and the run's times); its visits, errors (a run of them alone) through a
+/// plain fold with count, times, cadence and the fields that varied. A run
+/// of page visits each with its own request (an Inertia reload) is one
+/// entry: the requests' entry, `type` "page", the visits in `visits`, and
+/// `count` all its events (visits and requests), so counts still add up to
+/// the rows.
 fn run_entry(j: &Journey, run: &journey::Run, base: &Parsed, access: bool) -> compact::Entry {
     let events: Vec<&Event> = run.events.iter().map(|&i| &j.events[i]).collect();
     let lane = j.label(run.lane);
-    let mut entry = if let Kind::Request(_) = events[0].kind {
-        let rows: Vec<_> = events
-            .iter()
-            .map(|e| match &e.kind {
-                Kind::Request(r) => r.row(e.at),
-                _ => unreachable!("a run is of one kind"),
-            })
-            .collect();
+    let rows: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Request(r) => Some(r.row(e.at)),
+            _ => None,
+        })
+        .collect();
+    let others: Vec<&Event> = events.iter().copied().filter(|e| !matches!(e.kind, Kind::Request(_))).collect();
+    let mut entry = if rows.is_empty() {
+        other_entry(&others, access)
+    } else {
         let mut e = compact::request_entry(&rows, access);
         if e.count > 1 {
             let mut p = base.clone();
@@ -331,40 +342,60 @@ fn run_entry(j: &Journey, run: &journey::Run, base: &Parsed, access: bool) -> co
             let x = compact::expand(&p, &e);
             e.json.insert("expand".into(), x);
         }
-        e
-    } else {
-        let mut fold = compact::Fold::default();
-        for e in &events {
-            let duration = match &e.kind {
-                Kind::Visit(v) => Some(v.duration),
-                _ => None,
-            };
-            fold.add(e.at, duration, None);
-            for (name, v) in event_fields(e, access) {
-                if matches!(name, "duration_ms" | "component" | "class_name" | "status" | "method" | "partial") {
-                    continue;
+        if !others.is_empty() {
+            let v = other_entry(&others, access);
+            let mut visits = Map::new();
+            for k in ["count", "component", "first", "last", "at", "duration_ms", "varying", "not_listed"] {
+                if let Some(x) = v.json.get(k) {
+                    visits.insert(k.into(), x.clone());
                 }
-                let text = v.as_str().map_or_else(|| v.to_string(), str::to_string);
-                fold.field(name, Some(&text), FIELD_CHARS, false);
             }
+            e.json.insert("requests".into(), Value::from(e.count));
+            e.json.insert("visits".into(), Value::Object(visits));
+            e.count += v.count;
+            e.first = e.first.min(v.first);
+            e.json.insert("count".into(), Value::from(e.count));
         }
-        let mut key = Map::new();
-        for (k, v) in event_fields(events[0], access) {
-            if matches!(k, "component" | "class_name" | "status" | "method" | "partial") {
-                key.insert(k.into(), v);
-            }
-        }
-        compact::entry(String::new(), key, fold)
+        e
     };
     // The entry's own lead: type and lane, before its fields.
+    let paired = !rows.is_empty() && !others.is_empty();
     let mut m = Map::new();
-    m.insert("type".into(), Value::from(events[0].type_name()));
+    m.insert("type".into(), Value::from(if paired { "page" } else { events[0].type_name() }));
     if let Some(l) = lane {
         m.insert("lane".into(), Value::from(l));
     }
     m.extend(std::mem::take(&mut entry.json));
     entry.json = m;
     entry
+}
+
+/// Visits or errors folded: count, times, cadence, durations, the fields
+/// that varied, keyed by what makes them alike.
+fn other_entry(events: &[&Event], access: bool) -> compact::Entry {
+    const KEY: [&str; 5] = ["component", "class_name", "status", "method", "partial"];
+    let mut fold = compact::Fold::default();
+    for e in events {
+        let duration = match &e.kind {
+            Kind::Visit(v) => Some(v.duration),
+            _ => None,
+        };
+        fold.add(e.at, duration, None);
+        for (name, v) in event_fields(e, access) {
+            if name == "duration_ms" || KEY.contains(&name) {
+                continue;
+            }
+            let text = v.as_str().map_or_else(|| v.to_string(), str::to_string);
+            fold.field(name, Some(&text), FIELD_CHARS, false);
+        }
+    }
+    let mut key = Map::new();
+    for (k, v) in event_fields(events[0], access) {
+        if KEY.contains(&k) {
+            key.insert(k.into(), v);
+        }
+    }
+    compact::entry(String::new(), key, fold)
 }
 
 /// The newest entries that fit `budget` bytes (the last always); how many
@@ -415,10 +446,12 @@ mod tests {
     fn request_ids(f: &Seeded, v: &Value) -> Vec<String> {
         let mut out = vec![];
         for e in v["timeline"].as_array().unwrap_or_else(|| panic!("{v}")) {
-            if e["type"] != "request" {
-                continue;
-            }
-            let count = e["count"].as_i64().unwrap();
+            // A page entry's requests are `requests` of its `count`.
+            let count = match e["type"].as_str() {
+                Some("request") => e["count"].as_i64().unwrap(),
+                Some("page") => e["requests"].as_i64().unwrap(),
+                _ => continue,
+            };
             if count == 1 {
                 out.push(e["execution_id"].as_str().unwrap().to_string());
                 continue;
@@ -451,11 +484,8 @@ mod tests {
             .iter()
             .map(|e| format!("{} {} x{}", e["lane"].as_str().unwrap_or("-"), e["type"].as_str().unwrap(), e["count"]))
             .collect();
-        assert_eq!(
-            shown,
-            ["t1 visit x1", "t1 request x1", "t1 request x5", "t2 visit x1", "t2 request x1", "t2 exception x1", "t2 browser_error x1", "- request x1",]
-        );
-        let polls = &v["timeline"][2];
+        assert_eq!(shown, ["t1 page x2", "t1 request x5", "t2 page x2", "t2 exception x1", "t2 browser_error x1", "- request x1",]);
+        let polls = &v["timeline"][1];
         let t = |s: i64| super::compact::time(T0 + s * S);
         assert_eq!(
             (polls["route"].as_str(), polls["first"].as_str(), polls["last"].as_str()),
@@ -474,9 +504,56 @@ mod tests {
         assert!(!want.contains(&"other".to_string()) && !want.contains(&"old".to_string()));
         let s = &v["summary"];
         assert_eq!((s["tabs"].as_i64(), s["requests"].as_i64(), s["visits"].as_i64(), s["without_tab"].as_i64()), (Some(2), Some(8), Some(2), Some(1)));
-        assert_eq!(s["errors"], json!({"server": 1, "exceptions": 1, "browser": 1}));
+        assert_eq!(s["errors"], json!({"total": 2, "server": 1, "visits": 0, "browser": 1, "exceptions": 1}), "the exception is the 500's, not another error");
         assert_eq!(v["tabs"][1]["lane"], "t2");
         assert!(v["url"].as_str().unwrap().ends_with("/sessions/s1"));
+    }
+
+    /// The real client's poll (a visit, then its request, every 3 s): one
+    /// entry for the 15, with the visits counted inside it, and lossless.
+    #[test]
+    fn a_polling_tab_is_one_page_entry_and_loses_nothing() {
+        let f = seeded("journey-poll");
+        crate::dashboard::session_journey::tests::polling(&f.tenant());
+        let v = f.tool("session_journey", json!({"session_id": "p1"}));
+        let shown: Vec<String> = v["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} {} {} x{}",
+                    e["lane"].as_str().unwrap_or("-"),
+                    e["type"].as_str().unwrap(),
+                    e["route"].as_str().or(e["component"].as_str()).unwrap_or(""),
+                    e["count"]
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "t1 visit journey/three x1",
+                "- request GET /three x1",
+                "t1 page GET /three x30",
+                "t2 page GET /one x2",
+                "- request GET /vite/one.js x1",
+                "t2 page GET /two x2"
+            ]
+        );
+        let polls = &v["timeline"][2];
+        assert_eq!(
+            (polls["requests"].as_i64(), polls["visits"]["count"].as_i64(), polls["visits"]["component"].as_str()),
+            (Some(15), Some(15), Some("journey/three"))
+        );
+        assert_eq!(polls["cadence"], "every ~3s, regular");
+        let rows = f.tool("session_journey", json!({"session_id": "p1", "shape": "rows"}));
+        let all = rows["timeline"].as_array().unwrap();
+        let counted: i64 = v["timeline"].as_array().unwrap().iter().map(|e| e["count"].as_i64().unwrap()).sum();
+        assert_eq!(counted, all.len() as i64, "visits and requests all counted");
+        let mut want: Vec<String> = all.iter().filter(|r| r["type"] == "request").map(|r| r["execution_id"].as_str().unwrap().to_string()).collect();
+        want.sort();
+        assert_eq!(request_ids(&f, &v), want, "each run expands to exactly its requests");
     }
 
     /// Two tabs polling the same route at once are two runs, and each
@@ -596,7 +673,7 @@ mod tests {
         let v = f.tool("list_sessions", json!({"window": "24h"}));
         let ids: Vec<&str> = v["sessions"].as_array().unwrap().iter().map(|s| s["session_id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["s1", "s2"]);
-        assert_eq!(v["sessions"][0]["errors"], json!({"server": 1, "visits": 0, "browser": 1}));
+        assert_eq!(v["sessions"][0]["errors"], json!({"total": 2, "server": 1, "visits": 0, "browser": 1}));
         assert_eq!(v["sessions"][0]["tabs"], 2);
         assert_eq!(f.tool("list_sessions", json!({"window": "24h", "has_errors": true}))["total"], 1);
         assert_eq!(f.tool("list_sessions", json!({"window": "24h", "user": "nobody"}))["total"], 0);
