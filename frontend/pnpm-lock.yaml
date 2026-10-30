@@ -16,11 +16,11 @@ importers:
         specifier: ^2.2.0
         version: 2.2.10(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       '@inertiajs/core':
-        specifier: 2.3.27
-        version: 2.3.27
+        specifier: 2.3.29
+        version: 2.3.29
       '@inertiajs/react':
-        specifier: ^2.1.2
-        version: 2.3.27(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
+        specifier: ^2.3.29
+        version: 2.3.29(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       '@radix-ui/react-avatar':
         specifier: ^1.3.1
         version: 1.3.1(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
@@ -476,11 +476,11 @@ packages:
       react: ^18 || ^19 || ^19.0.0-rc
       react-dom: ^18 || ^19 || ^19.0.0-rc
 
-  '@inertiajs/core@2.3.27':
-    resolution: {integrity: sha512-UYoKpg/OrpcoLqb9nDmQh+QhQ4dI5B2ZT3LfhSfNWnRUcpMyd/MagcoVeck3zDfEcQscvFMhiZUD/lXpbuixQQ==}
+  '@inertiajs/core@2.3.29':
+    resolution: {integrity: sha512-Cx3zibnKdsmEnXpsWhwmE9i4k5NFtK+4gtceL3Kb6RwYC1J0wi5y/EesNMkpdJLsAT2h4ugUvu9Ed9T1EUl0/A==}
 
-  '@inertiajs/react@2.3.27':
-    resolution: {integrity: sha512-30YVDJAbTGYH1/Hb0ThYpuxA152m2FZWhP8yqXC8GD2Hq1rID8Mp3wxnclEJADksYvGkmEC9jW2a2yAgpTrczw==}
+  '@inertiajs/react@2.3.29':
+    resolution: {integrity: sha512-09SWBPxv8UrJdOWtQrEp1ro6jv1qJ8yOxH8eL+na9K/wbh7k9R0ALvAO3ofY52Cwuh7HMuSPgtRzk/q8E1k0Fg==}
     peerDependencies:
       react: ^16.9.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
       react-dom: ^16.9.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
@@ -1569,8 +1569,8 @@ packages:
   '@types/lodash-es@4.17.12':
     resolution: {integrity: sha512-0NgftHUcV4v34VhXm8QBSftKVXtbkBG3ViCjs6+eJ5a6y6Mi/jiFGPc1sC7QK+9BFhWrURE3EOggmWaSxL9OzQ==}
 
-  '@types/lodash@4.17.25':
-    resolution: {integrity: sha512-+K1NIO8I+F9/wNulfVvu23QYd0Pe9/OCqRrim4NoYIf1VoEDL90Ve4ClzpyqBLc7NpGGWRvYNCKZ1BE/Jpf8dQ==}
+  '@types/lodash@4.17.27':
+    resolution: {integrity: sha512-VenMRv/eKNrspX9v3H4dbmjsrnCOYdYBG3kxXKk3dG6X+urBGcj2Prww3xw1U5K4FV/mE4h5GbWd0szEKf+9ew==}
 
   '@types/node@26.6.5':
     resolution: {integrity: sha512-uMzsv9stDdofIZBx4UGh4Z9ZgXnGC9seRDscilBcTHAeOFk67MZg/k9bWVfO+bk4qZmG+l52hRnLwUiH2LnJTg==}
@@ -1759,8 +1759,8 @@ packages:
   asynckit@0.4.0:
     resolution: {integrity: sha512-Oei9OH4tRh0YqU3GxhX79dM/mwVgvbZJaSNaRk+bshkj0S5cfHcgYakreBjrHwatXKbz+IoIdYLxrKim2MjW0Q==}
 
-  axios@1.20.0:
-    resolution: {integrity: sha512-r8aOh8j9cGKpgQAqpzrUHnSIc6a59Y3Xf/cv8sy1DrHCkZHzQGEuoq1tARk6qSyDdtQGSDgpb9kFlruzPvrgwg==}
+  axios@1.21.0:
+    resolution: {integrity: sha512-YCzXMB53Q9PZBsh7yN7wtapit4WepwcHS2fP8QhGsBxSz5YtgYobV7GGlWlAJi+RxfU77GQTQi2DSLUma42EYA==}
 
   babel-plugin-react-compiler@1.0.0:
     resolution: {integrity: sha512-Ixm8tFfoKKIPYdCCKYTsqv+Fd4IJ0DQqMyEimo+pxUOMUR9cVPlwTrFt9Avu+3cb6Zp3mAzl+t1MrG2fxxKsxw==}
@@ -1977,8 +1977,8 @@ packages:
       picomatch:
         optional: true
 
-  follow-redirects@1.16.1:
-    resolution: {integrity: sha512-FNvFGzoMLWmE6Yj9spb/zjd7yiNCHiAW9/Tg9CXrQ8wuu32HtlJOwWO11OJafl5FfY3DxTdQ0vj42zU1kvv5jg==}
+  follow-redirects@1.16.2:
+    resolution: {integrity: sha512-/kVP2U8z596Ia0gwFrwyIeo74ta5aVmSeU1FfAUMAmcEP5EP7zydmag3SLiN64NaRKef3lxsq7i/g7ltJQDGow==}
     engines: {node: '>=4.0'}
     peerDependencies:
       debug: '*'
@@ -2996,10 +2996,10 @@ snapshots:
       react-dom: 19.3.1(react@19.3.1)
       use-sync-external-store: 1.6.0(react@19.3.1)
 
-  '@inertiajs/core@2.3.27':
+  '@inertiajs/core@2.3.29':
     dependencies:
       '@types/lodash-es': 4.17.12
-      axios: 1.20.0
+      axios: 1.21.0
       laravel-precognition: 1.0.2
       lodash-es: 4.18.1
       qs: 6.17.0
@@ -3007,9 +3007,9 @@ snapshots:
       - debug
       - supports-color
 
-  '@inertiajs/react@2.3.27(react-dom@19.3.1(react@19.3.1))(react@19.3.1)':
+  '@inertiajs/react@2.3.29(react-dom@19.3.1(react@19.3.1))(react@19.3.1)':
     dependencies:
-      '@inertiajs/core': 2.3.27
+      '@inertiajs/core': 2.3.29
       '@types/lodash-es': 4.17.12
       laravel-precognition: 1.0.2
       lodash-es: 4.18.1
@@ -4091,9 +4091,9 @@ snapshots:
 
   '@types/lodash-es@4.17.12':
     dependencies:
-      '@types/lodash': 4.17.25
+      '@types/lodash': 4.17.27
 
-  '@types/lodash@4.17.25': {}
+  '@types/lodash@4.17.27': {}
 
   '@types/node@26.6.5':
     dependencies:
@@ -4218,9 +4218,9 @@ snapshots:
 
   asynckit@0.4.0: {}
 
-  axios@1.20.0:
+  axios@1.21.0:
     dependencies:
-      follow-redirects: 1.16.1
+      follow-redirects: 1.16.2
       form-data: 4.0.6
       https-proxy-agent: 5.0.1
       proxy-from-env: 2.1.0
@@ -4438,7 +4438,7 @@ snapshots:
     optionalDependencies:
       picomatch: 4.0.7
 
-  follow-redirects@1.16.1: {}
+  follow-redirects@1.16.2: {}
 
   form-data@4.0.6:
     dependencies:
@@ -4545,7 +4545,7 @@ snapshots:
 
   laravel-precognition@1.0.2:
     dependencies:
-      axios: 1.20.0
+      axios: 1.21.0
       lodash-es: 4.18.1
     transitivePeerDependencies:
       - debug
