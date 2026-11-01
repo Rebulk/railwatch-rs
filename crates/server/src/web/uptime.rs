@@ -64,7 +64,7 @@ pub fn props(c: &rusqlite::Connection, env: i64, now: i64, window: &str, base_ur
             "latency": uptime::latency_series(c, m.id, from, bucket)?,
         }));
     }
-    let incidents: Vec<Value> = uptime::incidents(c, env, 20, false)?
+    let incidents: Vec<Value> = uptime::incidents(c, env, 20, false, None)?
         .iter()
         .map(|i| {
             json!({"id": i.id, "monitor_id": i.monitor_id, "monitor": i.monitor, "started_at": t(Some(i.started_at)), "ended_at": t(i.ended_at),

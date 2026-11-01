@@ -360,6 +360,57 @@ async fn probes_classify_each_way_a_check_fails() {
 }
 
 #[tokio::test]
+async fn every_resolved_address_is_tried_not_only_the_first() {
+    // `localhost` resolves to ::1 and 127.0.0.1; only the IPv4 one listens.
+    let base = local_server().await;
+    let port = base.rsplit(':').next().unwrap();
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(("localhost", 80)).await.unwrap().collect();
+    if !addrs.iter().any(|a| a.is_ipv6()) || !addrs.iter().any(|a| a.is_ipv4()) {
+        eprintln!("skipped: localhost is not dual-stack here ({addrs:?})");
+        return;
+    }
+    let out = probe::check(&req(format!("http://localhost:{port}/ok")), LAN).await;
+    assert_eq!(out.failure, None, "an unreachable first address is not an outage: {out:?}");
+}
+
+#[test]
+fn incidents_narrowed_to_one_monitor_are_narrowed_before_the_limit() {
+    let f = fixture("narrow");
+    let old = add(&f, input("Old"));
+    let busy = add(&f, input("Busy"));
+    let outage = |id: i64, at: i64| {
+        f.control.with(|x| record(x, id, at, &fail(Failure::Dns))).unwrap();
+        f.control.with(|x| record(x, id, at + MIN, &fail(Failure::Dns))).unwrap();
+        f.control.with(|x| record(x, id, at + 2 * MIN, &ok(1))).unwrap();
+    };
+    outage(old, T0);
+    for i in 1..=3 {
+        outage(busy, T0 + i * 10 * MIN);
+    }
+    let all = f.control.with(|x| incidents(x, f.env, 2, false, None)).unwrap();
+    assert!(all.iter().all(|i| i.monitor_id == busy), "the newest two are Busy's");
+    let mine = f.control.with(|x| incidents(x, f.env, 2, false, Some(old))).unwrap();
+    assert_eq!(mine.len(), 1, "Old's incident is found though newer ones fill the limit");
+}
+
+#[test]
+fn a_failed_commit_leaves_no_transaction_open() {
+    let f = fixture("busy");
+    let id = add(&f, input("Shop"));
+    // A second connection holding a read snapshot cannot block a WAL commit,
+    // so make COMMIT fail instead with a deferred foreign key violation.
+    f.control.with(|x| x.execute_batch("PRAGMA defer_foreign_keys = ON; CREATE TEMP TRIGGER bad AFTER INSERT ON uptime_checks BEGIN INSERT INTO uptime_incidents (monitor_id, started_at, cause) VALUES (-1, 0, 'x'); END;")).unwrap();
+    let r = f.control.with(|x| {
+        x.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+        record(x, id, T0, &ok(1))
+    });
+    assert!(r.is_err(), "the deferred violation fails the COMMIT");
+    assert!(f.control.with(|x| Ok(x.is_autocommit())).unwrap(), "rolled back, not left inside the transaction");
+    f.control.with(|x| x.execute_batch("DROP TRIGGER temp.bad")).unwrap();
+    assert!(f.control.with(|x| record(x, id, T0, &ok(1))).is_ok(), "the next check records normally");
+}
+
+#[tokio::test]
 async fn without_the_self_host_flag_a_local_server_is_never_contacted() {
     let base = local_server().await;
     let out = probe::check(&req(format!("{base}/ok")), Policy::default()).await;

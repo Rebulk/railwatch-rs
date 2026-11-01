@@ -324,17 +324,13 @@ pub enum Transition {
 /// deleted or disabled while the check ran (nothing is recorded then).
 pub fn record(c: &Connection, id: i64, at: i64, o: &probe::Outcome) -> rusqlite::Result<Option<Transition>> {
     c.execute_batch("BEGIN IMMEDIATE")?;
-    let r = record_in(c, id, at, o);
-    match r {
-        Ok(t) => {
-            c.execute_batch("COMMIT")?;
-            Ok(t)
-        }
-        Err(e) => {
-            let _ = c.execute_batch("ROLLBACK");
-            Err(e)
-        }
+    // A failed COMMIT (SQLITE_BUSY) leaves the transaction open on the
+    // shared control connection: roll back on any error, commit included.
+    let r = record_in(c, id, at, o).and_then(|t| c.execute_batch("COMMIT").map(|_| t));
+    if r.is_err() && !c.is_autocommit() {
+        let _ = c.execute_batch("ROLLBACK");
     }
+    r
 }
 
 fn record_in(c: &Connection, id: i64, at: i64, o: &probe::Outcome) -> rusqlite::Result<Option<Transition>> {
@@ -573,15 +569,16 @@ impl Incident {
 }
 
 /// The newest `limit` incidents of an environment's monitors (only the
-/// public monitors' when `public_only`), open ones first.
-pub fn incidents(c: &Connection, environment_id: i64, limit: i64, public_only: bool) -> rusqlite::Result<Vec<Incident>> {
+/// public monitors' when `public_only`, only `monitor`'s when given), open
+/// ones first.
+pub fn incidents(c: &Connection, environment_id: i64, limit: i64, public_only: bool, monitor: Option<i64>) -> rusqlite::Result<Vec<Incident>> {
     let public = if public_only { " AND m.public = 1 AND m.enabled = 1" } else { "" };
     c.prepare(&format!(
         "SELECT i.id, i.monitor_id, m.name, COALESCE(NULLIF(TRIM(m.public_name), ''), m.name), i.started_at, i.ended_at, i.cause, i.detail
          FROM uptime_incidents i JOIN uptime_monitors m ON m.id = i.monitor_id
-         WHERE m.environment_id = ?{public} ORDER BY i.ended_at IS NOT NULL, i.started_at DESC LIMIT ?"
+         WHERE m.environment_id = ?1 AND (?2 IS NULL OR m.id = ?2){public} ORDER BY i.ended_at IS NOT NULL, i.started_at DESC LIMIT ?3"
     ))?
-    .query_map(params![environment_id, limit], |r| {
+    .query_map(params![environment_id, monitor, limit], |r| {
         Ok(Incident {
             id: r.get(0)?,
             monitor_id: r.get(1)?,
@@ -703,7 +700,7 @@ pub fn public_status(c: &Connection, slug: &str, now: i64) -> rusqlite::Result<O
         components.push(v);
     }
     let statuses: Vec<&str> = shown.iter().map(|m| m.status.as_str()).collect();
-    let incidents: Vec<Value> = incidents(c, env, 10, true)?
+    let incidents: Vec<Value> = incidents(c, env, 10, true, None)?
         .iter()
         .map(|i| {
             json!({"component": i.public_name, "started_at": time::iso8601(i.started_at.div_euclid(1_000_000)),

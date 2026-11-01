@@ -16,7 +16,7 @@ or no longer answering correctly (DNS, TLS, the proxy, a 502).
 
    | field | default | |
    |---|---|---|
-   | name | | shown in alerts and on the page |
+   | name | | shown in alerts, on the page, and on the status page unless a public name is set |
    | URL | | `http://` or `https://`, no credentials |
    | method | GET | or HEAD |
    | expected status | any 2xx or 3xx | or one exact status |
@@ -128,11 +128,13 @@ URL there**).
   cookies. With `base_path` set it is under that path like every page, so
   a server mounted behind an app's own login (the railwatch-server gem) is
   only public if that app forwards `/status/` without its login.
-- It shows the overall status (all operational, some down, all down), each
+- It shows the overall status (all operational, some down, all down, or
+  "not yet known" until a public monitor has had a check), each
   public monitor with a 90-day bar and its 90-day uptime, and the last 10
   incidents of public monitors with their durations.
-- It shows **only** what is marked public: the public name (never the
-  internal name), the URL only when allowed, statuses, uptime and incident
+- It shows **only** what is marked public: the public name (a monitor with
+  no public name is shown by its name, so give one to anything you named for
+  internal use), the URL only when allowed, statuses, uptime and incident
   times. No ids, internal URLs, causes, error text or anything about users.
   The HTML and JSON are rendered from the same value, so the HTML cannot show
   more than the JSON.

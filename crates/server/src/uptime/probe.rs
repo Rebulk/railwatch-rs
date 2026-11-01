@@ -148,7 +148,7 @@ async fn run(req: &Request, policy: Policy) -> Result<(i64, Option<Failed>), Fai
         }
     }
     let client = reqwest::Client::builder()
-        .resolve(&host, addrs[0])
+        .resolve_to_addrs(&host, &addrs)
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(user_agent())
         .no_proxy()

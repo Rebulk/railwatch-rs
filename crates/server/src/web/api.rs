@@ -1355,7 +1355,7 @@ impl Api<'_> {
                     "days" => crate::uptime::daily(c, m.id, now, crate::uptime::DAILY_DAYS)?,
                 });
             }
-            let incidents: Vec<Value> = crate::uptime::incidents(c, e.id, 50, false)?
+            let incidents: Vec<Value> = crate::uptime::incidents(c, e.id, 50, false, None)?
                 .iter()
                 .map(|i| {
                     crate::obj! {

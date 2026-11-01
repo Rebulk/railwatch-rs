@@ -17,10 +17,12 @@ impl Mcp<'_> {
         let t = |m: i64| json!(crate::time::iso8601(m.div_euclid(1_000_000)));
         let (monitors, incidents, page) = self.env.control.with(|c| {
             let mut out = Vec::new();
+            let mut matched = None;
             for m in uptime::monitors(c, env.id)? {
                 if only.as_deref().is_some_and(|n| !n.eq_ignore_ascii_case(&m.name)) {
                     continue;
                 }
+                matched = Some(m.id);
                 let mut v = Map::new();
                 v.insert("name".into(), json!(m.name));
                 v.insert("url".into(), json!(m.url));
@@ -68,9 +70,14 @@ impl Mcp<'_> {
                 }
                 out.push(Value::Object(v));
             }
-            let incidents: Vec<Value> = uptime::incidents(c, env.id, limit, false)?
+            // Narrowed in the query, before the limit. No such monitor: none.
+            let incidents = match (&only, matched) {
+                (Some(_), None) => vec![],
+                (Some(_), id) => uptime::incidents(c, env.id, limit, false, id)?,
+                (None, _) => uptime::incidents(c, env.id, limit, false, None)?,
+            };
+            let incidents: Vec<Value> = incidents
                 .into_iter()
-                .filter(|i| only.as_deref().is_none_or(|n| n.eq_ignore_ascii_case(&i.monitor)))
                 .map(|i| {
                     let mut v = Map::new();
                     v.insert("monitor".into(), json!(i.monitor));

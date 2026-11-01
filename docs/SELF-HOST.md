@@ -137,7 +137,7 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `SILENCE_SECONDS` | 60 | quiet time before "app stopped reporting" |
 | `DEADMAN_URL` | | pinged every 30 s while healthy (healthchecks.io etc.) |
 | `ALLOW_PRIVATE_ALERT_TARGETS` | off | alert destinations on private/loopback addresses (SSRF risk; README) |
-| `ALLOW_PRIVATE_MONITOR_TARGETS` | off | uptime monitors of private/loopback URLs, for apps on this server's network (SSRF risk; [uptime.md](uptime.md)) |
+| `ALLOW_PRIVATE_MONITOR_TARGETS` | off | uptime monitors of private/loopback URLs, for apps on this server's network (SSRF risk; [uptime.md](uptime.md)). Environment variable only, not read from `railwatch.toml` |
 | `ALERT_DELIVERY` | `on` | `off` records alerts as skipped and withholds weekly digests (shadow installs) |
 | `SECRET_KEY_BASE` | generated into the data dir | |
 | `LOG` | `info` | `debug` logs every batch |
