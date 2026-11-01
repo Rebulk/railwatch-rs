@@ -101,7 +101,7 @@ pub struct Scoped {
     pub props: Value,
 }
 
-async fn scope(cx: &Ctx, app: i64, env: i64) -> Result<Scoped, Response> {
+pub(crate) async fn scope(cx: &Ctx, app: i64, env: i64) -> Result<Scoped, Response> {
     if cx.current.user.is_none() {
         return Err(cx.redirect(Redirect::to("/sign_in")));
     }
@@ -271,6 +271,7 @@ async fn props_for(cx: &Ctx, component: &str, scoped: &Scoped, params: &Params, 
     .unwrap_or_else(|e| Err(PageError::Unprocessable(format!("page task failed: {e}"))));
     match result {
         Ok(v) if component == "usage/show" => usage_control_props(cx, scoped, v).await,
+        Ok(v) if component == "overview/show" => uptime_overview_props(cx, scoped, v).await,
         Ok(v) => Ok(v),
         Err(PageError::NotFound) => Err((StatusCode::NOT_FOUND, "Not Found").into_response()),
         Err(PageError::Unprocessable(m)) => Err((StatusCode::UNPROCESSABLE_ENTITY, m).into_response()),
@@ -279,6 +280,28 @@ async fn props_for(cx: &Ctx, component: &str, scoped: &Scoped, params: &Params, 
             Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response())
         }
     }
+}
+
+/// The overview's uptime stat (Rust-only): how many enabled monitors are
+/// up and down, null without monitors so the stat stays hidden.
+async fn uptime_overview_props(cx: &Ctx, scoped: &Scoped, mut props: Value) -> Result<Value, Response> {
+    let env = scoped.id;
+    let r = cx
+        .state
+        .db(move |c| {
+            c.with(|x| {
+                let ms: Vec<String> = crate::uptime::monitors(x, env)?.into_iter().filter(|m| m.enabled).map(|m| m.status).collect();
+                let refs: Vec<&str> = ms.iter().map(String::as_str).collect();
+                Ok((ms.len(), ms.iter().filter(|s| *s == "down").count(), crate::uptime::overall(&refs)))
+            })
+        })
+        .await;
+    let (total, down, overall) = r.map_err(|e| {
+        tracing::error!(error = %e, "uptime summary failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+    })?;
+    props["uptime"] = if total == 0 { Value::Null } else { json!({"monitors": total, "down": down, "status": overall}) };
+    Ok(props)
 }
 
 /// UsageController#show's control half: `account` (plan, quota, cap,

@@ -18,6 +18,7 @@
 //! | quota_check 15 min          | quota_check                                |
 //! | weekly_digest every monday at 8am | weekly_digest::run_forever, 08:00 UTC Mondays |
 //! | (new) watchdog              | every 10 s; dead-man ping every 30 s       |
+//! | (new) uptime probes         | due monitors every 1 s; rollups hourly     |
 //!
 //! Not ported (no counterpart needed): optimize/backup/restore-verification
 //! (operational, Litestream-era), operations_status, Linear,
@@ -27,6 +28,7 @@ pub mod detectors;
 pub mod drain;
 pub mod prune;
 pub mod schedule;
+pub mod uptime;
 pub mod watchdog;
 pub mod weekly_digest;
 pub mod worker;
@@ -341,6 +343,8 @@ pub async fn scheduler(control: Arc<Control>, bg: Background, tenants_dir: PathB
             }),
         ));
     }
+    // Uptime monitors: probes, incidents, rollups (jobs/uptime.rs).
+    handles.push(tokio::spawn(uptime::run_forever(control.clone(), shutdown.clone())));
     // weekly_digest: every monday at 8am (UTC).
     handles.push(tokio::spawn(weekly_digest::run_forever(control.clone(), tenants_dir.clone(), shutdown.clone())));
     // Daily: prune at 03:00 UTC, auto-resolve at 04:00 UTC. Prune also runs

@@ -29,6 +29,8 @@ pub mod params;
 pub mod proxy_auth;
 pub mod session;
 pub mod sessions_oauth;
+pub mod status_page;
+pub mod uptime;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -139,7 +141,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .merge(issues::routes())
         .merge(alerts::routes())
         .merge(integrations::routes())
-        .merge(sessions_oauth::routes());
+        .merge(sessions_oauth::routes())
+        .merge(uptime::routes());
     let pages = inertia::layer(pages);
     let pages = session::layer(pages, state.clone());
     let router = Router::new()
@@ -148,6 +151,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .merge(mcp::routes())
         // /api/v1, the same tokens.
         .merge(api::routes())
+        // Public status pages: no session, no cookies (status_page.rs).
+        .merge(status_page::routes())
         .route("/cable", axum::routing::get(cable::upgrade))
         .route("/vite/{*path}", axum::routing::get(controllers::asset))
         // The source of this server (the license's notice).

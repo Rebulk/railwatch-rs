@@ -512,6 +512,22 @@ brief's suggestion). The fixed 60 s default came from the research
 measurement instead; a low-traffic environment with no health records would
 need a longer `RAILWATCH_SILENCE_SECONDS`.
 
+## Deliberate addition: uptime monitors and status pages
+
+No Rails counterpart ([uptime.md](uptime.md)). The server requests each
+monitor's URL on its interval (through the alert webhooks' address policy),
+records checks, incidents and daily rollups in new control tables
+(`uptime_monitors`, `uptime_checks`, `uptime_daily`, `uptime_incidents`,
+`status_pages`; control migration `20261101000001_uptime`), fires two new
+rule events, **`monitor_down`** and **`monitor_recovered`**, and serves an
+opt-in public page at `/status/<slug>`. New surfaces: the environment's
+Uptime page, an Uptime stat on the overview when monitors exist, the MCP
+tool `uptime`, and `GET /api/v1/.../environments/<env>/uptime`.
+
+Rollback: an older binary ignores the new tables (they are only read by this
+code); its migration list does not include the new version, so it does not
+drop them. Delete them by hand only if you will not upgrade again.
+
 # Gaps: issues, alerts, integrations, install (gaps)
 
 Checked by: unit tests in `web/integrations.rs`, `web/alerts.rs`,

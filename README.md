@@ -20,7 +20,8 @@ gem's embedded store and the hosted platform without conversion.
   [DIFFERENCES.md](docs/DIFFERENCES.md) (every known difference from the Rails server),
   [STORAGE.md](docs/STORAGE.md), [PERF.md](docs/PERF.md), [GATE1.md](docs/GATE1.md) (benchmarks),
   [agent-webhooks.md](docs/agent-webhooks.md) (alert webhooks an agent can act on, and a GitHub Action recipe),
-  [sessions.md](docs/sessions.md) (browser sessions across tabs, and the session journey)
+  [sessions.md](docs/sessions.md) (browser sessions across tabs, and the session journey),
+  [uptime.md](docs/uptime.md) (uptime monitors, incidents and public status pages)
 
 ## Self-hosting: the default path
 

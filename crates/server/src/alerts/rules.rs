@@ -24,6 +24,9 @@ pub const EVENTS: &[&str] = &[
     // Rust-only (docs/DIFFERENCES.md): the environment watchdog.
     "silent_environment",
     "environment_recovered",
+    // Rust-only (docs/uptime.md): uptime monitors.
+    "monitor_down",
+    "monitor_recovered",
 ];
 pub const BURST_EVENTS: &[&str] = &["new_issue", "regressed_issue"];
 pub const BURST_WINDOW_SECS: i64 = 60;

@@ -41,6 +41,8 @@ interface Props {
     sessions: number
     crash_free_sessions: number
   } | null
+  // railwatch-rs: uptime monitors; null without any.
+  uptime?: { monitors: number; down: number; status: string } | null
   processes: Record<
     string,
     {
@@ -126,6 +128,25 @@ export default function Overview(p: Props) {
             value={p.issues.length}
             tone={p.issues.length ? "destructive" : "success"}
           />
+          {p.uptime && (
+            <Link
+              href={R.applicationEnvironmentUptimePath(a, e)}
+              className="hover:bg-accent/40 min-w-0"
+            >
+              <Stat
+                label="Uptime"
+                value={
+                  p.uptime.down
+                    ? `${p.uptime.down} of ${p.uptime.monitors} down`
+                    : p.uptime.status === "operational"
+                      ? "All up"
+                      : "Waiting"
+                }
+                tone={p.uptime.down ? "destructive" : p.uptime.status === "operational" ? "success" : undefined}
+                hint={`${p.uptime.monitors} monitor${p.uptime.monitors === 1 ? "" : "s"}`}
+              />
+            </Link>
+          )}
           {p.release_health && (
             <Stat
               label="Crash-free sessions"
