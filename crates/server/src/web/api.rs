@@ -133,6 +133,7 @@ enum Action {
     Spans,
     Series,
     Visits,
+    Uptime,
     Issues,
     Issue,
     UpdateIssue,
@@ -162,6 +163,7 @@ impl Action {
             Spans => "api/v1/environments/spans",
             Series => "api/v1/environments/series",
             Visits => "api/v1/environments/visits",
+            Uptime => "api/v1/environments/uptime",
             Issues | Issue | UpdateIssue => "api/v1/issues",
             CreateComment => "api/v1/issue_comments",
         }
@@ -187,6 +189,7 @@ impl Action {
                 | Spans
                 | Series
                 | Visits
+                | Uptime
         )
     }
 }
@@ -252,6 +255,7 @@ fn route(method: &Method, path: &str) -> Option<Routed> {
                 (["spans"], true, _) => (Spans, p(&base)),
                 (["series"], true, _) => (Series, p(&base)),
                 (["visits"], true, _) => (Visits, p(&base)),
+                (["uptime"], true, _) => (Uptime, p(&base)),
                 _ => return None,
             }
         }
@@ -510,6 +514,7 @@ fn run(
         Spans => api.spans(e()),
         Series => api.series(e()),
         Visits => api.visits(e()),
+        Uptime => api.uptime(e()),
         Issues => api.issues(),
         Issue => api.issue(),
         UpdateIssue => api.update_issue(),
@@ -1328,6 +1333,41 @@ impl Api<'_> {
             "vitals" => Value::Object(vitals), "thresholds" => pages::vital_thresholds(), "ttfb_phases" => Value::Object(ttfb_phases),
             "data" => items, "meta" => meta, "releases" => releases,
         })
+    }
+
+    /// The environment's uptime monitors (docs/uptime.md): state, uptime
+    /// windows, the last 90 days and recent incidents. Rust-only.
+    fn uptime(&self, e: &Scoped) -> R<Rendered> {
+        let now = self.now;
+        let t = |m: Option<i64>| jt(m);
+        let (monitors, incidents) = self.control(|c| {
+            let mut out = Vec::new();
+            for m in crate::uptime::monitors(c, e.id)? {
+                out.push(crate::obj! {
+                    "id" => m.id, "name" => m.name.clone(), "url" => m.url.clone(), "method" => m.method.clone(),
+                    "expected_status" => db::ji(m.expected_status), "keyword" => js(m.keyword.as_deref()),
+                    "interval_seconds" => m.interval_seconds, "timeout_seconds" => m.timeout_seconds,
+                    "enabled" => m.enabled, "public" => m.public, "status" => m.status.clone(),
+                    "status_since" => t(crate::uptime::status_since(c, &m)?),
+                    "last_checked_at" => t(m.last_checked_at), "last_status_code" => db::ji(m.last_status_code),
+                    "last_latency_ms" => db::ji(m.last_latency_ms), "last_error" => js(m.last_error.as_deref()),
+                    "uptime" => crate::uptime::uptime_windows(c, m.id, now)?,
+                    "days" => crate::uptime::daily(c, m.id, now, crate::uptime::DAILY_DAYS)?,
+                });
+            }
+            let incidents: Vec<Value> = crate::uptime::incidents(c, e.id, 50, false, None)?
+                .iter()
+                .map(|i| {
+                    crate::obj! {
+                        "id" => i.id, "monitor_id" => i.monitor_id, "monitor" => i.monitor.clone(),
+                        "started_at" => t(Some(i.started_at)), "ended_at" => t(i.ended_at), "duration_seconds" => i.duration_secs(now),
+                        "cause" => i.cause.clone(), "detail" => js(i.detail.as_deref()),
+                    }
+                })
+                .collect();
+            Ok((out, incidents))
+        })?;
+        ok(crate::obj! { "data" => monitors, "incidents" => incidents })
     }
 
     // -- issues ------------------------------------------------------------------

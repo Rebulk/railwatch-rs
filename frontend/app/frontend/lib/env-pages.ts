@@ -15,6 +15,7 @@ import {
   Gauge,
   GitCommit,
   HardDrive,
+  HeartPulse,
   Layers,
   LayoutTemplate,
   Mail,
@@ -213,6 +214,12 @@ export function envPages(
       title: "Processes",
       href: R.applicationEnvironmentProcessesPath(a, e),
       icon: Server,
+      group: "monitoring",
+    },
+    {
+      title: "Uptime",
+      href: R.applicationEnvironmentUptimePath(a, e),
+      icon: HeartPulse,
       group: "monitoring",
     },
     {

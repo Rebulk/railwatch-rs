@@ -1130,6 +1130,64 @@ export const applicationEnvironmentTransactionsPath: ((
 
 /**
  * Generates rails route to
+ * /apps/:application_id/envs/:environment_id/uptime(.:format)
+ * @param {any} applicationId
+ * @param {any} environmentId
+ * @param {object | undefined} options
+ * @returns {string} route path
+ */
+export const applicationEnvironmentUptimePath: ((
+  applicationId: RequiredRouteParameter,
+  environmentId: RequiredRouteParameter,
+  options?: {format?: OptionalRouteParameter} & RouteOptions
+) => string) & RouteHelperExtras;
+
+/**
+ * Generates rails route to
+ * /apps/:application_id/envs/:environment_id/uptime/monitors(.:format)
+ * @param {any} applicationId
+ * @param {any} environmentId
+ * @param {object | undefined} options
+ * @returns {string} route path
+ */
+export const applicationEnvironmentUptimeMonitorsPath: ((
+  applicationId: RequiredRouteParameter,
+  environmentId: RequiredRouteParameter,
+  options?: {format?: OptionalRouteParameter} & RouteOptions
+) => string) & RouteHelperExtras;
+
+/**
+ * Generates rails route to
+ * /apps/:application_id/envs/:environment_id/uptime/monitors/:id(.:format)
+ * @param {any} applicationId
+ * @param {any} environmentId
+ * @param {any} id
+ * @param {object | undefined} options
+ * @returns {string} route path
+ */
+export const applicationEnvironmentUptimeMonitorPath: ((
+  applicationId: RequiredRouteParameter,
+  environmentId: RequiredRouteParameter,
+  id: RequiredRouteParameter,
+  options?: {format?: OptionalRouteParameter} & RouteOptions
+) => string) & RouteHelperExtras;
+
+/**
+ * Generates rails route to
+ * /apps/:application_id/envs/:environment_id/uptime/status_page(.:format)
+ * @param {any} applicationId
+ * @param {any} environmentId
+ * @param {object | undefined} options
+ * @returns {string} route path
+ */
+export const applicationEnvironmentUptimeStatusPagePath: ((
+  applicationId: RequiredRouteParameter,
+  environmentId: RequiredRouteParameter,
+  options?: {format?: OptionalRouteParameter} & RouteOptions
+) => string) & RouteHelperExtras;
+
+/**
+ * Generates rails route to
  * /apps/:application_id/envs/:environment_id/usage(.:format)
  * @param {any} applicationId
  * @param {any} environmentId

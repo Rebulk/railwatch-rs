@@ -14,6 +14,10 @@
 //!    issue_activities, comments, alerts, alert_rules, integrations,
 //!    thresholds, anomaly_rules; Rails' own DDL) plus the Rust-only
 //!    `environment_heartbeats` (watchdog state).
+//! 4. `uptime`: Rust-only uptime monitors (docs/uptime.md): monitors with
+//!    their state, raw checks (7 days), daily rollups (90 days), incidents,
+//!    and one status page per environment. Every table cascades from its
+//!    environment, so deleting an environment deletes its monitors.
 
 pub mod issues;
 
@@ -30,8 +34,12 @@ pub const SELF_HOSTED_QUOTA: i64 = 1_000_000_000_000;
 
 type Step = fn(&Transaction) -> rusqlite::Result<()>;
 
-pub const MIGRATIONS: &[(&str, Step)] =
-    &[("20261013000001_phase1", phase1), ("20261013000002_rails_primary", rails_primary), ("20261013000003_issues_alerts", issues_alerts)];
+pub const MIGRATIONS: &[(&str, Step)] = &[
+    ("20261013000001_phase1", phase1),
+    ("20261013000002_rails_primary", rails_primary),
+    ("20261013000003_issues_alerts", issues_alerts),
+    ("20261101000001_uptime", uptime),
+];
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<&'static str>> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS railwatch_migrations (version TEXT PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL)")?;
@@ -202,6 +210,79 @@ fn issues_alerts(tx: &Transaction) -> rusqlite::Result<()> {
         tx.execute_batch(sql)?;
     }
     tx.execute_batch(issues::RUST_ONLY)
+}
+
+/// Times are epoch microseconds (as environment_heartbeats), days
+/// "YYYY-MM-DD" in UTC.
+const UPTIME: &str = "
+CREATE TABLE uptime_monitors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+  environment_id INTEGER NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  url TEXT NOT NULL,
+  method TEXT NOT NULL DEFAULT 'GET',
+  -- NULL: any 2xx or 3xx
+  expected_status INTEGER,
+  keyword TEXT,
+  timeout_seconds INTEGER NOT NULL DEFAULT 10,
+  interval_seconds INTEGER NOT NULL DEFAULT 60,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  -- on the environment's status page, as public_name (or name)
+  public INTEGER NOT NULL DEFAULT 0,
+  public_name TEXT,
+  public_url INTEGER NOT NULL DEFAULT 0,
+  -- pending (no check yet) | up | down
+  status TEXT NOT NULL DEFAULT 'pending',
+  failures INTEGER NOT NULL DEFAULT 0,
+  failing_since INTEGER,
+  last_checked_at INTEGER,
+  last_status_code INTEGER,
+  last_latency_ms INTEGER,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX index_uptime_monitors_on_environment_id ON uptime_monitors (environment_id);
+CREATE TABLE uptime_checks (
+  monitor_id INTEGER NOT NULL REFERENCES uptime_monitors(id) ON DELETE CASCADE,
+  checked_at INTEGER NOT NULL,
+  ok INTEGER NOT NULL,
+  status_code INTEGER,
+  latency_ms INTEGER NOT NULL,
+  -- dns | connect | tls | timeout | status | keyword | blocked; NULL when ok
+  error TEXT
+);
+CREATE INDEX index_uptime_checks_on_monitor_id_and_checked_at ON uptime_checks (monitor_id, checked_at);
+CREATE TABLE uptime_daily (
+  monitor_id INTEGER NOT NULL REFERENCES uptime_monitors(id) ON DELETE CASCADE,
+  day TEXT NOT NULL,
+  checks INTEGER NOT NULL,
+  failures INTEGER NOT NULL,
+  p50_ms INTEGER,
+  p95_ms INTEGER,
+  PRIMARY KEY (monitor_id, day)
+) WITHOUT ROWID;
+CREATE TABLE uptime_incidents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+  monitor_id INTEGER NOT NULL REFERENCES uptime_monitors(id) ON DELETE CASCADE,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  cause TEXT NOT NULL,
+  detail TEXT
+);
+CREATE INDEX index_uptime_incidents_on_monitor_id_and_started_at ON uptime_incidents (monitor_id, started_at);
+CREATE TABLE status_pages (
+  environment_id INTEGER PRIMARY KEY NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+  slug TEXT NOT NULL UNIQUE,
+  title TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+";
+
+fn uptime(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(UPTIME)
 }
 
 #[cfg(test)]

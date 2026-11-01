@@ -107,6 +107,9 @@ const eventLabel: Record<string, string> = {
   // railwatch-rs: the environment watchdog's events.
   silent_environment: "App stopped reporting",
   environment_recovered: "App reporting again",
+  // railwatch-rs: uptime monitors.
+  monitor_down: "Monitor down",
+  monitor_recovered: "Monitor up again",
 }
 
 // "production · anomaly · >= high · /timeout/", or nothing when the rule

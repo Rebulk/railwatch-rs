@@ -50,4 +50,5 @@ pub mod storage;
 pub mod tenants;
 pub mod time;
 pub mod tls;
+pub mod uptime;
 pub mod web;

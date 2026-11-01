@@ -34,6 +34,8 @@ fn heading(event: &str) -> String {
         "crash_free_drop" => "Crash-free sessions dropped",
         "silent_environment" => "Silent environment",
         "environment_recovered" => "Environment reporting again",
+        "monitor_down" => "Monitor down",
+        "monitor_recovered" => "Monitor up",
         other => return humanize(other),
     }
     .to_string()
@@ -49,7 +51,7 @@ fn humanize(s: &str) -> String {
 fn severity_default(event: &str) -> Option<&'static str> {
     match event {
         "new_issue" | "regressed_issue" | "threshold" | "anomaly" | "quota" => Some("normal"),
-        "silent_host" | "crash_free_drop" | "silent_environment" => Some("high"),
+        "silent_host" | "crash_free_drop" | "silent_environment" | "monitor_down" => Some("high"),
         _ => None,
     }
 }
@@ -296,7 +298,7 @@ impl Context {
         let icon = match self.alert.event.as_str() {
             "resolved_issue" => Some("✅"),
             "ignored_issue" => Some("🔕"),
-            "environment_recovered" => Some("✅"),
+            "environment_recovered" | "monitor_recovered" => Some("✅"),
             _ => match sev.as_deref() {
                 Some("urgent") => Some("🚨"),
                 Some("high") => Some("🔴"),

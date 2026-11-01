@@ -47,6 +47,8 @@ mod records;
 mod security;
 #[path = "mcp_sessions.rs"]
 mod sessions;
+#[path = "mcp_uptime.rs"]
+mod uptime;
 use crate::control::Control;
 use crate::dashboard::cursor_page::{self, CursorKey, Order};
 use crate::dashboard::db::{self, Rec, jf, qt};
@@ -581,6 +583,7 @@ impl Mcp<'_> {
             "release_health" => self.release_health(&a),
             "web_vitals" => self.web_vitals(&a),
             "recent_deploys" => self.recent_deploys(&a),
+            "uptime" => self.uptime(&a),
             "list_alerts" => self.list_alerts(&a),
             "investigate_issue" => self.investigate_issue(&a),
             "explain_route" => self.explain_route(&a),

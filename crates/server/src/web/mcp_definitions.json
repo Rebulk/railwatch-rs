@@ -1367,6 +1367,40 @@
       }
     },
     {
+      "name": "uptime",
+      "description": "Uptime monitors of an environment: each monitor this server probes from outside (name, URL, status up/down/pending/paused and since when, the last check's status code, latency and error), uptime % over 24h/7d/30d/90d (a window without checks is left out), p50/p95 latency of yesterday and today, and the recent incidents (start, end or ongoing, duration, cause: dns, connect, tls, timeout, status, keyword or blocked). A monitor is down after 2 failed checks in a row and up after 1 success. Probes run from this server only, so they see the app down but not a regional outage. Also the public status page URL when one is on.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "application_slug": {
+            "type": "string",
+            "description": "Application slug from list_applications. Optional when this token can see only one application (an embedded server always has one)."
+          },
+          "account_slug": {
+            "type": "string",
+            "description": "Account slug from list_applications. Optional; pass it when the same application_slug exists in more than one of your accounts."
+          },
+          "application_id": {
+            "type": "integer",
+            "description": "Stable application_id from list_applications. Optional; the most precise way to name an application."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment name or slug within the application, e.g. production. Optional when the application has only one environment."
+          },
+          "monitor": {
+            "type": "string",
+            "description": "A monitor's name as listed in monitors[].name. Optional; narrows monitors and incidents to that one."
+          },
+          "incidents": {
+            "type": "integer",
+            "description": "Maximum incidents to return, 1-50. Defaults to 10."
+          }
+        },
+        "required": []
+      }
+    },
+    {
       "name": "list_alerts",
       "description": "Fired alerts across this token's accounts, newest first: which rule fired, on which issue, through which integration, and whether delivery succeeded.",
       "inputSchema": {
@@ -1396,7 +1430,9 @@
               "anomaly",
               "silent_host",
               "quota",
-              "crash_free_drop"
+              "crash_free_drop",
+              "monitor_down",
+              "monitor_recovered"
             ],
             "description": "Restrict to one alert event."
           },
