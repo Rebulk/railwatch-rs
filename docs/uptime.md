@@ -124,9 +124,10 @@ URL there**).
 - It is served at **`/status/<slug>`**, with JSON at **`/status/<slug>.json`**,
   without signing in. Leave the address blank for an unguessable slug (20
   random characters), or choose one (3 to 64 lowercase letters, digits and
-  hyphens). The path is outside the dashboard, its session and its cookies,
-  so it works on a server whose dashboard is mounted behind an app's login
-  (`base_path`) too.
+  hyphens). The route is outside the dashboard's session: no sign-in, no
+  cookies. With `base_path` set it is under that path like every page, so
+  a server mounted behind an app's own login (the railwatch-server gem) is
+  only public if that app forwards `/status/` without its login.
 - It shows the overall status (all operational, some down, all down), each
   public monitor with a 90-day bar and its 90-day uptime, and the last 10
   incidents of public monitors with their durations.
