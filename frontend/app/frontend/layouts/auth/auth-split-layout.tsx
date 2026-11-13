@@ -10,6 +10,8 @@ import {
 import { Signal, Track } from "@/components/railwatch/empty-state"
 import { rootPath } from "@/routes"
 
+import requestsScreenshot from "@/assets/requests-full.webp"
+
 interface AuthLayoutProps {
   title?: string
   description?: string
@@ -77,7 +79,7 @@ export default function AuthSplitLayout({
           aria-hidden
         >
           <img
-            src="/marketing/requests-full.webp"
+            src={requestsScreenshot}
             alt=""
             width={1920}
             height={1200}

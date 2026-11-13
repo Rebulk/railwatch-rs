@@ -5,4 +5,4 @@
 export const HERO_HEADLINE_LEAD = "Monitoring Rails "
 export const HERO_HEADLINE_ACCENT = "deserves."
 export const HERO_SUBHEAD =
-  "First-class monitoring that runs inside your Rails app. Every request, job, query, and exception, linked into one timeline and kept in SQLite files you own."
+  "First-class monitoring for Rails. Every request, job, query, and exception, linked into one timeline, with alerts that reach you when your app is down. Hosted by us, or one binary on your own server."

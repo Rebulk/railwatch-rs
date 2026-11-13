@@ -1,4 +1,4 @@
-import { Head, usePage } from "@inertiajs/react"
+import { Head } from "@inertiajs/react"
 
 import { AiAssistant } from "@/components/marketing/ai-assistant"
 import { DeploymentModes } from "@/components/marketing/deployment-modes"
@@ -11,13 +11,15 @@ import { MarketingNav } from "@/components/marketing/nav"
 import { ProductPreview } from "@/components/marketing/product-preview"
 import { Reveal } from "@/components/marketing/reveal"
 
+// railwatch.dev's landing page. A static page knows no session, so it is
+// always the signed-out view; the app's own `/` sends a signed-in user to
+// the dashboard.
 export default function Welcome() {
-  const { auth } = usePage().props
-  const signedIn = Boolean(auth.user)
+  const signedIn = false
 
   return (
     <>
-      <Head title="Railwatch — monitoring that runs inside your Rails app" />
+      <Head title="Monitoring Rails deserves" />
       {/* The marketing page is a brand page, so it always renders in the navy
           stack regardless of the signed-in appearance setting. */}
       <div className="dark bg-background text-foreground min-h-screen">

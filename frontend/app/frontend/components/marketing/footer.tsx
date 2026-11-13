@@ -1,7 +1,5 @@
-import { Link } from "@inertiajs/react"
-
 import AppWordmark from "@/components/app-wordmark"
-import { docPath, docsPath } from "@/routes"
+import { DOCS_URL, PRIVACY_URL, TERMS_URL } from "@/lib/site"
 
 import { RebulkWordmark } from "./rebulk-wordmark"
 
@@ -12,23 +10,17 @@ export function MarketingFooter() {
         <AppWordmark className="h-4 w-auto" />
       </div>
       <p className="text-muted-foreground flex flex-wrap items-center gap-x-2 gap-y-1">
-        <Link href={docsPath()} className="hover:text-foreground">
+        <a href={DOCS_URL} className="hover:text-foreground">
           Docs
-        </Link>
+        </a>
         <span aria-hidden>·</span>
-        <Link
-          href={docPath("legal", "terms")}
-          className="hover:text-foreground"
-        >
+        <a href={TERMS_URL} className="hover:text-foreground">
           Terms
-        </Link>
+        </a>
         <span aria-hidden>·</span>
-        <Link
-          href={docPath("legal", "privacy")}
-          className="hover:text-foreground"
-        >
+        <a href={PRIVACY_URL} className="hover:text-foreground">
           Privacy
-        </Link>
+        </a>
         <span aria-hidden>·</span>
         <span className="flex items-baseline gap-1.5">
           Built by

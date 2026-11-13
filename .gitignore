@@ -7,3 +7,4 @@ frontend/dist/
 dist/
 .cache/
 .pnpm-store/
+frontend/dist-site/

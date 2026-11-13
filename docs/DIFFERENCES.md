@@ -223,8 +223,10 @@ cloud-only page driven in a real browser.
    when the password changes, as Rails'.
 8. **Email without SMTP is logged, not sent** (WARN, full body). `railwatch
    doctor` says so. Plain-text emails; Rails sends HTML templates.
-9. **Not built:** the marketing
-   home page (`/` redirects to the dashboard or sign-in), docs, Linear,
+9. **The marketing home page and legal pages are not served here.** They
+   are a static site (frontend/site, deployed to railwatch.dev); `/`
+   redirects to the dashboard or sign-in, and the sign-up form links to
+   railwatch.dev's terms. **Not built:** docs, Linear,
    usage page, MCP, `/api/v1`, account deletion's background job (deletion is
    inline). Issues/alerts (`recent_issues`, `open_issues`, `issues_open`) are 0
    or empty until p2-rollups' tables merge.

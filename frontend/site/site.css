@@ -1,0 +1,4 @@
+/* The app's stylesheet, plus the app's components as Tailwind sources:
+   Vite's root here is site/, so Tailwind would otherwise only scan site/. */
+@import "../app/frontend/entrypoints/application.css";
+@source "../app/frontend";

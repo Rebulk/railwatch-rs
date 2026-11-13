@@ -1,7 +1,7 @@
 import { Link } from "@inertiajs/react"
 
 import { Button } from "@/components/ui/button"
-import { docsPath } from "@/routes"
+import { DOCS_URL } from "@/lib/site"
 
 import { HERO_HEADLINE_ACCENT, HERO_HEADLINE_LEAD, HERO_SUBHEAD } from "./copy"
 import { HeroLoop } from "./hero-line"
@@ -38,7 +38,7 @@ export function MarketingHero({ signedIn }: { signedIn: boolean }) {
             </Button>
           )}
           <Button asChild variant="outline" size="lg">
-            <Link href={docsPath()}>Read the docs</Link>
+            <a href={DOCS_URL}>Read the docs</a>
           </Button>
         </div>
         {/* Reserves the height the lower run and signal need; the product

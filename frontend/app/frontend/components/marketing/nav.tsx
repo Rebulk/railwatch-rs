@@ -2,13 +2,8 @@ import { Link } from "@inertiajs/react"
 
 import AppWordmark from "@/components/app-wordmark"
 import { Button } from "@/components/ui/button"
-import {
-  dashboardPath,
-  docsPath,
-  rootPath,
-  signInPath,
-  signUpPath,
-} from "@/routes"
+import { DOCS_URL, REQUEST_ACCESS_URL } from "@/lib/site"
+import { dashboardPath, rootPath, signInPath } from "@/routes"
 
 export function MarketingNav({ signedIn }: { signedIn: boolean }) {
   return (
@@ -19,7 +14,7 @@ export function MarketingNav({ signedIn }: { signedIn: boolean }) {
       {signedIn ? (
         <nav className="flex items-center gap-2">
           <Button asChild variant="ghost" size="sm">
-            <Link href={docsPath()}>Docs</Link>
+            <a href={DOCS_URL}>Docs</a>
           </Button>
           <Button asChild size="sm">
             <Link href={dashboardPath()}>Dashboard</Link>
@@ -28,13 +23,13 @@ export function MarketingNav({ signedIn }: { signedIn: boolean }) {
       ) : (
         <nav className="flex items-center gap-2">
           <Button asChild variant="ghost" size="sm">
-            <Link href={docsPath()}>Docs</Link>
+            <a href={DOCS_URL}>Docs</a>
           </Button>
           <Button asChild variant="ghost" size="sm">
             <Link href={signInPath()}>Sign in</Link>
           </Button>
           <Button asChild size="sm">
-            <Link href={signUpPath()}>Get started</Link>
+            <a href={REQUEST_ACCESS_URL}>Request access</a>
           </Button>
         </nav>
       )}

@@ -1,0 +1,65 @@
+<h1 id="privacy-policy">Privacy Policy</h1>
+<p>Last updated: September 15, 2026</p>
+<p>This policy describes what Railwatch Cloud at railwatch.rebulk.com collects,
+how it is stored, and what we do with it. The Service is operated by Rebulk.</p>
+<h2 id="what-we-collect">What we collect</h2>
+<p><strong>Account information.</strong> Your name, email address, and a password hash. If
+you sign in with Google, we store the Google account identifier and the
+email address it verifies.</p>
+<p><strong>Telemetry.</strong> Whatever the Railwatch gem in your application sends us:
+requests, background jobs, database queries, exceptions, logs, cache
+activity, outgoing HTTP calls, deploys, and host metrics. This can include
+request parameters, error messages, SQL, user identifiers, and log lines
+from your application. You control what is sent.</p>
+<p><strong>Operational data.</strong> Server logs with IP addresses and request metadata,
+kept for troubleshooting and abuse prevention.</p>
+<p>We do not use tracking cookies or third-party analytics on the Service.</p>
+<h2 id="redaction-before-data-leaves-your-application">Redaction before data leaves your application</h2>
+<p>The gem redacts on your servers, before anything is transmitted to us:</p>
+<ul>
+<li>Authorization, cookie, and other sensitive headers are removed.</li>
+<li>Request parameters are filtered using your Rails <code>filter_parameters</code>
+configuration, so anything hidden from your logs is hidden from us too.</li>
+<li>You can extend redaction with <code>redact_params</code>, <code>redact_headers</code>, and
+per-record <code>redact_*</code> hooks described in the <a href="https://github.com/Rebulk/railwatch/blob/main/docs/security.md">gem documentation</a>.</li>
+</ul>
+<p>Redaction is your responsibility. We store what we receive.</p>
+<h2 id="how-data-is-stored">How data is stored</h2>
+<ul>
+<li>
+<strong>One database per environment.</strong> Each application environment's
+telemetry lives in its own SQLite database file. Telemetry from one account
+is never written to or read from another account's database, and an
+environment token can only select the single database it was issued for.</li>
+<li>
+<strong>Encrypted in transit</strong> over TLS.</li>
+<li>
+<strong>Hosted on our servers</strong> in the United States on Hetzner infrastructure,
+with continuous off-site replication to object storage for recovery.</li>
+<li>
+<strong>Bounded.</strong> Oversized values are truncated at ingest and every stored
+string is limited in size.</li>
+</ul>
+<h2 id="how-long-we-keep-it">How long we keep it</h2>
+<p>Telemetry is pruned after the retention period on your plan (seven days on
+the free plan). When you delete an environment or an account, its telemetry
+databases are removed immediately. Off-site backups age out within seven
+days. Account records are deleted with the account.</p>
+<h2 id="how-we-use-it">How we use it</h2>
+<p>We use your data only to provide the Service to you: to show you your own
+telemetry, to send alerts and digests you configure, and to keep the Service
+running. We do not sell it, share it with advertisers, or use it to train
+models. We may look at aggregate, non-identifying usage to understand load.</p>
+<p>We disclose data only if required by law or to protect the Service and its
+users.</p>
+<h2 id="third-parties">Third parties</h2>
+<p>We use Hetzner for hosting, an object-storage provider for backups, and
+Amazon SES to send email. If you connect an integration such as Slack or
+Linear, we send the data you configure to that service under its own terms.</p>
+<h2 id="your-choices">Your choices</h2>
+<p>You can export or delete your data by deleting environments or your account
+from settings. You can stop sending data at any time by removing the gem or
+pausing an environment. For anything else, email <a href="mailto:cole@rebulk.com">cole@rebulk.com</a>.</p>
+<h2 id="changes">Changes</h2>
+<p>We may update this policy. Material changes will be noted on this page. The
+date at the top reflects the last revision.</p>
