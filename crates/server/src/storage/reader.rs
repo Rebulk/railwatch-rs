@@ -57,6 +57,22 @@ pub fn open(dir: &Path) -> rusqlite::Result<(Connection, Attached)> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
     let attached = attach_all(&conn, dir)?;
+    // Bench diagnostic, unset by default: RW_SQL_TRACE=1 prints every
+    // statement a union reader runs, binds expanded, as one `SQLTRACE` line
+    // on stderr (the index audit, bench/storage/index_audit.py).
+    let mut conn = conn;
+    if std::env::var_os("RW_SQL_TRACE").is_some() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        conn.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(|e: TraceEvent<'_>| {
+                if let TraceEvent::Profile(s, d) = e {
+                    let sql = s.expanded_sql().unwrap_or_else(|| s.sql().into_owned());
+                    eprintln!("SQLTRACE {:.3} {}", d.as_secs_f64() * 1e3, sql.replace('\n', " "));
+                }
+            }),
+        )?;
+    }
     Ok((conn, attached))
 }
 

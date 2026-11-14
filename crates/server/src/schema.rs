@@ -267,15 +267,36 @@ pub fn configure(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// The one deliberate departure from the exported DDL, for NEW tenant
-/// files only (docs/DIFFERENCES.md, research/IMPROVEMENTS.md 1(iii)): the
-/// two `queries` indexes no gem 0.9.1 read uses are created partial, `WHERE
-/// app_tenant IS NOT NULL`. Same names and columns, so Rails opens the file
-/// and the gem's plans are unchanged; they cost ~3% of a busy tenant's
-/// file and a B-tree insert per query row for nothing. Files that already
-/// exist (Rails-made, imported, older Rust ones) are never altered.
-pub const PARTIAL_INDEXES: [(&str, &str); 2] =
-    [("idx_queries_tenant_duration_cursor", " WHERE app_tenant IS NOT NULL"), ("idx_queries_duration_cursor", " WHERE app_tenant IS NOT NULL")];
+/// The deliberate departures from the exported DDL, for NEW tenant files
+/// only (docs/DIFFERENCES.md #11 and #16, research/IMPROVEMENTS.md 1(iii)):
+/// indexes no read uses are created partial. Same names and columns, so
+/// Rails opens the file and the gem's plans are unchanged. Files that
+/// already exist (Rails-made, imported, older Rust ones) are never altered.
+///
+/// - `idx_queries_tenant_duration_cursor`: only a tenant-filtered slowest
+///   page names it (cursor_page), and that filter implies the clause.
+/// - `idx_queries_duration_cursor`, `index_executions_on_deploy_and_occurred_at`:
+///   no plan of any dashboard, MCP, API or worker read uses them, and no
+///   read names them (bench/storage/index_audit.sh, docs/STORAGE.md
+///   "Sizing"); `WHERE 0` keeps the name and holds no row. The deploy
+///   index was 55 B of every execution (2.6% of a core day file).
+/// - `index_executions_on_parent_id`: no read uses it either; `WHERE
+///   parent_id IS NOT NULL` keeps a lookup by parent working, and a
+///   request or job without a parent (most of them) is not in it.
+/// - the `executions` indexes that lead with (or seek on) a nullable
+///   tenant or user: every read that uses them filters `col = ?`, `col IN
+///   (...)` or `col IS NOT NULL`, each of which implies the clause, so SQLite
+///   still picks them; an execution without a tenant or user (half of a
+///   busy app's) is not in them.
+pub const PARTIAL_INDEXES: [(&str, &str); 7] = [
+    ("idx_queries_tenant_duration_cursor", " WHERE app_tenant IS NOT NULL"),
+    ("idx_queries_duration_cursor", " WHERE 0"),
+    ("index_executions_on_deploy_and_occurred_at", " WHERE 0"),
+    ("index_executions_on_parent_id", " WHERE parent_id IS NOT NULL"),
+    ("index_executions_on_app_tenant_and_occurred_at", " WHERE app_tenant IS NOT NULL"),
+    ("idx_executions_kind_tenant_cursor", " WHERE app_tenant IS NOT NULL"),
+    ("index_executions_on_user_ref_and_occurred_at", " WHERE user_ref IS NOT NULL"),
+];
 
 /// Creates the telemetry tables in an empty database the way the Rails
 /// migrations leave them: every sqlite_master row replayed in creation order
