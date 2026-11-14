@@ -710,6 +710,21 @@ all of it (identical; 130/130).
     filter keys, and the `list_sessions` and `session_journey` MCP tools
     are this server's own; railwatch-cloud has none of them. Cost:
     docs/PERF.md, "Session journeys".
+16. **More indexes are partial in new files** (`schema::PARTIAL_INDEXES`;
+    docs/STORAGE.md, "Sizing"). Beyond #11: `idx_queries_duration_cursor`
+    and `index_executions_on_deploy_and_occurred_at` are `WHERE 0` (no
+    read's plan uses them: bench/storage/index_audit.sh), and
+    `index_executions_on_parent_id`, `..._on_app_tenant_and_occurred_at`,
+    `idx_executions_kind_tenant_cursor` and `..._on_user_ref_and_occurred_at`
+    leave out rows whose column is NULL. Same names and columns; a gem
+    read that filters the column by a value or `IS NOT NULL` still gets the
+    index, and the gem names none of them in `INDEXED BY`. A gem read by
+    deploy or parent id over raw executions would scan (none exists in gem
+    0.8.7). Every read plan of this server is unchanged (the audit's
+    136,640 statements: 0 differ). Existing files are never altered: they
+    keep their indexes until retention removes them.
+    `compare.py` accepts exactly these sqlite_master rows. Not checked
+    (no Rails container here): cross_open.sh against the new files.
 
 ## Process
 

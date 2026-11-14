@@ -51,19 +51,23 @@ if rt != ut:
     bad += 1
 schema_r = rails.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid").fetchall()
 schema_u = rust.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid").fetchall()
-# A new Rust tenant makes these two queries indexes partial (schema.rs
-# PARTIAL_INDEXES, docs/DIFFERENCES.md); every other row must be Rails' own.
-PARTIAL = {b"idx_queries_tenant_duration_cursor", b"idx_queries_duration_cursor", "idx_queries_tenant_duration_cursor", "idx_queries_duration_cursor"}
-CLAUSE = " WHERE app_tenant IS NOT NULL"
+# A new Rust tenant makes these indexes partial (schema.rs PARTIAL_INDEXES,
+# docs/DIFFERENCES.md #11 and #16); every other row must be Rails' own.
+PARTIAL = {"idx_queries_tenant_duration_cursor": " WHERE app_tenant IS NOT NULL", "idx_queries_duration_cursor": " WHERE 0",
+           "index_executions_on_deploy_and_occurred_at": " WHERE 0", "index_executions_on_parent_id": " WHERE parent_id IS NOT NULL",
+           "index_executions_on_app_tenant_and_occurred_at": " WHERE app_tenant IS NOT NULL", "idx_executions_kind_tenant_cursor": " WHERE app_tenant IS NOT NULL",
+           "index_executions_on_user_ref_and_occurred_at": " WHERE user_ref IS NOT NULL"}
 def expected_rust(row):
     ty, name, tbl, sql = row
-    if name in PARTIAL and sql is not None:
-        sql = sql + (CLAUSE.encode() if isinstance(sql, bytes) else CLAUSE)
+    key = name.decode() if isinstance(name, bytes) else name
+    if key in PARTIAL and sql is not None:
+        clause = PARTIAL[key]
+        sql = sql + (clause.encode() if isinstance(sql, bytes) else clause)
     return (ty, name, tbl, sql)
 if schema_r == schema_u:
     print(f"{'sqlite_master':<26} identical ({len(schema_r)} entries)")
 elif [expected_rust(r) for r in schema_r] == schema_u:
-    print(f"{'sqlite_master':<26} identical but for the 2 partial queries indexes ({len(schema_r)} entries)")
+    print(f"{'sqlite_master':<26} identical but for the {len(PARTIAL)} partial indexes ({len(schema_r)} entries)")
 else:
     print(f"{'sqlite_master':<26} DIFFERENT ({len(schema_r)} entries)")
     bad += 1
