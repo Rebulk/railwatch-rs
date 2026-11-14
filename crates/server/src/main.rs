@@ -193,6 +193,13 @@ fn tenants(cfg: &Config) -> Tenants {
 }
 
 fn main() -> ExitCode {
+    // No transparent huge pages for this process: mimalloc madvises its
+    // arenas MADV_HUGEPAGE, so under ingest the kernel zeroed 2 MiB pages and
+    // compacted memory to find them on page faults (9% of server CPU at 50
+    // apps; docs/PERF.md "Ingest floor"). Same as MIMALLOC_ALLOW_THP=0, which
+    // mimalloc reads before main. Fails harmlessly where unsupported.
+    // SAFETY: a process attribute; no pointers are passed.
+    unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) };
     railwatch_server::memory::configure();
     // The client reads no server configuration and runs as whoever calls it.
     let argv: Vec<String> = std::env::args().skip(1).collect();
