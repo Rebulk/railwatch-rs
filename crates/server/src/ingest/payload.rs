@@ -31,7 +31,10 @@ pub fn parse_bytes(raw: &[u8], gzip: bool) -> Result<Vec<Value>, Malformed> {
         return Err(Malformed("empty body".into()));
     }
     let mut records = Vec::new();
-    let mut pending: Vec<u8> = Vec::new();
+    // A chunk plus the partial line before it: sized once, so it does not
+    // grow through reallocations on every request (5% of server CPU at 50
+    // apps, docs/PERF.md "Ingest floor").
+    let mut pending: Vec<u8> = Vec::with_capacity(2 * READ_SIZE);
     let mut decoded = 0usize;
     let mut on_chunk = |chunk: &[u8], records: &mut Vec<Value>| -> Result<(), Malformed> {
         decoded += chunk.len();
