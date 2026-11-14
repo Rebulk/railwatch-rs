@@ -29,7 +29,10 @@ pub const IDLE_CLOSE: Duration = Duration::from_secs(60);
 /// Readers one tenant may have open at once.
 pub const PER_TENANT: usize = 4;
 /// Readers open across all tenants, by default (`max_read_connections`).
-pub const MAX_OPEN: usize = 8;
+/// One overview page takes 8 at once (overview_show_parallel); at 8 in all,
+/// pages over several tenants kept closing each other's readers, and a
+/// union reader takes ~100 ms to open.
+pub const MAX_OPEN: usize = 16;
 
 use rusqlite::{Connection, OpenFlags};
 

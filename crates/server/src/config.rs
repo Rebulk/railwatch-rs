@@ -57,7 +57,8 @@ pub struct Config {
     pub rate_limit_env: u64,
     pub tenant_idle_seconds: u64,
     /// Dashboard read connections open at once across every environment
-    /// (dashboard::pool). Each holds a few MB; idle ones close after a minute.
+    /// (dashboard::pool::MAX_OPEN). Each holds a few MB; idle ones close
+    /// after a minute.
     pub max_read_connections: usize,
     /// Account#quota_exhausted? turns ingest away with 402. Off by default:
     /// a self-hosted install has no billing (docs/DIFFERENCES.md).

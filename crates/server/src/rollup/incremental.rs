@@ -50,9 +50,10 @@ pub struct Accumulator {
 ///
 /// The cap is for all tenants together (jobs/worker.rs): at 128 MB per
 /// tenant, six busy tenants held 640 MB counted (docs/PERF.md, "Memory
-/// bounded by configuration"). 64 MB keeps two hours of a ~120k rows/hour
-/// tenant.
-pub const MAX_BYTES: usize = 64 << 20;
+/// bounded by configuration"). 64 MB tripped under 6 tenants at 1 batch/s
+/// and the full recomputes that followed held the write locks (ingest p50
+/// 0.2 -> 7 s); 128 MB, one tenant's former cap, did not.
+pub const MAX_BYTES: usize = 128 << 20;
 
 /// Heap a row holds here, roughly: the map entry, the row's values and
 /// their bytes, and the sort key's copy of occurred_at.

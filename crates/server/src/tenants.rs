@@ -33,8 +33,9 @@ pub const MAX_COALESCE_ROWS: usize = 20_000;
 
 /// A writer with no batch for this long frees its connections' page caches
 /// (Store::quiet): a cache fills to cache_size per file under load and,
-/// without this, stays full for as long as the writer runs.
-const QUIET: Duration = Duration::from_secs(5);
+/// without this, stays full for as long as the writer runs. Longer than the
+/// gap between a steady app's batches, which would otherwise start cold.
+const QUIET: Duration = Duration::from_secs(30);
 
 /// A stored receipt, as Telemetry::IngestReceipt.lookup returns it.
 #[derive(Debug, Clone)]
