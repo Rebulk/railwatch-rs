@@ -44,11 +44,13 @@ struct Tenant {
     /// Work reached it since the last flush; a flush without frees its
     /// connections' page caches.
     active: bool,
-    /// When work last reached it (TENANT_IDLE).
+    /// When a committed batch last reached it (TENANT_IDLE). Scheduled
+    /// work (the drain every minute, detectors) does not count: it would keep
+    /// every tenant open for good.
     used_at: Instant,
 }
 
-/// A tenant no work reached for this long is closed at the next flush once
+/// A tenant no batch reached for this long is closed at the next flush once
 /// nothing of it is pending (`forget`): its union reader attaches every day
 /// file and, while open, also keeps the descriptors of every other
 /// connection to those files that closed (SQLite's unix VFS parks them
@@ -114,7 +116,6 @@ impl Worker {
         }
         let t = &mut self.tenants.get_mut(&env).unwrap().1;
         t.active = true;
-        t.used_at = Instant::now();
         if let Some((dir, attached)) = t.days.as_mut() {
             crate::storage::reader::refresh(&t.read, dir, attached)?;
         }
@@ -237,6 +238,7 @@ impl Worker {
         let control = self.control.clone();
         let max_bytes = self.acc_max_bytes;
         let t = self.tenant(f.env_id, &f.slug).map_err(e)?;
+        t.used_at = Instant::now();
         // Direct path: GroupExceptionsJob. Receipted: the drain, under claims.
         if !f.exception_ids.is_empty() && !f.receipted {
             let rows = grouping::load_exceptions(&t.read, &f.exception_ids).map_err(e)?;
@@ -506,8 +508,10 @@ mod tests {
         w.handle_inner(TenantWork::Drain { env: env.id, slug: "quiet".into() }).unwrap();
         assert!(open() > 0);
         w.flush_all();
-        assert!(w.tenants.contains_key(&env.id), "just used: kept");
+        assert!(w.tenants.contains_key(&env.id), "just opened: kept");
         w.tenants.get_mut(&env.id).unwrap().1.used_at -= TENANT_IDLE;
+        // Scheduled work (the drain every minute) does not keep it open.
+        w.handle_inner(TenantWork::Drain { env: env.id, slug: "quiet".into() }).unwrap();
         w.flush_all();
         assert!(!w.tenants.contains_key(&env.id));
         assert_eq!(open(), 0, "no descriptor left to its files");
