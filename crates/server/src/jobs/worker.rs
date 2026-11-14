@@ -44,7 +44,16 @@ struct Tenant {
     /// Work reached it since the last flush; a flush without frees its
     /// connections' page caches.
     active: bool,
+    /// When work last reached it (TENANT_IDLE).
+    used_at: Instant,
 }
+
+/// A tenant no work reached for this long is closed at the next flush once
+/// nothing of it is pending (`forget`): its union reader attaches every day
+/// file and, while open, also keeps the descriptors of every other
+/// connection to those files that closed (SQLite's unix VFS parks them
+/// while a lock on the file is held). It reopens on the next batch.
+const TENANT_IDLE: Duration = Duration::from_secs(600);
 
 pub struct Worker {
     pub control: Arc<Control>,
@@ -98,12 +107,14 @@ impl Worker {
                         full_hours: HashSet::new(),
                         users: Default::default(),
                         active: true,
+                        used_at: Instant::now(),
                     },
                 ),
             );
         }
         let t = &mut self.tenants.get_mut(&env).unwrap().1;
         t.active = true;
+        t.used_at = Instant::now();
         if let Some((dir, attached)) = t.days.as_mut() {
             crate::storage::reader::refresh(&t.read, dir, attached)?;
         }
@@ -290,6 +301,13 @@ impl Worker {
                 tracing::error!(environment = env, tenant = slug, error = %e, "rollup flush failed");
             }
         }
+        self.tenants.retain(|_, (_, t)| {
+            t.used_at.elapsed() < TENANT_IDLE
+                || t.acc.row_count() > 0
+                || !t.full_hours.is_empty()
+                || !t.overflow_buckets.is_empty()
+                || !t.session_buckets.is_empty()
+        });
         if !self.tenants.is_empty() {
             tracing::debug!(ms = started.elapsed().as_millis() as u64, "rollup flush");
         }
@@ -469,5 +487,32 @@ mod tests {
         assert!(most_alone < 64 << 10, "neither reached it alone: {most_alone}");
         assert!(peak <= (64 << 10) + 25 * 1024, "held at most the cap plus one batch: {peak}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tenant no work reached for TENANT_IDLE is closed at the next flush,
+    /// with every descriptor of its files; work reopens it.
+    #[test]
+    fn an_idle_tenant_is_closed_and_reopened_on_demand() {
+        let root = std::env::temp_dir().join(format!("rw-worker-idle-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(root.join("telemetry")).unwrap();
+        let control = Arc::new(Control::open(&root.join("control.sqlite3")).unwrap());
+        let env = control.create("quiet", &format!("{:0>64}", 3), 30).unwrap();
+        let dir = root.join("telemetry").join("quiet");
+        crate::storage::layout::ensure(&dir).unwrap();
+        crate::storage::layout::open_or_create(&crate::storage::layout::day_path(&dir, crate::storage::Tier::Core, "2026-10-14")).unwrap();
+        let open =
+            || std::fs::read_dir("/proc/self/fd").unwrap().flatten().filter_map(|e| std::fs::read_link(e.path()).ok()).filter(|t| t.starts_with(&dir)).count();
+        let mut w = Worker::new(control, root.join("telemetry"));
+        w.handle_inner(TenantWork::Drain { env: env.id, slug: "quiet".into() }).unwrap();
+        assert!(open() > 0);
+        w.flush_all();
+        assert!(w.tenants.contains_key(&env.id), "just used: kept");
+        w.tenants.get_mut(&env.id).unwrap().1.used_at -= TENANT_IDLE;
+        w.flush_all();
+        assert!(!w.tenants.contains_key(&env.id));
+        assert_eq!(open(), 0, "no descriptor left to its files");
+        w.handle_inner(TenantWork::Drain { env: env.id, slug: "quiet".into() }).unwrap();
+        assert!(w.tenants.contains_key(&env.id), "reopened by the next work");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
