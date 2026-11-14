@@ -9,7 +9,8 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Spinner } from "@/components/ui/spinner"
 import AuthLayout from "@/layouts/auth-layout"
-import { docPath, signInPath, signUpPath } from "@/routes"
+import { PRIVACY_URL, TERMS_URL } from "@/lib/site"
+import { signInPath, signUpPath } from "@/routes"
 
 interface Invitation {
   token: string
@@ -122,12 +123,12 @@ export default function Register({ invitation }: { invitation?: Invitation }) {
                     className="text-muted-foreground text-sm leading-snug font-normal"
                   >
                     I agree to the{" "}
-                    <TextLink href={docPath("legal", "terms")} target="_blank">
+                    <TextLink href={TERMS_URL} target="_blank">
                       Terms of Service
                     </TextLink>{" "}
                     and{" "}
                     <TextLink
-                      href={docPath("legal", "privacy")}
+                      href={PRIVACY_URL}
                       target="_blank"
                     >
                       Privacy Policy
