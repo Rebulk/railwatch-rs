@@ -109,3 +109,7 @@ path = "src/bin/digest_dump.rs"
 [[bin]]
 name = "page-hammer"
 path = "src/bin/page_hammer.rs"
+
+[[bin]]
+name = "plan-audit"
+path = "src/bin/plan_audit.rs"

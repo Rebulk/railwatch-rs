@@ -196,3 +196,118 @@ single-file layout (2026-10-15, after the detectors work). The earlier
 40/42 was not storage: two detector-made "scheduled task missed" issues
 (#289, #290) whose `related_issues` differed (0 vs 2/1) because Rails'
 LIKE has no ESCAPE clause (DIFFERENCES issues #17 and "Former Rails bugs" 3).
+
+## Sizing (2026-11-14, branch perf/storage)
+
+**Capacity number: about 0.79 GB on disk per million events per day.**
+At the default retention (7 days of detail, 30 days of core) that is
+roughly **14 GB per million events/day**, plus meta (rollups, kept 13
+months). These numbers come from a bench day shaped like rebulk-system;
+real apps vary with how many queries each request makes. Before this
+branch: 0.82 GB per million and 14.8 GB.
+
+### Method
+
+One UTC day of `gen_tenant.py --spread-days 0.95 --executions 320000 --seed 5
+--records-per-batch 2000 --shapes 2000 --tenants 50 --uniform --by-time
+--few-logs --prod-shape`: 1,701,146 events (1.07M queries, 320k executions,
+100k cache events, 83k view renders, 42k logs). Main's binary and this
+branch's each posted the same batches to a fresh per-day server with
+`bench/storage/day.sh`. The server is stopped before measuring, so every WAL
+is checkpointed. Bytes per table and per index come from `dbstat`
+(`bench/storage/bytes.py`). Data on /dev/shm.
+
+### Bytes per event
+
+| | main | this branch |
+|---|---:|---:|
+| core day file | 678.2 MB (399 B/event) | 636.7 MB (374 B/event) |
+| detail day file | 691.8 MB (407 B/event) | 677.3 MB (398 B/event) |
+| meta (one day of rollups) | 23.4 MB (14 B/event) | 23.6 MB (14 B/event) |
+| **GB per million events** | **0.82** | **0.79** (-4.0%) |
+| 7 d detail + 30 d core, per million events/day | 14.8 GB | 14.0 GB (-5.3%) |
+
+Bytes per row, table plus its indexes: executions 1,986 -> 1,856 B, queries
+555 -> 541 B. Cache events (393 B), view renders (439 B) and logs (432 B) are
+unchanged. On main, indexes are 42% of the bytes of `executions` and 54% of
+the bytes of `queries`.
+
+**Where the bytes go (main).** Text is most of every row:
+
+- `executions`: `detail` (the request JSON: URL, headers, user agent) is 57%
+  of the row payload, 561 B a row. `stages` and `counters` are another 11%.
+- `queries`: `trace_id`, `execution_id` and `group_hash` are 43% of the
+  payload, 36 + 36 + 32 bytes of UUID or hex text on every row. The SQL
+  text is already interned: meta's `query_shapes` holds it once per group,
+  and the row stores `''`.
+- logs: `message` is 27%.
+
+**Production check** (`du` and `ls` only, 2026-11-14): rebulk-system's closed
+days are 600-650 MB detail and 230-390 MB core. It holds 4.2 GB of detail
+(7 days), 4.0 GB of core (15 days so far) and 0.9 GB of meta. At 30 days of
+core that is about 4.2 + 8 + 0.9 = 13 GB, close to the bench's 14 GB per
+million events a day.
+
+### What changed
+
+**Partial indexes** (`schema::PARTIAL_INDEXES`, DIFFERENCES #16), in new files only:
+
+- `idx_queries_duration_cursor` and `index_executions_on_deploy_and_occurred_at` hold no rows, because no read plan uses them.
+- `..._on_parent_id`, `..._on_app_tenant_and_occurred_at`, `idx_executions_kind_tenant_cursor` and `..._on_user_ref_and_occurred_at` leave out rows whose column is NULL.
+
+Together that saves 41 MB of a core day file and 14 MB of a detail day file. Old files are not altered and stay readable.
+
+**Page size: tried and backed out.** 8 KiB pages saved another 5% of a full core day (16 KiB saved 7%). But they broke `tests/disk_budget.rs`, the burst test: the budget's per-batch estimate counts WAL frames and checkpoint pages, and with bigger pages one batch overshot the "one batch per sender" bound (peak 25.2 MB against a 25.1 MB limit). They also double an empty file, which matters for quiet environments: 0.6 MB at 4 KiB, 1.2 MB at 8 KiB, 2.4 MB at 16 KiB, paid on each of a tenant's 38 files. Left for a change that also retunes the budget's estimate.
+
+### Proof that reads are unchanged
+
+**Index audit** (`bench/storage/index_audit.sh`): an 8-day prod-shaped tenant
+with deploys, sessions and security fields.
+
+- Traced with `RW_SQL_TRACE=1`: every props-diff page case (130), MCP case
+  (155) and API case (195), plus a `railwatch serve` run whose ingest drove
+  the rollup and detector workers.
+- `plan-audit` ran EXPLAIN QUERY PLAN through a union reader on every
+  distinct statement: 1,165 page, MCP and API statements and 135,445 worker
+  statements. All of them plan.
+- No plan names the two `WHERE 0` indexes. The partial ones are only used
+  under filters that imply their clause.
+- The same 136,640 statements planned against main's files and against this
+  branch's files chose **the same index set, statement by statement (0
+  differ)**.
+
+**Unused on day files, left alone:**
+
+- the `group_hash` indexes of the smaller core tables (broadcasts, mails, ...)
+- the ingest_batches and sessions indexes
+- `idx_executions_sessions` and `idx_visits_sessions`, which are this server's own; the bench's session cases did not reach them
+
+Each is under 1% of a busy day.
+
+**Dashboard latency.** props-dump, 128 page cases over the measured day, 5 warm runs, best of 2 rounds, CPUs 4-7, load average 12-28 (a shared box):
+
+- Per case, new/base: median 0.99x, p10 0.86x, p90 1.11x.
+- The ten slowest cases, re-timed best of 3 interleaved rounds: 0.90x to 1.02x. Examples: tenants@7d 297 -> 288 ms, queries.parallel_cursor@7d 276 -> 265 ms, requests.step_15m@24h 489 -> 495 ms.
+- Props: either binary reading the same files gives 128/128 identical.
+- Two ingests of the same batches give 113/128, even when both use main's binary. Routes tied on count swap places between ingests, so that is not this change.
+
+**Ingest.** `bench/flame/ingest.sh`, 10 envs, conc 32, 20 s, PERF=none, alternated, 4 runs each, load average 12-14. That run included 8 KiB pages; the partial indexes alone only remove B-tree inserts.
+
+| | ev/s | CPU-us/event |
+|---|---|---:|
+| main | 76.2k, 73.4k, 81.9k, 72.7k | 48.4-52.6 |
+| this branch | 75.7k, 70.3k, 73.4k, 73.6k | 50.6-54.8 |
+
+That is within this box's noise. Not measured on a quiet machine or on disk.
+
+### Considered, not done
+
+- **zstd per row with a trained dictionary** on `executions.detail`: 561 -> 38 B a row on the bench day (179.6 -> 12.1 MB; plain per-row zstd only reaches 119 MB). That is about 25% of a core file. It is not a side change:
+  - the security index (`idx_executions_requests`) and the pages read `detail` with `json_extract`;
+  - Rails needs the column to stay JSON;
+  - a dictionary must be stored and versioned per file.
+- **Interning ids** (`trace_id` and `execution_id` as integers) would save most of 43% of a query row. But the gem schema and every join use the text.
+- **Whole-file compression of closed days**: zstd -3 gives 6.4x on a core day and 4.2x on a detail day. SQLite cannot read such a file in place, so this needs a compressing filesystem (btrfs `compress=zstd`, ZFS) or a cold tier (research/IMPROVEMENTS.md 1(ii)). Production is on ext4.
+- **Meta** is 0.9 GB for rebulk-system: 13 months of hourly rollups, mostly query rollups (per group per hour: a 115 B t-digest plus the SQL as `name`). The obvious next step is to roll hours older than 90 days (the longest custom window) into days.
+
+**For Track D:** none of the indexes made partial here serves a slow query. The two biggest query indexes, `idx_queries_slowest` (57 B a query row) and `index_queries_on_execution_id_and_occurred_at` (84 B), both show up in the audit's plans and are kept.
