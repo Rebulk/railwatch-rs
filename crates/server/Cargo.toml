@@ -23,7 +23,7 @@ hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
 # bundled SQLite is compiled with SQLITE_ENABLE_FTS5 (logs_fts needs it).
-rusqlite = { version = "0.40", features = ["bundled", "backup", "trace"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup", "trace"] }
 # preserve_order: Ruby hashes keep insertion order. arbitrary_precision: keep the
 # literal so 1 (Integer) and 1.0 (Float) stay distinct, and bignums survive.
 serde = { version = "1", features = ["derive"] }

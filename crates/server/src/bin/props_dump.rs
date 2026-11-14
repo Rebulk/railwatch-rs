@@ -74,7 +74,7 @@ fn main() {
         std::process::exit(2);
     }
     let tenant_path = std::path::Path::new(&a[0]);
-    let conn = if tenant_path.is_dir() {
+    let mut conn = if tenant_path.is_dir() {
         railwatch_server::storage::reader::open(tenant_path).expect("open per-day tenant").0
     } else {
         open_reader(tenant_path).expect("open tenant")
@@ -89,7 +89,8 @@ fn main() {
                     eprintln!("SQLPROF {:.3} {}", d.as_secs_f64() * 1e3, s.sql().replace('\n', " "));
                 }
             }),
-        );
+        )
+        .expect("turn on SQL profiling");
     }
     let cases: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(&a[1]).unwrap()).unwrap();
     let control: StaticControl = serde_json::from_str(&std::fs::read_to_string(&a[2]).unwrap()).unwrap();
