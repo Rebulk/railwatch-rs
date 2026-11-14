@@ -96,9 +96,5 @@ fn main() {
         per(records, write_wall),
         write_cpu * 1e6 / records as f64
     );
-    println!(
-        "both, one thread: {:.0} events/s  {:.1} cpu-ms/1k events",
-        per(records, map_wall + write_wall),
-        (map_cpu + write_cpu) * 1e6 / records as f64
-    );
+    println!("both, one thread: {:.0} events/s  {:.1} cpu-ms/1k events", per(records, map_wall + write_wall), (map_cpu + write_cpu) * 1e6 / records as f64);
 }
