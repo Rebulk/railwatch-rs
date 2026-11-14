@@ -93,6 +93,7 @@ pub fn n_plus_ones(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<Va
     let per_file = crate::storage::reader::aggregate(
         conn,
         "n_plus_ones",
+        (from, to),
         "SELECT \"n_plus_ones\".\"group_hash\" AS group_hash, COUNT(*) AS n, MAX(sql) AS sql, MAX(source) AS source, MAX(count) AS most FROM {t} \
          WHERE \"n_plus_ones\".\"occurred_at\" BETWEEN ?1 AND ?2 GROUP BY \"n_plus_ones\".\"group_hash\"",
         "SELECT group_hash, SUM(n), MAX(sql), MAX(source), MAX(most) FROM {u} GROUP BY group_hash",
@@ -839,17 +840,22 @@ fn executions_in(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<i64>
     let first = if fh == from { from } else { fh + 3_600_000_000 };
     let last = rb::beginning_of_hour(to);
     if first >= last {
-        return db::count_where(conn, "executions", "\"executions\".\"occurred_at\" BETWEEN ?1 AND ?2", &[s(&qt(from)), s(&qt(to))]);
+        return db::count_where(conn, "executions", (from, to), "\"executions\".\"occurred_at\" BETWEEN ?1 AND ?2", &[s(&qt(from)), s(&qt(to))]);
     }
-    let a =
-        db::count_where(conn, "executions", "\"executions\".\"occurred_at\" >= ?1 AND \"executions\".\"occurred_at\" < ?2", &[s(&qt(from)), s(&qt(first))])?;
+    let a = db::count_where(
+        conn,
+        "executions",
+        (from, first),
+        "\"executions\".\"occurred_at\" >= ?1 AND \"executions\".\"occurred_at\" < ?2",
+        &[s(&qt(from)), s(&qt(first))],
+    )?;
     let b = db::count(
         conn,
         "SELECT SUM(\"rollups\".\"count\") FROM \"rollups\" WHERE \"rollups\".\"record_type\" IN ('request', 'job_attempt', 'scheduled_task', 'command', 'channel_action') \
          AND \"rollups\".\"bucket\" >= ?1 AND \"rollups\".\"bucket\" < ?2",
         rusqlite::params![qt(first), qt(last)],
     )?;
-    let c = db::count_where(conn, "executions", "\"executions\".\"occurred_at\" BETWEEN ?1 AND ?2", &[s(&qt(last)), s(&qt(to))])?;
+    let c = db::count_where(conn, "executions", (last, to), "\"executions\".\"occurred_at\" BETWEEN ?1 AND ?2", &[s(&qt(last)), s(&qt(to))])?;
     Ok(a + b + c)
 }
 
@@ -1762,6 +1768,11 @@ mod per_day_tests {
             vec![("window", "1h")],
             vec![("window", "30d"), ("q", "ac")],
             vec![("window", "7d"), ("sort", "p95"), ("dir", "asc")],
+            // Windows that leave day files out (storage::reader::within):
+            // inside one past day, across a day boundary, and before any.
+            vec![("from", "2026-10-13T01:00:00Z"), ("to", "2026-10-13T04:00:00Z")],
+            vec![("from", "2026-10-13T03:30:00Z"), ("to", "2026-10-14T02:00:00Z"), ("q", "complet")],
+            vec![("from", "2026-10-01T00:00:00Z"), ("to", "2026-10-02T00:00:00Z")],
         ] {
             let c = ctx(&params);
             // The props, or the 422 a page gives a key it does not read

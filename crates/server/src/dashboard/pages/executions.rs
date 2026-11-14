@@ -178,6 +178,7 @@ pub fn queue_stats(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<Va
     let per_file = crate::storage::reader::aggregate(
         conn,
         "executions",
+        (from, to),
         "SELECT \"executions\".\"queue\" AS queue, COUNT(*) AS n, SUM(queue_latency) AS lat, COUNT(queue_latency) AS lat_n, \
          SUM(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END) AS failed FROM {t} \
          WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 GROUP BY \"executions\".\"queue\"",
@@ -406,7 +407,7 @@ pub fn active_people(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<
     let per_file = crate::storage::reader::aggregate_hinted(
         conn,
         "executions",
-        Some(crate::storage::reader::Hint { window: (from, to), inside: "idx_executions_people", outside: "index_executions_on_kind_and_occurred_at" }),
+        crate::storage::reader::Hint { window: (from, to), inside: "idx_executions_people", outside: "index_executions_on_kind_and_occurred_at" },
         "SELECT \"executions\".\"user_ref\" AS user_ref, COUNT(*) AS n, SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END) AS errors, MAX(occurred_at) AS last \
          FROM {t} WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 AND \"executions\".\"user_ref\" IS NOT NULL \
          GROUP BY \"executions\".\"user_ref\"",

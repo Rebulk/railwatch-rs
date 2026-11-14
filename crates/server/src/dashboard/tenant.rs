@@ -350,7 +350,7 @@ fn aggregate(
     outer: &str,
     binds: &[Sql],
 ) -> rusqlite::Result<Option<Vec<db::Rec>>> {
-    crate::storage::reader::aggregate_hinted(conn, table, Some(crate::storage::reader::Hint { window, inside, outside }), inner, outer, binds)
+    crate::storage::reader::aggregate_hinted(conn, table, crate::storage::reader::Hint { window, inside, outside }, inner, outer, binds)
 }
 
 /// `filtered`'s SQL with its bind numbered `?n`.
