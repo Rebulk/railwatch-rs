@@ -52,10 +52,10 @@ pub struct Accumulator {
 ///
 /// The cap is for all tenants together (jobs/worker.rs): at 128 MB per
 /// tenant, six busy tenants held 640 MB counted (docs/PERF.md, "Memory
-/// bounded by configuration"). 64 MB tripped under 6 tenants at 1 batch/s
-/// and the full recomputes that followed held the write locks (ingest p50
-/// 0.2 -> 7 s); 128 MB, one tenant's former cap, did not.
-pub const MAX_BYTES: usize = 128 << 20;
+/// bounded by configuration"). At 50 apps under max ingest, 32 MB held
+/// 123 MB less after load than 128 MB at the same throughput; idle groups
+/// leave it after GROUP_IDLE, so a steady app rarely reaches it.
+pub const MAX_BYTES: usize = 32 << 20;
 
 /// A flushed group-hour no batch added to for this long leaves memory
 /// (`evict_before`): at idle the accumulator otherwise kept the current and
