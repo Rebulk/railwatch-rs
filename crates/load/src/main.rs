@@ -34,6 +34,8 @@ use rand::{Rng, SeedableRng};
 use serde_json::{Value, json};
 use sha2::Digest as _; // also brings Md5::digest into scope
 
+mod scale;
+
 const FIXTURES: &str = include_str!("../../server/tests/fixtures/wire_fixtures.json");
 const RECORDS_PER_BATCH: usize = 500; // the gem's flush_threshold
 const GEM_VERSION: &str = "0.9.0";
@@ -272,6 +274,10 @@ struct Sample {
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if scale::wanted(&args) {
+        return scale::run(args).await;
+    }
     let o = parse_args();
     let count = o.batches.unwrap_or_else(|| if o.rate > 0.0 { (o.rate * o.duration).ceil() as usize } else { (o.concurrency * 400).max(2000) });
     eprintln!("building {count} batches of {RECORDS_PER_BATCH} records...");
