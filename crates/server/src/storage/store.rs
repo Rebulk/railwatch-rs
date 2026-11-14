@@ -101,6 +101,17 @@ impl Store {
         }
     }
 
+    /// No batch for a while (tenants::run_writer): frees page caches and
+    /// closes idle day files (DayWriter::quiet).
+    pub fn quiet(&mut self) {
+        match self {
+            Store::Single(c) => crate::memory::release(c),
+            Store::Days(w) => {
+                w.quiet();
+            }
+        }
+    }
+
     pub fn rollback(&mut self) {
         match self {
             Store::Single(c) => {

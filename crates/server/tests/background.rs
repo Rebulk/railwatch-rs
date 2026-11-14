@@ -174,6 +174,26 @@ fn watchdog_alerts_once_on_silence_and_once_on_recovery() {
     assert_eq!(count(&c, "SELECT COUNT(*) FROM alerts WHERE event = 'environment_recovered'"), 1);
 }
 
+/// A server not seen for WATCH_WINDOW leaves the in-memory map (a pod per
+/// deploy otherwise piled up there for good) but not the table, so a
+/// restart still knows it; one seen again comes back.
+#[test]
+fn watchdog_forgets_servers_past_the_window() {
+    let (control, env, _t, _d) = setup("watchdog-forget");
+    let c = control.conn();
+    let hb = watchdog::Heartbeats::default();
+    let t0 = 1_791_900_000_000_000i64;
+    let window = watchdog::WATCH_WINDOW_SECS * 1_000_000;
+    hb.beat(env, &["pod-a".into()], t0);
+    hb.beat(env, &["pod-b".into()], t0 + window);
+    watchdog::check(&c, &hb, t0 + window + 1, 60).unwrap();
+    assert_eq!(hb.forget_before(t0 + window + 1 - window + 1), 1);
+    assert_eq!(hb.snapshot().iter().map(|((_, s), _)| s.clone()).collect::<Vec<_>>(), vec!["pod-b".to_string()]);
+    assert_eq!(count(&c, "SELECT COUNT(*) FROM environment_heartbeats"), 2, "both still persisted");
+    hb.beat(env, &["pod-a".into()], t0 + window + 5);
+    assert_eq!(hb.snapshot().len(), 2);
+}
+
 #[test]
 fn receipted_grouping_is_claimed_exactly_once() {
     let (control, env, t, _d) = setup("claims");

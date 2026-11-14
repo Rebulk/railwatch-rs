@@ -47,7 +47,12 @@ pub struct Accumulator {
 /// hours it holds are recomputed in full instead (worker.rs). Rows cost
 /// ~650 bytes of RSS each, so this is ~200k rows (docs/PERF.md, "Bounded
 /// memory"); 3M rows, the former row cap, was ~2 GB.
-pub const MAX_BYTES: usize = 128 << 20;
+///
+/// The cap is for all tenants together (jobs/worker.rs): at 128 MB per
+/// tenant, six busy tenants held 640 MB counted (docs/PERF.md, "Memory
+/// bounded by configuration"). 64 MB keeps two hours of a ~120k rows/hour
+/// tenant.
+pub const MAX_BYTES: usize = 64 << 20;
 
 /// Heap a row holds here, roughly: the map entry, the row's values and
 /// their bytes, and the sort key's copy of occurred_at.
@@ -116,10 +121,14 @@ impl Accumulator {
         Ok(())
     }
 
-    fn insert(&mut self, key: &Key, source: &Source, row: RawRow) {
+    fn insert(&mut self, key: &Key, source: &Source, mut row: RawRow) {
         let g = self.groups.get_mut(key).expect("loaded");
         let id = row[0].to_i();
         let sk = sort_key(source, &row);
+        // The group_hash is the key's and occurred_at the sort key's:
+        // fresh_attributes reads neither from the row.
+        row.pop();
+        row[1] = crate::rollup::sqlval::Sql::Null;
         let n = row_bytes(&sk, &row);
         match g.rows.insert(id, (sk, row)) {
             None => self.rows += 1,

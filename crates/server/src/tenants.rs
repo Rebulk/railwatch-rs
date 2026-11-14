@@ -26,9 +26,15 @@ use crate::ingest::writer::{WriteError, Written};
 use crate::schema;
 use crate::storage::Layout;
 use crate::storage::store::Store;
+use crate::storage::writer as storage_writer;
 
 pub const MAX_COALESCE_BATCHES: usize = 64;
 pub const MAX_COALESCE_ROWS: usize = 20_000;
+
+/// A writer with no batch for this long frees its connections' page caches
+/// (Store::quiet): a cache fills to cache_size per file under load and,
+/// without this, stays full for as long as the writer runs.
+const QUIET: Duration = Duration::from_secs(5);
 
 /// A stored receipt, as Telemetry::IngestReceipt.lookup returns it.
 #[derive(Debug, Clone)]
@@ -559,15 +565,28 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
         }
     };
     tracing::debug!(tenant = slug, "writer opened");
+    let mut last_job = Instant::now();
+    let mut quiet = false;
     loop {
-        let first = match rx.recv_timeout(idle) {
+        // Wakes after QUIET without work to let go of what the batches left
+        // cached (Store::quiet), then again to close idle day files, and
+        // exits after `idle`.
+        let wait = if quiet { storage_writer::FILE_IDLE.min(idle) } else { QUIET.min(idle) };
+        let first = match rx.recv_timeout(wait) {
             Ok(job) => job,
             Err(RecvTimeoutError::Timeout) => {
-                tracing::debug!(tenant = slug, "writer idle, closing");
-                return;
+                if last_job.elapsed() >= idle {
+                    tracing::debug!(tenant = slug, "writer idle, closing");
+                    return;
+                }
+                store.quiet();
+                quiet = true;
+                continue;
             }
             Err(RecvTimeoutError::Disconnected) => return,
         };
+        last_job = Instant::now();
+        quiet = false;
         let mut jobs = vec![first];
         let mut rows = row_count(&jobs[0]);
         while jobs.len() < MAX_COALESCE_BATCHES && rows < MAX_COALESCE_ROWS {

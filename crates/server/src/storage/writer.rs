@@ -50,6 +50,11 @@ use crate::ingest::writer::{Target, WriteError};
 /// yesterday in both tiers, plus a few late arrivals).
 const OPEN_FILES: usize = 8;
 
+/// A day file no transaction touched for this long is closed (`quiet`):
+/// each holds up to cache_size (8 MB) of pages, and yesterday's or a late
+/// batch's file otherwise stays open until OPEN_FILES newer ones push it out.
+pub const FILE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
 struct DayFile {
     tier: Tier,
     day: String,
@@ -57,6 +62,8 @@ struct DayFile {
     /// The file's sqlite_sequence as last read or set, per table.
     seq: HashMap<&'static str, i64>,
     last_used: u64,
+    /// When a transaction last touched it.
+    used_at: std::time::Instant,
 }
 
 pub struct DayWriter {
@@ -298,11 +305,12 @@ impl DayWriter {
             Some(i) => i + 1,
             None => {
                 let conn = self.create(tier, day)?;
-                self.files.push(DayFile { tier, day: day.to_string(), conn, seq: HashMap::new(), last_used: 0 });
+                self.files.push(DayFile { tier, day: day.to_string(), conn, seq: HashMap::new(), last_used: 0, used_at: std::time::Instant::now() });
                 self.files.len()
             }
         };
         self.files[i - 1].last_used = self.clock;
+        self.files[i - 1].used_at = std::time::Instant::now();
         if !self.in_txn.contains(&i) {
             let f = &self.files[i - 1];
             f.conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -348,6 +356,25 @@ impl DayWriter {
         debug_assert!(self.in_txn.is_empty());
         let dir = &self.dir;
         self.files.retain(|f| layout::day_path(dir, f.tier, &f.day).exists());
+    }
+
+    /// Between transactions, when no batch has come for a while: closes the
+    /// day files idle for FILE_IDLE and frees the rest's page caches (meta's
+    /// too). Returns how many files it closed.
+    pub fn quiet(&mut self) -> usize {
+        debug_assert!(self.in_txn.is_empty());
+        let before = self.files.len();
+        self.files.retain(|f| f.used_at.elapsed() < FILE_IDLE);
+        for f in &self.files {
+            crate::memory::release(&f.conn);
+        }
+        crate::memory::release(&self.meta);
+        before - self.files.len()
+    }
+
+    /// Day files open now.
+    pub fn open_files(&self) -> usize {
+        self.files.len()
     }
 
     /// Closes every day connection (before retention unlinks files).
@@ -511,5 +538,46 @@ pub fn crash_point(point: &str) {
     {
         eprintln!("railwatch: injected crash at {point}");
         std::process::abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_files_under(root: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .filter(|t| t.starts_with(root) && t.extension().is_some_and(|x| x == "sqlite3"))
+            .collect()
+    }
+
+    /// A quiet writer closes the day files no transaction touched for
+    /// FILE_IDLE and keeps the rest (and meta) open.
+    #[test]
+    fn a_quiet_writer_closes_its_idle_day_files() {
+        let dir = std::env::temp_dir().join(format!("rw-writer-quiet-{}", crate::control::base58(8)));
+        let mut w = DayWriter::open(&dir).unwrap();
+        w.begin().unwrap();
+        w.route_at("ingest_batches", "2026-10-10 12:00:00").unwrap();
+        w.route_at("ingest_batches", "2026-10-11 12:00:00").unwrap();
+        w.commit().unwrap();
+        assert_eq!(w.open_files(), 2);
+        assert_eq!(w.quiet(), 0, "both were used just now");
+        let old = layout::day_path(&dir, Tier::of("ingest_batches"), "2026-10-10");
+        w.files.iter_mut().find(|f| f.day == "2026-10-10").unwrap().used_at -= FILE_IDLE;
+        assert_eq!(w.quiet(), 1);
+        let open = open_files_under(&dir);
+        assert!(!open.contains(&old), "the idle day file is closed");
+        assert!(open.contains(&layout::meta_path(&dir)), "meta stays open");
+        // Writing to it again reopens it.
+        w.begin().unwrap();
+        w.route_at("ingest_batches", "2026-10-10 13:00:00").unwrap();
+        w.commit().unwrap();
+        assert_eq!(w.open_files(), 2);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

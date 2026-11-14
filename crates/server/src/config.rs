@@ -56,6 +56,9 @@ pub struct Config {
     pub rate_limit_ip: u64,
     pub rate_limit_env: u64,
     pub tenant_idle_seconds: u64,
+    /// Dashboard read connections open at once across every environment
+    /// (dashboard::pool). Each holds a few MB; idle ones close after a minute.
+    pub max_read_connections: usize,
     /// Account#quota_exhausted? turns ingest away with 402. Off by default:
     /// a self-hosted install has no billing (docs/DIFFERENCES.md).
     pub enforce_quota: bool,
@@ -324,6 +327,9 @@ impl Config {
         let rate_limit_ip = num(get("rate_limit_ip", &["RAILWATCH_RATE_LIMIT_IP"]), "rate_limit_ip", 2_400)?;
         let rate_limit_env = num(get("rate_limit_env", &["RAILWATCH_RATE_LIMIT_ENV"]), "rate_limit_env", 600)?;
         let tenant_idle_seconds = num(get("tenant_idle_seconds", &["RAILWATCH_TENANT_IDLE_SECONDS"]), "tenant_idle_seconds", 300)?;
+        let max_read_connections =
+            num(get("max_read_connections", &["RAILWATCH_MAX_READ_CONNECTIONS"]), "max_read_connections", crate::dashboard::pool::MAX_OPEN as u64)?.max(1)
+                as usize;
         let enforce_quota = get("enforce_quota", &["RAILWATCH_ENFORCE_QUOTA"]).is_some_and(|v| truthy(&v));
         let d = crate::storage::retention::Tiers::default();
         let tiers = crate::storage::retention::Tiers {
@@ -454,6 +460,7 @@ impl Config {
             rate_limit_ip,
             rate_limit_env,
             tenant_idle_seconds,
+            max_read_connections,
             enforce_quota,
             tiers,
             budget,
@@ -571,6 +578,7 @@ impl Config {
             ("rate_limit_ip".into(), self.rate_limit_ip.to_string(), src("rate_limit_ip")),
             ("rate_limit_env".into(), self.rate_limit_env.to_string(), src("rate_limit_env")),
             ("tenant_idle_seconds".into(), self.tenant_idle_seconds.to_string(), src("tenant_idle_seconds")),
+            ("max_read_connections".into(), self.max_read_connections.to_string(), src("max_read_connections")),
             ("enforce_quota".into(), self.enforce_quota.to_string(), src("enforce_quota")),
             (
                 "http".into(),

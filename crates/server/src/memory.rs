@@ -60,6 +60,16 @@ unsafe extern "C" fn x_init(_: *mut c_void) -> c_int {
 
 unsafe extern "C" fn x_shutdown(_: *mut c_void) {}
 
+/// Frees what SQLite can of a quiet connection's memory: its cached
+/// prepared statements and its page cache (unpinned pages), which otherwise
+/// stay as large as the busiest moment left them until it closes.
+pub fn release(conn: &rusqlite::Connection) {
+    conn.flush_prepared_statement_cache();
+    // SAFETY: the handle is live for `conn`'s lifetime and used from this
+    // thread only (connections are not shared across threads here).
+    unsafe { rusqlite::ffi::sqlite3_db_release_memory(conn.handle()) };
+}
+
 /// Call first thing in main, before any connection is opened:
 /// sqlite3_config is refused once SQLite is initialized (that is reported,
 /// and SQLite then keeps the C library's malloc).
