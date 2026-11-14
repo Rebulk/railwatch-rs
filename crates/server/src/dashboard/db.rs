@@ -125,7 +125,7 @@ pub fn query_as_is<P: Params>(conn: &Connection, sql: &str, params: P) -> rusqli
 }
 
 fn rows<P: Params>(mut stmt: rusqlite::CachedStatement<'_>, params: P) -> rusqlite::Result<Vec<Rec>> {
-    let cols: Arc<Vec<String>> = Arc::new(stmt.column_names().into_iter().map(str::to_string).collect());
+    let cols: Arc<Vec<String>> = Arc::new(stmt.column_names().map(str::to_string).collect());
     let n = cols.len();
     let mut rows = stmt.query(params)?;
     let mut out = Vec::new();
