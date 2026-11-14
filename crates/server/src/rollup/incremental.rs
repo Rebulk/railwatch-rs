@@ -31,6 +31,8 @@ struct Group {
     dirty: bool,
     /// `row_bytes` of its rows.
     bytes: usize,
+    /// When a batch last added to it.
+    touched: std::time::Instant,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -54,6 +56,11 @@ pub struct Accumulator {
 /// and the full recomputes that followed held the write locks (ingest p50
 /// 0.2 -> 7 s); 128 MB, one tenant's former cap, did not.
 pub const MAX_BYTES: usize = 128 << 20;
+
+/// A flushed group-hour no batch added to for this long leaves memory
+/// (`evict_before`): at idle the accumulator otherwise kept the current and
+/// previous hour of every group until the hour aged out.
+pub const GROUP_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Heap a row holds here, roughly: the map entry, the row's values and
 /// their bytes, and the sort key's copy of occurred_at.
@@ -142,6 +149,7 @@ impl Accumulator {
         g.bytes += n;
         self.bytes += n;
         g.dirty = true;
+        g.touched = std::time::Instant::now();
     }
 
     fn load_group(&mut self, read: &Connection, key: &Key) -> rusqlite::Result<()> {
@@ -154,7 +162,7 @@ impl Accumulator {
             let mut st = read.prepare_cached(&sql)?;
             st.query_map(rusqlite::params![g, from, to], |r| row_values(r, source.width() + 1))?.collect::<rusqlite::Result<_>>()?
         };
-        self.groups.insert(key.clone(), Group { rows: HashMap::new(), dirty: true, bytes: 0 });
+        self.groups.insert(key.clone(), Group { rows: HashMap::new(), dirty: true, bytes: 0, touched: std::time::Instant::now() });
         for row in rows {
             self.insert(key, source, row);
         }
@@ -180,11 +188,14 @@ impl Accumulator {
         out
     }
 
-    /// Drops group-hours that ended before `before` (epoch seconds).
+    /// Drops group-hours that ended before `before` (epoch seconds), and
+    /// flushed ones no batch added to for GROUP_IDLE: a group touched again
+    /// is loaded whole from the read connection (`load_group`), as on first
+    /// touch, so only memory changes.
     pub fn evict_before(&mut self, before: i64) {
         let (mut rows, mut bytes) = (0, 0);
         self.groups.retain(|k, g| {
-            let keep = k.2 + 3600 > before || g.dirty;
+            let keep = g.dirty || (k.2 + 3600 > before && g.touched.elapsed() < GROUP_IDLE);
             if !keep {
                 rows += g.rows.len();
                 bytes += g.bytes;
