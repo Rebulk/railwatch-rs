@@ -57,7 +57,7 @@ jobs:
           if epoch=$(git log -1 --format=%ct 2>/dev/null); then :; else epoch=$(date -d "$HEAD_COMMIT_TIMESTAMP" +%s); fi
           echo "SOURCE_DATE_EPOCH=$epoch" >> "$GITHUB_ENV"
       # The frontend: Node and pnpm at the versions bin/build pins under mise.
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: 10.30.3
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -95,11 +95,11 @@ jobs:
         with:
           name: release
           path: release
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: sign SHA256SUMS (cosign keyless)
         working-directory: release
         run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           files: release/*
           fail_on_unmatched_files: true
