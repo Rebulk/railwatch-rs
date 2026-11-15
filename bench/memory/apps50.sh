@@ -19,6 +19,7 @@ BIN=${BIN_DIR:-$ROOT/target/release}
 APPS=${APPS:-50} CONC=${CONC:-64} DUR=${DUR:-45} PORT=${PORT:-18751}
 # the previous run's scope may still be stopping
 for _ in $(seq 1 120); do ss -ltn | grep -q "127.0.0.1:$PORT " || break; sleep 0.5; done
+if ss -ltn | grep -q "127.0.0.1:$PORT "; then echo "port $PORT already has a listener" >&2; exit 1; fi
 mkdir -p "${DATA_ROOT:-$HOME/.cache/rwmem}"
 D=$(mktemp -d "${DATA_ROOT:-$HOME/.cache/rwmem}/rw-apps50.XXXX")
 unit=rw-apps50-$$

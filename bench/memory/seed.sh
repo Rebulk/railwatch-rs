@@ -24,6 +24,7 @@ for i in 2 3 4 5 6; do "$BIN/railwatch" env create "e$i" >> "$OUT/tokens"; done
 # `env create` puts environments in a "default" account; the proxied user
 # belongs to the first account only, so its application moves there.
 sqlite3 "$OUT/control.sqlite3" "UPDATE applications SET account_id = 1 WHERE slug = 'default'"
+if ss -ltn | grep -q "127.0.0.1:$PORT "; then echo "port $PORT already has a listener" >&2; exit 1; fi
 "$BIN/railwatch" serve > "$OUT/seed-server.log" 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null || true' EXIT
