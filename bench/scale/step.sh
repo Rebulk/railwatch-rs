@@ -72,16 +72,22 @@ cpu0=$(rvr_cpu_us)
     sleep "$SAMPLE_S"
   done ) > "$work/samples" &
 sampler=$!
+python3 -I "$HERE/fsync_probe.py" "$MNT" > "$work/fsync" &
+probe=$!
 # disk at the middle of the load window: growth over the second half is the
 # steady rate (the first minutes include each new file's fixed size)
-( sleep $((DURATION / 2)); du -sb "$data" | cut -f1 > "$work/disk_mid" ) &
-trap 'kill $sampler 2>/dev/null || true' EXIT
+# db_bytes: the same without -wal/-shm files (a WAL is reused, not grown, once
+# it reaches its checkpoint size, so on fresh files it inflates a short run)
+db_bytes() { find "$data" -type f ! -name "*-wal" ! -name "*-shm" -printf "%s\n" | awk "{t+=\$1} END{print t+0}"; }
+( sleep $((DURATION / 2)); du -sb "$data" | cut -f1 > "$work/disk_mid"; db_bytes > "$work/db_mid" ) &
+trap 'kill $sampler $probe 2>/dev/null || true' EXIT
 echo "== $run: load ${DURATION}s ($(date +%T))" >&2
 # in bench-load.slice: the caller sits in user.slice, which reserve.sh keeps
 # off the reserved CPUs, so a plain taskset there is refused.
 sudo systemd-run --scope --quiet --slice=bench-load.slice --uid="$(id -u)" --gid="$(id -g)" -- "$LOAD_BIN" --profile "$HERE/profiles.json" --url "$url" --tokens "$work/tokens" \
   --duration "$DURATION" --warmup "${WARMUP:-60}" --busy-every "$busy_every" --seed "${SEED:-1}" --out "$work/load.json" > "$work/load.txt" 2>&1
 cpu1=$(rvr_cpu_us)
+kill $probe 2>/dev/null || true
 read -r hb1 ha1 < <(host_busy)
 # tail: deferred work after the load stops (Rails' jobs, Rust's rollup flush).
 # Idle = under 5% of one core for 6 s in a row; at most TAIL_MAX s.
@@ -98,12 +104,13 @@ read -r q_end qage_end < <(queue)
 after_anon=$(rvr_anon)
 disk1=$(du -sb "$data" | cut -f1)
 tel1=$(du -sb "$data/telemetry" | cut -f1)
+db1=$(db_bytes)
 oom=$(awk '/^oom_kill /{print $2}' "$SLICE/memory.events")
 failed_jobs=None
 [ "$side" = rails ] && failed_jobs=$(sqlite3 "file:$data/production_queue.sqlite3?mode=ro" "SELECT count(*) FROM solid_queue_failed_executions")
 exited=$(docker ps -a --filter "name=rvr-" --filter status=exited --format '{{.Names}}' | tr '\n' ' ')
 
-python3 -I - "$work/load.json" "$work/samples" <<PY | tee -a "$RESULTS"
+python3 -I - "$work/load.json" "$work/samples" "$work/fsync" <<PY | tee -a "$RESULTS"
 import json, sys
 r = json.load(open(sys.argv[1]))
 S = [l.split() for l in open(sys.argv[2]) if len(l.split()) == 9]
@@ -118,7 +125,7 @@ lat = r["latency"]
 dur = $DURATION; apps = $apps
 lag_q = max([a for a in qa if a is not None], default=None)
 row = {
-  "run": "$run", "side": "$side", "apps": apps, "busy_every": $busy_every, "busy_apps": r["busy_apps"], "duration_s": dur,
+  "run": "$run", "disk_mode": "${DISK_MODE:-loop}", "side": "$side", "apps": apps, "busy_every": $busy_every, "busy_apps": r["busy_apps"], "duration_s": dur,
   "seed_s": $seed_s, "posts": r["posts"], "batches_per_s": round(r["batches_per_s"], 1), "records_per_s": round(r["records_per_s"]),
   "status_counts": r["status_counts"], "not_ok": r["not_ok"], "apps_with_errors": r["apps_with_errors"],
   "p50_ms": round(lat["p50_ms"], 1), "p99_ms": round(lat["p99_ms"], 1), "p999_ms": round(lat["p999_ms"], 1), "max_ms": round(lat["max_ms"], 1),
@@ -137,6 +144,8 @@ row = {
   "disk_seeded_bytes": $disk0, "disk_bytes": $disk1, "telemetry_bytes": $tel1,
   "disk_mid_bytes": $(cat "$work/disk_mid" 2>/dev/null || echo 0),
   "records_ok": r["records_ok"],
+  "db_mid_bytes": $(cat "$work/db_mid" 2>/dev/null || echo 0), "db_bytes": $db1,
+  "db_per_app_day_mib": round(($db1 - $(cat "$work/db_mid" 2>/dev/null || echo 0)) / apps * 86400 / (dur / 2) / 2**20, 1),
   # bytes per stored record over the whole run (fresh files, so an upper bound)
   "bytes_per_record": round(($disk1 - $disk0) / max(1, r["records_ok"]), 1),
   # steady growth over the second half of the load, per app, extrapolated to a day
@@ -150,6 +159,10 @@ if row["p99_ms"] > 1000: why.append("p99>1s")
 if row["not_ok"] > 0: why.append("drops")
 if (lag_q or 0) > 60 or not row["tail_idle"] or row["tail_s"] > 60: why.append("behind>60s")
 if row["oom_kills"] > 0 or row["exited_containers"]: why.append("oom/exit")
+F = sorted(float(x) for x in open(sys.argv[3]) if x.strip())
+fq = lambda p: round(F[min(len(F) - 1, int(p * len(F)))], 1) if F else None
+row.update({"fsync_probe_n": len(F), "fsync_p50_ms": fq(0.5), "fsync_p99_ms": fq(0.99), "fsync_max_ms": fq(1.0) if F else None,
+            "fsync_over_1s": sum(1 for x in F if x > 1000)})
 row["breaks"] = why
 print(json.dumps(row))
 PY
