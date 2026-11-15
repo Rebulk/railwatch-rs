@@ -297,7 +297,24 @@ Source: production (5.161.187.226), each tenant's `core/2026-11-13.sqlite3`
 - **Busy app = rebulk-system production**, the same way: a health batch every
   1.67 s, 17.1 data batches per minute.
 
-**rw-load `--profile`** (`crates/load/src/scale.rs`):
+**rw-load `--profile`** (`crates/load/src/scale.rs`).
+
+> **Known bias in the results above.** Every step in this document ran
+> before a load-generator fix (commit `1d3f626`, from review). The generator
+> cut each data batch at its target size, which dropped the tail of the batch's
+> last execution. That tail is the later record types: transactions, n+1s,
+> outgoing requests, cache events.
+> - Simulating the cut with the same profiles, the records sent were 79.7%
+>   queries for the typical app, against 77.4% intended; the busy app 77.7%
+>   against 71.9%.
+> - The record count and the batch count per app were unaffected, so the
+>   offered rate is right; only the mix within a batch is off.
+> - Queries are the cheapest kind for both servers to store, so the bias,
+>   if anything, flatters both a little and is the same for both.
+> - Steps run after the fix record `records_offered` and `send_late_*`; older
+>   rows do not have those fields.
+
+
 - Every app runs on its own schedule, open loop: a batch is sent when it is
   due, whether or not the previous one was answered. A slow server shows as
   latency and requests in flight, not as a lower offered rate.
