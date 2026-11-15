@@ -1,0 +1,12 @@
+rust conc 16 rep 1: 121 transactions, 936 batches, 7.74 batches/txn, max 13
+rust conc 64 rep 1: 48 transactions, 1475 batches, 30.73 batches/txn, max 33
+rust synchronous=off conc 16 rep 1 : 16950 ev/s p50 509 fsync 13
+rust conc 16 rep 2: 123 transactions, 977 batches, 7.94 batches/txn, max 14
+rust conc 64 rep 2: 46 transactions, 1369 batches, 29.76 batches/txn, max 40
+rust synchronous=off conc 16 rep 2 : 13983 ev/s p50 376 fsync 13
+rust conc 16 rep 3: 109 transactions, 857 batches, 7.86 batches/txn, max 15
+rust conc 64 rep 3: 51 transactions, 1346 batches, 26.39 batches/txn, max 40
+rust synchronous=off conc 16 rep 3 : 17217 ev/s p50 401 fsync 13
+rails synchronous=off conc 16 rep 1 : 10233 ev/s p50 674 fsync 0
+rails synchronous=off conc 16 rep 2 : 9750 ev/s p50 745 fsync 0
+rails synchronous=off conc 16 rep 3 : 8450 ev/s p50 630 fsync 0
