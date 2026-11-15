@@ -10,10 +10,10 @@
 # (/proc/<pid>/smaps_rollup) and its THP_enabled flag. Same binary, same load:
 # the difference is THP.
 #
-# Run it BETWEEN sweeps, never beside one: it uses the bench's own CPUs
-# (server SERVER_CPUS 11,23; rw-load LOAD_CPUS 6-10,18-22) inside the bench
-# slices, so it competes with nothing. It refuses to start while a bench
-# server or a sweep's rw-load is running (found by cgroup, not by name).
+# Run it BETWEEN sweeps, never beside one, with reserve.sh on: the server goes
+# into bench-server.slice and rw-load into bench-load.slice (each a transient
+# scope, so each gets its own slice's CPUs: 11,23 and 6-10,18-22). It refuses
+# to start while anything else is in bench.slice (found by cgroup, not name).
 # A side check, not a result row: it measures memory only.
 set -euo pipefail
 BIN=$1 APPS=$2 SECS=${3:-120}
@@ -21,9 +21,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SERVER_CPUS=${SERVER_CPUS:-11,23}
 LOAD_CPUS=${LOAD_CPUS:-6-10,18-22}
 busy=$(find /sys/fs/cgroup/bench.slice -name cgroup.procs -exec cat {} + 2>/dev/null | wc -l)
-# THP_SKIP_BUSY_CHECK=1: the caller holds the runners' lock and runs this
-# inside bench-server.slice itself (so its own shell is the "busy" process)
-[ "$busy" = 0 ] || [ -n "${THP_SKIP_BUSY_CHECK:-}" ] || { echo "thp_ab: bench.slice has $busy processes (a sweep is running); run between sweeps" >&2; exit 1; }
+[ "$busy" = 0 ] || { echo "thp_ab: bench.slice has $busy processes (a sweep is running); run between sweeps" >&2; exit 1; }
 PORT=${THP_PORT:-18890}
 LOAD=${LOAD_BIN:-$HOME/.cache/rw-scale/bin/rw-load}
 root=$(mktemp -d /dev/shm/rw-thp.XXXX)
@@ -37,16 +35,37 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# the server's PID: the one process named after the binary in bench-server.slice
+pgrep_cg() {
+  local p
+  for p in $(find /sys/fs/cgroup/bench.slice/bench-server.slice -name cgroup.procs -exec cat {} + 2>/dev/null); do
+    [ "$(readlink -f "/proc/$p/exe" 2>/dev/null)" = "$(readlink -f "$BIN")" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
 run() {  # $1 = label, rest = env for the server
   local label=$1; shift
   local d=$root/$label; mkdir -p "$d"
   for i in $(seq 1 "$APPS"); do RAILWATCH_DATA_DIR=$d/data "$BIN" env create "e$i" | grep -o 'rw_[A-Za-z0-9]*' >> "$d/tokens"; done
-  env "$@" RAILWATCH_DATA_DIR=$d/data PORT=$PORT RAILWATCH_SECRET_KEY_BASE="$(openssl rand -hex 64)" \
-    RAILWATCH_TRUST_PROXY=1 RAILWATCH_RATE_LIMIT_ENV=0 taskset -c "$SERVER_CPUS" "$BIN" serve > "$d/server.log" 2>&1 &
-  srv=$!
+  # the server's settings go in a 0600 env file read by `env -S`-free means:
+  # a small launcher script in the run dir, so no value (the generated secret
+  # included) appears on a command line other processes can read
+  ( umask 077
+    { echo "export RAILWATCH_DATA_DIR='$d/data' PORT='$PORT' RAILWATCH_TRUST_PROXY=1 RAILWATCH_RATE_LIMIT_ENV=0"
+      echo "export RAILWATCH_SECRET_KEY_BASE='$(openssl rand -hex 64)'"
+      for kv in "$@"; do echo "export $kv"; done
+      echo "exec '$BIN' serve"; } > "$d/launch.sh" )
+  sudo systemd-run --scope --quiet --slice=bench-server.slice --uid="$(id -u)" --gid="$(id -g)" -- bash "$d/launch.sh" > "$d/server.log" 2>&1 &
+  # the server is the scope's child; take its PID from the scope's own cgroup
+  srv=
+  for _ in $(seq 1 100); do
+    srv=$(pgrep_cg) && [ -n "$srv" ] && break; sleep 0.1
+  done
+  [ -n "$srv" ] || { echo "thp_ab: server did not start" >&2; cat "$d/server.log" >&2; return 1; }
   for _ in $(seq 1 150); do curl -fsS --max-time 2 -o /dev/null "http://127.0.0.1:$PORT/up" 2>/dev/null && break; sleep 0.2; done
   local idle; idle=$(awk '/^Anonymous:/{print $2}' "/proc/$srv/smaps_rollup")
-  taskset -c "$LOAD_CPUS" "$LOAD" --profile "$HERE/profiles.json" --url "http://127.0.0.1:$PORT" --tokens "$d/tokens" \
+  sudo systemd-run --scope --quiet --slice=bench-load.slice --uid="$(id -u)" --gid="$(id -g)" -- "$LOAD" --profile "$HERE/profiles.json" --url "http://127.0.0.1:$PORT" --tokens "$d/tokens" \
     --duration "$SECS" --warmup 10 --out "$d/load.json" > "$d/load.txt" 2>&1
   python3 -I - "$label" "$APPS" "$idle" "/proc/$srv/smaps_rollup" "/proc/$srv/status" "$d/load.json" <<'PY'
 import json, sys

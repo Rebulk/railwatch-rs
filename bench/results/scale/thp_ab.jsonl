@@ -1,0 +1,4 @@
+{"label": "thp_host", "apps": 25, "thp_enabled": "1", "idle_anon_mib": 32.8, "anon_mib": 254.1, "anon_hugepages_mib": 172.0, "huge_share": 0.677, "anon_per_app_mib": 8.85, "records_ok": 17026, "not_ok": 0}
+{"label": "thp_off", "apps": 25, "thp_enabled": "0", "idle_anon_mib": 17.3, "anon_mib": 104.7, "anon_hugepages_mib": 0.0, "huge_share": 0.0, "anon_per_app_mib": 3.5, "records_ok": 10412, "not_ok": 0}
+{"label": "thp_host", "apps": 100, "thp_enabled": "1", "idle_anon_mib": 62.2, "anon_mib": 740.5, "anon_hugepages_mib": 548.0, "huge_share": 0.74, "anon_per_app_mib": 6.78, "records_ok": 48875, "not_ok": 0}
+{"label": "thp_off", "apps": 100, "thp_enabled": "0", "idle_anon_mib": 37.2, "anon_mib": 394.2, "anon_hugepages_mib": 0.0, "huge_share": 0.0, "anon_per_app_mib": 3.57, "records_ok": 49013, "not_ok": 0}
