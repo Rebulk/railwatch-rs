@@ -32,8 +32,15 @@ def breaks(r):
     b = r["breaks"]
     if not b:
         return "-"
-    words = {"p99>1s": "p99 > 1 s", "drops": "drops", "behind>60s": "behind > 60 s", "oom/exit": "killed (out of memory)"}
-    return ", ".join(words.get(x, x) for x in b)
+    words = {"p99>1s": "p99 > 1 s", "drops": "drops", "behind>60s": "behind > 60 s", "oom": "killed (out of memory)",
+             "exited": "server exited", "failed_jobs": "failed jobs", "client_late": "client late (run invalid)"}
+    out = []
+    for x in b:
+        # older rows (before the oom/exit split) carry "oom/exit": name it from oom_kills
+        if x == "oom/exit":
+            x = "oom" if r.get("oom_kills") else "exited"
+        out.append(words.get(x, x))
+    return ", ".join(out)
 
 
 for side, title in SIDES:

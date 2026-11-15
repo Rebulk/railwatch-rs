@@ -24,8 +24,9 @@ trap cleanup EXIT
 trap 'exit 143' TERM INT
 "$HERE/reserve.sh" on
 "$HERE/disk.sh" up
+failed=0
 for n in $COUNTS; do
-  line=$("$HERE/step.sh" "$side" "$n" "$busy" | tail -1) || { echo "!! step failed: $side $n" >&2; break; }
+  line=$("$HERE/step.sh" "$side" "$n" "$busy" | tail -1) || { echo "!! step failed: $side $n" >&2; failed=1; break; }
   echo "$line"
   echo "scratch: $(( $("$HERE/disk.sh" usage) / 1048576 )) MiB held by the bench disk" >&2
   if ! python3 -I -c 'import json,sys; sys.exit(1 if json.loads(sys.argv[1])["breaks"] else 0)' "$line"; then
@@ -33,3 +34,6 @@ for n in $COUNTS; do
     break
   fi
 done
+# a step that could not run is a failure of the sweep (the EXIT trap still
+# cleans up); a step that ran and broke is the measurement, not a failure
+exit $failed

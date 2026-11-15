@@ -46,6 +46,18 @@ data=$MNT/$run
 work=$(mktemp -d "/tmp/rw-scale-$run.XXXX")
 rvr_stop
 sudo find "$MNT" -mindepth 1 -maxdepth 1 -name '20*' -exec rm -rf {} +
+# one cleanup for every exit path, installed before anything is started:
+# the background samplers this script starts (their PIDs, recorded here),
+# then this harness's own containers (unless KEEP_SERVER). $work is kept on
+# failure, as evidence.
+bg=()
+step_ok=0
+cleanup_step() {
+  for p in "${bg[@]}"; do kill "$p" 2>/dev/null || true; done
+  [ -n "${KEEP_SERVER:-}" ] || rvr_stop
+  if [ $step_ok = 1 ]; then rm -rf "$work"; else echo "step: kept $work for inspection" >&2; fi
+}
+trap cleanup_step EXIT
 
 echo "== $run: starting server, seeding $apps apps ($(date +%T))" >&2
 t_seed=$(date +%s)
@@ -86,24 +98,27 @@ date +%s.%N > "$work/load_t0"
     sleep "$SAMPLE_S"
   done ) > "$work/samples" &
 sampler=$!
+bg+=($sampler)
 ( m=999999999; while :; do a=$(awk '/^MemAvailable/{print int($2/1024)}' /proc/meminfo); [ "$a" -lt "$m" ] && m=$a && echo $m > "$work/memavail_min"; sleep 5; done ) &
 memmon=$!
+bg+=($memmon)
 python3 -I "$HERE/fsync_probe.py" "$MNT" > "$work/fsync" &
 probe=$!
+bg+=($probe)
 # disk at the middle of the load window: growth over the second half is the
 # steady rate (the first minutes include each new file's fixed size)
 # db_bytes: the same without -wal/-shm files (a WAL is reused, not grown, once
 # it reaches its checkpoint size, so on fresh files it inflates a short run)
 db_bytes() { find "$data" -type f ! -name "*-wal" ! -name "*-shm" -printf "%s\n" | awk "{t+=\$1} END{print t+0}"; }
-( sleep $((DURATION / 2)); du -sb "$data" | cut -f1 > "$work/disk_mid"; db_bytes > "$work/db_mid" ) &
-trap 'kill $sampler $probe $memmon 2>/dev/null || true' EXIT
+( sleep $((DURATION / 2)); date +%s.%N > "$work/disk_mid_t"; du -sb "$data" | cut -f1 > "$work/disk_mid"; db_bytes > "$work/db_mid" ) &
+bg+=($!)
 echo "== $run: load ${DURATION}s ($(date +%T))" >&2
 # in bench-load.slice: the caller sits in user.slice, which reserve.sh keeps
 # off the reserved CPUs, so a plain taskset there is refused.
 sudo systemd-run --scope --quiet --slice=bench-load.slice --uid="$(id -u)" --gid="$(id -g)" -- "$LOAD_BIN" --profile "$HERE/profiles.json" --url "$url" --tokens "$work/tokens" \
   --duration "$DURATION" --warmup "${WARMUP:-60}" --busy-every "$busy_every" --seed "${SEED:-1}" --out "$work/load.json" > "$work/load.txt" 2>&1
 cpu1=$(rvr_cpu_us)
-kill $probe 2>/dev/null || true
+kill $probe $sampler 2>/dev/null || true
 read -r hb1 ha1 < <(host_busy)
 # tail: deferred work after the load stops (Rails' jobs, Rust's rollup flush).
 # Idle = under 5% of one core for 6 s in a row; at most TAIL_MAX s.
@@ -114,10 +129,11 @@ while [ $quiet -lt 6 ] && [ $t -lt "${TAIL_MAX:-300}" ]; do
   prev=$now
 done
 tail_idle=$([ $quiet -ge 6 ] && echo True || echo False)
-kill $sampler $memmon 2>/dev/null || true
+kill $memmon 2>/dev/null || true
 cpu2=$(rvr_cpu_us)
 read -r q_end qage_end < <(queue)
 after_anon=$(rvr_anon)
+disk1_t=$(date +%s.%N)
 disk1=$(du -sb "$data" | cut -f1)
 tel1=$(du -sb "$data/telemetry" | cut -f1)
 db1=$(db_bytes)
@@ -166,13 +182,17 @@ row = {
   "peak_fds": max(fd), "steady_fds": half(fd), "oom_kills": int("${oom:-0}"), "exited_containers": "$exited".strip(),
   "disk_seeded_bytes": $disk0, "disk_bytes": $disk1, "telemetry_bytes": $tel1,
   "disk_mid_bytes": $(cat "$work/disk_mid" 2>/dev/null || echo 0),
-  "records_ok": r["records_ok"],
+  "records_ok": r["records_ok"], "records_offered": r.get("records_offered"),
+  "send_late_p99_ms": r.get("send_late_p99_ms"), "send_late_max_ms": r.get("send_late_max_ms"),
   "db_mid_bytes": $(cat "$work/db_mid" 2>/dev/null || echo 0), "db_bytes": $db1,
-  "db_per_app_day_mib": round(($db1 - $(cat "$work/db_mid" 2>/dev/null || echo 0)) / apps * 86400 / (dur / 2) / 2**20, 1),
+  # second-half growth over the real time between the snapshots (the last one
+  # is taken after the post-load tail)
+  "disk_span_s": round($disk1_t - $(cat "$work/disk_mid_t" 2>/dev/null || echo "$disk1_t - dur / 2"), 1),
+  "db_per_app_day_mib": round(($db1 - $(cat "$work/db_mid" 2>/dev/null || echo 0)) / apps * 86400 / max(1, $disk1_t - $(cat "$work/disk_mid_t" 2>/dev/null || echo "$disk1_t - dur / 2")) / 2**20, 1),
   # bytes per stored record over the whole run (fresh files, so an upper bound)
   "bytes_per_record": round(($disk1 - $disk0) / max(1, r["records_ok"]), 1),
   # steady growth over the second half of the load, per app, extrapolated to a day
-  "disk_per_app_day_mib": round(($disk1 - $(cat "$work/disk_mid" 2>/dev/null || echo 0)) / apps * 86400 / (dur / 2) / 2**20, 1),
+  "disk_per_app_day_mib": round(($disk1 - $(cat "$work/disk_mid" 2>/dev/null || echo 0)) / apps * 86400 / max(1, $disk1_t - $(cat "$work/disk_mid_t" 2>/dev/null || echo "$disk1_t - dur / 2")) / 2**20, 1),
   "host_busy_pct_rest": round(($hb1 - $hb0) / max(1, ($ha1 - $ha0)) * 100, 1),
   "loadavg_max": max(float(s[8]) for s in S),
   "loadavg_mean": round(sum(float(s[8]) for s in S) / len(S), 2),
@@ -184,7 +204,11 @@ why = []
 if row["p99_ms"] > 1000: why.append("p99>1s")
 if row["not_ok"] > 0: why.append("drops")
 if (lag_q or 0) > 60 or not row["tail_idle"] or row["tail_s"] > 60: why.append("behind>60s")
-if row["oom_kills"] > 0 or row["exited_containers"]: why.append("oom/exit")
+if row["oom_kills"] > 0: why.append("oom")
+elif row["exited_containers"]: why.append("exited")
+if (row["failed_jobs"] or 0) > 0: why.append("failed_jobs")
+# a client that started sends more than 1 s late is not a valid run: flag it
+if (row["send_late_p99_ms"] or 0) > 1000: why.append("client_late")
 P = [l.split() for l in open(sys.argv[3]) if len(l.split()) == 2]
 F = sorted(float(x[1]) for x in P)
 fq = lambda p: round(F[min(len(F) - 1, int(p * len(F)))], 1) if F else None
@@ -198,5 +222,4 @@ cp "$work/load.json" "$(dirname "$RESULTS")/raw/$run.load.json"
 cp "$work/samples" "$(dirname "$RESULTS")/raw/$run.samples"
 cp "$work/fsync" "$(dirname "$RESULTS")/raw/$run.fsync" 2>/dev/null || true
 cp "$work/load_t0" "$(dirname "$RESULTS")/raw/$run.t0" 2>/dev/null || true
-[ -n "${KEEP_SERVER:-}" ] || rvr_stop
-rm -rf "$work"
+step_ok=1

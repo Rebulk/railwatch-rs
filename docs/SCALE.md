@@ -474,7 +474,7 @@ mkdir -p ~/.cache/rw-scale/bin && cp target/release/{railwatch,rw-load} ~/.cache
   mv ~/.cache/rw-scale/bin/railwatch ~/.cache/rw-scale/bin/railwatch-main
 cp ~/.cache/rw-scale/target-memory/release/railwatch ~/.cache/rw-scale/bin/railwatch-memory
 # Rails image: railwatch-cloud @ 71020d3, as in docs/RAILS-VS-RUST.md
-git -C ~/src/railwatch-cloud archive 71020d3 | tar -x -C /tmp/rw-71020d3
+mkdir -p /tmp/rw-71020d3 && git -C ~/src/railwatch-cloud archive 71020d3 | tar -x -C /tmp/rw-71020d3
 docker build -t railwatch-cloud-baseline:71020d3 /tmp/rw-71020d3
 
 # check the topology and set SERVER_CPUS / LOAD_CPUS to one core + sibling / other cores

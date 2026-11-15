@@ -161,7 +161,9 @@ struct Sample {
     at: f64,
     status: u16, // 0 = error/timeout, 1 = client_full (never sent)
     latency_ms: f64,
-    records: usize,
+    late_ms: f64,    // send start minus its scheduled time
+    records: usize,  // offered
+    accepted: usize, // what the server said it accepted
 }
 
 pub fn wanted(args: &[String]) -> bool {
@@ -214,7 +216,6 @@ pub async fn run(args: Vec<String>) {
     let max_seen = Arc::new(AtomicUsize::new(0));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Sample>();
     let t0 = Instant::now();
-    let deadline = t0 + Duration::from_secs_f64(duration);
     let timeout = Duration::from_secs_f64(timeout_s);
     let busy_apps = if busy_every > 0 { tokens.len().div_ceil(busy_every) } else { 0 };
     eprintln!("rw-load --profile: {} apps ({busy_apps} busy), {duration} s, open loop", tokens.len());
@@ -232,6 +233,10 @@ pub async fn run(args: Vec<String>) {
             let max_rate = p.max_rate();
             let exp = |b: &mut Builder| -> f64 { -(1.0 - b.rng.random_range(0.0..1.0f64)).ln() / max_rate };
             let mut next_data = if max_rate > 0.0 { exp(&mut b) } else { f64::INFINITY };
+            // the tail of the last execution that did not fit a batch: sent
+            // first in the next one, so every execution reaches the server
+            // whole and the sent mix is the profile's (at most one execution)
+            let mut pending: Vec<Value> = Vec::new();
             loop {
                 let health = next_health <= next_data;
                 let at = if health { next_health } else { next_data };
@@ -250,16 +255,18 @@ pub async fn run(args: Vec<String>) {
                         continue;
                     }
                     let n = b.data_size(p, wall);
-                    let mut r = Vec::with_capacity(n + 64);
+                    let mut r = std::mem::take(&mut pending);
                     while r.len() < n {
                         b.profile_execution(p, wall, &mut r);
                     }
-                    r.truncate(n);
+                    if r.len() > n {
+                        pending = r.split_off(n);
+                    }
                     r
                 };
                 let n = records.len();
                 if in_flight.load(Ordering::Relaxed) >= max_in_flight {
-                    let _ = tx.send(Sample { app, busy, health, at, status: 1, latency_ms: 0.0, records: n });
+                    let _ = tx.send(Sample { app, busy, health, at, status: 1, latency_ms: 0.0, late_ms: 0.0, records: n, accepted: 0 });
                     continue;
                 }
                 let body = Bytes::from(Builder::gzip(&records));
@@ -273,37 +280,43 @@ pub async fn run(args: Vec<String>) {
                     .header("x-forwarded-for", &xff)
                     .body(Full::new(body))
                     .unwrap();
+                // how late this send starts against its schedule: record
+                // building, gzip and the executor all count. Reported, so a
+                // client-limited run cannot pass as low latency.
+                let late_ms = (t0.elapsed().as_secs_f64() - at).max(0.0) * 1000.0;
                 let now_in = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
                 max_seen.fetch_max(now_in, Ordering::Relaxed);
                 let (client, tx, in_flight) = (client.clone(), tx.clone(), in_flight.clone());
                 tokio::spawn(async move {
                     let sent = Instant::now();
-                    let status = match tokio::time::timeout(timeout, client.request(req)).await {
-                        Ok(Ok(resp)) => {
-                            let s = resp.status().as_u16();
-                            let _ = resp.into_body().collect().await;
-                            s
-                        }
-                        _ => 0,
+                    let exchange = async {
+                        let resp = client.request(req).await.ok()?;
+                        let s = resp.status().as_u16();
+                        let body = resp.into_body().collect().await.ok()?.to_bytes();
+                        let accepted =
+                            serde_json::from_slice::<Value>(&body).ok().and_then(|v| v.get("accepted").and_then(Value::as_u64)).unwrap_or(0) as usize;
+                        Some((s, accepted))
                     };
+                    let (status, accepted) = tokio::time::timeout(timeout, exchange).await.ok().flatten().unwrap_or((0, 0));
                     in_flight.fetch_sub(1, Ordering::Relaxed);
-                    let _ = tx.send(Sample { app, busy, health, at, status, latency_ms: sent.elapsed().as_secs_f64() * 1000.0, records: n });
+                    let latency_ms = sent.elapsed().as_secs_f64() * 1000.0;
+                    let _ = tx.send(Sample { app, busy, health, at, status, latency_ms, late_ms, records: n, accepted });
                 });
             }
         }));
     }
     drop(tx);
     // in-flight per second, for the timeline
+    let stop = Arc::new(tokio::sync::Notify::new());
     let sampler = {
-        let in_flight = in_flight.clone();
+        let (in_flight, stop) = (in_flight.clone(), stop.clone());
         tokio::spawn(async move {
             let mut v = Vec::new();
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
-                tick.tick().await;
-                v.push(in_flight.load(Ordering::Relaxed));
-                if Instant::now() >= deadline + timeout + Duration::from_secs(2) {
-                    return v;
+                tokio::select! {
+                    _ = tick.tick() => v.push(in_flight.load(Ordering::Relaxed)),
+                    _ = stop.notified() => return v,
                 }
             }
         })
@@ -315,7 +328,7 @@ pub async fn run(args: Vec<String>) {
     for a in apps {
         let _ = a.await;
     }
-    sampler.abort();
+    stop.notify_one();
     let in_flight_timeline = sampler.await.unwrap_or_default();
     report(&samples, warmup, duration, tokens.len(), busy_apps, max_seen.load(Ordering::Relaxed), &in_flight_timeline, timeout_s, out.as_deref());
 }
@@ -350,7 +363,12 @@ fn report(
         *status_counts.entry(k).or_default() += 1;
     }
     let ok_lat = |f: &dyn Fn(&Sample) -> bool| lat_stats(samples.iter().filter(measured).filter(|s| f(s)).map(|s| s.latency_ms).collect());
-    let records_ok: usize = samples.iter().filter(ok).map(|s| s.records).sum();
+    // records the server accepted (its "accepted"), not offered: a 200 can
+    // carry fewer (rejected lines) or none (paused)
+    let records_ok: usize = samples.iter().filter(ok).map(|s| s.accepted).sum();
+    let records_offered: usize = samples.iter().filter(|s| s.status != 1).map(|s| s.records).sum();
+    let mut late: Vec<f64> = samples.iter().filter(|s| s.status != 1 && s.at >= warmup).map(|s| s.late_ms).collect();
+    late.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let not_ok = samples.iter().filter(|s| s.status != 200).count();
     let over_3s = samples.iter().filter(|s| s.status == 200 && s.latency_ms > 3000.0).count();
     // per 10 s window: offered batches, ok, p99 of everything sent in it
@@ -373,7 +391,8 @@ fn report(
     let summary = json!({
         "mode": "profile", "warmup_s": warmup, "apps": apps, "busy_apps": busy_apps, "duration_s": duration,
         "posts": samples.len(), "ok": samples.len() - not_ok, "not_ok": not_ok, "status_counts": status_counts,
-        "records_ok": records_ok, "records_per_s": records_ok as f64 / duration, "batches_per_s": samples.len() as f64 / duration,
+        "records_ok": records_ok, "records_offered": records_offered, "records_per_s": records_ok as f64 / duration,
+        "send_late_p99_ms": percentile(&late, 99.0), "send_late_max_ms": late.last().copied().unwrap_or(0.0), "batches_per_s": samples.len() as f64 / duration,
         "over_3s": over_3s, "max_in_flight": max_in_flight, "request_timeout_s": timeout_s,
         "latency": lat_stats(all), "latency_health": ok_lat(&|s| s.health), "latency_data": ok_lat(&|s| !s.health),
         "latency_busy_apps": ok_lat(&|s| s.busy),

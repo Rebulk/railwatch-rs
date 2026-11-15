@@ -41,7 +41,10 @@ rvr_stop() { docker rm -f rvr-rust rvr-rails rvr-rails-jobs >/dev/null 2>&1 || t
 
 # rvr_wait URL: until it answers (max 180 s)
 rvr_wait() {
-  for _ in $(seq 1 900); do curl -fsS -o /dev/null "$1" 2>/dev/null && return 0; sleep 0.2; done
+  # a deadline, not a count: each curl is bounded too, so a server that accepts
+  # but never answers cannot hold this past 180 s
+  local end=$(( $(date +%s) + 180 ))
+  while [ "$(date +%s)" -lt "$end" ]; do curl -fsS --max-time 2 -o /dev/null "$1" 2>/dev/null && return 0; sleep 0.2; done
   echo "timed out waiting for $1" >&2; return 1
 }
 
