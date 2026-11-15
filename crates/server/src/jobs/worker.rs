@@ -109,7 +109,9 @@ impl Worker {
                         full_hours: HashSet::new(),
                         users: Default::default(),
                         active: true,
-                        used_at: Instant::now(),
+                        // Opened idle: only a committed batch renews it, so
+                        // a tenant the drain reopens closes at the next flush.
+                        used_at: Instant::now().checked_sub(TENANT_IDLE).unwrap_or_else(Instant::now),
                     },
                 ),
             );
@@ -507,8 +509,9 @@ mod tests {
         let mut w = Worker::new(control, root.join("telemetry"));
         w.handle_inner(TenantWork::Drain { env: env.id, slug: "quiet".into() }).unwrap();
         assert!(open() > 0);
+        w.tenants.get_mut(&env.id).unwrap().1.used_at = Instant::now();
         w.flush_all();
-        assert!(w.tenants.contains_key(&env.id), "just opened: kept");
+        assert!(w.tenants.contains_key(&env.id), "a batch reached it lately: kept");
         w.tenants.get_mut(&env.id).unwrap().1.used_at -= TENANT_IDLE;
         // Scheduled work (the drain every minute) does not keep it open.
         w.handle_inner(TenantWork::Drain { env: env.id, slug: "quiet".into() }).unwrap();
@@ -517,6 +520,9 @@ mod tests {
         assert_eq!(open(), 0, "no descriptor left to its files");
         w.handle_inner(TenantWork::Drain { env: env.id, slug: "quiet".into() }).unwrap();
         assert!(w.tenants.contains_key(&env.id), "reopened by the next work");
+        // Reopened by the drain alone, it does not stay open TENANT_IDLE.
+        w.flush_all();
+        assert!(!w.tenants.contains_key(&env.id), "a drain-only reopen closes at the next flush");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
