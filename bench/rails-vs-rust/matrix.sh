@@ -9,6 +9,7 @@
 # label apps concurrency duration rate(batches/s, 0 = closed loop)
 set -euo pipefail
 cd "$(dirname "$0")"
+failed=0
 CASES=(
   "max-1app    1 16 45 0"
   "max-10app  10 32 45 0"
@@ -27,7 +28,8 @@ for rep in $(seq 1 "${REPS:-3}"); do
     if [ $((rep % 2)) = 1 ]; then sides="rails rust"; else sides="rust rails"; fi
     for side in $sides; do
       echo "== rep $rep $side $label ($(date +%T), load $(cut -d' ' -f1-3 /proc/loadavg))" >&2
-      SEED=$rep ./run.sh "$side" "$label" "$apps" "$conc" "$dur" "$rate" || echo "!! run failed: $side $label rep $rep" >&2
+      SEED=$rep ./run.sh "$side" "$label" "$apps" "$conc" "$dur" "$rate" || { echo "!! run failed: $side $label rep $rep" >&2; failed=$((failed + 1)); }
     done
   done
 done
+[ "$failed" = 0 ] || { echo "$failed runs failed" >&2; exit 1; }

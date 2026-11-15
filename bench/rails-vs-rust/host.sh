@@ -33,6 +33,7 @@ up)
   echo root | sudo tee /sys/fs/cgroup/rvr.slice/cpuset.cpus.partition >/dev/null
   echo "rvr.slice: cpus $(cat /sys/fs/cgroup/rvr.slice/cpuset.cpus.effective) partition $(cat /sys/fs/cgroup/rvr.slice/cpuset.cpus.partition) mem $(cat /sys/fs/cgroup/rvr.slice/memory.max)"
   if ! mountpoint -q "$MNT"; then
+    mkdir -p "$(dirname "$STATE")"
     sudo modprobe zram dm-delay
     n=$(sudo cat /sys/class/zram-control/hot_add)
     echo lz4 | sudo tee "/sys/block/zram$n/comp_algorithm" >/dev/null

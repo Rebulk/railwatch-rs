@@ -40,10 +40,13 @@ cols = [
 ]
 order = ["max-1app", "max-10app", "max-50app", "rate-1app", "rate-10app", "rate-50app", "conc1-1app", "conc4-1app", "conc64-1app"]
 labels = sorted({k[0] for k in groups}, key=lambda l: order.index(l) if l in order else 99)
+# The three main sides first, then any variant (mechanism.sh's sync-off, debug-log).
+sides = ["rails", "rails+group-commit", "rust"]
+sides += sorted({k[1] for k in groups} - set(sides))
 print("| case | side | " + " | ".join(c for c, _ in cols) + " |")
 print("|---|---|" + "---:|" * len(cols))
 for label in labels:
-    for side in ["rails", "rails+group-commit", "rust"]:
+    for side in sides:
         rs = groups.get((label, side))
         if rs:
             print(f"| {label} | {side} | " + " | ".join(f(rs) for _, f in cols) + " |")
@@ -52,7 +55,7 @@ print("\nMemory and disk (median of the runs):\n")
 print("| case | side | idle anon MiB | anon after load MiB | telemetry bytes / 1M events | device bytes written / 1M events |")
 print("|---|---|---:|---:|---:|---:|")
 for label in labels:
-    for side in ["rails", "rails+group-commit", "rust"]:
+    for side in sides:
         rs = groups.get((label, side))
         if rs:
             m = lambda f: statistics.median([f(r) for r in rs])

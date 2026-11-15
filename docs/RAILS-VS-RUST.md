@@ -315,6 +315,10 @@ with the session cookie from signing in through each app's own `/sign_in`.
 Every response is checked to be a 200 Inertia page, and the payloads came out
 the same size within 50 bytes. "Cold" means the first request to that page
 after a server restart and `drop_caches`; "warm" is the median of 10 more.
+The overview is the exception: pages.py renders it once, untimed, to read the
+Inertia asset version, so its "cold" is the second request and its files are
+already in the page cache. Later pages run after the earlier pages' samples,
+without another `drop_caches`.
 Three repetitions, `window=24h`, both servers in the same 2-core slice.
 
 | page | Rails cold ms | Rust cold ms | Rails warm ms | Rust warm ms |
@@ -452,6 +456,7 @@ ceiling. That is an estimate, not a measurement.
 ```sh
 cargo build --release -p railwatch-server -p railwatch-load   # or bin/build
 # Rails image: railwatch-cloud @ 71020d3, built from a clean export
+mkdir -p /tmp/rw-71020d3
 git -C ~/src/railwatch-cloud archive 71020d3 | tar -x -C /tmp/rw-71020d3
 docker build -t railwatch-cloud-baseline:71020d3 /tmp/rw-71020d3
 bench/rails-vs-rust/host.sh up          # sudo: cpuset slice + delayed zram disk

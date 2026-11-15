@@ -68,7 +68,7 @@ sudo kill -INT $perfpid; wait $perfpid 2>/dev/null || true
 if [ "$side" = rails ]; then
   docker run --rm --network host --user 1000:1000 --cpuset-cpus "$LOAD_CPUS" --env-file "$SECRETS" \
     -e RAILWATCH_ALLOWED_HOSTS=127.0.0.1,localhost -v "$data:/rails/storage" "$RAILS_IMAGE" \
-    bin/rails runner 'RollupCatchupJob.perform_now' >/dev/null 2>&1 || echo "rollup catchup enqueue failed" >&2
+    bin/rails runner 'RollupCatchupJob.perform_now' >/dev/null 2>&1 || { echo "rollup catchup enqueue failed: no result (its CPU would be missing)" >&2; exit 1; }
 fi
 # tail: until the slice is idle (deferred work done). 6 quiet seconds, so
 # Rust's 5 s rollup flush cannot fall in a gap.

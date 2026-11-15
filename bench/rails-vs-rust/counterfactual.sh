@@ -7,6 +7,7 @@
 #   bench/rails-vs-rust/counterfactual.sh
 set -euo pipefail
 cd "$(dirname "$0")"
+failed=0
 export VARIANT=group-commit
 export RAILS_EXTRA_MOUNTS="-v $PWD/rails/zz_bench_group_commit.rb:/rails/config/initializers/zz_bench_group_commit.rb:ro"
 CASES=(
@@ -21,6 +22,7 @@ for rep in $(seq 1 "${REPS:-3}"); do
     read -r label apps conc dur rate <<< "$c"
     if [ -n "${ONLY:-}" ] && [[ " $ONLY " != *" $label "* ]]; then continue; fi
     echo "== rep $rep rails+group-commit $label ($(date +%T), load $(cut -d' ' -f1-3 /proc/loadavg))" >&2
-    SEED=$rep ./run.sh rails "$label" "$apps" "$conc" "$dur" "$rate" || echo "!! run failed: $label rep $rep" >&2
+    SEED=$rep ./run.sh rails "$label" "$apps" "$conc" "$dur" "$rate" || { echo "!! run failed: $label rep $rep" >&2; failed=$((failed + 1)); }
   done
 done
+[ "$failed" = 0 ] || { echo "$failed runs failed" >&2; exit 1; }

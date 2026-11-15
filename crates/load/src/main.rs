@@ -469,6 +469,11 @@ fn report(o: &Opts, samples: &[Sample], elapsed: f64, built: usize) {
     if samples.len() == built {
         println!("  WARNING: every prebuilt batch was sent; the run may have been limited by --batches, not the server");
     }
+    if o.rate > 0.0 {
+        // Permits still queued at the deadline are never sent: say how far dispatch fell behind.
+        let scheduled = (o.rate * o.duration).floor() as usize;
+        println!("  sent {} of {scheduled} scheduled posts ({} not dispatched)", samples.len(), scheduled.saturating_sub(samples.len()));
+    }
     println!("  batches/s (200): {:.1}   events/s accepted: {:.0}", ok.len() as f64 / elapsed, events as f64 / elapsed);
     println!("  {:>6} {:>8} {:>9} {:>9} {:>9} {:>9}", "status", "count", "p50 ms", "p90 ms", "p99 ms", "max ms");
     for (status, lat) in &mut by_status {

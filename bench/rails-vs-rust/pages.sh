@@ -30,6 +30,10 @@ if [ -n "${REUSE:-}" ] && [ -d "$root/rust" ]; then
   ENV_PATH=${ENV_PATH:-/apps/1/envs/1}
   rows=$(sqlite3 "file:$root/rails/telemetry/bench-bench-env-0001.sqlite3?mode=ro" "SELECT (SELECT count(*) FROM executions)||' executions, '||(SELECT count(*) FROM queries)||' queries, '||(SELECT count(*) FROM rollups)||' rollups'")
   size=$(stat -c %s "$root/rails/telemetry/bench-bench-env-0001.sqlite3")
+  # The pages read window=24h, which ends now: a seed older than that times empty pages.
+  recent=$(sqlite3 "file:$root/rails/telemetry/bench-bench-env-0001.sqlite3?mode=ro" "SELECT count(*) FROM executions WHERE occurred_at >= datetime('now', '-1 day')")
+  [ "$recent" -gt 0 ] || { echo "REUSE: no executions in the last 24 h; reseed (unset REUSE)" >&2; exit 1; }
+  rows="$rows, $recent executions in the last 24 h"
 else
 sudo rm -rf "$root"; mkdir -p "$root"
 
@@ -62,7 +66,8 @@ cp -a "$root/rails" "$root/rails-src"
 RAILWATCH_DATA_DIR=$root/rust "$RUST_BIN" import-rails --primary "$root/rails-src/production.sqlite3" --telemetry-dir "$root/rails-src/telemetry" | tail -3
 fi
 
-# 3. time
+# 3. time (pages.jsonl holds this invocation's runs only)
+: > "$OUT"
 for rep in $(seq 1 "$REPS"); do
   for side in rails rust; do
     rvr_stop
