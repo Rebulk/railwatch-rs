@@ -164,9 +164,27 @@ see [Still running](#still-running).
     burst peaked at 493 ready jobs, which fits. The second peaked at 677, more
     than the catch-up alone; the rest are likely per-batch `RollupJob`s and
     follow-ups that queued behind it. Not broken down.
-  - The job classes behind each burst are recorded per step from the 10%-busy
-    Rails sweep on (`job_mix`). The 250-app numbers above come from the queue
-    depth and timing, not from a class count.
+  - **Measured: the job load is linear in the app count.** The 10%-busy Rails
+    sweep records every job class that ran in each step (`job_mix`, from Solid
+    Queue's `solid_queue_jobs`, read-only after the load):
+
+    | apps | `RollupJob` | per app | `ReleaseHealthRollupJob` | `CheckScheduledTasksJob` | `RollupCatchupJob` | all jobs |
+    |---:|---:|---:|---:|---:|---:|---:|
+    | 10 | 104 | 10.4 | 34 | 10 | 2 | 197 |
+    | 25 | 263 | 10.5 | 92 | 25 | 2 | 424 |
+    | 50 | 544 | 10.9 | 155 | 50 | 2 | 794 |
+    | 100 | 1,029 | 10.3 | 335 | 100 | 2 | 1,511 |
+    | 250 | 2,629 | 10.5 | 721 | 250 | 3 | 3,663 |
+
+    - About **10.5 `RollupJob`s per app** in 10 minutes at every size, plus
+      about 3 `ReleaseHealthRollupJob`s and exactly 1 `CheckScheduledTasksJob`
+      per app. All three scale linearly.
+    - The catch-up itself runs a fixed 2-3 times; what it releases, 2 rollups
+      per app at once, is what grows. At 250 apps that is 500 at a time: the
+      493 and 677 ready-job peaks above.
+    - So the per-app work is constant. What breaks Rails is that this
+      constant work is delivered in bursts (the minute's :00, and the 5-minute
+      catch-up) onto two threads that also serve every request.
 - **It is not memory.** Rails' private memory was 1,064 MiB steady at
   250 apps, and grew at about 1.4 MiB per app from 10 to 100 apps. It never
   came near the cap: no cap hits, no kills.
@@ -219,6 +237,9 @@ Typical-app profile unless marked. Each step is a fresh server and fresh data,
 | 10 | 1 | 1.2 | 11.7 | 0 | 0.3 | 150 / 172 | 180 | 185 | 18.7% | 5.9 | - |
 | 25 | 3 | 1.2 | 11.8 | 0 | 0.9 | 318 / 331 | 370 | 441 | 19.3% | 5.2 | - |
 | 50 | 5 | 1.1 | 11.1 | 0 | 1.6 | 535 / 611 | 629 | 866 | 19.3% | 6.4 | - |
+| 100 | 10 | 1.4 | 13.1 | 0 | 3.4 | 1,022 / 1,139 | 1,192 | 1,717 | 5.9% | 2.7 | - |
+| 250 | 25 | 1.4 | 35.7 | 0 | 8.8 | 2,406 / 2,955 | 2,746 | 4,267 | 6.4% | 3.0 | - |
+| 500 | 50 | 1.9 | 1,801.8 | 51,578 | 9.5 | 0 / 4,008 | 0 | 0 | 2.7% | 11.3 | p99 > 1 s, drops, killed (out of memory) |
 
 ### Rust, PR #90 `f4ad31b` (perf/memory)
 
@@ -241,8 +262,34 @@ Typical-app profile unless marked. Each step is a fresh server and fresh data,
 | 100 | 12.6 | 122.9 | 0 | 23.0 | 973 / 1,048 | 1,641 | 804 | 10 | 19.0% | 5.7 | - |
 | 250 | 1,477.6 | 12,549.6 | 0 | 68.9 | 1,064 / 1,145 | 1,733 | 1,499 | 44 | 24.9% | 10.9 | p99 > 1 s |
 
+### Rails, railwatch-cloud `71020d3` (the image production last ran), 10% busy apps
+
+| apps | busy apps | p50 ms | p99 ms | not 200 | CPU % of 2 threads | steady / peak private MiB | RSS MiB | fds | oldest ready job s | rest busy | load max | breaks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 10 | 1 | 7.8 | 56.6 | 0 | 3.4 | 828 / 852 | 1,503 | 315 | 1 | 5.4% | 2.3 | - |
+| 25 | 3 | 7.4 | 36.4 | 0 | 6.4 | 868 / 892 | 1,536 | 516 | 1 | 8.2% | 3.7 | - |
+| 50 | 5 | 8.0 | 39.2 | 0 | 11.5 | 956 / 1,001 | 1,625 | 850 | 3 | 9.1% | 4.5 | - |
+| 100 | 10 | 13.1 | 124.9 | 0 | 27.8 | 1,009 / 1,062 | 1,693 | 827 | 8 | 2.3% | 2.0 | - |
+| 250 | 25 | 9,410.2 | 28,027.0 | 2,099 | 86.5 | 1,122 / 1,244 | 1,874 | 4,007 | 60 | 6.1% | 6.2 | p99 > 1 s, drops |
+
 In the 10%-busy mixes, every tenth app sends the busy profile
 (rebulk-system's shape, about 4.7x a typical app's records).
+
+**The busy mix moves neither limit.** Rust still fits 250 apps and Rails still
+fits 100.
+- **Rust, 500 apps, busy mix:** killed for memory about 250 s sooner than the
+  all-typical run (about 290 s against 540 s). The extra records from busy
+  apps reach the cap faster.
+- **Rails, 250 apps, busy mix:** falls behind for good, not just in bursts.
+  - Requests in flight rose all run: 194 at 1 min, about 1,000-1,140 from
+    5 to 8 min, 2,441 at 10 min.
+  - CPU stayed at 97-103% for the last three minutes.
+  - Queued jobs reached 410, the oldest at 60 s.
+  - 2,099 sends got no answer within 60 s, all in the last 40 s; none were
+    server errors.
+  - The all-typical run swung between 45% and 100% CPU and kept up overall.
+    The busy mix's extra work (+20-25% CPU at 50-100 apps) left no slack to
+    drain between bursts.
 
 ## Load profile: derived from production, read-only
 
