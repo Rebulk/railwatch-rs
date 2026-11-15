@@ -42,7 +42,12 @@ ingest)
   echo "$pw" | "$BIN/railwatch" setup --email bench@example.com --password-stdin --app bench --env production | sed -n 's/.*RAILWATCH_TOKEN=//p' > "$D/token"
   taskset -c "${SERVER_CPUS:-8-11}" "$BIN/railwatch" serve > "$D/server.log" 2>&1 &
   pid=$!
-  until curl -sf "127.0.0.1:$PORT/up" > /dev/null; do sleep 0.2; done
+  deadline=$((SECONDS + 60))
+  until curl -sf --max-time 2 "127.0.0.1:$PORT/up" > /dev/null; do
+    kill -0 "$pid" 2> /dev/null || { echo "server exited before /up" >&2; tail -n 20 "$D/server.log" >&2; exit 1; }
+    [ "$SECONDS" -lt "$deadline" ] || { echo "server not up after 60 s" >&2; tail -n 20 "$D/server.log" >&2; exit 1; }
+    sleep 0.2
+  done
   s=$(date +%s)
   for B in "${@:1:$#-1}"; do
     taskset -c "${POST_CPUS:-12-13}" python3 -I "$ROOT/bench/diff/post.py" "http://127.0.0.1:$PORT/ingest" "$(cat "$D/token")" "$B" "$D/acks-$(basename "$B").json"
@@ -59,9 +64,13 @@ ingest)
 run)
   D=${1:?DATA} L=${2:?LABEL} BIN=${3:-$ROOT/target/release} ROUNDS=${4:-3} WARM=${5:-5}
   NOW=$(cat "$D/now") USER_ID=$(cat "$D/cases.json.user")
-  OUT=$(dirname "$D")/runs/$L COLD=$(dirname "$D")/cold
+  OUT=$(dirname "$D")/runs/$L
+  # report.py reads every round file in OUT: a reused label would mix runs.
+  [ ! -e "$OUT" ] || { echo "$OUT exists; use a new LABEL" >&2; exit 1; }
   mkdir -p "$OUT"
-  rm -rf "$COLD"; cp -a "$D" "$COLD"
+  COLD=$(mktemp -d "$(dirname "$D")/cold.XXXX")/data
+  trap 'rm -rf "$(dirname "$COLD")"' EXIT
+  cp -a "$D" "$COLD"
   names=$(python3 -I -c 'import json,sys; [print(c["name"]) for c in json.load(open(sys.argv[1]))]' "$D/cases.json")
   for r in $(seq 1 "$ROUNDS"); do
     for n in $names; do
@@ -71,7 +80,6 @@ run)
     done
     taskset -c "${CPUS:-8-11}" "$BIN/page-replay" "$D" "$D/cases.json" "$NOW" "$USER_ID" "$OUT/warm-$r.json" "$WARM" 2> /dev/null
   done
-  rm -rf "$COLD"
   ;;
 report)
   python3 -I "$HERE/report.py" "$@"
