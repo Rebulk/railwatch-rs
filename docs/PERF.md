@@ -1340,18 +1340,24 @@ Anon MiB over time at 250 apps (cgroup, every 60 s from load start):
 - base: 146, 725, 926, 1036, 1097, 1238, 1290, 1347, 1418, 1463, 1554;
 - next: 103, 484, 556, 586, 613, 636, 642, 676, 684, 714, 725.
 
+The t=590 s column is one 2 s sample. For next it caught a short spike (992 MiB at t=592 s,
+737 MiB by t=596 s and 738 MiB at t=600 s, which is the series' 725 MiB at the 60 s mark);
+base's 1,539 MiB there is not a spike (1,540 MiB at t=599 s).
+
 **It still grows**, more slowly (+240 MiB over the last 9 min against +830), and what grows is
 "allocator retained": the live components above are flat after the change. With
 `MIMALLOC_PURGE_DELAY=0` (one run) anon went 434, 484, 510, 533, 580, 565, 567, 574, 578, 599
 MiB, the same shape at a lower level, so the remainder is not the purge delay either. It is
-not attributed past "mimalloc arenas minus live bytes" by these runs. The heap profile,
-blocking-pool and THP runs below rule out a program-side leak, the blocking pool and THP.
+not attributed past "mimalloc arenas minus live bytes" by these runs. The blocking-pool and
+THP runs below rule those two out. The heap profile (system allocator, a backlogged run) found
+no program-side leak, but it is not the mimalloc run that grew, so that is not confirmed.
 
 500 apps, 3 min (diagnostic builds, base vs this branch before the collect change):
 steady anon 3,017 vs 2,114 KiB/app; at t=60 s 2,756 vs 2,246 KiB/app; p99 3,164 vs 36 ms.
 
 **Target (< 3 MiB per idle-ish typical tenant): met on RssAnon at 250 apps after 10 min
-(3.0 MiB), not met on cgroup anon at t=590 s (4.0 MiB).**
+(3.0 MiB). On cgroup anon it is met outside the spike (738 MiB at t=600 s, 2.9 MiB per app)
+and not met at the spike's peak (4.0 MiB at t=590 s).**
 
 ### Root cause of what still grows (heap profile, blocking pool, THP)
 
@@ -1403,7 +1409,7 @@ binary). The heap profile shows the live heap flat over the same window, so the 
 memory the allocator holds beyond live bytes ("allocator retained" in the tables above),
 not anything the program keeps. It slows over time (the default run is flat from 5 min on:
 605, 608, 629, 615, 622, 619 MiB). It is bounded by how much each thread's heap peaked, not
-by run time. Not proven past that.
+by run time: a hypothesis from these samples, not shown past them.
 
 **The design cause of the floor: connections per tenant.** Each active per-day tenant holds:
 
@@ -1467,9 +1473,11 @@ The two writer costs "Ingest floor" above measured and left unbuilt.
   tenant would add to the per-tenant cost above) to run a PASSIVE checkpoint on a short-lived
   connection of its own. The writer goes on committing.
 - **Hard cap:** at 8000 pages (32 MB of 4 KB pages) the writer checkpoints inline, as the
-  autocheckpoint would, waiting up to ~1 s if the checkpointer holds the file. PASSIVE cannot
-  copy frames a reader still needs, so a long reader can still hold a WAL past the cap; that
-  was true of the autocheckpoint too. journal_size_limit (64 MB) still truncates after a reset.
+  autocheckpoint would, waiting up to ~1 s if the checkpointer holds the file. The cap is best
+  effort: PASSIVE cannot copy frames a reader still needs, so a long reader can still hold a
+  WAL past it (logged as "WAL over its cap", once a minute at most); that was true of the
+  autocheckpoint too. If the checkpointer still holds the file after ~1 s, or the checkpoint
+  fails, the commit goes on and the WAL grows until the next one. journal_size_limit (64 MB) still truncates after a reset.
 - Tests: `the_wal_is_checkpointed_in_the_background_and_capped` (200 commits of ~200 pages;
   the WAL file never passes the cap plus one commit, every row is there),
   `a_request_is_checkpointed_by_the_thread`.
