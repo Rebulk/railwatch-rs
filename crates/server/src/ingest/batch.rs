@@ -100,6 +100,10 @@ pub struct Prepared {
     pub record_count: usize,
     pub meta: Meta,
     pub receipt: Option<ReceiptAttrs>,
+    /// Writer#with_query_shapes' rows, once the first write took them out of
+    /// `tables` (it blanks their sql there): a batch written again after its
+    /// transaction rolled back (tenants.rs) writes the same shapes.
+    pub query_shapes: Option<Vec<Row>>,
 }
 
 impl Prepared {
@@ -130,6 +134,7 @@ pub fn map_all(records: Vec<Value>, ingest_floor: f64, meta: Meta, receipt: Opti
         record_count: records.len(),
         meta,
         receipt,
+        query_shapes: None,
     };
 
     for rec in &records {

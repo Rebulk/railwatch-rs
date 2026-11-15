@@ -130,7 +130,11 @@ pub fn write(conn: &Connection, p: &mut Prepared, gc_floor_micros: i64) -> Resul
 /// `write` through any target.
 pub fn write_to(t: &mut dyn Target, p: &mut Prepared, gc_floor_micros: i64) -> Result<Written, WriteError> {
     // --- Ingest::Writer#write!
-    let shapes = with_query_shapes(&mut p.tables);
+    if p.query_shapes.is_none() {
+        p.query_shapes = Some(with_query_shapes(&mut p.tables));
+    }
+    let p = &*p;
+    let shapes = p.query_shapes.as_deref().unwrap_or_default();
     let mut exception_ids = Vec::new();
     let mut log_ids = Vec::new();
     let mut accepted: i64 = 0;
@@ -145,8 +149,7 @@ pub fn write_to(t: &mut dyn Target, p: &mut Prepared, gc_floor_micros: i64) -> R
         }
     }
     if !shapes.is_empty() {
-        let rows: Vec<Row> = shapes;
-        insert_table(t, "query_shapes", &rows, &mut Vec::new(), &mut Vec::new(), None)?;
+        insert_table(t, "query_shapes", shapes, &mut Vec::new(), &mut Vec::new(), None)?;
     }
     index_logs(t, &log_ids)?;
 

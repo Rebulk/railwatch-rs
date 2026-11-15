@@ -1367,6 +1367,63 @@ Shared box, RAILWATCH_SQLITE_SYNC=off, 2 CPUs; median (min-max).
 (the 5% bar). max-50app was ~24% faster; this run did not split that gain between the memory
 and the write-path changes, and the run-to-run spread on this box is ~15%.
 
+## Write path: background checkpoints with a WAL cap, no savepoint per batch (branch perf/next)
+
+The two writer costs "Ingest floor" above measured and left unbuilt.
+
+### Background checkpointer (storage/checkpoint.rs)
+
+- Every ingest write connection (single file, meta, each day file) gets a WAL hook in place
+  of SQLite's autocheckpoint. At 1000 WAL pages (the autocheckpoint's own threshold) it asks
+  **one** checkpointer thread for the whole process (not one per tenant: a thread per
+  tenant would add to the per-tenant cost above) to run a PASSIVE checkpoint on a short-lived
+  connection of its own. The writer goes on committing.
+- **Hard cap:** at 8000 pages (32 MB of 4 KB pages) the writer checkpoints inline, as the
+  autocheckpoint would, waiting up to ~1 s if the checkpointer holds the file. PASSIVE cannot
+  copy frames a reader still needs, so a long reader can still hold a WAL past the cap; that
+  was true of the autocheckpoint too. journal_size_limit (64 MB) still truncates after a reset.
+- Tests: `the_wal_is_checkpointed_in_the_background_and_capped` (200 commits of ~200 pages;
+  the WAL file never passes the cap plus one commit, every row is there),
+  `a_request_is_checkpointed_by_the_thread`.
+
+### No SAVEPOINT per batch, with a retry path (tenants::process)
+
+- A coalesced group is written with no savepoints (`Store::write_unguarded`). If every
+  batch succeeds, the group commits as before.
+- If one fails, the whole transaction rolls back and the group is written again with a
+  SAVEPOINT per batch (`Store::write`, the old path), so the failing batch rolls back alone and
+  the others commit. Retries are counted (`tenants::GUARDED_GROUPS`).
+- A batch written twice must write the same thing twice. `with_query_shapes` blanks each
+  query's `sql` in the batch's rows as it moves the text to `query_shapes`, so a second write
+  would have stored no shapes. The shapes are now kept on the batch (`Prepared::query_shapes`)
+  after the first write.
+- Tests (tenants.rs): `a_poisoned_batch_in_a_group_fails_alone_and_the_rest_commit_per_day`
+  and `..._single_file`: 8 batches in one group, 2 poisoned (a bignum Dropped header, which
+  fails the ingest_batches insert after the batch's rows went in); the 2 answer the error, the
+  6 commit, and exactly 6 queries, logs, ingest_batches rows and query_shapes are stored, with
+  6 follow-ups. `a_clean_group_commits_on_the_fast_path`. The existing HTTP test
+  `a_failing_batch_rolls_back_alone_when_coalesced` and tests/storage_crash.rs pass unchanged.
+- The floor (`rw-ingest-floor`, 800 rw-load bodies, seed 1, one thread pinned to CPU 14,
+  files on tmpfs so fsync is out of it, synchronous=normal; base = 1ede1c8, next = this
+  branch; 3 runs each, alternating; median (min-max); write stage only):
+
+  | batches per txn | base events/s | next events/s | base CPU-ms / 1k | next CPU-ms / 1k | checkpoints background / inline |
+  |---:|---:|---:|---:|---:|---:|
+  | 1 | 28,847 (27,992-29,698) | 34,332 (33,241-34,845) | 34.5 (33.5-35.5) | 20.8 (20.4-21.5) | ~1,010 / ~127 |
+  | 8 | 40,092 (38,460-40,950) | 47,125 (46,937-48,645) | 24.8 (24.2-25.8) | 19.2 (18.6-19.3) | ~125 / ~63 |
+  | 30 | 54,058 (53,094-54,662) | 72,372 (72,176-73,716) | 18.4 (18.2-18.7) | 13.2 (12.9-13.2) | 31 / 21 |
+
+  Ranges do not overlap. The writer thread's CPU fell 22-40%; part of that moved to the
+  checkpointer thread (not counted in "CPU-ms" here, which is the writer thread's own).
+  With a writer that does nothing but write, the one checkpointer falls behind and a third to
+  two fifths of checkpoints still run inline at the cap. A real server's writer also waits on
+  requests, so it should be fewer there; not measured. Not measured on a real disk either:
+  the shared btrfs runs on this box were dominated by other work's fsyncs
+  (200-500 s walls for 800 batches), so they are not reported.
+- Checked that the tests catch the bugs they are for: without the rollback before the retry,
+  both poisoned-group tests fail (8 ledger rows, not 6); without keeping the shapes, both fail
+  (4 query_shapes, not 6).
+
 ## Proposals
 
 None of these is implemented.

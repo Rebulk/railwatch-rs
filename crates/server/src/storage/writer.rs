@@ -98,7 +98,8 @@ pub struct Recovered {
 
 impl DayWriter {
     pub fn open(dir: &Path) -> rusqlite::Result<DayWriter> {
-        let meta = layout::open_or_create(&layout::meta_path(dir))?;
+        let mut meta = layout::open_or_create(&layout::meta_path(dir))?;
+        super::checkpoint::install(&mut meta, &layout::meta_path(dir))?;
         let committed = read_marks(&meta)?;
         let mut w = DayWriter {
             dir: dir.to_path_buf(),
@@ -333,7 +334,8 @@ impl DayWriter {
     fn create(&mut self, tier: Tier, day: &str) -> rusqlite::Result<Connection> {
         let path = layout::day_path(&self.dir, tier, day);
         let fresh = !path.exists();
-        let conn = layout::open_or_create(&path)?;
+        let mut conn = layout::open_or_create(&path)?;
+        super::checkpoint::install(&mut conn, &path)?;
         if fresh {
             self.written += super::budget::file_bytes(&path);
         }

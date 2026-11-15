@@ -21,6 +21,7 @@
 
 pub mod backup;
 pub mod budget;
+pub mod checkpoint;
 pub mod exemplars;
 pub mod export;
 pub mod layout;

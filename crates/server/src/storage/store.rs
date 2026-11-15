@@ -1,6 +1,7 @@
 //! What the tenant writer thread (tenants.rs) writes through: the Rails
 //! single file, or a per-day directory. Same transaction shape for both:
-//! begin, a savepoint per batch, commit.
+//! begin, the batches (without savepoints, or a savepoint per batch when a
+//! group is written again after one failed: tenants::process), commit.
 
 use std::path::Path;
 
@@ -22,7 +23,11 @@ impl Store {
     /// file stays one until `railwatch split`).
     pub fn open(tenants_dir: &Path, slug: &str) -> rusqlite::Result<Store> {
         match Layout::detect(tenants_dir, slug) {
-            Some(Layout::Single(path)) => crate::tenants::open_tenant(&path).map(Store::Single),
+            Some(Layout::Single(path)) => {
+                let mut c = crate::tenants::open_tenant(&path)?;
+                super::checkpoint::install(&mut c, &path)?;
+                Ok(Store::Single(c))
+            }
             Some(Layout::Days(dir)) => DayWriter::open(&dir).map(|w| Store::Days(Box::new(w))),
             None => {
                 let dir = tenants_dir.join(slug);
@@ -76,6 +81,18 @@ impl Store {
                     }
                 }
             }
+        }
+    }
+
+    /// One batch with no savepoint of its own: cheaper (the savepoint's
+    /// statement journal was 16% of the writer, docs/PERF.md), but a batch
+    /// that fails leaves the transaction with its partial rows, so the caller
+    /// must roll the whole transaction back (tenants::process does, then
+    /// writes the group again with `write`).
+    pub fn write_unguarded(&mut self, batch: &mut Prepared, gc_floor_micros: i64) -> Result<Written, WriteError> {
+        match self {
+            Store::Single(c) => writer::write(c, batch, gc_floor_micros),
+            Store::Days(w) => writer::write_to(w.as_mut(), batch, gc_floor_micros),
         }
     }
 
