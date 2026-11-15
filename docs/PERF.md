@@ -1344,15 +1344,103 @@ Anon MiB over time at 250 apps (cgroup, every 60 s from load start):
 "allocator retained": the live components above are flat after the change. With
 `MIMALLOC_PURGE_DELAY=0` (one run) anon went 434, 484, 510, 533, 580, 565, 567, 574, 578, 599
 MiB, the same shape at a lower level, so the remainder is not the purge delay either. It is
-not yet attributed past "mimalloc arenas minus live bytes": fragmentation or abandoned
-per-thread heaps (tokio's blocking pool grew from 37 to 123 threads over the run) are the
-leading suspects. A heap profiler (heaptrack is not installed here) is the next step.
+not attributed past "mimalloc arenas minus live bytes" by these runs. The heap profile,
+blocking-pool and THP runs below rule out a program-side leak, the blocking pool and THP.
 
 500 apps, 3 min (diagnostic builds, base vs this branch before the collect change):
 steady anon 3,017 vs 2,114 KiB/app; at t=60 s 2,756 vs 2,246 KiB/app; p99 3,164 vs 36 ms.
 
 **Target (< 3 MiB per idle-ish typical tenant): met on RssAnon at 250 apps after 10 min
 (3.0 MiB), not met on cgroup anon at t=590 s (4.0 MiB).**
+
+### Root cause of what still grows (heap profile, blocking pool, THP)
+
+**Heap profile.** heaptrack 1.5.0 on a bench-only build with the system allocator (mimalloc
+cannot be intercepted), 250 apps, 10 min. heaptrack slowed the server enough to drop 4,488
+batches (p99 47 s), so this profiles a backlogged run. Live heap at exit, by what allocated
+it (call stacks folded; SQLite's C frames unwound to the SQLite function):
+
+| what | MiB | KiB per app | per what |
+|---|---:|---:|---|
+| parsed schema (CREATE TABLE/INDEX of each attached file) | 151.8 | 622 | per connection × per attached file |
+| page cache | 63.7 | 261 | per connection |
+| lookaside (SQLite's per-connection small-object arena) | 52.0 | 213 | per connection: 1,502 open, ~35 KiB each |
+| rollup accumulators (Rust) | 50.1 | 205 | #90's 32 MB budget + the hours a backlog keeps open |
+| prepared statements and views | 7.4 | 30 | |
+| everything else | 12.2 | 51 | |
+| **total** | **337** | **1,380** | |
+
+Live heap over the run was flat at 310-430 MiB from t=2 min on (heaptrack's own timeline):
+**the live heap does not grow**. 85% of it is SQLite per-connection state, which is fixed for
+as long as a connection stays open. With 6 connections per active app (1,502 / 250), the
+per-app floor is the connection count.
+
+**Blocking-pool hypothesis: not the cause.** Three 250-app runs on this branch's build
+(mimalloc), back to back, same seed:
+
+| | blocking threads (end) | anon t=60 s | anon t=600 s | growth t=120→600 s | events/s | p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| default pool | 23 | 520 MiB | 619 MiB | +57 MiB | 742 | 14 ms |
+| `max_blocking_threads(8)` | 10 | 464 MiB | 596 MiB | +75 MiB | 736 | 23 ms |
+| cap 8 + THP allowed | 10 | 499 MiB | 607 MiB | +71 MiB | 751 | 21 ms |
+
+Capping the pool did not stop the growth (+75 against +57 MiB, within this box's run-to-run
+spread); it is not kept. The earlier 37 → 123 blocking threads were from runs where the box
+was busier; in these runs the pool stayed at 23.
+
+**THP: not the cause here.** On this branch `PR_SET_THP_DISABLE` (#89) is set: AnonHugePages
+was 0 for the whole default run (sampled every 30 s). With THP allowed (`always` on this box),
+the process held 24-43 MiB of huge pages, all from start-up, none collapsed later
+(khugepaged's pages_collapsed did not move), and the growth was the same. So THP explains
+none of the growth after the first minute on this box; Track F's finding that #89 cut the
+per-tenant jump at 10 apps is consistent with THP inflating the *floor* where mimalloc's
+arenas are sparsely used, and #92 keeps #89's THP-off. Not checked: production's `madvise`
+mode with THP on (#89 measured THP faults there).
+
+**So what is the remaining growth?** In the three runs above it is 57-75 MiB (230-300
+KiB/app) over 8 min, not the 240 MiB of the earlier run (that run's box was busier; same
+binary). The heap profile shows the live heap flat over the same window, so the growth is
+memory the allocator holds beyond live bytes ("allocator retained" in the tables above),
+not anything the program keeps. It slows over time (the default run is flat from 5 min on:
+605, 608, 629, 615, 622, 619 MiB). It is bounded by how much each thread's heap peaked, not
+by run time. Not proven past that.
+
+**The design cause of the floor: connections per tenant.** Each active per-day tenant holds:
+
+| connection | owner | files | schema KiB |
+|---|---|---:|---:|
+| meta write connection | ingest writer (tenants.rs) | 1 | ~110 |
+| today's core + detail write connections (+ yesterday's for up to FILE_IDLE) | ingest writer | 2-4 | ~110 each |
+| rollup write connection (meta) | rollup worker (jobs/worker.rs) | 1 | ~110 |
+| union reader (meta + every day file attached, + temp views) | rollup worker | 1 conn, 3+ files | ~390 |
+| dashboard readers (pooled, closed after 60 s idle; none in these runs) | dashboard::pool | 0-4 | ~390 each |
+
+Measured: 6.0 open connections per active app (heaptrack, lookaside allocations), schema
+~620 KiB + lookaside ~210 KiB + page cache ~260 KiB per app.
+
+**Design options (written up, not built):**
+
+1. **Rollup worker without per-tenant connections.** The worker's union reader and rollup
+   write connection exist per tenant for as long as it is active (10 min idle). Instead, one
+   worker-owned connection that ATTACHes a tenant's files for a flush and DETACHes after.
+   Saves the worker's ~500 KiB schema + 2 × 35 KiB lookaside + its cache per active app:
+   **~0.6 MiB per app**, ~150 MiB at 250 apps. Cost: re-parsing ~4 files' schemas per tenant
+   per flush (measured 1.4 ms to open and attach meta + 2 day files and parse their schemas;
+   250 tenants × every 5 s ≈ 7% of one core). Changes the worker's structure (its accumulator
+   and incremental reads assume an open reader); not small.
+2. **Writers keep only meta open between transactions.** Day-file connections would open per
+   transaction (0.46 ms each to open and parse one file's schema) instead of for FILE_IDLE.
+   Saves ~2 × (110 + 35) KiB = **~0.3 MiB per app** at a cost of ~1 ms per transaction, which
+   matters to the single-tenant ceiling (≈7k transactions/s at 1 batch per transaction).
+   Could be limited to tenants whose last transaction is older than a few seconds.
+3. **A writer pool shared across tenants** (N threads, each owning connections for tenants
+   assigned to it) changes nothing on its own: the schema is per connection, not per thread.
+   It removes ~1 thread per app (stacks measured at ~40 KiB per app), so **~0.04 MiB per app**.
+4. **`SQLITE_DEFAULT_LOOKASIDE` smaller** (e.g. 64 × 128 B instead of 1200 × 100) would save
+   ~30 KiB per connection, **~0.2 MiB per app**, a compile flag (libsqlite3-sys's build reads
+   `LIBSQLITE3_FLAGS`). Small; not measured for speed.
+
+Together 1 + 2 + 4 would take an active app from ~1.4 MiB of live SQLite heap to ~0.3-0.4.
 
 ### Throughput (Track C's cases through bench/memory/apps50.sh, 3 runs each, interleaved)
 
