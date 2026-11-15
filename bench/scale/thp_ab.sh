@@ -20,17 +20,27 @@ BIN=$1 APPS=$2 SECS=${3:-120}
 HERE=$(cd "$(dirname "$0")" && pwd)
 SERVER_CPUS=${SERVER_CPUS:-11,23}
 LOAD_CPUS=${LOAD_CPUS:-6-10,18-22}
-busy=$(find /sys/fs/cgroup/bench.slice -name cgroup.procs -exec cat {} + 2>/dev/null | wc -l)
+# The runners' lock, held through cleanup, so no sweep starts beside this.
+# after-followup.sh holds it already and says so with THP_LOCK_HELD=1.
+if [ -z "${THP_LOCK_HELD:-}" ]; then exec 9>/var/tmp/rw-scale.lock; flock -n 9 || { echo "thp_ab: a runner holds /var/tmp/rw-scale.lock" >&2; exit 1; }; fi
+# no bench.slice (reserve.sh off) is idle; any other error stops the script
+if [ -d /sys/fs/cgroup/bench.slice ]; then busy=$(find /sys/fs/cgroup/bench.slice -name cgroup.procs -exec cat {} + | wc -l); else busy=0; fi
 [ "$busy" = 0 ] || { echo "thp_ab: bench.slice has $busy processes (a sweep is running); run between sweeps" >&2; exit 1; }
 PORT=${THP_PORT:-18890}
 LOAD=${LOAD_BIN:-$HOME/.cache/rw-scale/bin/rw-load}
 root=$(mktemp -d /dev/shm/rw-thp.XXXX)
-srv=
-cleanup() {
+srv= launcher=
+# the server is not our child (systemd-run's scope runs it): join the launcher
+stop_server() {
   if [ -n "$srv" ] && kill -0 "$srv" 2>/dev/null; then
     ps -o pid,pgid,comm,args -p "$srv" | tail -1 | cut -c1-80 >&2
-    kill "$srv"; wait "$srv" 2>/dev/null || true
+    kill "$srv"
   fi
+  [ -z "$launcher" ] || wait "$launcher" 2>/dev/null || true
+  srv= launcher=
+}
+cleanup() {
+  stop_server
   rm -rf "$root"
 }
 trap cleanup EXIT
@@ -57,6 +67,7 @@ run() {  # $1 = label, rest = env for the server
       for kv in "$@"; do echo "export $kv"; done
       echo "exec '$BIN' serve"; } > "$d/launch.sh" )
   sudo systemd-run --scope --quiet --slice=bench-server.slice --uid="$(id -u)" --gid="$(id -g)" -- bash "$d/launch.sh" > "$d/server.log" 2>&1 &
+  launcher=$!
   # the server is the scope's child; take its PID from the scope's own cgroup
   srv=
   for _ in $(seq 1 100); do
@@ -78,8 +89,7 @@ print(json.dumps({"label": label, "apps": apps, "thp_enabled": thp, "idle_anon_m
   "anon_mib": round(a, 1), "anon_hugepages_mib": round(h, 1), "huge_share": round(h / a, 3) if a else None,
   "anon_per_app_mib": round((a - int(idle) / 1024) / apps, 2), "records_ok": r["records_ok"], "not_ok": r["not_ok"]}))
 PY
-  ps -o pid,pgid,comm,args -p "$srv" | tail -1 | cut -c1-80 >&2
-  kill "$srv"; wait "$srv" 2>/dev/null || true; srv=
+  stop_server
 }
 
 run thp_host

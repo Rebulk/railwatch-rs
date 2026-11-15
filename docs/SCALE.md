@@ -348,8 +348,8 @@ fixed on that branch:
   was below 1 CPU-ms/s in Track G's runs and was left unchanged; "not
   verified at Track F's 10% busy mix". It ran 721 times in the busy-mix
   250-app step here.
-- The best-case image is swept here as `rails-best` (still running; see
-  [Still running](#still-running)).
+- The best-case image is swept here as `rails-best`; results in
+  [Rails best case (Track G)](#rails-best-case-track-g).
 
 ## Best against best: Rust next and Rails best
 
@@ -746,7 +746,10 @@ tailnet.
   - It is fair to both sides, but it is not a real NVMe.
 
 **Breaks**, defined before any run: p99 above 1 s, any send not answered with
-200, falling behind for more than 60 s, or out of memory.
+200, falling behind for more than 60 s, or out of memory. Since added: a 200
+that stored fewer records than it was sent (records_ok below records_offered,
+also "drops"; the one step where it happens already had drops) and any failed
+Rails job ("failed_jobs").
 - Falling behind means one of three things:
   - Rails' oldest ready job older than 60 s;
   - a post-load tail longer than 60 s;

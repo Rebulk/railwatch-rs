@@ -43,17 +43,20 @@ else
 fi
 
 # RUST_NEXT_SHA256: the hash the binary's owner gave for it. When set, the
-# sweep runs only on that exact binary (it may be replaced by a newer build up
-# to the moment this check runs; the hash actually run is recorded either way).
+# sweep runs only on that exact binary. The sweep runs a snapshot (a copy of
+# BIN taken here), so a newer build dropped in later is not what any step runs.
 if [ -x "$BIN/railwatch-next" ]; then
-  have=$(sha256sum "$BIN/railwatch-next" | cut -d' ' -f1)
+  snap=$(mktemp -d /var/tmp/rw-scale-bin.XXXX)
+  cp -a "$BIN/." "$snap/"
+  have=$(sha256sum "$snap/railwatch-next" | cut -d' ' -f1)
   echo "#### rust-next binary sha256=$have ($(stat -c %y "$BIN/railwatch-next" | cut -c1-19))"
   if [ -n "${RUST_NEXT_SHA256:-}" ] && [ "$have" != "$RUST_NEXT_SHA256" ]; then
     echo "#### rust-next SKIPPED: sha256 $have is not the expected $RUST_NEXT_SHA256"
     echo "#### FOLLOWUP DONE $(date +%T)"; exit 0
   fi
   echo "#### sweep rust-next sha256=$have start $(date +%T)"
-  rc=0; bench/scale/sweep.sh rust-next 0 & child=$!; wait "$child" || rc=$?; child=
+  rc=0; BIN=$snap bench/scale/sweep.sh rust-next 0 & child=$!; wait "$child" || rc=$?; child=
+  rm -rf "$snap"
   echo "#### sweep rust-next end $(date +%T) rc=$rc"
   [ $rc = 143 ] && exit 143
 else

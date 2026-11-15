@@ -113,11 +113,18 @@ db_bytes() { find "$data" -type f ! -name "*-wal" ! -name "*-shm" -printf "%s\n"
 ( sleep $((DURATION / 2)); date +%s.%N > "$work/disk_mid_t"; du -sb "$data" | cut -f1 > "$work/disk_mid"; db_bytes > "$work/db_mid" ) &
 bg+=($!)
 echo "== $run: load ${DURATION}s ($(date +%T))" >&2
+# CPU and samples for the load window end at its scheduled end, not when
+# rw-load returns: a slow request can drain for up to --request-timeout after.
+( sleep "$DURATION"; rvr_cpu_us > "$work/cpu_end"; kill $sampler 2>/dev/null || true ) &
+endmark=$!
+bg+=($endmark)
 # in bench-load.slice: the caller sits in user.slice, which reserve.sh keeps
 # off the reserved CPUs, so a plain taskset there is refused.
 sudo systemd-run --scope --quiet --slice=bench-load.slice --uid="$(id -u)" --gid="$(id -g)" -- "$LOAD_BIN" --profile "$HERE/profiles.json" --url "$url" --tokens "$work/tokens" \
   --duration "$DURATION" --warmup "${WARMUP:-60}" --busy-every "$busy_every" --seed "${SEED:-1}" --out "$work/load.json" > "$work/load.txt" 2>&1
-cpu1=$(rvr_cpu_us)
+cpu_ret=$(rvr_cpu_us)
+wait $endmark 2>/dev/null || true
+cpu1=$(cat "$work/cpu_end")
 kill $probe $sampler 2>/dev/null || true
 read -r hb1 ha1 < <(host_busy)
 # tail: deferred work after the load stops (Rails' jobs, Rust's rollup flush).
@@ -173,7 +180,7 @@ row = {
   "worst_10s_p99_ms": round(max(w["p99_ms"] for w in r["timeline_10s"]), 1),
   "cpu_pct_avg": round(($cpu1 - $cpu0) / 1e6 / dur / 2 * 100, 1), "cpu_pct_steady": round(half(cpu), 1) if cpu else None,
   "cpu_pct_max_2s": round(max(cpu), 1) if cpu else None,
-  "cpu_tail_s": round(($cpu2 - $cpu1) / 1e6, 1), "tail_s": $t, "tail_idle": $tail_idle,
+  "cpu_drain_s": round(max(0, $cpu_ret - $cpu1) / 1e6, 1), "cpu_tail_s": round(($cpu2 - $cpu_ret) / 1e6, 1), "tail_s": $t, "tail_idle": $tail_idle,
   "jobs_ready_max": max([q for q in qn if q is not None], default=None), "jobs_oldest_ready_max_s": lag_q,
   "jobs_ready_end": num("$q_end"), "failed_jobs": $failed_jobs, "job_mix": $job_mix,
   "idle_anon_mib": round($idle_anon / 2**20), "peak_anon_mib": round(max(anon) / 2**20), "steady_anon_mib": round(half(anon) / 2**20),
@@ -202,7 +209,8 @@ row = {
 # breaks (defined in docs/SCALE.md): p99 > 1 s, any drop, > 60 s behind, OOM
 why = []
 if row["p99_ms"] > 1000: why.append("p99>1s")
-if row["not_ok"] > 0: why.append("drops")
+# records a 200 did not store (rejected or paused) are dropped too
+if row["not_ok"] > 0 or row["records_ok"] < (row["records_offered"] or 0): why.append("drops")
 if (lag_q or 0) > 60 or not row["tail_idle"] or row["tail_s"] > 60: why.append("behind>60s")
 if row["oom_kills"] > 0: why.append("oom")
 elif row["exited_containers"]: why.append("exited")
