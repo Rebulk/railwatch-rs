@@ -279,8 +279,40 @@ grows"; measured on Archie, 250 apps, 10 min, Track F's `rw-load --profile`):
   The catch-up's work grows with the number of environments, and each
   `RollupJob` recomputes up to an hour of one environment. That is the likely
   reason the cost per app climbs at 100-250 apps; it was not profiled.
-- Track G is building the best case (Rails 8.1.4, tuned Puma, a dedicated
-  writer process). Its root-cause analysis will be linked here when it lands.
+**Track G's root cause** ([railwatch-cloud PR #261](https://github.com/Rebulk/railwatch-cloud/pull/261)
+at `b911c9e`, `docs/RAILS-BEST.md`, "Why it grows faster than the app count";
+same rig as Track C, Track F's profile, per-process stackprof). Two causes, both
+fixed on that branch:
+- **Tenant connection-pool churn.** activerecord-tenanted keeps at most 50
+  tenant pools per process (`max_connection_pools`, default 50).
+  - Past 50 environments, almost every request found its pool evicted and
+    reopened it. Each reopen re-ran the pending-migration check and re-parsed
+    the 109 KB schema-cache YAML.
+  - At 150 apps the two web workers created 40 pools/s for 42 requests/s.
+  - That was **23% of web CPU** (and 26% of job CPU).
+  - Web CPU per request was flat to 50 apps (8.2-8.6 ms), then 12.1-12.9 ms
+    at 150 and 13.0 at 250. That is the superlinear CPU per app in the table
+    above.
+- **Two owners per tenant-hour.** Each batch enqueued its hour's `RollupJob`,
+  and `RollupCatchupJob` also enqueued the current and previous hour of every
+  environment every 5 minutes.
+  - So every tenant-hour was recomputed twice, and the previous hour 12 times
+    after it closed.
+  - That is the 5-minute burst here. It also explains the 677 against 500
+    above: the catch-up's 500, plus that minute's per-batch `RollupJob`s (one
+    per environment-hour per minute per worker, two workers), minus those
+    Solid Queue discarded as already queued.
+- With both fixed (Track G's numbers): web CPU per request was flat at
+  7.6-9.9 ms from 50 to 250 apps, and p99 at 250 apps fell from 10.4 s to
+  0.6 s.
+- Ruled out there: GC pressure, SQLite busy-retry spin, per-request tenant
+  lookups, and recurring jobs that walk every environment.
+- `ReleaseHealthRollupJob` has no per-minute debounce, unlike `RollupJob`. It
+  was below 1 CPU-ms/s in Track G's runs and was left unchanged; "not
+  verified at Track F's 10% busy mix". It ran 721 times in the busy-mix
+  250-app step here.
+- The best-case image is swept here as `rails-best` (still running; see
+  [Still running](#still-running)).
 
 ## Results: steady disk (framework)
 
@@ -609,9 +641,15 @@ tailnet.
 
 - **Rust next (Track H, PR #92 `46fa311`, binary sha256 `424b30c2…`):**
   sweeping on framework, started 02:05.
-- **Best-case Rails (Track G):** waiting for its image. `followup.sh` runs it
-  once the image is on framework.
-- **THP A/B (`thp_ab.sh`):** after rust-next, between sweeps.
+- **THP A/B (`thp_ab.sh`), then best-case Rails:** `after-followup.sh`
+  (unit `rw-scale-final`) waits for rust-next to finish and clean up. It runs
+  the THP A/B on the main binary at 25 and 100 apps, then the `rails-best`
+  sweep at 10, 25, 50, 100, **150**, 250, **350** and 500 apps.
+  - Image `railwatch-cloud-best:b911c9e`, the same image ID as `:6daab3e`
+    (`9d512a783a01`).
+  - `WEB_CONCURRENCY=2`, `RAILS_MAX_THREADS=5`, as stock.
+  - Track G measured its limit between 250 and 350 apps: p99 0.6 s at 250,
+    18 s at 350.
 - TODO: rerun the Rust sweeps once Track E (perf/ingest, PR #89) lands on
   main.
 - TODO: a multi-hour step at 250 and 500 apps, to see whether Rust's growth
