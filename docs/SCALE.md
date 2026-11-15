@@ -119,9 +119,31 @@ What is not settled yet: best-case Rails (Track G) and the next Rust round
   sitting a few hundred MiB under the cap from the first minute, I read the
   earlier kill as chance in a single run, not as #90 being worse. One run
   each.
-- What would raise the limit is a smaller floor per open tenant. That is
-  Track H's subject; its root-cause analysis will be linked here when it
-  lands.
+- What would raise the limit is a smaller floor per open tenant.
+
+**Track H's root cause** ([PR #92](https://github.com/Rebulk/railwatch-rs/pull/92)
+at `7b2e31e`, `docs/PERF.md` "Memory per tenant" and "Root cause of what still
+grows"; measured on Archie, 250 apps, 10 min, Track F's `rw-load --profile`):
+- **The floor is about 6 SQLite connections per active tenant.** heaptrack
+  counted 1,502 open connections for 250 apps. Live heap per app:
+  - parsed schema 622 KiB;
+  - page cache 261 KiB;
+  - lookaside (SQLite's per-connection small-object arena) 213 KiB;
+  - rollup accumulators 205 KiB.
+
+  Of the 1,380 KiB total, 85% is SQLite per-connection state. That matches
+  the 17 descriptors per tenant measured here.
+- **What grows after that is allocator-retained memory, not live heap.**
+  - The live heap was flat at 310-430 MiB from t=2 min on (heaptrack, on a
+    system-allocator build, which ran backlogged).
+  - With #92's per-thread purge, growth from minute 2 to 10 at 250 apps was
+    57-75 MiB over three runs (230-300 KiB per app). Before #92 it was
+    +830 MiB over the last 9 minutes.
+  - Track H: "Not proven past that."
+- #92 also fixes three causes of growth: page caches freed on a 10 s clock,
+  one cached statement per power-of-two IN length, and each thread
+  collecting its own mimalloc heap. Its design options to cut the floor
+  further (fewer connections per tenant) are written up and not built.
 
 **What #89 on #90 changes: the arrival cost, not the growth.**
 - **Measured.** Private memory per tenant, split into the jump when apps
@@ -154,6 +176,15 @@ What is not settled yet: best-case Rails (Track G) and the next Rust round
   - What was **not** checked: the same binary with THP on under the same
     load. `bench/scale/thp_ab.sh` does exactly that, and has not run yet.
     Until it does, this is "likely, not verified".
+  - **Track H's finding agrees.** THP does not cause the *growth*, only the
+    arrival floor. On #92 with THP allowed (`always`), the process held
+    24-43 MiB of huge pages, all from start-up, none collapsed later
+    (khugepaged's `pages_collapsed` did not move), and growth was the same as
+    with THP off. That matches the table above: the jump falls with #89 and
+    the growth does not ([PR #92](https://github.com/Rebulk/railwatch-rs/pull/92),
+    `docs/PERF.md`, "THP: not the cause here"). Not checked there either:
+    THP's effect on the floor with the same binary, which is what
+    `thp_ab.sh` measures.
 - **500 apps passed, narrowly.**
   - p99 was 35.8 ms, with 0 drops and no kill; all 866,574 records offered
     were accepted.
