@@ -21,7 +21,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SERVER_CPUS=${SERVER_CPUS:-11,23}
 LOAD_CPUS=${LOAD_CPUS:-6-10,18-22}
 busy=$(find /sys/fs/cgroup/bench.slice -name cgroup.procs -exec cat {} + 2>/dev/null | wc -l)
-[ "$busy" = 0 ] || { echo "thp_ab: bench.slice has $busy processes (a sweep is running); run between sweeps" >&2; exit 1; }
+# THP_SKIP_BUSY_CHECK=1: the caller holds the runners' lock and runs this
+# inside bench-server.slice itself (so its own shell is the "busy" process)
+[ "$busy" = 0 ] || [ -n "${THP_SKIP_BUSY_CHECK:-}" ] || { echo "thp_ab: bench.slice has $busy processes (a sweep is running); run between sweeps" >&2; exit 1; }
 PORT=${THP_PORT:-18890}
 LOAD=${LOAD_BIN:-$HOME/.cache/rw-scale/bin/rw-load}
 root=$(mktemp -d /dev/shm/rw-thp.XXXX)
