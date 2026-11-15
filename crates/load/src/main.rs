@@ -53,6 +53,9 @@ struct Opts {
     spread_days: f64,
     /// PEM CA to trust for https:// besides the webpki roots.
     cacert: Option<String>,
+    /// Write the built bodies to DIR (one gzip file per batch) and exit,
+    /// for replaying the same batches without HTTP (rw-ingest-floor).
+    dump: Option<String>,
 }
 
 fn parse_args() -> Opts {
@@ -69,6 +72,7 @@ fn parse_args() -> Opts {
         seed: 1,
         spread_days: 0.0,
         cacert: None,
+        dump: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -93,9 +97,10 @@ fn parse_args() -> Opts {
             "--spread-days" => o.spread_days = next(&mut i).parse().unwrap_or_else(|_| die("bad --spread-days")),
             "--out" => o.out = Some(next(&mut i)),
             "--cacert" => o.cacert = Some(next(&mut i)),
+            "--dump" => o.dump = Some(next(&mut i)),
             "-h" | "--help" => {
                 eprintln!(
-                    "rw-load --url URL (--tokens FILE | --token T) [--concurrency N] [--rate BATCHES_PER_S, 0 = closed loop]\n        [--duration S] [--batches N] [--xff-rotate N] [--receipted] [--seed N] [--spread-days D] [--cacert ca.pem] [--out results.json]"
+                    "rw-load --url URL (--tokens FILE | --token T) [--concurrency N] [--rate BATCHES_PER_S, 0 = closed loop]\n        [--duration S] [--batches N] [--xff-rotate N] [--receipted] [--seed N] [--spread-days D] [--cacert ca.pem] [--out results.json]\n        [--dump DIR: write the bodies there and exit]"
                 );
                 std::process::exit(0);
             }
@@ -115,7 +120,7 @@ fn parse_args() -> Opts {
     if let Some(t) = token {
         o.tokens.push(t);
     }
-    if o.tokens.is_empty() {
+    if o.tokens.is_empty() && o.dump.is_none() {
         die("--tokens FILE or --token T is required");
     }
     o.url = o.url.trim_end_matches('/').to_string();
@@ -316,6 +321,18 @@ async fn main() {
         started_build.elapsed().as_secs_f64()
     );
 
+    if let Some(dir) = &o.dump {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| die(&format!("{dir}: {e}")));
+        // rw-ingest-floor replays every file there: stale batches would mix in.
+        if std::fs::read_dir(dir).unwrap_or_else(|e| die(&format!("{dir}: {e}"))).next().is_some() {
+            die(&format!("{dir}: not empty; --dump needs an empty or new directory"));
+        }
+        for (i, b) in batches.iter().enumerate() {
+            std::fs::write(format!("{dir}/{i:06}.ndjson.gz"), &b.body).unwrap_or_else(|e| die(&format!("{dir}: {e}")));
+        }
+        eprintln!("wrote {} bodies to {dir}", batches.len());
+        return;
+    }
     let batches = Arc::new(batches);
     let next = Arc::new(AtomicUsize::new(0));
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new())

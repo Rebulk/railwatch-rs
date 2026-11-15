@@ -357,7 +357,13 @@ impl<'a> Parser<'a> {
     /// Returns None for an unterminated string (cursor left at the end).
     fn parse_string(&mut self) -> Result<Option<Vec<u8>>, ParseError> {
         self.cur += 1;
-        let mut out = Vec::new();
+        // The run of plain bytes up to the first quote, backslash or control
+        // character, copied at once (sized exactly when it ends the string,
+        // which it nearly always does). The loop below then handles that
+        // byte exactly as if it had pushed the run one byte at a time.
+        let run = self.src[self.cur..].iter().position(|&b| b == b'"' || b == b'\\' || b < 0x20).unwrap_or(self.src.len() - self.cur);
+        let mut out = self.src[self.cur..self.cur + run].to_vec();
+        self.cur += run;
         loop {
             if self.eos() {
                 return Ok(None);

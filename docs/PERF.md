@@ -1087,6 +1087,162 @@ tests/background.rs (the watchdog forgets servers past the window).
   both builds); the 50-app runs are the throughput comparison.
 - Not measured on the production box (read-only for this track).
 
+## Ingest floor: where one tenant's CPU goes (branch perf/ingest, from main ad5a091)
+
+Question: the Rust server does only 1.5x Rails with one app and 2.4x with 50
+(docs/RAILS-VS-RUST.md). Is that a ceiling or a bottleneck?
+
+### Method
+
+- Track C's harness (bench/rails-vs-rust, `host.sh up`): the server gets 2
+  exclusive cores (6-7) and 3 GiB. The disk is ext4 on zram behind a 1 ms
+  dm-delay on writes (fdatasync p50 3.0 ms). rw-load runs on cores 2-5.
+- Profiles: a frame-pointer build, `perf record -e cpu-clock -F 999 -g -a -C 6,7`
+  for 28 s, starting once rw-load has finished building its batches. Folded
+  with `perf script --no-inline` and limited to the server's threads.
+  (`-p PID` with the default cycles event caught 1-300 samples per run under
+  this cgroup/cpuset, so the bucket shares it gave were wrong. A window that
+  starts with rw-load also profiled mostly idle time: rw-load needs 10-45 s
+  to build 6k-25k batches before it sends anything.)
+- Floor: `rw-ingest-floor` (new bin) replays 1,600 rw-load bodies
+  (`rw-load --dump`, seed 1) on one thread, pinned to core 6 in the same
+  slice and disk. It first runs parse+map (payload::parse_bytes,
+  batch::map_all), then writes through the same `Store` the tenant writer
+  uses (BEGIN, a SAVEPOINT per batch, COMMIT), N batches per transaction.
+  No HTTP, no channel, no rollups.
+- Before/after: `run.sh rust` for max-1app (16 senders) and max-50app (64
+  senders), 45 s, 3 reps, alternating the order. Load average was about
+  9-10 throughout.
+
+### Where the CPU goes (origin/main, % of server CPU samples)
+
+| bucket | max-1app | max-50app |
+|---|---:|---:|
+| HTTP (hyper/axum) + gzip inflate | 0.9 | 1.5 |
+| JSON parse (rjson) | 8.7 | 12.7 |
+| map + validate (mapper.rs, batch.rs) | 10.2 | 15.6 |
+| grouping / fingerprinting | 0.1 | 0.3 |
+| SQLite: COMMIT, WAL frames, autocheckpoint (incl. its fsync) | 33.1 | 24.7 |
+| SQLite: insert, table + index b-trees (seek, write, balance) | 25.4 | 17.5 |
+| SQLite: VDBE, binding, other | 3.8 | 4.2 |
+| SQLite: statement prepare | 0.0 | 0.2 |
+| SQLite: logs_fts | 0.4 | 0.5 |
+| Rust around the inserts (routing, ids, binds) | 4.0 | 6.0 |
+| rollups thread (incremental flush, t-digests, grouping drain) | 9.2 | 7.6 |
+| tokio runtime / other | 4.2 | 9.2 |
+| *of all of the above: allocator (mimalloc) incl. THP page faults* | *~10* | *~15* |
+
+Writer thread alone at max-1app (67.5% of the process):
+- autocheckpoint at COMMIT: 26.3%
+- WAL frame write at COMMIT: 22.7%
+- savepoint sub-journal (memjrnl): 16.2%
+- index seeks: 16.1%
+- VDBE: 5.2%
+- page balance: 4.2%
+- rusqlite bind: 2.8%
+- Rust writer code: 2.7%
+
+**Ruled out by these numbers:**
+- Per-row statement re-preparation: 0.0-0.2%. `prepare_cached` hits.
+- JSON → serde_json → re-serialize round trips: none on this path. rjson
+  goes straight to `Bind`.
+- Rollup work inline with ingest: none on the writer. Rollups run on their
+  own thread (7.6-9.2%).
+- Parsing on the writer: it already runs on the request threads under the
+  CPU semaphore (http.rs).
+
+### The floor (one thread, no HTTP)
+
+| stage | events/s | CPU-ms / 1k events |
+|---|---:|---:|
+| parse + map | 55-68k | 14.7-17.9 |
+| write, 1 batch per transaction | 7,187 | 70.7 |
+| write, 8 per transaction (what 16 senders coalesce to) | 11,758 | 51.1 |
+| write, 30 per transaction (what 64 senders coalesce to) | 20,481 | 33.6 |
+
+Each row is one event (500 rows per batch). With 2 cores and one app, the
+whole server reaches 12.5-14k events/s at 16 senders. Its writer thread was
+66% running and 30% in fsync (the checkpoint's), sampled from /proc every
+2 ms. So **the single-tenant ceiling is the one writer thread**. It is
+within about 10-20% of the write-only floor at the same group size (11.8k).
+Parse and map run beside it on the other core. HTTP and the channel add
+almost nothing.
+
+Experiments on the floor (800 batches, 8 per transaction, write CPU-ms /
+1k):
+
+| change | write CPU-ms / 1k |
+|---|---:|
+| as is | 38.6 |
+| no per-batch SAVEPOINT | 33.0 |
+| `wal_autocheckpoint=0` | 32.7 |
+| both | 26.7 |
+
+Full server, max-1app, 1 run each:
+- No SAVEPOINT: 15.7k events/s against 15.2k.
+- No autocheckpoint: 17.7k events/s, but the WAL grew to 5 GB in 30 s and
+  CPU per event rose (81.8 against 59.7 ms / 1k). Without a checkpointer,
+  the cost only moves.
+
+### What changed (3 reps each, median (min-max))
+
+1. **No transparent huge pages for the server** (main.rs:
+   `prctl(PR_SET_THP_DISABLE)`, the same as `MIMALLOC_ALLOW_THP=0`).
+   mimalloc madvises its arenas `MADV_HUGEPAGE`. Under ingest, the kernel
+   then zeroed 2 MiB pages and compacted memory on page faults: 9% of server
+   CPU at 50 apps (`do_huge_pmd_anonymous_page`, `try_to_compact_pages`
+   under `mi_page_free_list_extend`). Production's THP mode is the same
+   `madvise` (read from /sys on the prod box).
+2. **rjson `parse_string`** copies the run of plain bytes up to the first
+   quote, backslash or control byte at once. It no longer pushes one byte at
+   a time. Every byte is handled exactly as before, so output and error
+   messages are unchanged (tests/rjson.rs).
+3. **payload: the line buffer is sized once** (2 x READ_SIZE). Before, it
+   grew by reallocation on every request: 5.3% of server CPU at 50 apps.
+
+| case | | events/s | CPU-ms / 1k events | p50 ms | p99 ms | peak anon MiB |
+|---|---|---:|---:|---:|---:|---:|
+| max-1app | before | 12,533 (12,378-13,433) | 71.6 (63.9-73.6) | 644 (634-684) | 1,033 (914-1,628) | 285 (269-338) |
+| max-1app | after | 12,989 (12,922-14,056) | **65.3** (63.7-66.9) | 627 (626-663) | 888 (880-1,156) | 292 (287-295) |
+| max-50app | before | 40,678 (39,722-43,533) | 46.4 (45.9-46.9) | 712 (697-737) | 1,931 (1,487-2,616) | 1,621 (1,541-1,712) |
+| max-50app | after | 44,156 (42,978-46,800) | **40.9** (40.9-42.3) | 623 (613-661) | 1,596 (1,532-2,530) | 1,485 (1,479-1,575) |
+
+- At 50 apps, CPU per event fell 12% and the ranges do not overlap.
+- At 1 app, it fell 9%, but one "before" run (63.9) is inside the "after"
+  range. One app is writer-bound, and none of these changes touch the
+  writer.
+- No on-disk change and no change to any stored byte.
+
+### The ceiling, and what would move it (written up, not built)
+
+- **1 app:** one SQLite write connection per tenant. It inserts ~500 rows
+  per batch into tables with 14 (executions) and 7 (queries) indexes, then
+  writes and checkpoints the WAL. That is about 40-50 CPU-µs per row on
+  this CPU, and it is a real ceiling for this file format. The Rust/Rails
+  ratio is small here because both sides pay SQLite's per-row cost, and
+  Rust has no second writer to add. Rails is 9.1k against Rust's 13-14k.
+- **50 apps:** CPU-bound across both cores at 41-46 CPU-ms / 1k, about
+  44k events/s. Half of that is SQLite, the other half parse/map and
+  rollups.
+
+What would move it, largest first. None is in this branch:
+1. **Fewer indexes on the hot tables** (Track B / schema.rs). Index seeks
+   plus b-tree writes are 25% of the process at 1 app. This is an on-disk
+   change.
+2. **A checkpointer thread per tenant** (proposal 1 below). The
+   autocheckpoint is 26% of the writer at 1 app. This needs a WAL-growth
+   bound (see the 5 GB result above). It lives in tenants.rs (Track A's
+   file).
+3. **No SAVEPOINT per batch, or only when a batch fails.** The statement
+   journal is 16% of the writer, and the floor showed -14% write CPU
+   without it. A coalesced group would need a retry path that rewrites the
+   other batches when one fails, to keep the "rolls back alone" guarantee
+   (tests/ingest_http.rs).
+4. Parse+map is 15-18 CPU-ms / 1k on one thread. The rest is IndexMap
+   hashing (SipHash) and per-key `Vec<u8>` allocation for every record.
+   Swapping the hasher touches the `rjson::Hash` type in 30+ places, so it
+   was not done here.
+
 ## Proposals
 
 None of these is implemented.
