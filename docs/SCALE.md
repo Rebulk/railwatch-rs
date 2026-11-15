@@ -16,7 +16,7 @@ Scripts: [`bench/scale/`](../bench/scale/). Raw results:
 
 | server | apps that fit (largest step that did not break) | breaks at | what breaks it |
 |---|---:|---:|---|
-| Rust, origin/main `ad5a091` | **250** | 500 | memory: about 6 MiB per active tenant at once, then about 3-5 MiB more per tenant per 10 min, until the 4 GiB cap kills it |
+| Rust, origin/main `ad5a091` | **250** | 500 | memory: about 5-6 MiB per active tenant at once, then about 5 MiB more per tenant over 10 min, until the 4 GiB cap kills it |
 | Rust, PR #90 `f4ad31b` | **250** | 500 | the same; #90 holds p99 down at 250 (34 vs 632 ms) but does not move the limit |
 | Rails, railwatch-cloud `71020d3` | **100** | 250 | CPU: both threads pinned during every minute's :00-:15 burst, and for about a minute during each 5-minute rollup catch-up |
 
@@ -44,12 +44,13 @@ see [Still running](#still-running).
 ## Why Rust breaks: a per-tenant memory floor, then growth
 
 **Mechanism.**
-- Each tenant that sends data costs about **6 MiB of private memory** the
+- Each tenant that sends data costs about **5-6 MiB of private memory** the
   moment it becomes active.
-- After that, memory **keeps growing by 3.5-5 MiB per tenant over a 10-minute
-  step** without levelling off.
-- At 500 apps, the floor alone is about 3.3 GiB, and the growth pushes the
-  server into the 4 GiB cap within 8-9 minutes. The kernel then kills it.
+- After that, memory **keeps growing by about 5 MiB per tenant over a
+  10-minute step** without levelling off.
+- At 500 apps, the floor alone is about 3.3 GiB. Growth of only about 1.3 MiB
+  per tenant then reaches the 4 GiB cap after about 9 minutes, and the kernel
+  kills the server.
 - CPU was never the limit: 13.6% of the two threads at 500 apps.
 
 **Evidence** (framework, steady disk; `steps.jsonl`, `raw/*.samples` at 2 s):
@@ -82,8 +83,9 @@ see [Still running](#still-running).
     5-6 MiB per tenant on arrival. **Which part of the 5-6 MiB is page cache
     versus statements and rollup state was not measured**; that split is
     Track H's subject.
-- **Then it grows without settling.** Growth over the last 5 minutes of each
-  step:
+- **Then it grows without settling.** From the floor (about 12 s in) to the
+  step's peak, main grew 495 MiB at 100 apps and 1,290 MiB at 250: **4.95 and
+  5.16 MiB per tenant**. Growth over the last 5 minutes:
 
   | apps | main (MiB/min) | #90 (MiB/min) |
   |---:|---:|---:|
@@ -135,25 +137,33 @@ see [Still running](#still-running).
 
 - **Both threads were pinned in bursts, not on average.**
   - CPU averaged 69% of the two threads over the step.
-  - It swung between 30-55% and 95-108% in a one-minute cycle: up for 20-30 s
-    starting at each minute's :00, down for the rest.
+  - It followed the wall-clock minute. Average CPU by 5-second bucket of the
+    minute: **84, 91, 88, 88, 82%** for :00-:25, then 69, 64, 64, 58, 50, 52,
+    48% for :25-:60. Leaving out the two catch-up minutes gives 85-88% and
+    43-62%.
   - 43 of the 60 ten-second windows had a p99 above 1 s; the worst were
     during the pinned stretches.
-- **The minute burst is in the traffic, not in Rails.** In the production
-  profile, the first three 5-second buckets of each minute carry 31% of data
-  batches and 1.4-1.9x the records per batch (rebulk-system;
-  `minute_weights` and `minute_size_mult` in `profiles.json`). It is what
-  production's own scheduled tasks produce. Rust takes the same bursts at
-  250 apps with p99 34 ms (#90).
+- **The minute burst is in the traffic, not in Rails.**
+  - In the typical profile (rebulk-crm production), the first three
+    5-second buckets of each minute carry **79% of data batches**; :10-:15
+    alone has 28%, at 2.6x the mean batch size (`minute_weights` and
+    `minute_size_mult` in `profiles.json`). That is production's own
+    scheduled work landing at the top of the minute.
+  - Rust takes the same burst. Its CPU at 250 apps followed the same shape,
+    peaking at 12-13% in the :10-:15 bucket against 4-5% later. Its p99 was
+    34 ms (#90) and 632 ms (main, which was at its memory cap).
 - **The 5-minute storm is the rollup catch-up.**
-  - At t≈130 s and t≈430 s, exactly 300 s apart, Solid Queue's ready queue
-    jumped from 0 to 493 and to 677 jobs.
+  - At t≈137 s and t≈435 s, 298 s apart, Solid Queue's ready queue jumped
+    from 0 to 493 and to 677 jobs.
   - Both threads stayed at 100-107% for about 60 s while it drained.
   - Those two minutes hold the 10-13 s latencies.
   - `RollupCatchupJob` (railwatch-cloud `71020d3`,
     `app/jobs/rollup_catchup_job.rb`) runs every 5 minutes. It enqueues
     `RollupJob.perform_later(env, now)` and `(env, now - 1.hour)` for every
-    environment seen in the last 2 hours: 500 jobs for 250 apps.
+    environment seen in the last 2 hours: 500 jobs for 250 apps. The first
+    burst peaked at 493 ready jobs, which fits. The second peaked at 677, more
+    than the catch-up alone; the rest are likely per-batch `RollupJob`s and
+    follow-ups that queued behind it. Not broken down.
   - The job classes behind each burst are recorded per step from the 10%-busy
     Rails sweep on (`job_mix`). The 250-app numbers above come from the queue
     depth and timing, not from a class count.
@@ -170,8 +180,9 @@ see [Still running](#still-running).
   | 100 | 23.0% | 0.23% |
   | 250 | 68.9% | 0.28% |
 
-  It rises because the catch-up's work grows with the number of environments,
-  and each `RollupJob` recomputes up to an hour of one environment.
+  The catch-up's work grows with the number of environments, and each
+  `RollupJob` recomputes up to an hour of one environment. That is the likely
+  reason the cost per app climbs at 100-250 apps; it was not profiled.
 - Track G is building the best case (Rails 8.1.4, tuned Puma, a dedicated
   writer process). Its root-cause analysis will be linked here when it lands.
 
