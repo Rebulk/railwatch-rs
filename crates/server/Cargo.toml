@@ -113,3 +113,7 @@ path = "src/bin/page_hammer.rs"
 [[bin]]
 name = "rw-ingest-floor"
 path = "src/bin/rw_ingest_floor.rs"
+
+[[bin]]
+name = "plan-audit"
+path = "src/bin/plan_audit.rs"
