@@ -22,7 +22,9 @@ for _ in $(seq 1 120); do ss -ltn | grep -q "127.0.0.1:$PORT " || break; sleep 0
 mkdir -p "${DATA_ROOT:-$HOME/.cache/rwmem}"
 D=$(mktemp -d "${DATA_ROOT:-$HOME/.cache/rwmem}/rw-apps50.XXXX")
 unit=rw-apps50-$$
-trap 'cat "$cg/memory.events" > /tmp/rwmem/last-events 2>/dev/null; cp "$D/server.log" /tmp/rwmem/last-server.log 2>/dev/null; systemctl --user stop "$unit.scope" 2>/dev/null || true; rm -rf "$D"' EXIT
+mkdir -p /tmp/rwmem
+cg=
+trap '{ [ -z "$cg" ] || cat "$cg/memory.events" > /tmp/rwmem/last-events; } 2>/dev/null || true; cp "$D/server.log" /tmp/rwmem/last-server.log 2>/dev/null || true; systemctl --user stop "$unit.scope" 2>/dev/null || true; rm -rf "$D"' EXIT
 for i in $(seq 1 "$APPS"); do RAILWATCH_DATA_DIR=$D "$BIN/railwatch" env create "e$i" | grep -o 'rw_[A-Za-z0-9]*'; done > "$D/tokens"
 systemd-run --user --scope --unit "$unit" -p MemoryMax=3G -p MemorySwapMax=0 -p AllowedCPUs="${SERVER_CPUS:-0-1}" \
   env RAILWATCH_DATA_DIR="$D" PORT="$PORT" RAILWATCH_TRUST_PROXY=1 RAILWATCH_RATE_LIMIT_ENV=0 RAILWATCH_SQLITE_SYNC=off "$@" \
