@@ -31,7 +31,8 @@ if [ -f "$CONF" ]; then
   export RAILS_BEST_IMAGE RAILS_EXTRA_ENV
   if sudo docker image inspect "${RAILS_BEST_IMAGE:-none}" >/dev/null 2>&1; then
     echo "#### sweep rails-best image=$RAILS_BEST_IMAGE start $(date +%T)"
-    rc=0; bench/scale/sweep.sh rails-best 0 & child=$!; wait "$child" || rc=$?; child=
+    # RAILS_BEST_COUNTS: app counts for this sweep (default: the standard set)
+    rc=0; COUNTS=${RAILS_BEST_COUNTS:-${COUNTS:-10 25 50 100 250 500}} bench/scale/sweep.sh rails-best 0 & child=$!; wait "$child" || rc=$?; child=
     echo "#### sweep rails-best end $(date +%T) rc=$rc"
     [ $rc = 143 ] && exit 143
   else
