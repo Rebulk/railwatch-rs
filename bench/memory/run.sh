@@ -53,14 +53,14 @@ echo mixed > "$R/phase"
 $LOAD "$BIN/rw-load" --url "$URL" --tokens "$D/tokens" --concurrency 8 --rate "$RATE" --duration "$MIXED" --xff-rotate 64 --seed 11 > "$R/load-mixed.txt" 2>&1 &
 lp=$!
 $LOAD python3 -I "$ROOT/bench/memory/dash.py" "$URL" "$D/proxy.secret" "$D/envs" "$CLIENTS" "$MIXED" "$PAUSE" > "$R/dash-mixed.json"
-wait $lp || true
+wait $lp || { echo "rw-load failed, see $R/load-*.txt" >&2; exit 1; }
 echo idle1 > "$R/phase"
 sleep "$IDLE"
 echo burst > "$R/phase"
 $LOAD "$BIN/rw-load" --url "$URL" --tokens "$D/tokens" --concurrency 12 --rate 0 --duration "$BURST" --xff-rotate 64 --seed 13 > "$R/load-burst.txt" 2>&1 &
 lp=$!
 $LOAD python3 -I "$ROOT/bench/memory/dash.py" "$URL" "$D/proxy.secret" "$D/envs" "$((CLIENTS * 2))" "$BURST" 0 > "$R/dash-burst.json"
-wait $lp || true
+wait $lp || { echo "rw-load failed, see $R/load-*.txt" >&2; exit 1; }
 echo idle2 > "$R/phase"
 sleep "$IDLE"
 kill -TERM $pid; wait $pid || true
