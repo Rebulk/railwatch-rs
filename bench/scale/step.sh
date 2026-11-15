@@ -123,6 +123,13 @@ tel1=$(du -sb "$data/telemetry" | cut -f1)
 db1=$(db_bytes)
 oom=$(awk '/^oom_kill /{print $2}' "$SLICE/memory.events")
 failed_jobs=None
+# Rails: which job classes ran during the step, and how many (Solid Queue
+# keeps finished jobs: solid_queue_jobs.finished_at; preserve_finished_jobs
+# is the gem default). Read-only, after the load.
+job_mix=None
+[ "$is_rails" = 1 ] && job_mix=$(sqlite3 "file:$data/production_queue.sqlite3?mode=ro" \
+  "SELECT json_group_object(class_name, n) FROM (SELECT class_name, count(*) n FROM solid_queue_jobs GROUP BY class_name ORDER BY n DESC)" 2>/dev/null || echo None)
+[ -n "$job_mix" ] || job_mix=None
 [ "$is_rails" = 1 ] && failed_jobs=$(sqlite3 "file:$data/production_queue.sqlite3?mode=ro" "SELECT count(*) FROM solid_queue_failed_executions")
 exited=$(docker ps -a --filter "name=rvr-" --filter status=exited --format '{{.Names}}' | tr '\n' ' ')
 
@@ -152,7 +159,7 @@ row = {
   "cpu_pct_max_2s": round(max(cpu), 1) if cpu else None,
   "cpu_tail_s": round(($cpu2 - $cpu1) / 1e6, 1), "tail_s": $t, "tail_idle": $tail_idle,
   "jobs_ready_max": max([q for q in qn if q is not None], default=None), "jobs_oldest_ready_max_s": lag_q,
-  "jobs_ready_end": num("$q_end"), "failed_jobs": $failed_jobs,
+  "jobs_ready_end": num("$q_end"), "failed_jobs": $failed_jobs, "job_mix": $job_mix,
   "idle_anon_mib": round($idle_anon / 2**20), "peak_anon_mib": round(max(anon) / 2**20), "steady_anon_mib": round(half(anon) / 2**20),
   "after_anon_mib": round($after_anon / 2**20), "peak_current_mib": round(max(cur) / 2**20),
   "peak_rss_mib": round(max(rss) / 1024), "steady_rss_mib": round(half(rss) / 1024),
