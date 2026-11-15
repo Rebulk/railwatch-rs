@@ -323,6 +323,10 @@ async fn main() {
 
     if let Some(dir) = &o.dump {
         std::fs::create_dir_all(dir).unwrap_or_else(|e| die(&format!("{dir}: {e}")));
+        // rw-ingest-floor replays every file there: stale batches would mix in.
+        if std::fs::read_dir(dir).unwrap_or_else(|e| die(&format!("{dir}: {e}"))).next().is_some() {
+            die(&format!("{dir}: not empty; --dump needs an empty or new directory"));
+        }
         for (i, b) in batches.iter().enumerate() {
             std::fs::write(format!("{dir}/{i:06}.ndjson.gz"), &b.body).unwrap_or_else(|e| die(&format!("{dir}: {e}")));
         }
