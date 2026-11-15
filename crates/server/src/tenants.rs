@@ -37,6 +37,12 @@ pub const MAX_COALESCE_ROWS: usize = 20_000;
 /// gap between a steady app's batches, which would otherwise start cold.
 const QUIET: Duration = Duration::from_secs(30);
 
+/// A writer that is never quiet (a typical app sends a health batch every
+/// few seconds) still frees its caches this often, between transactions:
+/// otherwise every live tenant's caches only grow (docs/PERF.md, "Memory per
+/// tenant"). Pages come back through mmap, so a busy writer refills cheaply.
+pub const TRIM: Duration = Duration::from_secs(10);
+
 /// A stored receipt, as Telemetry::IngestReceipt.lookup returns it.
 #[derive(Debug, Clone)]
 pub struct StoredReceipt {
@@ -567,6 +573,7 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
     };
     tracing::debug!(tenant = slug, "writer opened");
     let mut last_job = Instant::now();
+    let mut trimmed = Instant::now();
     let mut quiet = false;
     loop {
         // Wakes after QUIET without work to let go of what the batches left
@@ -581,6 +588,7 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
                     return;
                 }
                 store.quiet();
+                crate::memory::collect_thread();
                 quiet = true;
                 continue;
             }
@@ -601,6 +609,11 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
         }
         process(env_id, slug, &mut store, jobs, followups);
         disk.wrote(store.take_written());
+        if trimmed.elapsed() >= TRIM {
+            store.quiet();
+            crate::memory::collect_thread();
+            trimmed = Instant::now();
+        }
     }
 }
 

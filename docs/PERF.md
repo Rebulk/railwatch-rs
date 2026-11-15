@@ -1243,6 +1243,130 @@ What would move it, largest first. None is in this branch:
    Swapping the hasher touches the `rjson::Hash` type in 30+ places, so it
    was not done here.
 
+## Memory per tenant (branch perf/next, on #90 + #89)
+
+Question: why does a Rust server with N quiet apps hold ~6-10 MiB of anonymous memory per
+app, and why does that keep growing at a constant app count?
+
+### Method
+
+- `step.sh` (Track H, kept out of the repo): a fresh data dir, N environments, Track F's
+  `rw-load --profile typical` (production-shaped: a 1-record health batch every 3.75 s per
+  app, ~0.8 data batches/min), 10 min, server in a user systemd unit with MemoryMax=4G, no
+  swap, on 2 CPUs of Archie (shared box, other work running). cgroup memory.stat every 2 s.
+- Attribution: a diagnostic build (never committed) printing every 10 s: RssAnon;
+  /proc/self/smaps summed by mapping kind (mimalloc arenas, other anonymous, mmap'd
+  `.sqlite3`, `-shm`); `sqlite3_db_status` CACHE_USED / SCHEMA_USED / STMT_USED summed over
+  every ingest writer connection and every rollup-worker connection; Rust's live heap (a
+  counting global allocator); the rollup accumulators' bytes; threads by name.
+  "Allocator retained" = mimalloc's anonymous arenas minus every live byte above.
+- Base = #90 + #89 merged (1ede1c8). 250 apps, the same seed, one run each, back to back.
+
+### Where it goes, 250 apps, KiB per app (base)
+
+| component | t=60 s | t=300 s | t=590 s | grows? |
+|---|---:|---:|---:|---|
+| cgroup anon | 2,973 | 4,938 | 6,303 | yes |
+| writer page caches (2.6-3.0 connections per app) | 407 | 800 | 1,186 | **yes, toward cache_size** |
+| rollup-worker page caches (2 connections per app) | 192 | 443 | 602 | **yes** |
+| rollup-worker prepared statements | 154 | 680 | 1,056 | **yes, without bound** |
+| writer prepared statements | 62 | 98 | 109 | slowly |
+| parsed schema, writers (meta + day files) | 226 | 259 | 260 | no (fixed) |
+| parsed schema, rollup worker (union reader + meta) | 335 | 387 | 390 | no (fixed) |
+| Rust heap (incl. accumulators 55-117) | 194 | 241 | 273 | levels off |
+| allocator retained (freed, not returned) | 1,788 | 2,171 | 2,363 | yes, follows the above |
+| thread stacks + libc maps | 37 | 41 | 47 | no |
+
+Not in anon: mmap'd `.sqlite3` pages (1.1-1.7 MiB/app of *file* RSS, reclaimable page cache) and
+the WAL index (`-shm`, 80 KiB/app, shared file pages). Channels were empty at every sample
+(`queued=0`): no backlog anywhere.
+
+### Why it grew
+
+Three things, all measured above:
+
+1. **Page caches never shrank while a tenant was active.** #90 frees a writer's cache after
+   30 s with no batch (`QUIET`), and the worker's at a flush with no work. A typical app sends
+   a health batch every 3.75 s, so neither condition ever held: every active tenant's caches
+   filled toward cache_size (2000 pages = 8 MB per file, writers have meta + today's core +
+   detail) for as long as it stayed active.
+2. **The rollup worker cached one statement per IN-list length.** `ingest_except` builds
+   `... WHERE id IN (?, ?, ...)` with one placeholder per id and prepares it with
+   `prepare_cached`: every distinct batch size is a new cached statement, each a plan over
+   every attached day file's branch of the union views. With production's size spread that is
+   up to hundreds of statements per tenant, 1 MiB per app after 10 min and still climbing
+   (statement cache capacity 256).
+3. **Freed memory stayed in the freeing thread's mimalloc heap.** mimalloc keeps a heap per
+   thread. A writer thread that freed its caches kept the pages in its own heap; they come
+   back to the OS only when that thread allocates or collects. #90 tried `mi_collect` from one
+   thread once a second and saw nothing: a collect only reaches the calling thread's heap.
+
+### What changed
+
+Root causes fixed:
+- **Caches are freed on a clock, not only on silence** (`tenants::TRIM`, 10 s): the writer
+  frees its connections' caches (`Store::quiet`) between transactions every 10 s whatever the
+  traffic, and the worker does the same at a flush for any tenant not trimmed for 10 s. Pages
+  come back through mmap (the file stays in the OS page cache), so refilling is cheap.
+- **One cached statement per power-of-two IN length** (`incremental::ingest_except`): ids are
+  padded with the last id up to the next power of two (IN ignores repeats), so at most 10
+  shapes (1..512, 900) exist per source.
+- **Each thread collects its own heap** (`memory::collect_thread`, `mi_collect(false)`) after
+  it freed caches: the writer after `quiet`, the worker after each flush.
+
+Not changed, still per tenant, and why:
+- **Parsed schema, ~610 KiB per active app** (writer 220 + worker 390): one copy per
+  connection of ~40 tables and ~100 indexes, plus the union reader's views. Fixed per
+  connection, does not grow. Removing it needs fewer connections per tenant (a writer pool
+  shared across tenants, or the worker without its own per-tenant union reader): a design
+  change, not made here.
+- **One OS thread per active tenant writer** (1.1-1.5 threads per app): stacks are lazily
+  touched (~40 KiB per app measured), so this costs little memory but is a design limit.
+- **The rollup accumulators** (#90's 32 MB global budget): ~120 KiB per app at 250 apps.
+
+### After, 250 apps, KiB per app (same run shape)
+
+| | base t=60 s | base t=590 s | next t=60 s | next t=590 s |
+|---|---:|---:|---:|---:|
+| cgroup anon | 2,973 | 6,303 | 1,986 | 4,062 |
+| RssAnon | 3,398 | 6,289 | 1,998 | 3,019 |
+| writer page caches | 407 | 1,186 | 74 | 93 |
+| worker page caches | 192 | 602 | 45 | 47 |
+| worker statements | 154 | 1,056 | 0 | 0 |
+| writer statements | 62 | 109 | 23 | 19 |
+| allocator retained | 1,788 | 2,363 | 1,172 | 1,965 |
+
+Anon MiB over time at 250 apps (cgroup, every 60 s from load start):
+- base: 146, 725, 926, 1036, 1097, 1238, 1290, 1347, 1418, 1463, 1554;
+- next: 103, 484, 556, 586, 613, 636, 642, 676, 684, 714, 725.
+
+**It still grows**, more slowly (+240 MiB over the last 9 min against +830), and what grows is
+"allocator retained": the live components above are flat after the change. With
+`MIMALLOC_PURGE_DELAY=0` (one run) anon went 434, 484, 510, 533, 580, 565, 567, 574, 578, 599
+MiB, the same shape at a lower level, so the remainder is not the purge delay either. It is
+not yet attributed past "mimalloc arenas minus live bytes": fragmentation or abandoned
+per-thread heaps (tokio's blocking pool grew from 37 to 123 threads over the run) are the
+leading suspects. A heap profiler (heaptrack is not installed here) is the next step.
+
+500 apps, 3 min (diagnostic builds, base vs this branch before the collect change):
+steady anon 3,017 vs 2,114 KiB/app; at t=60 s 2,756 vs 2,246 KiB/app; p99 3,164 vs 36 ms.
+
+**Target (< 3 MiB per idle-ish typical tenant): met on RssAnon at 250 apps after 10 min
+(3.0 MiB), not met on cgroup anon at t=590 s (4.0 MiB).**
+
+### Throughput (Track C's cases through bench/memory/apps50.sh, 3 runs each, interleaved)
+
+Shared box, RAILWATCH_SQLITE_SYNC=off, 2 CPUs; median (min-max).
+
+| case | base events/s | next events/s | base peak / after anon MiB | next peak / after anon MiB |
+|---|---:|---:|---:|---:|
+| max-50app | 13,889 (13,322-13,900) | 17,211 (15,367-17,822) | 800 / 741 | 589 / 307 |
+| max-1app | 4,467 (3,689-4,767) | 4,667 (3,889-5,211) | 131 / 82 | 136 / 82 |
+
+"next" is the whole branch (this section and the next). No regression in either case
+(the 5% bar). max-50app was ~24% faster; this run did not split that gain between the memory
+and the write-path changes, and the run-to-run spread on this box is ~15%.
+
 ## Proposals
 
 None of these is implemented.

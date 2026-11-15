@@ -44,6 +44,9 @@ struct Tenant {
     /// Work reached it since the last flush; a flush without frees its
     /// connections' page caches.
     active: bool,
+    /// When a flush last freed its caches: a tenant with work at every flush
+    /// still has them freed every TRIM.
+    trimmed: Instant,
     /// When a committed batch last reached it (TENANT_IDLE). Scheduled
     /// work (the drain every minute, detectors) does not count: it would keep
     /// every tenant open for good.
@@ -109,6 +112,7 @@ impl Worker {
                         full_hours: HashSet::new(),
                         users: Default::default(),
                         active: true,
+                        trimmed: Instant::now(),
                         // Opened idle: only a committed batch renews it, so
                         // a tenant the drain reopens closes at the next flush.
                         used_at: Instant::now().checked_sub(TENANT_IDLE).unwrap_or_else(Instant::now),
@@ -295,9 +299,10 @@ impl Worker {
                 let before = now - now.rem_euclid(3600) - 3600;
                 t.acc.evict_before(before);
                 t.full_hours.retain(|h| h + 3600 > before);
-                if !std::mem::take(&mut t.active) {
+                if !std::mem::take(&mut t.active) || t.trimmed.elapsed() >= crate::tenants::TRIM {
                     crate::memory::release(&t.read);
                     crate::memory::release(&t.write);
+                    t.trimmed = Instant::now();
                 }
                 Ok(())
             })();
@@ -312,6 +317,7 @@ impl Worker {
                 || !t.overflow_buckets.is_empty()
                 || !t.session_buckets.is_empty()
         });
+        crate::memory::collect_thread();
         if !self.tenants.is_empty() {
             tracing::debug!(ms = started.elapsed().as_millis() as u64, "rollup flush");
         }

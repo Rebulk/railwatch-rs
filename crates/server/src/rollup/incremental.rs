@@ -107,10 +107,17 @@ impl Accumulator {
                 continue;
             }
             for chunk in ids.chunks(900) {
-                let sql = source.select_by_ids_sql(chunk.len());
+                // Cached by its text, so one statement per distinct length
+                // would pile up (each a plan over every attached day file:
+                // 1.2 MB per tenant after 10 min of typical batches,
+                // docs/PERF.md "Memory per tenant"). Lengths round up to a
+                // power of two, padded with the last id (IN ignores repeats).
+                let n = chunk.len().next_power_of_two().min(900);
+                let sql = source.select_by_ids_sql(n);
+                let padded = chunk.iter().chain(std::iter::repeat_n(chunk.last().unwrap(), n - chunk.len()));
                 let rows: Vec<RawRow> = {
                     let mut st = read.prepare_cached(&sql)?;
-                    st.query_map(params_from_iter(chunk), |r| row_values(r, source.width() + 1))?.collect::<rusqlite::Result<_>>()?
+                    st.query_map(params_from_iter(padded), |r| row_values(r, source.width() + 1))?.collect::<rusqlite::Result<_>>()?
                 };
                 for row in rows {
                     let Some(g) = row[1].text().map(<[u8]>::to_vec) else { continue };
