@@ -4,7 +4,7 @@
 # production-shaped, open-loop traffic. Prints one JSON line and appends it
 # to $RESULTS. Needs reserve.sh on and disk.sh up first (sweep.sh does both).
 #
-#   bench/scale/step.sh rails|rust|rust-memory APPS [BUSY_EVERY]
+#   bench/scale/step.sh rails|rust|rust-memory|rust-mem-ingest APPS [BUSY_EVERY]
 #
 # Sampled every SAMPLE_S (2) seconds while the load runs: slice CPU, anon,
 # memory.current, summed VmRSS and open fds of the server processes, Rails'
@@ -14,10 +14,10 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 export RVR_SLICE=bench-server.slice
 export RVR_SLICE_PATH=/sys/fs/cgroup/bench.slice/bench-server.slice
-export SERVER_CPUS=${SERVER_CPUS:-14,30}
+export SERVER_CPUS=${SERVER_CPUS:-11,23}
 export BENCH_MNT=${BENCH_MNT:-/var/tmp/rw-scale/mnt}
 BIN=${BIN:-$HOME/.cache/rw-scale/bin}
-export LOAD_CPUS=${LOAD_CPUS:-12,13,15,28,29,31}
+export LOAD_CPUS=${LOAD_CPUS:-6-10,18-22}
 # docker needs root on the bench box (not in the docker group)
 [ -w /var/run/docker.sock ] || docker() { sudo docker "$@"; }
 . "$HERE/../rails-vs-rust/lib.sh"
@@ -26,14 +26,16 @@ side=$1 apps=$2 busy_every=${3:-0}
 case "$side" in
 rust) RUST_BIN=$BIN/railwatch-main ;;
 rust-memory) RUST_BIN=$BIN/railwatch-memory ;;
+rust-mem-ingest) RUST_BIN=$BIN/railwatch-mem-ingest ;;
 rails) ;;
-*) echo "side: rails|rust|rust-memory" >&2; exit 2 ;;
+*) echo "side: rails|rust|rust-memory|rust-mem-ingest" >&2; exit 2 ;;
 esac
 DURATION=${DURATION:-600} SAMPLE_S=${SAMPLE_S:-2}
 RESULTS=${RESULTS:-$RVR_ROOT/bench/results/scale/steps.jsonl}
 mkdir -p "$(dirname "$RESULTS")"
 run=$(date +%Y%m%dT%H%M%S)-$side-$apps-b$busy_every
 data=$MNT/$run
+[ "$(findmnt -no FSTYPE "$MNT" 2>/dev/null)" = ext4 ] || { echo "step: $MNT is not the bench ext4 (disk.sh up)" >&2; exit 1; }
 work=$(mktemp -d "/tmp/rw-scale-$run.XXXX")
 rvr_stop
 sudo find "$MNT" -mindepth 1 -maxdepth 1 -name '20*' -exec rm -rf {} +
@@ -57,7 +59,11 @@ pids() { find "$SLICE" -name cgroup.procs -exec cat {} + 2>/dev/null; }
 rss_kb() { local t=0; for p in $(pids); do r=$(awk '/^VmRSS/{print $2}' "/proc/$p/status" 2>/dev/null || echo 0); t=$((t + ${r:-0})); done; echo $t; }
 fds() { local t=0; for p in $(pids); do n=$(sudo ls "/proc/$p/fd" 2>/dev/null | wc -l); t=$((t + n)); done; echo $t; }
 # busy jiffies / total jiffies of the unreserved CPUs since the last call
-host_busy() { awk '/^cpu[0-9]/{c=substr($1,4)+0; if (c<12 || (c>=16 && c<28)) {t=0; for(i=2;i<=NF;i++) t+=$i; b+=t-$5-$6; a+=t}} END{print b, a}' /proc/stat; }
+# busy/total jiffies of the CPUs outside the bench (REST, e.g. 0-5,12-17)
+REST=${REST:-0-5,12-17}
+rest_list() { python3 -I -c 'import sys; print(" ".join(str(c) for p in sys.argv[1].split(",") for c in (range(int(p.split("-")[0]), int(p.split("-")[-1]) + 1))))' "$REST"; }
+REST_CPUS=" $(rest_list) "
+host_busy() { awk -v want="$REST_CPUS" '/^cpu[0-9]/{c=substr($1,4); if (index(want, " " c " ")) {t=0; for(i=2;i<=NF;i++) t+=$i; b+=t-$5-$6; a+=t}} END{print b, a}' /proc/stat; }
 queue() {
   [ "$side" = rails ] || { echo "- -"; return; }
   sqlite3 "file:$data/production_queue.sqlite3?mode=ro" \
@@ -126,7 +132,7 @@ lat = r["latency"]
 dur = $DURATION; apps = $apps
 lag_q = max([a for a in qa if a is not None], default=None)
 row = {
-  "run": "$run", "disk_mode": "${DISK_MODE:-loop}", "side": "$side", "apps": apps, "busy_every": $busy_every, "busy_apps": r["busy_apps"], "duration_s": dur,
+  "run": "$run", "disk_mode": "${DISK_MODE:-ram}", "side": "$side", "apps": apps, "busy_every": $busy_every, "busy_apps": r["busy_apps"], "duration_s": dur,
   "seed_s": $seed_s, "posts": r["posts"], "batches_per_s": round(r["batches_per_s"], 1), "records_per_s": round(r["records_per_s"]),
   "status_counts": r["status_counts"], "not_ok": r["not_ok"], "apps_with_errors": r["apps_with_errors"],
   "p50_ms": round(lat["p50_ms"], 1), "p99_ms": round(lat["p99_ms"], 1), "p999_ms": round(lat["p999_ms"], 1), "max_ms": round(lat["max_ms"], 1),
@@ -151,7 +157,7 @@ row = {
   "bytes_per_record": round(($disk1 - $disk0) / max(1, r["records_ok"]), 1),
   # steady growth over the second half of the load, per app, extrapolated to a day
   "disk_per_app_day_mib": round(($disk1 - $(cat "$work/disk_mid" 2>/dev/null || echo 0)) / apps * 86400 / (dur / 2) / 2**20, 1),
-  "host_busy_pct_unreserved": round(($hb1 - $hb0) / max(1, ($ha1 - $ha0)) * 100, 1),
+  "host_busy_pct_rest": round(($hb1 - $hb0) / max(1, ($ha1 - $ha0)) * 100, 1),
   "loadavg_max": max(float(s[8]) for s in S),
 }
 # breaks (defined in docs/SCALE.md): p99 > 1 s, any drop, > 60 s behind, OOM

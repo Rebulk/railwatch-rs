@@ -2,11 +2,11 @@
 # The data disk for the scale runs: ext4, no compression at the filesystem
 # level, like production. Two backings (DISK_MODE):
 #
-#   loop  (default) a sparse image file at $DIR/disk.img on the host's own
+#   loop  a sparse image file at $DIR/disk.img on the host's own
 #         disk, loop-mounted. On rebulk that is a shared btrfs+zstd NVMe; the
 #         image is NOCOW (chattr +C), which also turns btrfs compression off
 #         for it. Its fsync latency follows whatever else the host is doing.
-#   ram   ext4 on zram (RAM, ZRAM_GB, default 20 GB cap) behind dm-delay with
+#   ram   (default) ext4 on zram (RAM, ZRAM_GB, default 10 GB cap) behind dm-delay with
 #         WRITE_DELAY_MS (1) on every write bio: an fdatasync of ~3 ms with
 #         almost no variance, a steady "modest cloud NVMe". The same disk
 #         Track C used (bench/rails-vs-rust/host.sh). Reads are not delayed.
@@ -20,7 +20,7 @@ set -euo pipefail
 DIR=${SCALE_DIR:-/var/tmp/rw-scale}
 IMG=$DIR/disk.img
 MNT=$DIR/mnt
-MODE=${DISK_MODE:-loop}
+MODE=${DISK_MODE:-ram}
 DM=rwscale
 STATE=$DIR/zram-dev   # zram index, for down
 
@@ -34,7 +34,7 @@ up)
       n=$(sudo cat /sys/class/zram-control/hot_add)
       echo "$n" | sudo tee "$STATE" >/dev/null
       echo lz4 | sudo tee "/sys/block/zram$n/comp_algorithm" >/dev/null
-      echo "${ZRAM_GB:-20}G" | sudo tee "/sys/block/zram$n/disksize" >/dev/null
+      echo "${ZRAM_GB:-10}G" | sudo tee "/sys/block/zram$n/disksize" >/dev/null
       s=$(sudo blockdev --getsz "/dev/zram$n")
       d=${WRITE_DELAY_MS:-1}
       # dm-delay: <dev> <offset> <read delay> <dev> <offset> <write delay>
@@ -52,6 +52,7 @@ up)
     sudo chown "$(id -u):$(id -g)" "$MNT"
   fi
   findmnt -no SOURCE,FSTYPE,OPTIONS "$MNT"
+  [ "$(findmnt -no FSTYPE "$MNT")" = ext4 ] || { echo "disk: $MNT is not the bench ext4" >&2; exit 1; }
   if [ "$MODE" = ram ]; then sudo dmsetup table "$DM"; else lsattr "$IMG"; fi
   ;;
 down)
