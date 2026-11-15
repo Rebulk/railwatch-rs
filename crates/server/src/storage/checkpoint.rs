@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 
@@ -30,6 +30,8 @@ pub const HARD_PAGES: i32 = 8000;
 /// Checkpoints the thread has run, and those the writers ran inline.
 pub static BACKGROUND: AtomicU64 = AtomicU64::new(0);
 pub static INLINE: AtomicU64 = AtomicU64::new(0);
+/// The minute an incomplete inline checkpoint was last logged.
+static INCOMPLETE_WARNED: AtomicI64 = AtomicI64::new(-1);
 
 struct Checkpointer {
     tx: Mutex<Sender<PathBuf>>,
@@ -92,8 +94,16 @@ pub fn install(conn: &mut Connection, path: &Path) -> rusqlite::Result<()> {
             // for it (up to ~1 s), or the cap would not hold while it is slow.
             for _ in 0..100 {
                 match wal.checkpoint_v2(CheckpointMode::PASSIVE) {
-                    Ok(_) => {
+                    Ok((log, done)) => {
                         INLINE.fetch_add(1, Ordering::Relaxed);
+                        // A reader still needs the rest: the cap does not
+                        // hold until it ends. Said once a minute at most.
+                        if done < log {
+                            let now = crate::time::now_micros() / 60_000_000;
+                            if INCOMPLETE_WARNED.swap(now, Ordering::Relaxed) != now {
+                                tracing::warn!(wal_pages = log, checkpointed = done, "WAL over its cap: a reader holds frames back");
+                            }
+                        }
                         break;
                     }
                     Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::DatabaseBusy => {
