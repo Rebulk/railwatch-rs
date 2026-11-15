@@ -2,9 +2,10 @@
 //! (in parallel), then hand the prepared batch to the tenant's writer over a
 //! channel. The writer owns the only write connection to the file. It
 //! coalesces whatever is queued (up to MAX_COALESCE_BATCHES batches or
-//! MAX_COALESCE_ROWS rows) into one `BEGIN IMMEDIATE` transaction, with a
-//! SAVEPOINT per batch so a batch that fails rolls back alone, commits, and
-//! only then answers each request.
+//! MAX_COALESCE_ROWS rows) into one `BEGIN IMMEDIATE` transaction, commits,
+//! and only then answers each request. The batches go in without savepoints;
+//! if one fails, the transaction rolls back and the group is written again
+//! with a SAVEPOINT per batch, so the failing batch rolls back alone.
 //!
 //! The writer is a dedicated OS thread (rusqlite is blocking); it is opened
 //! lazily on the first batch and closes itself after `idle` without work.
@@ -36,6 +37,12 @@ pub const MAX_COALESCE_ROWS: usize = 20_000;
 /// without this, stays full for as long as the writer runs. Longer than the
 /// gap between a steady app's batches, which would otherwise start cold.
 const QUIET: Duration = Duration::from_secs(30);
+
+/// A writer that is never quiet (a typical app sends a health batch every
+/// few seconds) still frees its caches this often, between transactions:
+/// otherwise every live tenant's caches only grow (docs/PERF.md, "Memory per
+/// tenant"). Pages come back through mmap, so a busy writer refills cheaply.
+pub const TRIM: Duration = Duration::from_secs(10);
 
 /// A stored receipt, as Telemetry::IngestReceipt.lookup returns it.
 #[derive(Debug, Clone)]
@@ -567,6 +574,7 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
     };
     tracing::debug!(tenant = slug, "writer opened");
     let mut last_job = Instant::now();
+    let mut trimmed = Instant::now();
     let mut quiet = false;
     loop {
         // Wakes after QUIET without work to let go of what the batches left
@@ -581,6 +589,7 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
                     return;
                 }
                 store.quiet();
+                crate::memory::collect_thread();
                 quiet = true;
                 continue;
             }
@@ -601,6 +610,11 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
         }
         process(env_id, slug, &mut store, jobs, followups);
         disk.wrote(store.take_written());
+        if trimmed.elapsed() >= TRIM {
+            store.quiet();
+            crate::memory::collect_thread();
+            trimmed = Instant::now();
+        }
     }
 }
 
@@ -625,6 +639,9 @@ fn fail(job: Job, message: String) {
     }
 }
 
+/// A Job::Write taken apart: the batch, its gc floor, where to answer.
+type WriteJob = (Box<Prepared>, i64, oneshot::Sender<Result<Written, WriteError>>);
+
 type Pending = (oneshot::Sender<Result<Written, WriteError>>, Result<Written, WriteError>, Option<Followup>);
 
 fn process(env_id: i64, slug: &str, store: &mut Store, jobs: Vec<Job>, followups: &FollowupSender) {
@@ -647,24 +664,47 @@ fn process(env_id: i64, slug: &str, store: &mut Store, jobs: Vec<Job>, followups
         return;
     }
     let started = Instant::now();
+    let mut writes: Vec<WriteJob> = writes
+        .into_iter()
+        .map(|job| match job {
+            Job::Write { batch, gc_floor_micros, reply } => (batch, gc_floor_micros, reply),
+            Job::LookupReceipt { .. } | Job::Release { .. } => unreachable!(),
+        })
+        .collect();
     let begin = store.begin();
     let lock_ms = started.elapsed().as_millis() as u64;
     if let Err(e) = begin {
-        let busy = matches!(&e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::DatabaseBusy);
-        for job in writes {
-            match job {
-                Job::Write { reply, .. } => {
-                    let _ = reply.send(Err(if busy { WriteError::Busy } else { WriteError::Internal(e.to_string()) }));
-                }
-                Job::LookupReceipt { .. } | Job::Release { .. } => unreachable!(),
-            }
-        }
+        refuse(writes, &e);
         return;
     }
+    // Fast path: no savepoint per batch. All or nothing, so a batch that
+    // fails sends the whole group to the guarded path below.
+    let mut results: Vec<Result<Written, WriteError>> = Vec::with_capacity(writes.len());
+    for (batch, gc_floor_micros, _) in writes.iter_mut() {
+        match store.write_unguarded(batch, *gc_floor_micros) {
+            Ok(w) => results.push(Ok(w)),
+            Err(e) => {
+                tracing::debug!(tenant = slug, error = ?e, "a batch failed; writing the group again with a savepoint per batch");
+                results.clear();
+                break;
+            }
+        }
+    }
+    if results.len() < writes.len() {
+        // Guarded path: a SAVEPOINT per batch, so the failing batch rolls
+        // back alone and the others commit (tests/ingest_http.rs).
+        GUARDED_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        store.rollback();
+        if let Err(e) = store.begin() {
+            refuse(writes, &e);
+            return;
+        }
+        for (batch, gc_floor_micros, _) in writes.iter_mut() {
+            results.push(store.write(batch, *gc_floor_micros));
+        }
+    }
     let mut pending: Vec<Pending> = Vec::new();
-    for job in writes {
-        let Job::Write { mut batch, gc_floor_micros, reply } = job else { unreachable!() };
-        let result = store.write(&mut batch, gc_floor_micros);
+    for ((batch, _, reply), result) in writes.into_iter().zip(results) {
         let followup = result.as_ref().ok().map(|w| Followup::from_batch(env_id, slug, &batch, w));
         tracing::debug!(tenant = slug, records = batch.record_count, ok = result.is_ok(), "batch written");
         pending.push((reply, result, followup));
@@ -690,10 +730,153 @@ fn process(env_id: i64, slug: &str, store: &mut Store, jobs: Vec<Job>, followups
     tracing::debug!(tenant = slug, batches = n, lock_ms, ms = started.elapsed().as_millis() as u64, "transaction committed");
 }
 
+/// Groups written again with a savepoint per batch because one batch of
+/// the group failed (process).
+pub static GUARDED_GROUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The transaction could not start: every batch of the group is answered
+/// with the error (503 busy, else 500).
+fn refuse(writes: Vec<WriteJob>, e: &rusqlite::Error) {
+    let busy = matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::DatabaseBusy);
+    for (_, _, reply) in writes {
+        let _ = reply.send(Err(if busy { WriteError::Busy } else { WriteError::Internal(e.to_string()) }));
+    }
+}
+
 fn lookup_receipt(conn: &Connection, producer_id: &str, delivery_id: &str) -> rusqlite::Result<Option<StoredReceipt>> {
     conn.prepare_cached("SELECT body_sha256, metadata_sha256, ack, committed_at FROM ingest_receipts WHERE producer_id = ? AND delivery_id = ? LIMIT 1")?
         .query_row([producer_id, delivery_id], |r| {
             Ok(StoredReceipt { body_sha256: r.get(0)?, metadata_sha256: r.get(1)?, ack: r.get(2)?, committed_at: r.get(3)? })
         })
         .optional()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rjson::Value;
+
+    /// A batch of one query (its sql filed in query_shapes) and one log;
+    /// `poisoned` gives it the bignum Dropped header, which passes mapping
+    /// and fails the ingest_batches insert after its rows went in.
+    fn batch(i: usize, poisoned: bool) -> Box<Prepared> {
+        let all: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/wire_fixtures.json")).unwrap();
+        let now = crate::time::now_micros() as f64 / 1e6;
+        let sql = format!("SELECT {i} FROM widgets");
+        let group = format!("{:x}", <md5::Md5 as md5::Digest>::digest(format!("primary,{sql}").as_bytes()));
+        let mut q = all["query"].clone();
+        q["timestamp"] = serde_json::json!(now);
+        q["execution_id"] = serde_json::json!(format!("exec-{i}"));
+        q["sql"] = serde_json::json!(sql);
+        q["_group"] = serde_json::json!(group);
+        let mut l = all["log"].clone();
+        l["timestamp"] = serde_json::json!(now);
+        l["message"] = serde_json::json!(format!("m{i}"));
+        let body = format!("{q}\n{l}\n");
+        let records = crate::ingest::payload::parse_bytes(body.as_bytes(), false).unwrap();
+        let meta = crate::ingest::batch::Meta {
+            dropped_by_client: if poisoned { Value::BigInt("99999999999999999999".into()) } else { Value::Int(0) },
+            backpressure_factor: 1.0,
+            bytes: Value::Int(body.len() as i64),
+            gem_version: Some(b"0.9.1".to_vec()),
+            received_at_micros: crate::time::now_micros(),
+        };
+        let p = crate::ingest::batch::map_all(records, 0.0, meta, None);
+        assert!(p.rejections.is_empty(), "{:?}", p.rejections);
+        Box::new(p)
+    }
+
+    fn count(dir: &Path, slug: &str, table: &str) -> i64 {
+        let c = crate::dashboard::pool::open_tenant_reader(dir, slug).unwrap();
+        c.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| r.get(0)).unwrap()
+    }
+
+    /// One coalesced group of 8 batches, the 3rd and 6th poisoned, through
+    /// `process` (the writer thread's transaction), on both layouts.
+    fn a_group_with_poisoned_batches(single: bool) {
+        let dir = std::env::temp_dir().join(format!("rw-group-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let slug = "e1";
+        if single {
+            drop(open_tenant(&dir.join(format!("{slug}.sqlite3"))).unwrap());
+        }
+        let mut store = Store::open(&dir, slug).unwrap();
+        assert_eq!(matches!(store, Store::Single(_)), single);
+        let (followups, mut followups_rx) = crate::followups::channel();
+        let poisoned = [2, 5];
+        let mut replies = Vec::new();
+        let jobs: Vec<Job> = (0..8)
+            .map(|i| {
+                let (reply, rx) = oneshot::channel();
+                replies.push(rx);
+                Job::Write { batch: batch(i, poisoned.contains(&i)), gc_floor_micros: 0, reply }
+            })
+            .collect();
+        let guarded = GUARDED_GROUPS.load(std::sync::atomic::Ordering::Relaxed);
+        process(1, slug, &mut store, jobs, &followups);
+        assert!(GUARDED_GROUPS.load(std::sync::atomic::Ordering::Relaxed) > guarded, "the group took the guarded path");
+        for (i, rx) in replies.into_iter().enumerate() {
+            let r = rx.blocking_recv().unwrap();
+            if poisoned.contains(&i) {
+                assert!(matches!(r, Err(WriteError::Internal(ref m)) if m.contains("out of range")), "batch {i}: {r:?}");
+            } else {
+                assert_eq!(r.unwrap().accepted, 2, "batch {i}");
+            }
+        }
+        drop(store);
+        assert_eq!(count(&dir, slug, "ingest_batches"), 6, "only the good batches' ledger rows");
+        assert_eq!(count(&dir, slug, "queries"), 6, "the poisoned batches' rows rolled back");
+        assert_eq!(count(&dir, slug, "logs"), 6);
+        // The retry wrote the good batches' query text: the first pass had
+        // already moved it out of their rows (with_query_shapes).
+        assert_eq!(count(&dir, slug, "query_shapes"), 6, "each good batch's shape, written once");
+        let c = crate::dashboard::pool::open_tenant_reader(&dir, slug).unwrap();
+        let blank: i64 = c.query_row("SELECT COUNT(*) FROM queries WHERE sql = ''", [], |r| r.get(0)).unwrap();
+        assert_eq!(blank, 6, "the rows point at their shape");
+        let ids: Vec<i64> = c.prepare("SELECT id FROM queries ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(ids.len(), 6);
+        drop(c);
+        let mut n = 0;
+        while followups_rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 6, "a follow-up per committed batch, none for the failed ones");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_poisoned_batch_in_a_group_fails_alone_and_the_rest_commit_per_day() {
+        a_group_with_poisoned_batches(false);
+    }
+
+    #[test]
+    fn a_poisoned_batch_in_a_group_fails_alone_and_the_rest_commit_single_file() {
+        a_group_with_poisoned_batches(true);
+    }
+
+    /// No batch fails: one pass, no savepoints, every batch committed.
+    #[test]
+    fn a_clean_group_commits_on_the_fast_path() {
+        let dir = std::env::temp_dir().join(format!("rw-group-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = Store::open(&dir, "e1").unwrap();
+        let (followups, _rx) = crate::followups::channel();
+        let mut replies = Vec::new();
+        let jobs: Vec<Job> = (0..8)
+            .map(|i| {
+                let (reply, rx) = oneshot::channel();
+                replies.push(rx);
+                Job::Write { batch: batch(i, false), gc_floor_micros: 0, reply }
+            })
+            .collect();
+        process(1, "e1", &mut store, jobs, &followups);
+        for rx in replies {
+            assert_eq!(rx.blocking_recv().unwrap().unwrap().accepted, 2);
+        }
+        drop(store);
+        assert_eq!(count(&dir, "e1", "queries"), 8);
+        assert_eq!(count(&dir, "e1", "ingest_batches"), 8);
+        assert_eq!(count(&dir, "e1", "query_shapes"), 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -27,6 +27,7 @@ D=$R/data
 cp -a --reflink=auto "$SEED" "$D"
 export RAILWATCH_DATA_DIR=$D RAILWATCH_TRUST_PROXY=1 RAILWATCH_RATE_LIMIT_ENV=0 RAILWATCH_RATE_LIMIT_IP=0 PORT
 export RAILWATCH_TRUSTED_PROXY_SECRET_FILE=$D/proxy.secret
+if ss -ltn | grep -q "127.0.0.1:$PORT "; then echo "port $PORT already has a listener" >&2; exit 1; fi
 env "$@" taskset -c "${SERVER_CPUS:-8-11}" "$BIN/railwatch" serve > "$R/server.log" 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null || true; kill $sampler 2>/dev/null || true' EXIT

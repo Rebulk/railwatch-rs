@@ -4,7 +4,8 @@
 //! Reads gzip NDJSON bodies (`rw-load --dump DIR`), then, on one thread:
 //! 1. parse + map every body (payload::parse_bytes, batch::map_all), timed;
 //! 2. writes the mapped batches into a fresh environment through the same
-//!    Store the tenant writer uses: BEGIN, a savepoint per batch, COMMIT,
+//!    Store the tenant writer uses: BEGIN, the batches (no savepoints: the
+//!    writer's path when no batch fails, tenants::process), COMMIT,
 //!    PER_TXN batches per transaction (the server coalesced ~8 at 16
 //!    senders to one app), timed.
 //!
@@ -80,7 +81,7 @@ fn main() {
     for chunk in prepared.chunks_mut(per_txn) {
         store.begin().expect("begin");
         for p in chunk.iter_mut() {
-            store.write(p, 0).expect("write");
+            store.write_unguarded(p, 0).expect("write");
         }
         store.commit().expect("commit");
         txns += 1;
@@ -89,6 +90,11 @@ fn main() {
 
     let per = |n: usize, s: f64| n as f64 / s;
     println!("batches {} records {records} rows {rows} rejected {rejected} txns {txns} per_txn {per_txn}", bodies.len());
+    println!(
+        "checkpoints: background {} inline {}",
+        railwatch_server::storage::checkpoint::BACKGROUND.load(std::sync::atomic::Ordering::Relaxed),
+        railwatch_server::storage::checkpoint::INLINE.load(std::sync::atomic::Ordering::Relaxed)
+    );
     println!(
         "parse+map: wall {map_wall:.2}s cpu {map_cpu:.2}s  {:.0} events/s  {:.1} cpu-ms/1k events",
         per(records, map_wall),

@@ -15,7 +15,10 @@
 use std::ffi::{c_int, c_long, c_void};
 
 // libmimalloc-sys links these (the mimalloc crate's dependency); its Rust
-// declarations of them need its `extended` feature.
+// declarations of them need its `extended` feature. Named here so binaries
+// that do not make mimalloc their global allocator (the lib's tests) still
+// link it.
+use mimalloc as _;
 unsafe extern "C" {
     fn mi_malloc(size: usize) -> *mut c_void;
     fn mi_free(p: *mut c_void);
@@ -23,6 +26,7 @@ unsafe extern "C" {
     fn mi_usable_size(p: *const c_void) -> usize;
     fn mi_good_size(size: usize) -> usize;
     fn mi_option_set(option: c_int, value: c_long);
+    fn mi_collect(force: bool);
 }
 
 /// mi_option_purge_delay in mimalloc v3's mi_option_e.
@@ -68,6 +72,17 @@ pub fn release(conn: &rusqlite::Connection) {
     // SAFETY: the handle is live for `conn`'s lifetime and used from this
     // thread only (connections are not shared across threads here).
     unsafe { rusqlite::ffi::sqlite3_db_release_memory(conn.handle()) };
+}
+
+/// Gives back the calling thread's free allocator pages. mimalloc keeps a
+/// heap per thread, and a tenant's writer thread allocates its connections'
+/// page caches in its own: freed by `release`, they stayed in that heap
+/// (docs/PERF.md, "Memory per tenant"). A collect from another thread does
+/// not reach them, which is why one every second from a single thread did
+/// nothing (docs/PERF.md, "Memory bounded by configuration", 6).
+pub fn collect_thread() {
+    // SAFETY: no arguments to get wrong; acts on this thread's heap.
+    unsafe { mi_collect(false) }
 }
 
 /// Call first thing in main, before any connection is opened:

@@ -1243,6 +1243,283 @@ What would move it, largest first. None is in this branch:
    Swapping the hasher touches the `rjson::Hash` type in 30+ places, so it
    was not done here.
 
+## Memory per tenant (branch perf/next, on #90 + #89)
+
+Question: why does a Rust server with N quiet apps hold ~6-10 MiB of anonymous memory per
+app, and why does that keep growing at a constant app count?
+
+### Method
+
+- `step.sh` (Track H, kept out of the repo): a fresh data dir, N environments, Track F's
+  `rw-load --profile typical` (production-shaped: a 1-record health batch every 3.75 s per
+  app, ~0.8 data batches/min), 10 min, server in a user systemd unit with MemoryMax=4G, no
+  swap, on 2 CPUs of Archie (shared box, other work running). cgroup memory.stat every 2 s.
+- Attribution: a diagnostic build (never committed) printing every 10 s: RssAnon;
+  /proc/self/smaps summed by mapping kind (mimalloc arenas, other anonymous, mmap'd
+  `.sqlite3`, `-shm`); `sqlite3_db_status` CACHE_USED / SCHEMA_USED / STMT_USED summed over
+  every ingest writer connection and every rollup-worker connection; Rust's live heap (a
+  counting global allocator); the rollup accumulators' bytes; threads by name.
+  "Allocator retained" = mimalloc's anonymous arenas minus every live byte above.
+- Base = #90 + #89 merged (1ede1c8). 250 apps, the same seed, one run each, back to back.
+
+### Where it goes, 250 apps, KiB per app (base)
+
+| component | t=60 s | t=300 s | t=590 s | grows? |
+|---|---:|---:|---:|---|
+| cgroup anon | 2,973 | 4,938 | 6,303 | yes |
+| writer page caches (2.6-3.0 connections per app) | 407 | 800 | 1,186 | **yes, toward cache_size** |
+| rollup-worker page caches (2 connections per app) | 192 | 443 | 602 | **yes** |
+| rollup-worker prepared statements | 154 | 680 | 1,056 | **yes, without bound** |
+| writer prepared statements | 62 | 98 | 109 | slowly |
+| parsed schema, writers (meta + day files) | 226 | 259 | 260 | no (fixed) |
+| parsed schema, rollup worker (union reader + meta) | 335 | 387 | 390 | no (fixed) |
+| Rust heap (incl. accumulators 55-117) | 194 | 241 | 273 | levels off |
+| allocator retained (freed, not returned) | 1,788 | 2,171 | 2,363 | yes, follows the above |
+| thread stacks + libc maps | 37 | 41 | 47 | no |
+
+Not in anon: mmap'd `.sqlite3` pages (1.1-1.7 MiB/app of *file* RSS, reclaimable page cache) and
+the WAL index (`-shm`, 80 KiB/app, shared file pages). Channels were empty at every sample
+(`queued=0`): no backlog anywhere.
+
+### Why it grew
+
+Three things, all measured above:
+
+1. **Page caches never shrank while a tenant was active.** #90 frees a writer's cache after
+   30 s with no batch (`QUIET`), and the worker's at a flush with no work. A typical app sends
+   a health batch every 3.75 s, so neither condition ever held: every active tenant's caches
+   filled toward cache_size (2000 pages = 8 MB per file, writers have meta + today's core +
+   detail) for as long as it stayed active.
+2. **The rollup worker cached one statement per IN-list length.** `ingest_except` builds
+   `... WHERE id IN (?, ?, ...)` with one placeholder per id and prepares it with
+   `prepare_cached`: every distinct batch size is a new cached statement, each a plan over
+   every attached day file's branch of the union views. With production's size spread that is
+   up to hundreds of statements per tenant, 1 MiB per app after 10 min and still climbing
+   (statement cache capacity 256).
+3. **Freed memory stayed in the freeing thread's mimalloc heap.** mimalloc keeps a heap per
+   thread. A writer thread that freed its caches kept the pages in its own heap; they come
+   back to the OS only when that thread allocates or collects. #90 tried `mi_collect` from one
+   thread once a second and saw nothing: a collect only reaches the calling thread's heap.
+
+### What changed
+
+Root causes fixed:
+- **Caches are freed on a clock, not only on silence** (`tenants::TRIM`, 10 s): the writer
+  frees its connections' caches (`Store::quiet`) between transactions every 10 s whatever the
+  traffic, and the worker does the same at a flush for any tenant not trimmed for 10 s. Pages
+  come back through mmap (the file stays in the OS page cache), so refilling is cheap.
+- **One cached statement per power-of-two IN length** (`incremental::ingest_except`): ids are
+  padded with the last id up to the next power of two (IN ignores repeats), so at most 10
+  shapes (1..512, 900) exist per source.
+- **Each thread collects its own heap** (`memory::collect_thread`, `mi_collect(false)`) after
+  it freed caches: the writer after `quiet`, the worker after each flush.
+
+Not changed, still per tenant, and why:
+- **Parsed schema, ~610 KiB per active app** (writer 220 + worker 390): one copy per
+  connection of ~40 tables and ~100 indexes, plus the union reader's views. Fixed per
+  connection, does not grow. Removing it needs fewer connections per tenant (a writer pool
+  shared across tenants, or the worker without its own per-tenant union reader): a design
+  change, not made here.
+- **One OS thread per active tenant writer** (1.1-1.5 threads per app): stacks are lazily
+  touched (~40 KiB per app measured), so this costs little memory but is a design limit.
+- **The rollup accumulators** (#90's 32 MB global budget): ~120 KiB per app at 250 apps.
+
+### After, 250 apps, KiB per app (same run shape)
+
+| | base t=60 s | base t=590 s | next t=60 s | next t=590 s |
+|---|---:|---:|---:|---:|
+| cgroup anon | 2,973 | 6,303 | 1,986 | 4,062 |
+| RssAnon | 3,398 | 6,289 | 1,998 | 3,019 |
+| writer page caches | 407 | 1,186 | 74 | 93 |
+| worker page caches | 192 | 602 | 45 | 47 |
+| worker statements | 154 | 1,056 | 0 | 0 |
+| writer statements | 62 | 109 | 23 | 19 |
+| allocator retained | 1,788 | 2,363 | 1,172 | 1,965 |
+
+Anon MiB over time at 250 apps (cgroup, every 60 s from load start):
+- base: 146, 725, 926, 1036, 1097, 1238, 1290, 1347, 1418, 1463, 1554;
+- next: 103, 484, 556, 586, 613, 636, 642, 676, 684, 714, 725.
+
+The t=590 s column is one 2 s sample. For next it caught a short spike (992 MiB at t=592 s,
+737 MiB by t=596 s and 738 MiB at t=600 s, which is the series' 725 MiB at the 60 s mark);
+base's 1,539 MiB there is not a spike (1,540 MiB at t=599 s).
+
+**It still grows**, more slowly (+240 MiB over the last 9 min against +830), and what grows is
+"allocator retained": the live components above are flat after the change. With
+`MIMALLOC_PURGE_DELAY=0` (one run) anon went 434, 484, 510, 533, 580, 565, 567, 574, 578, 599
+MiB, the same shape at a lower level, so the remainder is not the purge delay either. It is
+not attributed past "mimalloc arenas minus live bytes" by these runs. The blocking-pool and
+THP runs below rule those two out. The heap profile (system allocator, a backlogged run) found
+no program-side leak, but it is not the mimalloc run that grew, so that is not confirmed.
+
+500 apps, 3 min (diagnostic builds, base vs this branch before the collect change):
+steady anon 3,017 vs 2,114 KiB/app; at t=60 s 2,756 vs 2,246 KiB/app; p99 3,164 vs 36 ms.
+
+**Target (< 3 MiB per idle-ish typical tenant): met on RssAnon at 250 apps after 10 min
+(3.0 MiB). On cgroup anon it is met outside the spike (738 MiB at t=600 s, 2.9 MiB per app)
+and not met at the spike's peak (4.0 MiB at t=590 s).**
+
+### Root cause of what still grows (heap profile, blocking pool, THP)
+
+**Heap profile.** heaptrack 1.5.0 on a bench-only build with the system allocator (mimalloc
+cannot be intercepted), 250 apps, 10 min. heaptrack slowed the server enough to drop 4,488
+batches (p99 47 s), so this profiles a backlogged run. Live heap at exit, by what allocated
+it (call stacks folded; SQLite's C frames unwound to the SQLite function):
+
+| what | MiB | KiB per app | per what |
+|---|---:|---:|---|
+| parsed schema (CREATE TABLE/INDEX of each attached file) | 151.8 | 622 | per connection × per attached file |
+| page cache | 63.7 | 261 | per connection |
+| lookaside (SQLite's per-connection small-object arena) | 52.0 | 213 | per connection: 1,502 open, ~35 KiB each |
+| rollup accumulators (Rust) | 50.1 | 205 | #90's 32 MB budget + the hours a backlog keeps open |
+| prepared statements and views | 7.4 | 30 | |
+| everything else | 12.2 | 51 | |
+| **total** | **337** | **1,380** | |
+
+Live heap over the run was flat at 310-430 MiB from t=2 min on (heaptrack's own timeline):
+**the live heap does not grow**. 85% of it is SQLite per-connection state, which is fixed for
+as long as a connection stays open. With 6 connections per active app (1,502 / 250), the
+per-app floor is the connection count.
+
+**Blocking-pool hypothesis: not the cause.** Three 250-app runs on this branch's build
+(mimalloc), back to back, same seed:
+
+| | blocking threads (end) | anon t=60 s | anon t=600 s | growth t=120→600 s | events/s | p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| default pool | 23 | 520 MiB | 619 MiB | +57 MiB | 742 | 14 ms |
+| `max_blocking_threads(8)` | 10 | 464 MiB | 596 MiB | +75 MiB | 736 | 23 ms |
+| cap 8 + THP allowed | 10 | 499 MiB | 607 MiB | +71 MiB | 751 | 21 ms |
+
+Capping the pool did not stop the growth (+75 against +57 MiB, within this box's run-to-run
+spread); it is not kept. The earlier 37 → 123 blocking threads were from runs where the box
+was busier; in these runs the pool stayed at 23.
+
+**THP: not the cause here.** On this branch `PR_SET_THP_DISABLE` (#89) is set: AnonHugePages
+was 0 for the whole default run (sampled every 30 s). With THP allowed (`always` on this box),
+the process held 24-43 MiB of huge pages, all from start-up, none collapsed later
+(khugepaged's pages_collapsed did not move), and the growth was the same. So THP explains
+none of the growth after the first minute on this box; Track F's finding that #89 cut the
+per-tenant jump at 10 apps is consistent with THP inflating the *floor* where mimalloc's
+arenas are sparsely used, and #92 keeps #89's THP-off. Not checked: production's `madvise`
+mode with THP on (#89 measured THP faults there).
+
+**So what is the remaining growth?** In the three runs above it is 57-75 MiB (230-300
+KiB/app) over 8 min, not the 240 MiB of the earlier run (that run's box was busier; same
+binary). The heap profile shows the live heap flat over the same window, so the growth is
+memory the allocator holds beyond live bytes ("allocator retained" in the tables above),
+not anything the program keeps. It slows over time (the default run is flat from 5 min on:
+605, 608, 629, 615, 622, 619 MiB). It is bounded by how much each thread's heap peaked, not
+by run time: a hypothesis from these samples, not shown past them.
+
+**The design cause of the floor: connections per tenant.** Each active per-day tenant holds:
+
+| connection | owner | files | schema KiB |
+|---|---|---:|---:|
+| meta write connection | ingest writer (tenants.rs) | 1 | ~110 |
+| today's core + detail write connections (+ yesterday's for up to FILE_IDLE) | ingest writer | 2-4 | ~110 each |
+| rollup write connection (meta) | rollup worker (jobs/worker.rs) | 1 | ~110 |
+| union reader (meta + every day file attached, + temp views) | rollup worker | 1 conn, 3+ files | ~390 |
+| dashboard readers (pooled, closed after 60 s idle; none in these runs) | dashboard::pool | 0-4 | ~390 each |
+
+Measured: 6.0 open connections per active app (heaptrack, lookaside allocations), schema
+~620 KiB + lookaside ~210 KiB + page cache ~260 KiB per app.
+
+**Design options (written up, not built):**
+
+1. **Rollup worker without per-tenant connections.** The worker's union reader and rollup
+   write connection exist per tenant for as long as it is active (10 min idle). Instead, one
+   worker-owned connection that ATTACHes a tenant's files for a flush and DETACHes after.
+   Saves the worker's ~500 KiB schema + 2 × 35 KiB lookaside + its cache per active app:
+   **~0.6 MiB per app**, ~150 MiB at 250 apps. Cost: re-parsing ~4 files' schemas per tenant
+   per flush (measured 1.4 ms to open and attach meta + 2 day files and parse their schemas;
+   250 tenants × every 5 s ≈ 7% of one core). Changes the worker's structure (its accumulator
+   and incremental reads assume an open reader); not small.
+2. **Writers keep only meta open between transactions.** Day-file connections would open per
+   transaction (0.46 ms each to open and parse one file's schema) instead of for FILE_IDLE.
+   Saves ~2 × (110 + 35) KiB = **~0.3 MiB per app** at a cost of ~1 ms per transaction, which
+   matters to the single-tenant ceiling (≈7k transactions/s at 1 batch per transaction).
+   Could be limited to tenants whose last transaction is older than a few seconds.
+3. **A writer pool shared across tenants** (N threads, each owning connections for tenants
+   assigned to it) changes nothing on its own: the schema is per connection, not per thread.
+   It removes ~1 thread per app (stacks measured at ~40 KiB per app), so **~0.04 MiB per app**.
+4. **`SQLITE_DEFAULT_LOOKASIDE` smaller** (e.g. 64 × 128 B instead of 1200 × 100) would save
+   ~30 KiB per connection, **~0.2 MiB per app**, a compile flag (libsqlite3-sys's build reads
+   `LIBSQLITE3_FLAGS`). Small; not measured for speed.
+
+Together 1 + 2 + 4 would take an active app from ~1.4 MiB of live SQLite heap to ~0.3-0.4.
+
+### Throughput (Track C's cases through bench/memory/apps50.sh, 3 runs each, interleaved)
+
+Shared box, RAILWATCH_SQLITE_SYNC=off, 2 CPUs; median (min-max).
+
+| case | base events/s | next events/s | base peak / after anon MiB | next peak / after anon MiB |
+|---|---:|---:|---:|---:|
+| max-50app | 13,889 (13,322-13,900) | 17,211 (15,367-17,822) | 800 / 741 | 589 / 307 |
+| max-1app | 4,467 (3,689-4,767) | 4,667 (3,889-5,211) | 131 / 82 | 136 / 82 |
+
+"next" is the whole branch (this section and the next). No regression in either case
+(the 5% bar). max-50app was ~24% faster; this run did not split that gain between the memory
+and the write-path changes, and the run-to-run spread on this box is ~15%.
+
+## Write path: background checkpoints with a WAL cap, no savepoint per batch (branch perf/next)
+
+The two writer costs "Ingest floor" above measured and left unbuilt.
+
+### Background checkpointer (storage/checkpoint.rs)
+
+- Every ingest write connection (single file, meta, each day file) gets a WAL hook in place
+  of SQLite's autocheckpoint. At 1000 WAL pages (the autocheckpoint's own threshold) it asks
+  **one** checkpointer thread for the whole process (not one per tenant: a thread per
+  tenant would add to the per-tenant cost above) to run a PASSIVE checkpoint on a short-lived
+  connection of its own. The writer goes on committing.
+- **Hard cap:** at 8000 pages (32 MB of 4 KB pages) the writer checkpoints inline, as the
+  autocheckpoint would, waiting up to ~1 s if the checkpointer holds the file. The cap is best
+  effort: PASSIVE cannot copy frames a reader still needs, so a long reader can still hold a
+  WAL past it (logged as "WAL over its cap", once a minute at most); that was true of the
+  autocheckpoint too. If the checkpointer still holds the file after ~1 s, or the checkpoint
+  fails, the commit goes on and the WAL grows until the next one. journal_size_limit (64 MB) still truncates after a reset.
+- Tests: `the_wal_is_checkpointed_in_the_background_and_capped` (200 commits of ~200 pages;
+  the WAL file never passes the cap plus one commit, every row is there),
+  `a_request_is_checkpointed_by_the_thread`.
+
+### No SAVEPOINT per batch, with a retry path (tenants::process)
+
+- A coalesced group is written with no savepoints (`Store::write_unguarded`). If every
+  batch succeeds, the group commits as before.
+- If one fails, the whole transaction rolls back and the group is written again with a
+  SAVEPOINT per batch (`Store::write`, the old path), so the failing batch rolls back alone and
+  the others commit. Retries are counted (`tenants::GUARDED_GROUPS`).
+- A batch written twice must write the same thing twice. `with_query_shapes` blanks each
+  query's `sql` in the batch's rows as it moves the text to `query_shapes`, so a second write
+  would have stored no shapes. The shapes are now kept on the batch (`Prepared::query_shapes`)
+  after the first write.
+- Tests (tenants.rs): `a_poisoned_batch_in_a_group_fails_alone_and_the_rest_commit_per_day`
+  and `..._single_file`: 8 batches in one group, 2 poisoned (a bignum Dropped header, which
+  fails the ingest_batches insert after the batch's rows went in); the 2 answer the error, the
+  6 commit, and exactly 6 queries, logs, ingest_batches rows and query_shapes are stored, with
+  6 follow-ups. `a_clean_group_commits_on_the_fast_path`. The existing HTTP test
+  `a_failing_batch_rolls_back_alone_when_coalesced` and tests/storage_crash.rs pass unchanged.
+- The floor (`rw-ingest-floor`, 800 rw-load bodies, seed 1, one thread pinned to CPU 14,
+  files on tmpfs so fsync is out of it, synchronous=normal; base = 1ede1c8, next = this
+  branch; 3 runs each, alternating; median (min-max); write stage only):
+
+  | batches per txn | base events/s | next events/s | base CPU-ms / 1k | next CPU-ms / 1k | checkpoints background / inline |
+  |---:|---:|---:|---:|---:|---:|
+  | 1 | 28,847 (27,992-29,698) | 34,332 (33,241-34,845) | 34.5 (33.5-35.5) | 20.8 (20.4-21.5) | ~1,010 / ~127 |
+  | 8 | 40,092 (38,460-40,950) | 47,125 (46,937-48,645) | 24.8 (24.2-25.8) | 19.2 (18.6-19.3) | ~125 / ~63 |
+  | 30 | 54,058 (53,094-54,662) | 72,372 (72,176-73,716) | 18.4 (18.2-18.7) | 13.2 (12.9-13.2) | 31 / 21 |
+
+  Ranges do not overlap. The writer thread's CPU fell 22-40%; part of that moved to the
+  checkpointer thread (not counted in "CPU-ms" here, which is the writer thread's own).
+  With a writer that does nothing but write, the one checkpointer falls behind and a third to
+  two fifths of checkpoints still run inline at the cap. A real server's writer also waits on
+  requests, so it should be fewer there; not measured. Not measured on a real disk either:
+  the shared btrfs runs on this box were dominated by other work's fsyncs
+  (200-500 s walls for 800 batches), so they are not reported.
+- Checked that the tests catch the bugs they are for: without the rollback before the retry,
+  both poisoned-group tests fail (8 ledger rows, not 6); without keeping the shapes, both fail
+  (4 query_shapes, not 6).
+
 ## Proposals
 
 None of these is implemented.
