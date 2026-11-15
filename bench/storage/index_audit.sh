@@ -16,6 +16,7 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BIN=${BIN_DIR:-$ROOT/target/release} PORT=${PORT:-8812}
+mkdir -p /dev/shm/rwps
 W=${1:-$(mktemp -d /dev/shm/rwps/audit.XXXX)}
 mkdir -p "$W"
 export RAILWATCH_DATA_DIR=$W/data RAILWATCH_RATE_LIMIT_ENV=0 PORT
@@ -29,7 +30,12 @@ tok=$("$BIN/railwatch" env create e1 | grep -o 'rw_[A-Za-z0-9]*')
 "$BIN/railwatch" serve > "$W/server.log" 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null || true; wait $pid 2>/dev/null || true; [ -n "${KEEP:-}" ] || rm -rf "$W"' EXIT
-until curl -sf "127.0.0.1:$PORT/up" >/dev/null; do sleep 0.1; done
+deadline=$((SECONDS + 60))
+until curl -sf --max-time 2 "127.0.0.1:$PORT/up" >/dev/null; do
+  kill -0 $pid 2>/dev/null || { echo "server exited before /up" >&2; tail -n 20 "$W/server.log" >&2; exit 1; }
+  [ "$SECONDS" -lt "$deadline" ] || { echo "server not up after 60 s" >&2; tail -n 20 "$W/server.log" >&2; exit 1; }
+  sleep 0.1
+done
 python3 -I "$ROOT/bench/diff/post.py" "http://127.0.0.1:$PORT/ingest" "$tok" "$W/batches" "$W/acks.json"
 # The deploys too: the release, deploy and compare reads filter by them.
 python3 -I - "$W/batches/deploys.json" "$tok" "$PORT" <<'PY'
@@ -58,9 +64,10 @@ PY
 python3 -I "$ROOT/bench/diff/props/make_cases.py" "$W/single.sqlite3" "$W/control.json" "$W/props.json" > /dev/null
 python3 -I "$ROOT/bench/diff/mcp/make_cases.py" "$W/single.sqlite3" "$W/data/control.sqlite3" 1 "$W/mcp.json"
 python3 -I "$ROOT/bench/diff/api/make_cases.py" "$W/single.sqlite3" "$W/data/control.sqlite3" 1 "$MEMBER" "$W/api.json"
-RW_SQL_TRACE=1 "$BIN/props-dump" "$T" "$W/props.json" "$W/control.json" "$NOW" 1 "$W/props.out.json" 0 2> "$W/props.trace" > /dev/null || true
-RW_SQL_TRACE=1 "$BIN/mcp-dump" "$W/data" "$W/mcp.json" "$NOW" "$W/mcp.out.json" 0 2> "$W/mcp.trace" > /dev/null || true
-RW_SQL_TRACE=1 "$BIN/api-dump" "$W/data" "$W/api.json" "$NOW" "$W/api.out.json" 0 2> "$W/api.trace" > /dev/null || true
+# A dump exits 0 with non-2xx cases in its output; any other exit is an aborted capture.
+RW_SQL_TRACE=1 "$BIN/props-dump" "$T" "$W/props.json" "$W/control.json" "$NOW" 1 "$W/props.out.json" 0 2> "$W/props.trace" > /dev/null
+RW_SQL_TRACE=1 "$BIN/mcp-dump" "$W/data" "$W/mcp.json" "$NOW" "$W/mcp.out.json" 0 2> "$W/mcp.trace" > /dev/null
+RW_SQL_TRACE=1 "$BIN/api-dump" "$W/data" "$W/api.json" "$NOW" "$W/api.out.json" 0 2> "$W/api.trace" > /dev/null
 for f in props mcp api; do echo "$f: $(grep -c ^SQLTRACE "$W/$f.trace") statements traced, $(python3 -I -c "import json,sys;d=json.load(open(sys.argv[1]));print(len(d), 'cases,', sum(1 for v in d.values() if isinstance(v, dict) and str(v.get('status','200'))[0] not in '2'), 'not 2xx')" "$W/$f.out.json")"; done
 "$BIN/plan-audit" "$T" "$W/props.trace" "$W/mcp.trace" "$W/api.trace" > "$W/report.json"
 python3 -I - "$W/report.json" <<'PY'
