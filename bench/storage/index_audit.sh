@@ -20,10 +20,13 @@ mkdir -p /dev/shm/rwps
 W=${1:-$(mktemp -d /dev/shm/rwps/audit.XXXX)}
 mkdir -p "$W"
 export RAILWATCH_DATA_DIR=$W/data RAILWATCH_RATE_LIMIT_ENV=0 PORT
-NOW=$(date +%s)
-if [ ! -f "$W/batches/manifest.json" ]; then
+# The batches are timestamped relative to NOW, so a reused work dir keeps its NOW.
+if [ -f "$W/batches/manifest.json" ] && [ -f "$W/batches/now" ]; then NOW=$(cat "$W/batches/now"); else
+  rm -rf "$W/batches"
+  NOW=$(date +%s)
   python3 -I "$ROOT/bench/diff/props/gen_tenant.py" "$ROOT/crates/server/tests/fixtures/wire_fixtures.json" "$W/batches" --now "$NOW" \
     --spread-days 8 --executions 60000 --seed 5 --records-per-batch 2000 --shapes 2000 --tenants 50 --uniform --by-time --few-logs --prod-shape --sessions
+  echo "$NOW" > "$W/batches/now"
 fi
 rm -rf "$W/data" "$W/single.sqlite3"
 tok=$("$BIN/railwatch" env create e1 | grep -o 'rw_[A-Za-z0-9]*')
