@@ -4,6 +4,11 @@
 //!   rw-rollup FILE all [--seed N]            # every hour with raw rows
 //!   rw-rollup FILE HOUR_EPOCH... [--seed N]  # given hours
 //!
+//! FILE may be a per-day directory: rows are read through the union reader
+//! (storage::reader) and the rollups written to its meta file, which is how
+//! a bench tenant whose flushes failed under load is settled
+//! (bench/perf/dashboard.sh).
+//!
 //! --seed N: a Ruby MT stream per hour, seeded like `srand(N + hour index)`,
 //! which is what bench/diff/rollup_rails.rb does on the Rails side. Without
 //! it each group gets its own stream (the server's mode).
@@ -28,9 +33,15 @@ fn main() {
             i += 1;
         }
     }
-    let conn = railwatch_server::tenants::open_tenant(std::path::Path::new(file)).expect("open tenant");
+    let path = std::path::Path::new(file);
+    let (read, conn) = if path.is_dir() {
+        let meta = railwatch_server::tenants::open_tenant(&railwatch_server::storage::layout::meta_path(path)).expect("open meta");
+        (railwatch_server::storage::reader::open(path).expect("open per-day tenant").0, meta)
+    } else {
+        (railwatch_server::tenants::open_tenant(path).expect("open tenant"), railwatch_server::tenants::open_tenant(path).expect("open tenant"))
+    };
     let hours: Vec<i64> = if hours_arg == ["all"] {
-        rollup_job::hours_with_rows(&conn).expect("hours")
+        rollup_job::hours_with_rows(&read).expect("hours")
     } else {
         hours_arg.iter().map(|h| h.parse().expect("hour epoch")).collect()
     };
@@ -43,8 +54,8 @@ fn main() {
             Some(r) => rollup_job::Rng::Shared(r),
             None => rollup_job::Rng::PerGroup,
         };
-        let n = rollup_job::perform(&conn, &conn, *h, &mut rng).expect("rollup");
-        let rh = release_health_rollup_job::perform(&conn, &conn, *h, i64::MIN).expect("release health");
+        let n = rollup_job::perform(&read, &conn, *h, &mut rng).expect("rollup");
+        let rh = release_health_rollup_job::perform(&read, &conn, *h, i64::MIN).expect("release health");
         groups += n;
         eprintln!("hour {h}: {n} rollup rows, {} release_health rows, {:.1} ms", rh.unwrap_or(0), t.elapsed().as_secs_f64() * 1e3);
     }

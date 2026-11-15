@@ -1520,6 +1520,200 @@ The two writer costs "Ingest floor" above measured and left unbuilt.
   both poisoned-group tests fail (8 ledger rows, not 6); without keeping the shapes, both fail
   (4 query_shapes, not 6).
 
+## Cold dashboard reads (branch perf/dashboard-speed, from main ad5a091)
+
+The question: why do cold dashboard and MCP reads take 1-3.5 s (the cold
+numbers in "Security filters" and "Security reads" above), and can the main
+pages (overview, requests, queries, jobs, issues) and MCP tools
+(list_slow_routes, get_route, search_requests, list_issues) get under
+300 ms cold and 100 ms warm. **Not met.** One fix shipped (day files outside
+the window are no longer opened by the per-file reads); the cost that
+remains is described below with what would remove it.
+
+### Harness
+
+`bench/perf/dashboard.sh` (ingest / run / report) around `page-replay`,
+which now times each case (`OUT.json.timings.json`: `first` call, sorted
+warm calls, and `first_read_bytes`, what the first call read from storage
+per /proc/self/io, mmap faults included) and takes POST cases (MCP through
+the real `/mcp` route with a bearer token). `cases.py` writes the 20 cases:
+the five pages and four tools (search_requests plain and `status:5xx`) at
+7d and 30d. Cold: the data dir's files dropped from the page cache
+(`evict.py`: fdatasync + `posix_fadvise(DONTNEED)`, no root; 0.0 MiB still
+resident by mincore after every eviction), a fresh process, that one case
+first. Warm: one process, 1 + 5 calls per case, first dropped, median.
+`report.py` checks the outputs are identical across binaries (ignoring the
+session id page-replay signs in with). `rw-rollup` now takes a per-day
+directory, to settle a bench tenant whose server flushes failed.
+
+### Tenant (scaled down, and why)
+
+`gen_tenant.py --prod-shape --uniform --by-time --few-logs --shapes 2000
+--tenants 50`, 30 days ending 2026-11-05 11:00 UTC: 40k executions a day,
+~205k stored rows a day (2.0M in all), 2.5 GB over 21 core + 5 detail day
+files and a 253 MB meta. The 1.7M events/day asked for was generated
+(2.24M executions over 7 days), but posting it to one server on this
+machine ran at ~2 days of data per 20 min with the box at load 15-23 and
+I/O pressure ~50% (other sessions' builds and benches): the 7 busy days
+would have taken hours, and the server's rollup flushes failed on
+"database is locked" ~5 times a minute throughout. So: **about 1/8 of the
+asked-for daily volume**, the busy days dropped, every hour's rollups
+recomputed from the rows afterwards (`rw-rollup DIR all`: request rollup
+counts equal raw counts on every day checked). Every row was checked to be
+in the day file its occurred_at names (3.4M rows, 0 elsewhere).
+
+**File system.** Cold numbers were taken on ext4 (a loop image, as
+production's /dev/sda1 is ext4), not on this machine's btrfs with
+`compress=zstd`: on btrfs a cold mmap fault reads a whole 128 KiB
+compressed extent, and the same cases read 3-8x the bytes (overview@7d
+146 MiB on btrfs vs 18 MiB on ext4 on an earlier tenant). Bench cold
+numbers on a compressed btrfs say little about production.
+
+### What a cold read costs (profiled)
+
+Per statement, bytes read (`RW_SQL_PROFILE` plus /proc/self/io), on an
+earlier 9-day tenant, ext4, evicted:
+
+| page@7d | statement | MiB read |
+|---|---|---:|
+| queries | slowest-queries page, per day file | 98.5 |
+| queries | rollups fold (`Groups::between`) | 70.2 |
+| queries | n+1s, per day file | 33.6 |
+| jobs | queue stats, per day file | 66.0 |
+| jobs | rollups fold | 11.8 |
+| overview | rollups fold | 16.6 |
+
+And the same pages with mmap off (`PRAGMA mmap_size = 0`, a probe build;
+not shipped): overview@7d 18.1 -> 8.2 MiB, jobs@7d 92.6 -> 6.8 MiB,
+queries@7d 215 -> 93 MiB, get_route@7d 137 -> 11 MiB,
+search_requests status:5xx@7d 200 -> 43 MiB. **Most cold bytes are mmap
+fault-around and readahead, not pages SQLite asked for.** A 1-byte touch
+every 1 MiB of a 61 MB day file through mmap read 63 MiB (the whole file).
+Wall time did not fall with the bytes on this box (get_route 4.3 s with
+mmap, 5.7 s without), because a read() per page under 50% I/O pressure is
+slow too; on an idle disk the 10x fewer bytes should win, but that was not
+measured.
+
+Other findings:
+
+- **Opening the reader is ~45 ms warm and 0.2-2.7 s cold.** ATTACH of each
+  of 26-90 files reads its header and first schema pages; the WAL of every
+  day file (production: 15 to 23 small WALs per tenant) adds its index
+  build. The schema of a day file is 12 pages spread from page 1 to 153.
+- The busiest per-file statements (queue stats, slowest queries, n+1s,
+  tenant counts) read every file of the window, each through its own index.
+  Over 7 days that is 7 B-tree descents per index per page, which cold is
+  7x the random reads.
+- Warm, every page and tool but queries is under 100 ms (overview 30-50,
+  requests 9-22, jobs 17-41, MCP 1-87 ms). queries@7d is ~300 ms and
+  queries@30d ~450 ms warm: the rollups fold over 204k and 612k query
+  rollup rows (docs: "Rollup reads", "Covering index on rollups").
+
+### What changed
+
+**Day files outside the window are not read** (`storage::reader::within`).
+The per-file paths (`reader::per_file`, `aggregate`, `aggregate_hinted`,
+`count_where`) put one branch per day file into the statement, every file
+of the retention period, whatever the window: a 7-day queue-stats read
+touched all 30 core files' indexes. The writer puts every row in the file
+of its own occurred_at's day (`DayWriter::route`, `day_of`; split and
+exemplars keep that), so a file of another day holds none of the window's
+rows; those branches are dropped. `aggregate` and `count_where` now take
+the window; `aggregate_hinted`'s hint, already carrying it, is required.
+Tables whose day column is not occurred_at (processes, health_samples,
+ingest_batches) keep every file. When no file's day is in the window the
+newest file stays, so the statement keeps its shape.
+
+Tests: `within_keeps_the_window_days_only` (inclusive edges, the empty
+case, other day columns), and `per_day_pages_equal_the_single_file` gains
+three custom windows (inside one past day, across a day boundary, before
+any data) on which logs, queries, jobs, people, profiles and tenants must
+equal the single file. All 20 bench outputs byte-identical before and after.
+
+### Results (ms; cold: 3 runs, each the first call of a fresh process on evicted files; warm: median of 3 rounds' medians)
+
+ext4 loop image, release builds, CPUs 8-11, rounds interleaved
+before/after; load average 15-23 throughout. Before is main ad5a091 with
+this branch's page-replay.
+
+| case | before cold | before MiB | before warm | after cold | after MiB | after warm |
+|---|---|---:|---:|---|---:|---:|
+| overview@7d | 372 / 2557 / 2068 | 106.5 | 29.1 | 2401 / 2660 / 2875 | 106.5 | 29.5 |
+| requests@7d | 256 / 611 / 715 | 101.5 | 9.1 | 1332 / 2546 / 1895 | 101.5 | 9.2 |
+| queries@7d | 1309 / 2382 / 2688 | 392.6 | 343.6 | 3078 / 9513 / 5983 | 372.5 | 296.8 |
+| jobs@7d | 790 / 1940 / 1960 | 199.1 | 19.5 | 4079 / 6616 / 6429 | 191.0 | 16.8 |
+| issues@7d | 8 / 3 / 15 | 0.1 | 0.6 | 5 / 26 / 1 | 0.1 | 0.4 |
+| list_slow_routes@7d | 368 / 2082 / 614 | 101.4 | 3.3 | 3120 / 1145 / 668 | 101.4 | 2.5 |
+| get_route@7d | 3112 / 4933 / 1137 | 318.2 | 12.1 | 6935 / 9689 / 11631 | 318.2 | 11.1 |
+| search_requests@7d | 254 / 675 / 330 | 92.1 | 1.3 | 882 / 2157 / 354 | 92.1 | 1.2 |
+| search_requests status:5xx@7d | 2677 / 10230 / 2801 | 321.4 | 34.7 | 23642 / 39244 / 3855 | 322.8 | 32.8 |
+| list_issues@7d | 7 / 3 / 4 | 0.0 | 0.4 | 5 / 63 / 4 | 0.7 | 0.3 |
+| overview@30d | 581 / 13878 / 733 | 110.1 | 50.7 | 3773 / 4310 / 899 | 110.1 | 47.7 |
+| requests@30d | 598 / 2581 / 751 | 107.1 | 23.9 | 3236 / 9142 / 650 | 107.1 | 22.3 |
+| queries@30d | 3285 / 7855 / 4181 | 599.2 | 467.0 | 6231 / 12635 / 2491 | 599.2 | 443.7 |
+| jobs@30d | 3477 / 8218 / 1923 | 361.5 | 46.1 | 6424 / 14392 / 1403 | 361.5 | 41.1 |
+| issues@30d | 3 / 55 / 3 | 0.1 | 0.4 | 3 / 56 / 1 | 0.1 | 0.4 |
+| list_slow_routes@30d | 406 / 4291 / 1646 | 107.1 | 8.1 | 811 / 4217 / 574 | 107.1 | 7.3 |
+| get_route@30d | 1327 / 11270 / 2019 | 323.0 | 16.5 | 1881 / 8019 / 1239 | 323.0 | 13.1 |
+| search_requests@30d | 399 / 1491 / 340 | 95.2 | 1.4 | 344 / 4006 / 250 | 95.2 | 1.2 |
+| search_requests status:5xx@30d | 6522 / 64533 / 7315 | 706.1 | 100.8 | 8795 / 75775 / 5953 | 706.1 | 83.6 |
+| list_issues@30d | 3 / 5 / 4 | 0.0 | 0.4 | 10 / 11 / 10 | 0.0 | 0.3 |
+
+How to read it:
+
+- **Cold wall times on this box are noise**: the same binary's three runs
+  of one case differ up to 10x (overview@30d before: 581, 13878, 733 ms),
+  and the after runs happened to land in a busier stretch. The bytes read
+  are stable to the 0.1 MiB across runs and binaries, so they are the
+  measure here. Cold before/after wall times are not a valid comparison.
+- **Bytes**: the window fix took queries@7d from 393 to 373 MiB and
+  jobs@7d from 199 to 191 MiB. Small, because on this tenant the 7d
+  window's day files are most of what the page reads anyway; the files it
+  skips were the other 23 days' index roots. At 30d nothing changes (every
+  file is in the window). The fix matters most for short windows on long
+  retention (24h or 1h over 30-90 days of files), which these cases do not
+  include.
+- **Warm**: every page and tool but queries is under 100 ms before and
+  after (search_requests status:5xx@30d is 84-101 ms). queries is 297 ms
+  at 7d and 444 ms at 30d, warm, the rollups fold.
+- Issues and list_issues read the control DB only: 0-1 MiB, single-digit
+  ms cold and warm.
+
+### Not done, and what would hit the target
+
+The 300 ms cold target needs fewer bytes per cold read, and the bytes are
+in Track A's and Track B's areas, so this branch describes them instead of
+changing them:
+
+1. **mmap off for union readers, or a small mmap** (Track A,
+   `storage/reader.rs` attach pragmas and `dashboard/pool.rs`). 5-50x fewer
+   bytes per cold page above. The cost is warm time (`docs/DIFFERENCES.md`
+   #3: mmap was taken for warm reads on a 2.4 GB single file, people@7d
+   174 -> 110 ms) and a page cache per connection to size. Needs a warm and
+   cold A/B on an idle ext4 box before choosing; this box could not give
+   one.
+2. **`MADV_RANDOM` on the mapped day files**, if mmap stays: stops kernel
+   fault-around reading 16+ pages for each one SQLite touches. Needs a
+   VFS-level hook; SQLite does not expose one.
+3. **A daily rollup tier** (Track B, schema): queries@30d warm is 444 ms
+   because the fold reads 612k hourly rows; the same 30 days as daily rows
+   are 42k (the "What would" note under "Covering index on rollups"). The same
+   change cuts the cold rollup bytes (70 MiB of queries@7d).
+4. **Checkpoint closed day files' WALs** (Track B / ingest): attaching a
+   file with a WAL builds its WAL index on open; 23 small WALs per tenant
+   in production. The background index pass already does
+   `wal_checkpoint(TRUNCATE)` on the days it builds; a pass over closed days
+   that have a WAL would make every cold ATTACH a header read only.
+5. **A summary cache** for overview/requests/list_slow_routes keyed by
+   (tenant, window, rollups' max(id)) was considered and not built: warm
+   they are already 3-50 ms, and a cold process has an empty cache by
+   definition.
+
+### Ingest
+
+Untouched: no write path changed (the reader and the page-replay harness
+only). Ingest throughput was not re-measured.
+
 ## Proposals
 
 None of these is implemented.

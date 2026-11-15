@@ -226,6 +226,7 @@ fn class_latency(conn: &Connection, from: i64, to: i64) -> rusqlite::Result<Vec<
     let per_file = crate::storage::reader::aggregate(
         conn,
         "executions",
+        (from, to),
         "SELECT \"executions\".\"group_hash\" AS g, MAX(\"executions\".\"queue\") AS q, SUM(queue_latency) AS lat, COUNT(queue_latency) AS lat_n FROM {t} \
          WHERE \"executions\".\"kind\" = ?1 AND \"executions\".\"occurred_at\" BETWEEN ?2 AND ?3 GROUP BY \"executions\".\"group_hash\"",
         "SELECT g, MAX(q), CAST(SUM(lat) AS REAL) / SUM(lat_n) FROM {u} GROUP BY g",

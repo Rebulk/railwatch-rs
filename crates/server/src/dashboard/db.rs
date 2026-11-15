@@ -154,12 +154,13 @@ pub fn count<P: Params>(conn: &Connection, sql: &str, params: P) -> rusqlite::Re
 }
 
 /// `SELECT COUNT(*) FROM "<table>" WHERE <cond>` (`cond` with `?1`...
-/// binds). Over a per-day tenant each day file counts its own rows and the
-/// counts are added (storage::reader::aggregate), which gives the same
-/// number without the union materializing every row.
-pub fn count_where(conn: &Connection, table: &str, cond: &str, binds: &[Sql]) -> rusqlite::Result<i64> {
+/// binds, bounding occurred_at to `window`, epoch micros). Over a per-day
+/// tenant each day file of the window counts its own rows and the counts are
+/// added (storage::reader::aggregate), which gives the same number without
+/// the union materializing every row.
+pub fn count_where(conn: &Connection, table: &str, window: (i64, i64), cond: &str, binds: &[Sql]) -> rusqlite::Result<i64> {
     let inner = format!("SELECT COUNT(*) AS n FROM {{t}} WHERE {cond}");
-    if let Some(rows) = crate::storage::reader::aggregate(conn, table, &inner, "SELECT SUM(n) FROM {u}", binds)? {
+    if let Some(rows) = crate::storage::reader::aggregate(conn, table, window, &inner, "SELECT SUM(n) FROM {u}", binds)? {
         return Ok(rows.first().and_then(|r| r.i("SUM(n)")).unwrap_or(0));
     }
     count(conn, &format!("SELECT COUNT(*) FROM \"{table}\" WHERE {cond}"), rusqlite::params_from_iter(binds.iter()))

@@ -1043,7 +1043,7 @@ fn requests_aggregate(conn: &Connection, (from, to): (i64, i64), inner: &str, ou
     let binds: [rusqlite::types::Value; 2] = [qt(from).into(), qt(to).into()];
     let index = crate::schema::REQUEST_INDEX;
     let hint = crate::storage::reader::Hint { window: (from, to), inside: index, outside: index };
-    if let Some(rows) = crate::storage::reader::aggregate_hinted(conn, "executions", Some(hint), inner, outer, &binds)? {
+    if let Some(rows) = crate::storage::reader::aggregate_hinted(conn, "executions", hint, inner, outer, &binds)? {
         return Ok(rows);
     }
     let table = filter_query::request_index(conn)?.unwrap_or_else(|| "\"executions\"".into());

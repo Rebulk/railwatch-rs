@@ -618,7 +618,7 @@ pub fn list(conn: &Connection, (from, to): (i64, i64), user: Option<&str>, has_e
          WHERE \"executions\".\"kind\" = 'request' AND {sid} IS NOT NULL AND \"executions\".\"occurred_at\" BETWEEN ?1 AND ?2 GROUP BY 1, 2"
     );
     let hint = crate::storage::reader::Hint { window: (from, to), inside: crate::schema::SESSION_INDEX, outside: "index_executions_on_kind_and_occurred_at" };
-    let rows = match crate::storage::reader::aggregate_hinted(conn, "executions", Some(hint), &inner, "SELECT * FROM {u}", &binds)? {
+    let rows = match crate::storage::reader::aggregate_hinted(conn, "executions", hint, &inner, "SELECT * FROM {u}", &binds)? {
         Some(rows) => rows,
         None => {
             let table = filter_query::session_index(conn)?.unwrap_or_else(|| "\"executions\"".into());
@@ -636,7 +636,7 @@ pub fn list(conn: &Connection, (from, to): (i64, i64), user: Option<&str>, has_e
          group_concat(DISTINCT \"visits\".\"user_ref\") AS \"users\" \
          FROM {t} WHERE \"visits\".\"session_id\" IS NOT NULL AND \"visits\".\"occurred_at\" BETWEEN ?1 AND ?2 GROUP BY 1, 2";
     let hint = crate::storage::reader::Hint { window: (from, to), inside: "index_visits_on_occurred_at", outside: "index_visits_on_occurred_at" };
-    let rows = match crate::storage::reader::aggregate_hinted(conn, "visits", Some(hint), inner, "SELECT * FROM {u}", &binds)? {
+    let rows = match crate::storage::reader::aggregate_hinted(conn, "visits", hint, inner, "SELECT * FROM {u}", &binds)? {
         Some(rows) => rows,
         None => db::query(conn, &inner.replace("{t}", "\"visits\""), rusqlite::params_from_iter(binds.iter()))?,
     };

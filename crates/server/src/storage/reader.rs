@@ -250,6 +250,24 @@ pub fn branches(conn: &Connection, table: &str) -> rusqlite::Result<Vec<Branch>>
     Ok(files)
 }
 
+/// The branches whose day can hold a row with occurred_at in [lo, hi] (epoch
+/// micros). The writer puts every row in the file of its own occurred_at's
+/// day (writer.rs `route`, `day_of`; split and exemplars keep it), so a file
+/// of another day has none: a 7-day read paged in every file of the 30 days
+/// kept. Only for tables whose day column is occurred_at
+/// (layout::day_column). When no file's day is in the window, the newest
+/// file stays as the one branch, so the statement keeps its shape (and
+/// finds no row there either).
+pub fn within(files: Vec<Branch>, table: &str, (lo, hi): (i64, i64)) -> Vec<Branch> {
+    if layout::day_column(table) != "occurred_at" {
+        return files;
+    }
+    let (from_day, to_day) = (crate::time::quoted_date_micros(lo)[..10].to_string(), crate::time::quoted_date_micros(hi)[..10].to_string());
+    let newest = files.iter().max_by(|a, b| a.day.cmp(&b.day)).cloned();
+    let kept: Vec<Branch> = files.into_iter().filter(|f| f.day >= from_day && f.day <= to_day).collect();
+    if kept.is_empty() { newest.into_iter().collect() } else { kept }
+}
+
 /// `cond_sql` for one day file: `logs_fts` (filter_query's full-text term)
 /// names that file's own index. A log's FTS entry is always in the file that
 /// holds the log (ingest, exemplars and export index per file), so the
@@ -266,10 +284,11 @@ pub fn pair_fts(cond_sql: &str, alias: &str) -> String {
 /// bounds) spans the file's whole day. `binds` repeat per branch. None when
 /// there is no day file (the view, over meta's empty table, is as cheap).
 ///
-/// Every file is read, so the rows are the view's rows whatever a file
-/// holds; what this buys is that a page's ORDER BY ... LIMIT and GROUP BY run
-/// inside each file on its own indexes, instead of over the union's rows.
-/// `covered` only picks a plan (an index hint); it never drops a row.
+/// Every file whose day [lo, hi] touches is read (`within`), so the rows are
+/// the view's rows; what this buys is that a page's ORDER BY ... LIMIT and
+/// GROUP BY run inside each file on its own indexes, instead of over the
+/// union's rows. `covered` only picks a plan (an index hint). `cond_sql` must
+/// bound occurred_at to [lo, hi].
 pub fn per_file(
     conn: &Connection,
     table: &str,
@@ -278,7 +297,7 @@ pub fn per_file(
     binds: &[rusqlite::types::Value],
     branch: impl Fn(&Branch, bool, &str) -> String,
 ) -> rusqlite::Result<Option<(String, Vec<rusqlite::types::Value>)>> {
-    let files = branches(conn, table)?;
+    let files = within(branches(conn, table)?, table, (lo, hi));
     if files.is_empty() {
         return Ok(None);
     }
@@ -316,8 +335,10 @@ fn renumber(sql: &str, by: usize) -> String {
 /// `inner` is one file's statement with `{t}` where the table goes (each
 /// branch reads `<file>."table" AS "table"`, so qualified column names
 /// resolve), `outer` combines the branches, read as `{u}`. `binds` are the
-/// inner statement's, numbered `?1`... and repeated per branch. None on a
-/// single file or before any day file exists: run the plain statement.
+/// inner statement's, numbered `?1`... and repeated per branch. `window`
+/// (epoch micros) is the occurred_at range `inner` reads: only the files of
+/// its days are read (`within`). None on a single file or before any day
+/// file exists: run the plain statement.
 ///
 /// Through the views, SQLite runs an aggregate over the union's rows (it
 /// does not push GROUP BY or COUNT into the branches), materializing every
@@ -325,11 +346,12 @@ fn renumber(sql: &str, by: usize) -> String {
 pub fn aggregate(
     conn: &Connection,
     table: &str,
+    window: (i64, i64),
     inner: &str,
     outer: &str,
     binds: &[rusqlite::types::Value],
 ) -> rusqlite::Result<Option<Vec<crate::dashboard::db::Rec>>> {
-    aggregate_hinted(conn, table, None, inner, outer, binds)
+    aggregate_over(conn, table, window, None, inner, outer, binds)
 }
 
 /// The indexes `aggregate_hinted` names: `inside` in the files whose day
@@ -341,7 +363,8 @@ pub struct Hint<'a> {
     pub outside: &'a str,
 }
 
-/// `aggregate` with `INDEXED BY` on every branch. In the window's files a
+/// `aggregate` with `INDEXED BY` on every branch (`hint.window` is the
+/// statement's occurred_at range). In the window's files a
 /// covering index filtered on occurred_at beats the planner's occurred_at
 /// range, which reads every row of the range from the table (people@7d
 /// 111 -> 20 ms, the tenants' log counts 222 -> 49 ms). In the others the
@@ -354,6 +377,18 @@ pub struct Hint<'a> {
 pub fn aggregate_hinted(
     conn: &Connection,
     table: &str,
+    hint: Hint<'_>,
+    inner: &str,
+    outer: &str,
+    binds: &[rusqlite::types::Value],
+) -> rusqlite::Result<Option<Vec<crate::dashboard::db::Rec>>> {
+    aggregate_over(conn, table, hint.window, Some(hint), inner, outer, binds)
+}
+
+fn aggregate_over(
+    conn: &Connection,
+    table: &str,
+    window: (i64, i64),
     hint: Option<Hint<'_>>,
     inner: &str,
     outer: &str,
@@ -362,7 +397,7 @@ pub fn aggregate_hinted(
     if !is_union(conn) {
         return Ok(None);
     }
-    let files = branches(conn, table)?;
+    let files = within(branches(conn, table)?, table, window);
     if files.is_empty() {
         return Ok(None);
     }
@@ -472,6 +507,20 @@ pub fn strip_index_hints(sql: &str) -> std::borrow::Cow<'_, str> {
 mod tests {
     use super::*;
     use crate::storage::layout::{day_path, meta_path, open_or_create};
+
+    #[test]
+    fn within_keeps_the_window_days_only() {
+        let b = |alias: &str, day: &str| Branch { alias: alias.into(), day: day.into(), tier: Tier::Core };
+        let files = vec![b("c0", "2026-10-12"), b("c1", "2026-10-13"), b("c2", "2026-10-14"), b("c3", "2026-10-15")];
+        let t = |s: &str| crate::time::parse_db_time(s).unwrap();
+        let days = |f: Vec<Branch>| f.into_iter().map(|b| b.day).collect::<Vec<_>>();
+        // Edges inclusive: a window ending at midnight reads that day's file.
+        assert_eq!(days(within(files.clone(), "executions", (t("2026-10-13 23:00:00"), t("2026-10-14 00:00:00")))), ["2026-10-13", "2026-10-14"]);
+        // Nothing in range: the newest file alone keeps the statement's shape.
+        assert_eq!(days(within(files.clone(), "queries", (t("2026-09-01 00:00:00"), t("2026-09-02 00:00:00")))), ["2026-10-15"]);
+        // Tables whose day column is not occurred_at are left alone.
+        assert_eq!(within(files.clone(), "processes", (t("2026-10-13 00:00:00"), t("2026-10-13 01:00:00"))).len(), 4);
+    }
 
     #[test]
     fn renumbers_parameters_once() {
