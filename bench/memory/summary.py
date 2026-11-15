@@ -32,7 +32,7 @@ def load(name):
         return None
     m = re.search(r"batches/s \(200\): ([\d.]+)\s+events/s accepted: (\d+)", s)
     st = re.search(r"^\s+200\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)", s, re.M)
-    other = sum(int(x) for x in re.findall(r"^\s+(?!200)\d{3}\s+(\d+)", s, re.M))
+    other = sum(int(x) for x in re.findall(r"^\s+(?!200)(?:\d{3}|error)\s+(\d+)", s, re.M))
     return {"batches_s": float(m.group(1)) if m else None, "events_s": int(m.group(2)) if m else None,
             "lat_ms_p50_p90_p99_max": [float(x) for x in st.groups()[1:]] if st else None, "non200": other}
 
