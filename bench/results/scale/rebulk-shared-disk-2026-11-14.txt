@@ -1,0 +1,39 @@
+Track F, first attempt: rebulk (AMD 9955HX), 2026-11-14 18:19-19:15 CT.
+Disk: ext4 on a NOCOW loop image on rebulk's shared btrfs+zstd NVMe root
+(the "shared disk"). Server bench-server.slice CPUs 14,30, MemoryMax 4G;
+rw-load bench-load.slice CPUs 12,13,15,28,29,31; every other slice confined
+to 0-11,16-27. Typical-app profile, 10 min per step, 60 s warmup.
+
+The raw files (steps.jsonl, raw/*) stayed on rebulk in
+~/rw-scale-bench/bench/results/scale/ when it went offline; these are the
+step summaries as the sweep printed them, copied from the session log.
+
+side          apps  p50 ms  p99 ms   not 200  cpu % (2 thr)  steady/peak anon MiB  db MiB/app/day  breaks
+rust (main)     10    0.9      25.9        0      0.2           142 / 177              (not measured)  -
+rust (main)     25    0.9      35.1        0      0.5           262 / 288              (not measured)  -
+rust (main)     50    0.9    2500.5        0      0.8           588 / 707              53.3            p99>1s
+rust-memory     10    -        25.3        0      0.2           121 / -                (not measured)  -
+rust-memory     25    -       447.0        0      0.5           326 / -                -               -
+(rust-memory 50 was running when the host dropped off the tailnet; no result.)
+
+rust (main) 25 apps: 43,738 records stored in 600 s; 252,226,680 bytes on disk;
+steady fds 441; steady RSS 318 MiB; unreserved CPUs 86.2% busy.
+
+Stall evidence.
+rust (main) 50 apps: health (1-record) batches p99 2,379 ms, max 8,106 ms;
+data batches p99 6,226 ms; 75 sends over 3 s; never more than 5 in flight;
+slow windows at t = 0, 30, 100, 150, 220-260, 390, 450-470, 520-590 s, with
+the server's own cgroup cpu.pressure and io.pressure at 0.00 and host
+/proc/pressure/io full avg10 up to 12.6% while sampled (18:50-18:51).
+
+rust-memory 25 apps, the first step with the per-second fdatasync probe
+(4 KiB write + fdatasync on the bench ext4, i.e. through the loop image to btrfs):
+  probe n=568, p50 8.44 ms, p99 559.67 ms, max 7,116.93 ms, 6 over 500 ms
+  10 s windows with an ingest max over 1 s, and the worst fdatasync near them:
+    t=0    max 2,018 ms   no fsync >100 ms within 10 s before / 20 s after (server warm-up)
+    t=220  max 3,725 ms   fsync 7,117 ms in the same window
+    t=230  max 1,316 ms   fsync 7,117 ms 10 s earlier
+    t=560  max 2,512 ms   fsync 2,379 ms in the same window
+  Slow fsyncs with no slow ingest: t=440 (6,574 ms), 520 (2,200), 540 (3,642).
+  stalls.py verdict (same-window, >=80% rule): 2 of 4, "lines_up": false;
+  within +-20 s, 3 of 4, and the 4th is the first 10 s of a fresh server.
