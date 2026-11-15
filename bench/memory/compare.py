@@ -16,6 +16,14 @@ for d in sys.argv[1:]:
         pass
 
 
+def get(f, s):
+    """f(s), or None when a run is missing that phase or metric (null in summary.txt)."""
+    try:
+        return f(s)
+    except (KeyError, TypeError, IndexError):
+        return None
+
+
 def rng(vals):
     vals = [v for v in vals if v is not None]
     if not vals:
@@ -35,7 +43,7 @@ rows = [
     (".sqlite3 fds, end of mixed", lambda s: s["mixed"]["sqlite_fds_end"]),
     (".sqlite3 fds, idle after burst", lambda s: s["idle2"]["sqlite_fds_end"]),
     ("threads, idle after burst", lambda s: s["idle2"]["threads_end"]),
-    ("mixed: ingest batches/s (target 1)", lambda s: s["mixed"]["ingest"]["batches_s"]),
+    ("mixed: ingest batches/s (open loop)", lambda s: s["mixed"]["ingest"]["batches_s"]),
     ("mixed: ingest p50 / p99 ms", lambda s: None),
     ("mixed: dashboard pages", lambda s: s["mixed"]["dash"]["pages"]),
     ("mixed: dashboard p50 / p90 ms", lambda s: None),
@@ -50,13 +58,13 @@ for name, f in rows:
     cells = []
     for l in labels:
         if "ingest p50" in name:
-            a = rng([s["mixed"]["ingest"]["lat_ms_p50_p90_p99_max"][0] for s in runs[l]])
-            b = rng([s["mixed"]["ingest"]["lat_ms_p50_p90_p99_max"][2] for s in runs[l]])
+            a = rng([get(lambda s: s["mixed"]["ingest"]["lat_ms_p50_p90_p99_max"][0], s) for s in runs[l]])
+            b = rng([get(lambda s: s["mixed"]["ingest"]["lat_ms_p50_p90_p99_max"][2], s) for s in runs[l]])
             cells.append(f"{a} / {b}")
         elif "mixed: dashboard p50" in name:
-            cells.append(f"{rng([s['mixed']['dash']['p50'] for s in runs[l]])} / {rng([s['mixed']['dash']['p90'] for s in runs[l]])}")
+            cells.append(f"{rng([get(lambda s: s['mixed']['dash']['p50'], s) for s in runs[l]])} / {rng([get(lambda s: s['mixed']['dash']['p90'], s) for s in runs[l]])}")
         elif "burst: dashboard p50" in name:
-            cells.append(f"{rng([s['burst']['dash']['p50'] for s in runs[l]])} / {rng([s['burst']['dash']['p90'] for s in runs[l]])}")
+            cells.append(f"{rng([get(lambda s: s['burst']['dash']['p50'], s) for s in runs[l]])} / {rng([get(lambda s: s['burst']['dash']['p90'], s) for s in runs[l]])}")
         else:
-            cells.append(rng([f(s) for s in runs[l]]))
+            cells.append(rng([get(f, s) for s in runs[l]]))
     print(f"| {name} | " + " | ".join(cells) + " |")
