@@ -86,7 +86,7 @@ impl WebState {
         let secret = config.secret()?;
         let keys = cookies::Keys::new(&secret);
         let cursor_key = crate::dashboard::CursorKey(cursor_key_bytes(&secret));
-        let readers = crate::dashboard::pool::ReadPools::new(tenants.dir(), 4);
+        let readers = crate::dashboard::pool::ReadPools::with_max(tenants.dir(), crate::dashboard::pool::PER_TENANT, config.max_read_connections);
         let mailer = config.smtp.as_ref().map(mailer::Mailer::new).transpose()?;
         Ok(WebState {
             control,

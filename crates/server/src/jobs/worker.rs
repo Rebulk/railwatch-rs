@@ -41,13 +41,27 @@ struct Tenant {
     /// their rows are not accumulated; each flush recomputes them.
     full_hours: HashSet<i64>,
     users: grouping::AffectedUsers,
+    /// Work reached it since the last flush; a flush without frees its
+    /// connections' page caches.
+    active: bool,
+    /// When a committed batch last reached it (TENANT_IDLE). Scheduled
+    /// work (the drain every minute, detectors) does not count: it would keep
+    /// every tenant open for good.
+    used_at: Instant,
 }
+
+/// A tenant no batch reached for this long is closed at the next flush once
+/// nothing of it is pending (`forget`): its union reader attaches every day
+/// file and, while open, also keeps the descriptors of every other
+/// connection to those files that closed (SQLite's unix VFS parks them
+/// while a lock on the file is held). It reopens on the next batch.
+const TENANT_IDLE: Duration = Duration::from_secs(600);
 
 pub struct Worker {
     pub control: Arc<Control>,
     pub dir: PathBuf,
     pub tiers: crate::storage::retention::Tiers,
-    /// The accumulator's memory cap per tenant (MAX_BYTES; tests lower it).
+    /// The accumulators' memory cap, all tenants together (MAX_BYTES; tests lower it).
     pub acc_max_bytes: usize,
     /// After this thread's prune deleted day files: closes the rest of the
     /// process's handles to them (the dashboard pools, the ingest writers).
@@ -94,11 +108,16 @@ impl Worker {
                         overflow_buckets: HashSet::new(),
                         full_hours: HashSet::new(),
                         users: Default::default(),
+                        active: true,
+                        // Opened idle: only a committed batch renews it, so
+                        // a tenant the drain reopens closes at the next flush.
+                        used_at: Instant::now().checked_sub(TENANT_IDLE).unwrap_or_else(Instant::now),
                     },
                 ),
             );
         }
         let t = &mut self.tenants.get_mut(&env).unwrap().1;
+        t.active = true;
         if let Some((dir, attached)) = t.days.as_mut() {
             crate::storage::reader::refresh(&t.read, dir, attached)?;
         }
@@ -221,6 +240,7 @@ impl Worker {
         let control = self.control.clone();
         let max_bytes = self.acc_max_bytes;
         let t = self.tenant(f.env_id, &f.slug).map_err(e)?;
+        t.used_at = Instant::now();
         // Direct path: GroupExceptionsJob. Receipted: the drain, under claims.
         if !f.exception_ids.is_empty() && !f.receipted {
             let rows = grouping::load_exceptions(&t.read, &f.exception_ids).map_err(e)?;
@@ -232,9 +252,13 @@ impl Worker {
                 t.acc.ingest_except(&t.read, table, ids, &t.full_hours).map_err(e)?;
             }
         }
-        if t.acc.bytes() > max_bytes {
-            // Checked after the batch is in, so a cold group load or a
-            // big batch never stays over the cap until the next batch.
+        t.overflow_buckets.extend(f.rollup_buckets.iter().filter(|b| t.full_hours.contains(b)));
+        t.session_buckets.extend(f.session_buckets.iter().copied());
+        // Checked after the batch is in, so a cold group load or a big batch
+        // never stays over the cap until the next batch. The cap is for every
+        // tenant's accumulator together; the largest gives way first.
+        while self.tenants.values().map(|(_, t)| t.acc.bytes()).sum::<usize>() > max_bytes {
+            let Some((slug, t)) = self.tenants.values_mut().max_by_key(|(_, t)| t.acc.bytes()) else { break };
             // The hours it holds are too big to keep in memory: they leave
             // the accumulator for good and are recomputed in full at each
             // flush while rows arrive (RollupJob, same output), until they
@@ -242,7 +266,7 @@ impl Worker {
             // would refill it with the same hour on the next batch.
             let hours = t.acc.touched_buckets();
             tracing::info!(
-                tenant = f.slug,
+                tenant = %slug,
                 rows = t.acc.row_count(),
                 bytes = t.acc.bytes(),
                 hours = hours.len(),
@@ -252,8 +276,6 @@ impl Worker {
             t.full_hours.extend(hours);
             t.acc.clear();
         }
-        t.overflow_buckets.extend(f.rollup_buckets.iter().filter(|b| t.full_hours.contains(b)));
-        t.session_buckets.extend(f.session_buckets.iter().copied());
         Ok(())
     }
 
@@ -273,12 +295,23 @@ impl Worker {
                 let before = now - now.rem_euclid(3600) - 3600;
                 t.acc.evict_before(before);
                 t.full_hours.retain(|h| h + 3600 > before);
+                if !std::mem::take(&mut t.active) {
+                    crate::memory::release(&t.read);
+                    crate::memory::release(&t.write);
+                }
                 Ok(())
             })();
             if let Err(e) = r {
                 tracing::error!(environment = env, tenant = slug, error = %e, "rollup flush failed");
             }
         }
+        self.tenants.retain(|_, (_, t)| {
+            t.used_at.elapsed() < TENANT_IDLE
+                || t.acc.row_count() > 0
+                || !t.full_hours.is_empty()
+                || !t.overflow_buckets.is_empty()
+                || !t.session_buckets.is_empty()
+        });
         if !self.tenants.is_empty() {
             tracing::debug!(ms = started.elapsed().as_millis() as u64, "rollup flush");
         }
@@ -401,5 +434,95 @@ mod tests {
         rollup_job::perform(&t, &t, hour, &mut rollup_job::Rng::PerGroup).unwrap();
         assert_eq!(capped, dump(&t), "same rollups as a full recompute");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cap is one budget for every tenant's accumulator: two tenants
+    /// that each stay under it but together go over have the larger one
+    /// give way, and the total stays within the cap plus one batch.
+    #[test]
+    fn the_memory_cap_is_shared_by_all_tenants() {
+        let dir = std::env::temp_dir().join(format!("rw-acc-shared-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let control = Arc::new(Control::open(&dir.join("control.sqlite3")).unwrap());
+        let now = crate::time::now_micros() / 1_000_000;
+        let hour = now - now.rem_euclid(3600);
+        let mut w = Worker::new(control.clone(), dir.clone());
+        w.acc_max_bytes = 64 << 10;
+        let mut envs = Vec::new();
+        for (k, slug) in ["one", "two"].iter().enumerate() {
+            let env = control.create(slug, &format!("{:0>64}", k + 1), 30).unwrap();
+            envs.push((env.id, slug.to_string(), crate::tenants::open_tenant(&dir.join(format!("{slug}.sqlite3"))).unwrap()));
+        }
+        let (mut peak, mut capped, mut most_alone) = (0, false, 0);
+        for batch in 0..9 {
+            for (env, slug, t) in &envs {
+                let mut ids = Vec::new();
+                for i in 0..25 {
+                    t.execute(
+                        "INSERT INTO queries (occurred_at, duration, group_hash, sql) VALUES (?, ?, ?, 'SELECT 1')",
+                        rusqlite::params![crate::time::quoted_date_micros((hour + batch * 60 + i) * 1_000_000), i + 1, format!("q{}", i % 6)],
+                    )
+                    .unwrap();
+                    ids.push(t.last_insert_rowid());
+                }
+                let f = Followup {
+                    env_id: *env,
+                    slug: slug.clone(),
+                    accepted: ids.len() as i64,
+                    committed_at_micros: now * 1_000_000,
+                    rollup_buckets: vec![hour],
+                    session_buckets: vec![],
+                    exception_ids: vec![],
+                    counts: vec![],
+                    receipted: false,
+                    rolled_ids: vec![("queries", ids)],
+                    servers: vec![],
+                };
+                let rows_before = w.tenants.get(env).map_or(0, |(_, t)| t.acc.bytes());
+                w.committed(f).unwrap();
+                let each: Vec<usize> = w.tenants.values().map(|(_, t)| t.acc.bytes()).collect();
+                most_alone = most_alone.max(rows_before).max(w.tenants[env].1.acc.bytes());
+                peak = peak.max(each.iter().sum::<usize>());
+                capped |= w.tenants.values().any(|(_, t)| t.full_hours.contains(&hour));
+                assert!(each.iter().all(|b| *b <= 64 << 10));
+            }
+        }
+        assert!(capped, "together they reached the cap");
+        assert!(most_alone < 64 << 10, "neither reached it alone: {most_alone}");
+        assert!(peak <= (64 << 10) + 25 * 1024, "held at most the cap plus one batch: {peak}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tenant no work reached for TENANT_IDLE is closed at the next flush,
+    /// with every descriptor of its files; work reopens it.
+    #[test]
+    fn an_idle_tenant_is_closed_and_reopened_on_demand() {
+        let root = std::env::temp_dir().join(format!("rw-worker-idle-{}", crate::control::base58(8)));
+        std::fs::create_dir_all(root.join("telemetry")).unwrap();
+        let control = Arc::new(Control::open(&root.join("control.sqlite3")).unwrap());
+        let env = control.create("quiet", &format!("{:0>64}", 3), 30).unwrap();
+        let dir = root.join("telemetry").join("quiet");
+        crate::storage::layout::ensure(&dir).unwrap();
+        crate::storage::layout::open_or_create(&crate::storage::layout::day_path(&dir, crate::storage::Tier::Core, "2026-10-14")).unwrap();
+        let open =
+            || std::fs::read_dir("/proc/self/fd").unwrap().flatten().filter_map(|e| std::fs::read_link(e.path()).ok()).filter(|t| t.starts_with(&dir)).count();
+        let mut w = Worker::new(control, root.join("telemetry"));
+        w.handle_inner(TenantWork::Drain { env: env.id, slug: "quiet".into() }).unwrap();
+        assert!(open() > 0);
+        w.tenants.get_mut(&env.id).unwrap().1.used_at = Instant::now();
+        w.flush_all();
+        assert!(w.tenants.contains_key(&env.id), "a batch reached it lately: kept");
+        w.tenants.get_mut(&env.id).unwrap().1.used_at -= TENANT_IDLE;
+        // Scheduled work (the drain every minute) does not keep it open.
+        w.handle_inner(TenantWork::Drain { env: env.id, slug: "quiet".into() }).unwrap();
+        w.flush_all();
+        assert!(!w.tenants.contains_key(&env.id));
+        assert_eq!(open(), 0, "no descriptor left to its files");
+        w.handle_inner(TenantWork::Drain { env: env.id, slug: "quiet".into() }).unwrap();
+        assert!(w.tenants.contains_key(&env.id), "reopened by the next work");
+        // Reopened by the drain alone, it does not stay open TENANT_IDLE.
+        w.flush_all();
+        assert!(!w.tenants.contains_key(&env.id), "a drain-only reopen closes at the next flush");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

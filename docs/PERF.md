@@ -967,6 +967,126 @@ day-long session's time is building and folding 2.2k events (and
   10,538 CPU ticks on main, 10,401 on this branch (201 s and 206 s wall),
   within run-to-run noise.
 
+## Memory bounded by configuration (branch perf/memory, from main ad5a091)
+
+Production (6 tenants) grew to 877 MB anonymous over 15 days and held 484 open `.sqlite3`
+descriptors, up to 7 per tenant meta file; 274 MB right after a restart (345 MB 31 minutes
+after the 2026-11-14 restart, read-only `/proc` on the box).
+
+### Method
+
+- **6 tenants** (`bench/memory/seed.sh` + `run.sh`): one account, 6 environments, 3M rows over
+  14 days from `rw-load --spread-days 14` (2.7 GB, 186 files). Each run copies the seed and
+  runs the musl release build (bin/release's toolchain, cargo-zigbuild) on CPUs 8-11:
+  idle 150 s, then 15 min of 1 batch/s open-loop ingest across all six plus 6 dashboard
+  clients (15 pages incl. 7d windows, signed in through the trusted-proxy header), idle
+  150 s, a 2 min burst (closed-loop ingest, 12 clients with no pause), idle 150 s. RssAnon,
+  threads and open `.sqlite3` descriptors from /proc every 2 s. `bench/memory/compare.py`
+  makes the table.
+- **50 apps** (`bench/memory/apps50.sh`): Track C's max-50app case (50 fresh environments,
+  rw-load closed loop, concurrency 64, 45 s, then until idle) with the server in a user
+  systemd scope, MemoryMax=3G, no swap, 2 CPUs; peak and after-load anon from the scope's
+  memory.stat. Data on the workstation's shared btrfs with `RAILWATCH_SQLITE_SYNC=off`, not
+  Track C's zram disk (needs sudo); tmpfs data counts against the scope and OOM-killed it.
+  So throughput here (~15k events/s) is not comparable with Track C's 41k; the variants are,
+  run interleaved, 3 runs each.
+- Where memory went: a diagnostic build counting live bytes of SQLite's allocator and of
+  Rust's, plus `sqlite3_db_status` per connection kind. Not committed.
+
+### What held the memory
+
+1. **Per-tenant rollup accumulators**, capped at 128 MB *each*: 640 MB counted across six
+   busy tenants on main (diagnostic run, mixed + burst). Now one budget for every tenant
+   (`incremental::MAX_BYTES`, 32 MB), the largest gives way first, rows keep no copy of the
+   group_hash or occurred_at, and flushed group-hours no batch touched for 2 min leave.
+2. **Writer page caches**: the 12 open day-file writers held 96-102 MB of cache that stayed
+   after load (cache_spill off lets a transaction's dirty pages pass cache_size). A writer
+   with no batch for 30 s now frees its caches and cached statements
+   (`sqlite3_db_release_memory`), and closes day files no transaction touched for 60 s.
+3. **Readers**: 12-24 pooled union readers, 4 per tenant, never closed: 20-40 MB cache,
+   30-70 MB prepared statements, 28-55 MB parsed schema. Now idle readers close after 60 s,
+   at most `max_read_connections` (default 16) are open across all tenants, a tenant at the
+   cap closes another's oldest idle reader, and empty pools are forgotten.
+4. **The rollup worker's per-tenant connections** stayed open forever, and while a
+   connection to a file is open SQLite's unix VFS keeps the descriptors of every other
+   closed connection to it (that is why closing a dashboard reader did not drop its
+   descriptors). The worker now closes a tenant no batch reached for 10 min (scheduled work
+   does not count, as the drain runs every minute) and frees quiet tenants' caches at each
+   flush.
+5. **Watchdog**: every (environment, server) pair ever seen stayed in memory; pairs past the
+   24 h window now leave it (still in environment_heartbeats).
+6. **The allocator**: SQLite already allocates through mimalloc (memory.rs). After load the
+   process kept 200-400 MB more than live bytes; `mi_collect(true)` once a second brought one
+   idle run from 383 to 214 MB but the 50-app runs show no gain (below), so it is not kept.
+   THP off: 465 vs 550 MB at one idle point, one run each; not pursued.
+
+### 50 apps, max ingest (3 runs each, median (min-max))
+
+| variant | events/s | p99 ms | anon peak MiB | anon after load MiB |
+|---|---:|---:|---:|---:|
+| main, glibc build (Track C's binary) | 14,789 (14,700-15,922) | 10,004 | 1,138 (1,065-1,203) | 1,112 (1,065-1,138) |
+| main, musl release | 14,967 (14,367-15,756) | 10,804 | 1,130 (1,074-1,139) | 1,074 (1,047-1,098) |
+| branch, 128 MB budget | 15,044 (14,544-15,444) | 11,637 | 937 (936-948) | 937 (867-948) |
+| + `cache_spill` on (suspect 1) | 13,244 (11,300-14,889) | 13,939 | 889 (876-1,007) | 889 (818-931) |
+| + 32 MB budget (suspect 2) **kept** | 15,778 (14,911-16,056) | 9,766 | 894 (891-933) | 814 (757-855) |
+| + `mi_collect` every 1 s (suspect 3) | 15,211 (12,456-15,411) | 9,972 | 941 (828-958) | 893 (551-955) |
+
+- Suspect 1, `cache_spill = OFF`: turning spill back on saved ~50 MB but cost 12% throughput
+  (and swung 11.3-14.9k): not kept, over the 5% bar.
+- Suspect 2, the accumulators: 32 MB instead of 128 MB, same throughput: kept.
+- Suspect 3, the heap after a burst: the release build is musl with mimalloc for Rust and
+  SQLite (no glibc arenas; the glibc build Track C measured holds about the same). A forced
+  collect every second did not lower the median: not kept.
+- Track C's 1.78 GiB peak was on a 41k events/s run; at 15k here main peaks at 1.13 GiB, so
+  absolute numbers are not comparable, only the deltas.
+
+### 6 tenants, mixed ingest + dashboard (musl builds)
+
+Same seed, same phases; main ad5a091 x3, the final branch (a8dd1c2) x2. The third branch run
+used the build before the 32 MB budget (128 MB) and is left out; its numbers were in the same
+ranges (peak during mixed 538, idle after burst 380). Ranges are min-max.
+
+| | main (n=3) | branch (n=2) |
+|---|---:|---:|
+| anon MiB, idle at start | 101-115 | 56-75 |
+| anon MiB, peak during mixed | 567-652 | 418-419 |
+| anon MiB, end of mixed (15 min) | 522-641 | 379-403 |
+| anon MiB, idle after mixed | 172-615 | 194-208 |
+| anon MiB, peak during burst | 717-897 | 612-658 |
+| anon MiB, idle after burst | 675-765 | 238-287 |
+| .sqlite3 descriptors, end of mixed | 583-607 | 580-605 |
+| .sqlite3 descriptors, idle after burst | 870-871 | 907 |
+| mixed: ingest batches/s (target 1) | 0.8-1 | 1 |
+| mixed: ingest p50 / p99 ms | 233-6,756 / 3,511-46,449 | 67-74 / 1,024-1,083 |
+| mixed: dashboard pages, p50 / p90 ms | 4,768-5,280, 6.6-11.3 / 48.6-124 | 5,333-5,345, 5.3-5.7 / 17.5-21.1 |
+| burst: ingest batches/s (closed loop) | 0.9-4.3 | 3.6-4.5 |
+| burst: dashboard pages, p50 / p90 ms | 10,665-36,922, 23.8-35.2 / 77.5-199 | 36,100-42,244, 24.3-26.9 / 70.2-82.2 |
+
+**The 150 MB target is not met.** Idle after the burst fell from 675-765 to 238-287 MB and
+peaks by 150-250 MB, but idle is still over 150 MB. The rest is freed memory that mimalloc
+keeps (see 6) and the accumulators' budget while hours are open.
+
+Descriptors are not lower within these runs: the idle phases are 150 s, shorter than the
+10 min before the worker closes a tenant (descriptors stay while any connection to the file
+is open, see 4). The worker test (`an_idle_tenant_is_closed_and_reopened_on_demand`) and the
+pool tests check that they go once both have closed. Throughput and dashboard latency did
+not regress: main's ingest latency swung 30x between identical runs on this shared box, and
+the branch was steadier, but that is not a measured improvement. The budget reached its cap
+2-8 times a run during the burst; main's 128 MB each never did.
+
+Tests: dashboard::pool (idle readers closed with their descriptors, the cap across
+tenants, empty pools forgotten), storage::writer (a quiet writer closes idle day files),
+jobs::worker (the budget shared by tenants, an idle tenant closed and reopened),
+tests/background.rs (the watchdog forgets servers past the window).
+
+### Not done
+
+- The worst idle number is still mimalloc keeping freed pages after a burst (above).
+- Ingest latency in the 6-tenant run swung 0.2-7 s p50 between identical main runs (other
+  tracks' load on this box, `rollup flush failed: database is locked` 15-75 times a run on
+  both builds); the 50-app runs are the throughput comparison.
+- Not measured on the production box (read-only for this track).
+
 ## Proposals
 
 None of these is implemented.

@@ -62,6 +62,22 @@ impl Heartbeats {
         self.seen.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)).collect()
     }
 
+    /// Forgets pairs last seen before `before` (micros): they are past
+    /// WATCH_WINDOW, so no longer watched, and their last-seen time is
+    /// already in environment_heartbeats. Without this, every server name
+    /// ever seen (a pod per deploy) stayed in memory and was upserted every
+    /// tick. Returns how many went.
+    pub fn forget_before(&self, before: i64) -> usize {
+        let mut m = self.seen.lock().unwrap();
+        let n = m.len();
+        m.retain(|_, at| *at >= before);
+        // retain keeps the peak's allocation; give it back after a big expiry.
+        if m.capacity() > 2 * m.len() + 64 {
+            m.shrink_to_fit();
+        }
+        n - m.len()
+    }
+
     /// Reloads persisted last-seen times at boot.
     pub fn restore(&self, c: &Connection) -> rusqlite::Result<()> {
         let mut s = c.prepare("SELECT environment_id, server, last_seen_micros FROM environment_heartbeats")?;

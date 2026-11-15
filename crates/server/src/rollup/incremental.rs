@@ -31,6 +31,8 @@ struct Group {
     dirty: bool,
     /// `row_bytes` of its rows.
     bytes: usize,
+    /// When a batch last added to it.
+    touched: std::time::Instant,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,7 +49,18 @@ pub struct Accumulator {
 /// hours it holds are recomputed in full instead (worker.rs). Rows cost
 /// ~650 bytes of RSS each, so this is ~200k rows (docs/PERF.md, "Bounded
 /// memory"); 3M rows, the former row cap, was ~2 GB.
-pub const MAX_BYTES: usize = 128 << 20;
+///
+/// The cap is for all tenants together (jobs/worker.rs): at 128 MB per
+/// tenant, six busy tenants held 640 MB counted (docs/PERF.md, "Memory
+/// bounded by configuration"). At 50 apps under max ingest, 32 MB held
+/// 123 MB less after load than 128 MB at the same throughput; idle groups
+/// leave it after GROUP_IDLE, so a steady app rarely reaches it.
+pub const MAX_BYTES: usize = 32 << 20;
+
+/// A flushed group-hour no batch added to for this long leaves memory
+/// (`evict_before`): at idle the accumulator otherwise kept the current and
+/// previous hour of every group until the hour aged out.
+pub const GROUP_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Heap a row holds here, roughly: the map entry, the row's values and
 /// their bytes, and the sort key's copy of occurred_at.
@@ -116,10 +129,14 @@ impl Accumulator {
         Ok(())
     }
 
-    fn insert(&mut self, key: &Key, source: &Source, row: RawRow) {
+    fn insert(&mut self, key: &Key, source: &Source, mut row: RawRow) {
         let g = self.groups.get_mut(key).expect("loaded");
         let id = row[0].to_i();
         let sk = sort_key(source, &row);
+        // The group_hash is the key's and occurred_at the sort key's:
+        // fresh_attributes reads neither from the row.
+        row.pop();
+        row[1] = crate::rollup::sqlval::Sql::Null;
         let n = row_bytes(&sk, &row);
         match g.rows.insert(id, (sk, row)) {
             None => self.rows += 1,
@@ -132,6 +149,7 @@ impl Accumulator {
         g.bytes += n;
         self.bytes += n;
         g.dirty = true;
+        g.touched = std::time::Instant::now();
     }
 
     fn load_group(&mut self, read: &Connection, key: &Key) -> rusqlite::Result<()> {
@@ -144,7 +162,7 @@ impl Accumulator {
             let mut st = read.prepare_cached(&sql)?;
             st.query_map(rusqlite::params![g, from, to], |r| row_values(r, source.width() + 1))?.collect::<rusqlite::Result<_>>()?
         };
-        self.groups.insert(key.clone(), Group { rows: HashMap::new(), dirty: true, bytes: 0 });
+        self.groups.insert(key.clone(), Group { rows: HashMap::new(), dirty: true, bytes: 0, touched: std::time::Instant::now() });
         for row in rows {
             self.insert(key, source, row);
         }
@@ -170,11 +188,14 @@ impl Accumulator {
         out
     }
 
-    /// Drops group-hours that ended before `before` (epoch seconds).
+    /// Drops group-hours that ended before `before` (epoch seconds), and
+    /// flushed ones no batch added to for GROUP_IDLE: a group touched again
+    /// is loaded whole from the read connection (`load_group`), as on first
+    /// touch, so only memory changes.
     pub fn evict_before(&mut self, before: i64) {
         let (mut rows, mut bytes) = (0, 0);
         self.groups.retain(|k, g| {
-            let keep = k.2 + 3600 > before || g.dirty;
+            let keep = g.dirty || (k.2 + 3600 > before && g.touched.elapsed() < GROUP_IDLE);
             if !keep {
                 rows += g.rows.len();
                 bytes += g.bytes;

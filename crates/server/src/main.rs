@@ -1347,7 +1347,9 @@ fn serve() -> ExitCode {
         // disk budget deletes day files, every handle to them is closed so
         // the space comes back (idle readers here, the ingest writers'
         // cached files, the worker's own union readers).
-        let readers = railwatch_server::dashboard::pool::ReadPools::new(cfg.tenants_dir(), 4);
+        let readers =
+            railwatch_server::dashboard::pool::ReadPools::with_max(cfg.tenants_dir(), railwatch_server::dashboard::pool::PER_TENANT, cfg.max_read_connections);
+        readers.spawn_idle_closer();
         let release = {
             let (readers, tenants) = (readers.clone(), tenants.clone());
             move || {

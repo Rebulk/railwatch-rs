@@ -428,6 +428,10 @@ pub async fn scheduler(control: Arc<Control>, bg: Background, tenants_dir: PathB
                 let ok = tokio::task::spawn_blocking(move || {
                     let conn = c2.conn();
                     let checked = watchdog::check(&conn, &hb2, time::now_micros(), threshold);
+                    // Persisted by the check just now; past the window they are not watched.
+                    if checked.is_ok() {
+                        hb2.forget_before(time::now_micros() - watchdog::WATCH_WINDOW_SECS * 1_000_000);
+                    }
                     let stuck = crate::alerts::outbox::stuck(&conn, 600).unwrap_or(true);
                     (checked.is_ok(), stuck)
                 })
