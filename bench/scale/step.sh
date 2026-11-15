@@ -66,6 +66,7 @@ queue() {
 
 read -r hb0 ha0 < <(host_busy)
 cpu0=$(rvr_cpu_us)
+date +%s.%N > "$work/load_t0"
 ( while :; do
     read -r q qage < <(queue)
     echo "$(date +%s) $(rvr_cpu_us) $(rvr_anon) $(rvr_mem_current) $(rss_kb) $(fds) $q $qage $(cut -d' ' -f1 /proc/loadavg)"
@@ -159,7 +160,8 @@ if row["p99_ms"] > 1000: why.append("p99>1s")
 if row["not_ok"] > 0: why.append("drops")
 if (lag_q or 0) > 60 or not row["tail_idle"] or row["tail_s"] > 60: why.append("behind>60s")
 if row["oom_kills"] > 0 or row["exited_containers"]: why.append("oom/exit")
-F = sorted(float(x) for x in open(sys.argv[3]) if x.strip())
+P = [l.split() for l in open(sys.argv[3]) if len(l.split()) == 2]
+F = sorted(float(x[1]) for x in P)
 fq = lambda p: round(F[min(len(F) - 1, int(p * len(F)))], 1) if F else None
 row.update({"fsync_probe_n": len(F), "fsync_p50_ms": fq(0.5), "fsync_p99_ms": fq(0.99), "fsync_max_ms": fq(1.0) if F else None,
             "fsync_over_1s": sum(1 for x in F if x > 1000)})
@@ -169,5 +171,7 @@ PY
 mkdir -p "$(dirname "$RESULTS")/raw"
 cp "$work/load.json" "$(dirname "$RESULTS")/raw/$run.load.json"
 cp "$work/samples" "$(dirname "$RESULTS")/raw/$run.samples"
+cp "$work/fsync" "$(dirname "$RESULTS")/raw/$run.fsync" 2>/dev/null || true
+cp "$work/load_t0" "$(dirname "$RESULTS")/raw/$run.t0" 2>/dev/null || true
 [ -n "${KEEP_SERVER:-}" ] || rvr_stop
 rm -rf "$work"
