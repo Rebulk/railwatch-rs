@@ -71,6 +71,10 @@ impl Heartbeats {
         let mut m = self.seen.lock().unwrap();
         let n = m.len();
         m.retain(|_, at| *at >= before);
+        // retain keeps the peak's allocation; give it back after a big expiry.
+        if m.capacity() > 2 * m.len() + 64 {
+            m.shrink_to_fit();
+        }
         n - m.len()
     }
 
