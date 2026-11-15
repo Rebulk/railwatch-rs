@@ -1,0 +1,803 @@
+# How many apps fit on a small box: Rust vs Rails (Track F, 2026-11-14)
+
+The question: on a box the size of a small VPS (2 threads, 4 GiB), how many
+realistic apps can one Railwatch server take, Rust vs Rails? Where does each
+break, and what does each app cost in memory and disk?
+
+The numbers only mean something next to each other: one machine, one disk,
+one load generator, the same 2 threads and 4 GiB for both. The point is the
+root cause of each limit, so each side's section leads with the mechanism and
+the evidence for it.
+
+Scripts: [`bench/scale/`](../bench/scale/). Raw results:
+[`bench/results/scale/`](../bench/results/scale/).
+
+## Short version
+
+| server | apps that fit (largest step that did not break) | breaks at | what breaks it |
+|---|---:|---:|---|
+| Rust, origin/main `ad5a091` | **250** | 500 | memory: about 5-6 MiB per active tenant at once, then about 5 MiB more per tenant over 10 min, until the 4 GiB cap kills it |
+| Rust, PR #90 `f4ad31b` | **250** | 500 | the same; #90 holds p99 down at 250 (34 vs 632 ms) but does not move the limit |
+| Rust, #89 `ef4b907` on #90 (bench-only build) | **500** (narrowly) | not reached in 500 | the arrival cost per tenant falls to about 1.3-1.9 MiB; growth unchanged. At 500 apps total memory sat at the 4 GiB cap from about 5 min on, and private memory was still climbing 173 MiB/min at the end |
+| Rails, railwatch-cloud `71020d3` | **100** | 250 | CPU: both threads pinned during every minute's :00-:15 burst, and for about a minute during each 5-minute rollup catch-up |
+| **Rust next**, PR #92 `46fa311` (Track H) | **500** | not reached in 500 | private memory flat from 5 min at about 1.5 GiB; page cache, not the server, filled the 4 GiB cap |
+| **Rails best**, railwatch-cloud #261 `b911c9e` (Track G) | **~150-200** | 250 (p99 1.3 s) | the minute burst still pins both threads; no 5-minute job pile-up any more |
+
+- **Best against best: Rust next fits 500 apps, Rails best about 150-200.**
+  That is roughly 2.5-3x, on this box with the typical-app profile from
+  production. Stock against stock it is 250 against 100. See
+  [Best against best](#best-against-best-rust-next-and-rails-best).
+- With #89 on #90, Rust fits 500 for a 10-minute step but is still growing
+  at the end. With #92 (Rust next), it fits 500 with private memory flat.
+- **The two run out of different things.** Rust runs out of memory with CPU
+  at 7-14%. Rails runs out of CPU with memory at 1.1 GiB of 4.
+- **Per app, at 10-100 apps:**
+  - Rust: 8.9 MiB of private memory, 0.03% of the two threads, 17 file
+    descriptors.
+  - Rails: 1.4 MiB, 0.23% of the two threads (about 8x Rust), 5 file
+    descriptors.
+  - Rails starts from about 830 MiB; Rust from about 54 MiB.
+- **Latency below each side's limit:** Rust p99 was 8-10 ms at 10-100 apps.
+  Rails was 27-39 ms at 10-50 apps and 123 ms at 100.
+- **Disk:** a 10-minute step cannot give a per-day figure on either side.
+  The writes are mostly WAL, and the database files grow too little to time
+  (see Disk). Production's figure for a typical app is 150-181 MiB/day.
+  At any moment Rust held about 7.5 MiB of WAL per tenant.
+
+Not run: Rails best at 350 and 500 apps. The sweep stops at the first
+broken step, and it broke at 250.
+
+## Why Rust breaks: a per-tenant memory floor, then growth
+
+**Mechanism.**
+- Each tenant that sends data costs about **5-6 MiB of private memory** the
+  moment it becomes active.
+- After that, memory **keeps growing by about 5 MiB per tenant over a
+  10-minute step** without levelling off.
+- At 500 apps, the floor alone is about 3.3 GiB. Growth of only about 1.3 MiB
+  per tenant then reaches the 4 GiB cap after about 9 minutes, and the kernel
+  kills the server.
+- CPU was never the limit: 13.6% of the two threads at 500 apps.
+
+**Evidence** (framework, steady disk; `steps.jsonl`, `raw/*.samples` at 2 s):
+
+- **The floor arrives with the first batches, not with the data.** Private
+  memory just before the load starts, and then 4-10 s in:
+
+  | apps | before load (MiB) | 4-10 s in (MiB) | per app (MiB) |
+  |---:|---:|---:|---:|
+  | 100 | 83 | 569-579 | about 5.0 |
+  | 250 | 172 | 1,437-1,457 | about 5.1 |
+  | 500 | 307 | 3,295-3,343 | about 6.1 |
+
+  - At that point each app has sent only a few health pings, so this is a
+    fixed cost of a tenant being open, not of what it stored.
+  - #90 shows the same jump: 310 to 3,005 MiB at 500 apps, 5.4 MiB per app.
+- **It is per tenant.**
+  - Private memory fits 54 MiB + 8.91 MiB per app from 10 to 100 apps
+    (152, 269, 496 and 948 MiB).
+  - Open file descriptors rise by exactly **17.0 per app** (185 at 10 apps,
+    8,630 at 500).
+  - What they are: a listing of the Rust process's descriptors at 100 apps
+    (`/proc/<pid>/fd`, the 10%-busy step) showed per tenant **3 connections
+    to `meta.sqlite3`** and **2 to the day's `core` file**, each with its
+    `-wal` (and one `-shm` per file). 39 of the 100 tenants also had the day's
+    `detail` file open twice. That is about 14 descriptors per tenant, plus a
+    socket each.
+  - So each active tenant keeps about 5 SQLite connections open, and each
+    connection has its own page cache and prepared statements. That fits the
+    5-6 MiB per tenant on arrival. **Which part of the 5-6 MiB is page cache
+    versus statements and rollup state was not measured**; that split is
+    Track H's subject.
+- **Then it grows without settling.** From the floor (about 12 s in) to the
+  step's peak, main grew 495 MiB at 100 apps and 1,290 MiB at 250: **4.95 and
+  5.16 MiB per tenant**. Growth over the last 5 minutes:
+
+  | apps | main (MiB/min) | #90 (MiB/min) |
+  |---:|---:|---:|
+  | 100 | +35 | +30 |
+  | 250 | +150 | +154 |
+
+  Rails at 100 apps grew +10 MiB/min. Ten minutes is too short to say where
+  Rust would level off, if it does.
+- **The break is memory, and only memory.**
+  - At 250 apps, main's total memory (private memory plus page cache) reached
+    the 4 GiB cap halfway through the step. The cgroup recorded 6,902
+    cap-hit events and 353 throttled sockets.
+  - Health pings then took up to 2 s, which is where the 632 ms p99 comes
+    from.
+  - At 500 apps the kernel killed `railwatch` at about 540 s, with 4.1 GB of
+    private memory resident.
+  - The disk sync p99 was 1.8-2.1 ms in those steps, and CPU was 7-14%.
+  - At 100 apps, before the cap, health pings had p99 5 ms and max 35 ms;
+    at 250 they had p99 599 ms and max 2,048 ms.
+
+**What #90 changes.**
+- #90 caps readers and rollup accumulators across tenants, and closes idle
+  connections.
+- At 250 apps it reached the cap later than main (about 66% of the way through
+  the step against about 50%), with about half as many cap hits (3,728). Its
+  p99 was 34 ms against 632 ms, and steady memory was 2,100 MiB against 2,507.
+- It does not lower the floor: 5.4 MiB per app on arrival, against main's
+  5.1-6.1.
+- At 500 apps it was killed at about 460 s, against main's 540 s. With both
+  sitting a few hundred MiB under the cap from the first minute, I read the
+  earlier kill as chance in a single run, not as #90 being worse. One run
+  each.
+- What would raise the limit is a smaller floor per open tenant.
+
+**Track H's root cause** ([PR #92](https://github.com/Rebulk/railwatch-rs/pull/92)
+at `7b2e31e`, `docs/PERF.md` "Memory per tenant" and "Root cause of what still
+grows"; measured on Archie, 250 apps, 10 min, Track F's `rw-load --profile`):
+- **The floor is about 6 SQLite connections per active tenant.** heaptrack
+  counted 1,502 open connections for 250 apps. Live heap per app:
+  - parsed schema 622 KiB;
+  - page cache 261 KiB;
+  - lookaside (SQLite's per-connection small-object arena) 213 KiB;
+  - rollup accumulators 205 KiB.
+
+  Of the 1,380 KiB total, 85% is SQLite per-connection state. That matches
+  the 17 descriptors per tenant measured here.
+- **What grows after that is allocator-retained memory, not live heap.**
+  - The live heap was flat at 310-430 MiB from t=2 min on (heaptrack, on a
+    system-allocator build, which ran backlogged).
+  - With #92's per-thread purge, growth from minute 2 to 10 at 250 apps was
+    57-75 MiB over three runs (230-300 KiB per app). Before #92 it was
+    +830 MiB over the last 9 minutes.
+  - Track H: "Not proven past that."
+- #92 also fixes three causes of growth: page caches freed on a 10 s clock,
+  one cached statement per power-of-two IN length, and each thread
+  collecting its own mimalloc heap. Its design options to cut the floor
+  further (fewer connections per tenant) are written up and not built.
+
+**What #89 on #90 changes: the arrival cost, not the growth.**
+- **Measured.** Private memory per tenant, split into the jump when apps
+  start sending (first 12 s) and the growth after it (12 s to 9 min):
+
+  | apps | jump per tenant: main / #90 / #89 on #90 | growth per tenant: main / #90 / #89 on #90 |
+  |---:|---|---|
+  | 25 | 5.2 / 5.3 / **2.1** MiB | 4.5 / 4.4 / **4.4** MiB |
+  | 100 | 5.0 / 5.4 / **1.3** MiB | 3.9 / 3.2 / **3.7** MiB |
+  | 250 | 5.1 / - / **1.9** MiB | 4.6 / - / **2.9** MiB |
+  | 500 | 6.1 / - / **1.7** MiB | 1.2 (killed) / - / **3.3** MiB |
+
+  The jump falls from about 5-6 MiB to 1.3-2.1 MiB per tenant. The growth
+  stays at about 3-4.5 MiB per tenant in 10 minutes, the same as main and
+  #90. Steady memory is about half: 500 MiB against 948 at 100 apps,
+  1,270 against 2,507 at 250.
+- Open file descriptors are unchanged: 17 per tenant, the same 5 SQLite
+  connections. So what #89 removes is not a connection or a file.
+- **Why: transparent huge pages. Measured.** #89 adds
+  `prctl(PR_SET_THP_DISABLE, 1)` at start-up (`crates/server/src/main.rs`;
+  its comment says mimalloc madvises its arenas `MADV_HUGEPAGE`).
+  - With THP on (this host: `enabled=always`), each thread's mimalloc heap
+    can be backed by 2 MiB pages, so a tenant's writer thread can pin
+    2-4 MiB of private memory while it uses far less. That would fit a
+    jump of about 5 MiB falling to about 1.5 MiB, with the growth and the
+    open files unchanged.
+  - What was checked: the #89-on-#90 server ran with `THP_enabled: 0` and
+    `AnonHugePages` of 4 MiB out of 76 MiB private at 25 apps
+    (`/proc/<pid>/smaps_rollup`).
+  - **The A/B** (`bench/scale/thp_ab.sh`): the main binary, which has no
+    THP change, run twice under the same load. Once with THP as the host has
+    it (`always`), once with `MIMALLOC_ALLOW_THP=0`, which is what #89's
+    `prctl` amounts to for mimalloc. The server's `Anonymous` and
+    `AnonHugePages` come from `/proc/<pid>/smaps_rollup` after 180 s of load.
+    Framework, 2026-11-15 07:51-08:03, bench otherwise idle
+    ([`thp_ab.jsonl`](../bench/results/scale/thp_ab.jsonl)):
+
+    | apps | THP | private memory | huge pages (share) | per app above idle | records accepted |
+    |---:|---|---:|---:|---:|---:|
+    | 25 | host (`always`) | 254 MiB | 172 MiB (68%) | 8.85 MiB | 17,026 |
+    | 25 | off | 105 MiB | 0 | 3.50 MiB | 10,412 |
+    | 100 | host (`always`) | 740 MiB | 548 MiB (74%) | 6.78 MiB | 48,875 |
+    | 100 | off | 394 MiB | 0 | 3.57 MiB | 49,013 |
+
+    - **THP off about halves private memory at the same load.** The 100-app
+      pair carried the same records (48,875 against 49,013): 740 against
+      394 MiB, and 6.78 against 3.57 MiB per app.
+    - The 25-app pair carried different loads (17,026 against 10,412
+      records), so it is noisier and the 100-app pair is the one to quote.
+    - With THP on, 68-74% of private memory was huge pages. That is the
+      arrival floor #89 removes, and it verifies #89's THP change.
+    - **Caveat:** these runs used the script as it stood at `acced1a`,
+      started inside `bench-server.slice`. So the server and rw-load shared
+      CPUs 11 and 23. That does not change how much memory a tenant holds,
+      but the CPU and latency of these runs are not comparable with the
+      sweep's, and are not reported.
+    - **The first attempt (03:09) failed within a second of starting, for a
+      known reason.** `after-followup.sh` started `thp_ab.sh` inside
+      `bench-server.slice`, whose cpuset allows only 11 and 23. Pinning rw-load
+      to 6-10,18-22 was then refused (`taskset: Invalid argument`), and the
+      script's own busy check counted its own shell. Fixed since then: each
+      process gets its own slice's scope, and server settings, including the
+      generated secret, go through a 0600 launcher file, not argv. Dry-run on
+      archie at 5 apps, not yet rerun on framework.
+  - **Track H's finding agrees.** THP does not cause the *growth*, only the
+    arrival floor. On #92 with THP allowed (`always`), the process held
+    24-43 MiB of huge pages, all from start-up, none collapsed later
+    (khugepaged's `pages_collapsed` did not move), and growth was the same as
+    with THP off. That matches the table above: the jump falls with #89 and
+    the growth does not ([PR #92](https://github.com/Rebulk/railwatch-rs/pull/92),
+    `docs/PERF.md`, "THP: not the cause here"). Not checked there either:
+    THP's effect on the floor with the same binary, which is what
+    `thp_ab.sh` measures.
+- **500 apps passed, narrowly.**
+  - p99 was 35.8 ms, with 0 drops and no kill; all 866,574 records offered
+    were accepted.
+  - Total memory (private plus page cache) was at the 4 GiB cap in 162 of
+    295 samples, from about 5 minutes in. The kernel reclaimed page cache to
+    stay there, which is why the worst 10-second window had a p99 of 1.4 s.
+  - Private memory was still rising at 173 MiB/min at the end, 3,033 MiB.
+    At that rate it would reach 4 GiB about 6 minutes later. So "fits 500"
+    is true of a 10-minute step, and a longer step at 500 would very likely
+    be killed.
+- #89 is described as a CPU change ("9-12% less CPU per event"). Its CPU at
+  100-500 apps here was within a few tenths of a point of main's (2.6
+  against 2.8% at 100 apps, 13.4 against 13.6% at 500); this sweep does not
+  resolve a 10% CPU difference.
+
+## Why Rails breaks: CPU, in two kinds of burst
+
+**Mechanism.**
+- Rails' web and job processes share the two threads.
+- At 250 apps they run out of CPU twice over:
+  - **every minute**, during the :00-:15 burst in production's traffic;
+  - **every 5 minutes**, for about a minute, when `RollupCatchupJob` enqueues
+    two `RollupJob`s per active environment (the current and the previous
+    hour) and the job workers run all of them.
+- Requests queue behind both. Nothing was dropped, but p99 reached 12.5 s.
+
+**Evidence** (framework, steady disk, Rails 250 apps):
+
+- **Both threads were pinned in bursts, not on average.**
+  - CPU averaged 69% of the two threads over the step.
+  - It followed the wall-clock minute. Average CPU by 5-second bucket of the
+    minute: **84, 91, 88, 88, 82%** for :00-:25, then 69, 64, 64, 58, 50, 52,
+    48% for :25-:60. Leaving out the two catch-up minutes gives 85-88% and
+    43-62%.
+  - 43 of the 60 ten-second windows had a p99 above 1 s; the worst were
+    during the pinned stretches.
+- **The minute burst is in the traffic, not in Rails.**
+  - In the typical profile (rebulk-crm production), the first three
+    5-second buckets of each minute carry **79% of data batches**; :10-:15
+    alone has 28%, at 2.6x the mean batch size (`minute_weights` and
+    `minute_size_mult` in `profiles.json`). That is production's own
+    scheduled work landing at the top of the minute.
+  - Rust takes the same burst. Its CPU at 250 apps followed the same shape,
+    peaking at 12-13% in the :10-:15 bucket against 4-5% later. Its p99 was
+    34 ms (#90) and 632 ms (main, which was at its memory cap).
+- **The 5-minute storm is the rollup catch-up.**
+  - At t≈137 s and t≈435 s, 298 s apart, Solid Queue's ready queue jumped
+    from 0 to 493 and to 677 jobs.
+  - Both threads stayed at 100-107% for about 60 s while it drained.
+  - Those two minutes hold the 10-13 s latencies.
+  - `RollupCatchupJob` (railwatch-cloud `71020d3`,
+    `app/jobs/rollup_catchup_job.rb`) runs every 5 minutes. It enqueues
+    `RollupJob.perform_later(env, now)` and `(env, now - 1.hour)` for every
+    environment seen in the last 2 hours: 500 jobs for 250 apps. The first
+    burst peaked at 493 ready jobs, which fits. The second peaked at 677, more
+    than the catch-up alone; the rest are likely per-batch `RollupJob`s and
+    follow-ups that queued behind it. Not broken down.
+  - **Measured: the job load is linear in the app count.** The 10%-busy Rails
+    sweep records every job class that ran in each step (`job_mix`, from Solid
+    Queue's `solid_queue_jobs`, read-only after the load):
+
+    | apps | `RollupJob` | per app | `ReleaseHealthRollupJob` | `CheckScheduledTasksJob` | `RollupCatchupJob` | all jobs |
+    |---:|---:|---:|---:|---:|---:|---:|
+    | 10 | 104 | 10.4 | 34 | 10 | 2 | 197 |
+    | 25 | 263 | 10.5 | 92 | 25 | 2 | 424 |
+    | 50 | 544 | 10.9 | 155 | 50 | 2 | 794 |
+    | 100 | 1,029 | 10.3 | 335 | 100 | 2 | 1,511 |
+    | 250 | 2,629 | 10.5 | 721 | 250 | 3 | 3,663 |
+
+    - About **10.5 `RollupJob`s per app** in 10 minutes at every size, plus
+      about 3 `ReleaseHealthRollupJob`s and exactly 1 `CheckScheduledTasksJob`
+      per app. All three scale linearly.
+    - The catch-up itself runs a fixed 2-3 times; what it releases, 2 rollups
+      per app at once, is what grows. At 250 apps that is 500 at a time: the
+      493 and 677 ready-job peaks above.
+    - So the per-app work is constant. What breaks Rails is that this
+      constant work is delivered in bursts (the minute's :00, and the 5-minute
+      catch-up) onto two threads that also serve every request.
+- **It is not memory.** Rails' private memory was 1,064 MiB steady at
+  250 apps, and grew at about 1.4 MiB per app from 10 to 100 apps. It never
+  came near the cap: no cap hits, no kills.
+- **The CPU cost per app rises before the break:**
+
+  | apps | CPU (% of 2 threads) | per app |
+  |---:|---:|---:|
+  | 10 | 2.7% | 0.27% |
+  | 25 | 5.0% | 0.20% |
+  | 50 | 9.2% | 0.18% |
+  | 100 | 23.0% | 0.23% |
+  | 250 | 68.9% | 0.28% |
+
+  The catch-up's work grows with the number of environments, and each
+  `RollupJob` recomputes up to an hour of one environment. That is the likely
+  reason the cost per app climbs at 100-250 apps; it was not profiled.
+**Track G's root cause** ([railwatch-cloud PR #261](https://github.com/Rebulk/railwatch-cloud/pull/261)
+at `b911c9e`, `docs/RAILS-BEST.md`, "Why it grows faster than the app count";
+same rig as Track C, Track F's profile, per-process stackprof). Two causes, both
+fixed on that branch:
+- **Tenant connection-pool churn.** activerecord-tenanted keeps at most 50
+  tenant pools per process (`max_connection_pools`, default 50).
+  - Past 50 environments, almost every request found its pool evicted and
+    reopened it. Each reopen re-ran the pending-migration check and re-parsed
+    the 109 KB schema-cache YAML.
+  - At 150 apps the two web workers created 40 pools/s for 42 requests/s.
+  - That was **23% of web CPU** (and 26% of job CPU).
+  - Web CPU per request was flat to 50 apps (8.2-8.6 ms), then 12.1-12.9 ms
+    at 150 and 13.0 at 250. That is the superlinear CPU per app in the table
+    above.
+- **Two owners per tenant-hour.** Each batch enqueued its hour's `RollupJob`,
+  and `RollupCatchupJob` also enqueued the current and previous hour of every
+  environment every 5 minutes.
+  - So every tenant-hour was recomputed twice, and the previous hour 12 times
+    after it closed.
+  - That is the 5-minute burst here. It also explains the 677 against 500
+    above: the catch-up's 500, plus that minute's per-batch `RollupJob`s (one
+    per environment-hour per minute per worker, two workers), minus those
+    Solid Queue discarded as already queued.
+- With both fixed (Track G's numbers): web CPU per request was flat at
+  7.6-9.9 ms from 50 to 250 apps, and p99 at 250 apps fell from 10.4 s to
+  0.6 s.
+- Ruled out there: GC pressure, SQLite busy-retry spin, per-request tenant
+  lookups, and recurring jobs that walk every environment.
+- `ReleaseHealthRollupJob` has no per-minute debounce, unlike `RollupJob`. It
+  was below 1 CPU-ms/s in Track G's runs and was left unchanged; "not
+  verified at Track F's 10% busy mix". It ran 721 times in the busy-mix
+  250-app step here.
+- The best-case image is swept here as `rails-best`; results in
+  [Rails best case (Track G)](#rails-best-case-track-g).
+
+## Best against best: Rust next and Rails best
+
+The same profile, disk and box, on 2 threads and 4 GiB. Rust next is PR #92
+`46fa311` (binary sha256 `424b30c2…`); Rails best is railwatch-cloud PR #261,
+image `railwatch-cloud-best:b911c9e` (image ID `9d512a783a01`), with
+`WEB_CONCURRENCY=2` and `RAILS_MAX_THREADS=5` as stock.
+
+| apps | Rust next p99 | Rails best p99 | Rust next CPU % | Rails best CPU % | Rust next steady private MiB | Rails best steady private MiB | Rails best ready jobs, max |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 8.3 ms | 26.2 ms | 0.3 | 2.7 | 39 | 796 | 3 |
+| 25 | 10.3 ms | 27.3 ms | 0.7 | 5.0 | 78 | 833 | 2 |
+| 50 | 8.5 ms | 27.4 ms | 1.4 | 8.8 | 137 | 936 | 6 |
+| 100 | 10.6 ms | 38.5 ms | 2.7 | 16.5 | 262 | 1,052 | 40 |
+| 150 | - | 93.3 ms | - | 25.6 | - | 1,121 | 109 |
+| 250 | 14.3 ms | **1,338 ms** | 7.0 | 48.7 | 597 | 1,324 | 446 |
+| 500 | 99.8 ms | not run | 15.2 | - | 1,519 | - | - |
+
+- Neither side dropped a request at any step shown.
+- Rust next used about a sixth of Rails best's CPU at every size, and a
+  fifth to a twentieth of its private memory below 100 apps.
+- Rust next was not run at 150 (its sweep has no 150 step). Rails best was
+  not run past 250 (the sweep stops at the first break).
+
+**Rails best's limit: about 150-200 apps, against stock's about 100.**
+- 150 passed: p99 93 ms.
+- 250 broke: p99 1,338 ms, with 10 of the 60 ten-second windows over 1 s.
+  It broke narrowly, and **Track G's own run had 250 at 0.6 s**. So 250 is
+  borderline, and the limit is between 150 and 250. I call it about 150-200.
+- Track G's two fixes did what they say:
+  - **The 5-minute job pile-up is gone.** The most ready jobs at once was
+    3-6 at 10-50 apps and 40 at 100, against stock's 62, 140 and 252 at 25,
+    50 and 100. At 250 it reached 446, once, in the last two minutes; the
+    queue's oldest job was 9 s old at most, against stock's 44.
+  - **Fewer rollups per app:** about 5.3-6.5 `RollupJob`s per app in
+    10 minutes (540 at 100 apps, 1,632 at 250), against stock's 10.5. That
+    fits one owner per tenant-hour.
+  - CPU per app was 0.17-0.20% of the two threads from 25 to 250 apps, with
+    no upward trend. Stock rose from 0.18-0.20% to 0.28% at 250. That fits
+    the pool-churn fix.
+- **What still breaks it at 250: the minute burst, likely on CPU.**
+  - CPU by 5-second bucket of the wall-clock minute was 82, 72, 82, 68%
+    for :00-:20, then 32-48% for the rest. That is the traffic's own burst.
+  - Each of the 10 slow windows sat in a stretch where both threads were at
+    or near 100% (93-105% in the surrounding 2-second samples). In 29 of 281
+    samples CPU was at 95% or more.
+  - So the average (49%) hides it. As for stock at 250, the bursts saturate
+    the two threads and requests queue behind them.
+- **Not ruled out: thread or GVL limits.** 2 Puma workers × 5 threads is
+  10 request slots. In-flight requests reached 136 (19 at 150 apps), so
+  requests also queued for a slot. Each Ruby process runs Ruby code one thread at a time
+  under the GVL. A bottleneck there would also show as latency with CPU
+  below 100%.
+  - The data here cannot tell "both cores busy" from "slots or GVL full,
+    cores partly idle" inside a burst. The 2-second CPU samples are too
+    coarse.
+  - **This is unconfirmed.** Track G's stackprof is the place to check it.
+
+## Results: steady disk (framework)
+
+Typical-app profile unless marked. Each step is a fresh server and fresh data,
+10 minutes of load, and latency counted from t = 60 s.
+- "rest busy" is how busy the CPUs outside the bench were (0-5 and 12-17),
+  where Track G and Track H work. "load max" is the highest 1-minute load
+  average during the step.
+- "private" is the cgroup's anonymous memory, the same measure on both sides.
+- Rails' RSS sums the two Puma workers, their master, Thruster and the Solid
+  Queue processes (two containers).
+- No Rails step had a failed job, and every Rails step ended with 0 ready jobs.
+- The tables are generated by `bench/scale/tables.py` from
+  [`steps.jsonl`](../bench/results/scale/steps.jsonl); every field there is
+  per step.
+
+### Rust, origin/main `ad5a091`
+
+| apps | p50 ms | p99 ms | not 200 | CPU % of 2 threads | steady / peak private MiB | RSS MiB | fds | rest busy | load max | breaks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 10 | 1.5 | 8.0 | 0 | 0.3 | 152 / 164 | 187 | 185 | 2.2% | 2.6 | - |
+| 25 | 1.5 | 9.0 | 0 | 0.7 | 269 / 309 | 327 | 436 | 2.3% | 0.8 | - |
+| 50 | 1.5 | 8.8 | 0 | 1.4 | 496 / 554 | 592 | 861 | 5.4% | 1.8 | - |
+| 100 | 1.6 | 9.8 | 0 | 2.8 | 948 / 1,073 | 1,115 | 1,717 | 2.0% | 0.6 | - |
+| 250 | 1.7 | 632.3 | 0 | 7.0 | 2,507 / 2,746 | 2,859 | 4,272 | 3.3% | 2.1 | - |
+| 500 | 1.9 | 1,665.4 | 7,153 | 13.6 | 3,767 / 3,997 | 3,883 | 8,630 | 2.3% | 22.6 | p99 > 1 s, drops, killed (out of memory) |
+
+### Rust, origin/main `ad5a091`, 10% busy apps
+
+| apps | busy apps | p50 ms | p99 ms | not 200 | CPU % of 2 threads | steady / peak private MiB | RSS MiB | fds | rest busy | load max | breaks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 10 | 1 | 1.2 | 11.7 | 0 | 0.3 | 150 / 172 | 180 | 185 | 18.7% | 5.9 | - |
+| 25 | 3 | 1.2 | 11.8 | 0 | 0.9 | 318 / 331 | 370 | 441 | 19.3% | 5.2 | - |
+| 50 | 5 | 1.1 | 11.1 | 0 | 1.6 | 535 / 611 | 629 | 866 | 19.3% | 6.4 | - |
+| 100 | 10 | 1.4 | 13.1 | 0 | 3.4 | 1,022 / 1,139 | 1,192 | 1,717 | 5.9% | 2.7 | - |
+| 250 | 25 | 1.4 | 35.7 | 0 | 8.8 | 2,406 / 2,955 | 2,746 | 4,267 | 6.4% | 3.0 | - |
+| 500 | 50 | 1.9 | 1,801.8 | 51,578 | 9.5 | 0 / 4,008 | 0 | 0 | 2.7% | 11.3 | p99 > 1 s, drops, killed (out of memory) |
+
+### Rust, PR #90 `f4ad31b` (perf/memory)
+
+| apps | p50 ms | p99 ms | not 200 | CPU % of 2 threads | steady / peak private MiB | RSS MiB | fds | rest busy | load max | breaks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 10 | 1.5 | 7.9 | 0 | 0.3 | 139 / 157 | 171 | 185 | 2.0% | 4.2 | - |
+| 25 | 1.5 | 8.6 | 0 | 0.7 | 278 / 305 | 335 | 441 | 2.1% | 0.6 | - |
+| 50 | 1.4 | 8.6 | 0 | 1.3 | 469 / 524 | 562 | 861 | 8.6% | 3.3 | - |
+| 100 | 1.1 | 8.6 | 0 | 2.4 | 878 / 974 | 1,036 | 1,713 | 22.2% | 12.7 | - |
+| 250 | 1.6 | 34.1 | 0 | 6.8 | 2,100 / 2,675 | 2,455 | 4,267 | 10.5% | 6.1 | - |
+| 500 | 1.9 | 1,822.1 | 19,009 | 11.5 | 3,511 / 4,014 | 3,785 | 8,500 | 6.7% | 13.8 | p99 > 1 s, drops, killed (out of memory) |
+
+### Rust, PR #89 `ef4b907` merged onto #90 `f4ad31b` (bench-only build)
+
+| apps | p50 ms | p99 ms | not 200 | CPU % of 2 threads | steady / peak private MiB | RSS MiB | fds | rest busy | load max | breaks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 10 | 1.3 | 7.7 | 0 | 0.3 | 64 / 75 | 97 | 185 | 7.2% | 4.3 | - |
+| 25 | 1.2 | 8.3 | 0 | 0.7 | 176 / 189 | 231 | 441 | 14.6% | 5.0 | - |
+| 50 | 1.2 | 7.6 | 0 | 1.2 | 261 / 297 | 357 | 866 | 15.8% | 4.2 | - |
+| 100 | 1.4 | 9.9 | 0 | 2.6 | 500 / 593 | 669 | 1,712 | 11.9% | 4.1 | - |
+| 250 | 1.2 | 11.1 | 0 | 6.4 | 1,270 / 1,445 | 1,620 | 4,265 | 17.7% | 4.7 | - |
+| 500 | 1.2 | 35.8 | 0 | 13.4 | 2,581 / 3,035 | 3,275 | 8,520 | 19.4% | 5.6 | - |
+
+### Rust next (Track H)
+
+| apps | p50 ms | p99 ms | not 200 | CPU % of 2 threads | steady / peak private MiB | RSS MiB | fds | rest busy | load max | breaks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 10 | 1.2 | 8.3 | 0 | 0.3 | 39 / 49 | 64 | 190 | 18.9% | 4.7 | - |
+| 25 | 1.2 | 10.3 | 0 | 0.7 | 78 / 106 | 123 | 449 | 18.4% | 4.9 | - |
+| 50 | 1.5 | 8.5 | 0 | 1.4 | 137 / 184 | 216 | 893 | 5.2% | 2.7 | - |
+| 100 | 1.3 | 10.6 | 0 | 2.7 | 262 / 333 | 401 | 1,763 | 7.7% | 2.3 | - |
+| 250 | 1.2 | 14.3 | 0 | 7.0 | 597 / 848 | 974 | 4,401 | 12.9% | 4.3 | - |
+| 500 | 1.5 | 99.8 | 0 | 15.2 | 1,519 / 2,026 | 2,192 | 8,812 | 20.5% | 9.2 | - |
+
+### Rails, railwatch-cloud `71020d3` (the image production last ran)
+
+| apps | p50 ms | p99 ms | not 200 | CPU % of 2 threads | steady / peak private MiB | RSS MiB | fds | oldest ready job s | rest busy | load max | breaks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 10 | 7.1 | 29.9 | 0 | 2.7 | 830 / 840 | 1,492 | 313 | 0 | 19.3% | 5.0 | - |
+| 25 | 7.3 | 27.3 | 0 | 5.0 | 887 / 912 | 1,504 | 511 | 1 | 19.1% | 4.6 | - |
+| 50 | 7.4 | 38.5 | 0 | 9.2 | 900 / 940 | 1,592 | 845 | 3 | 17.2% | 5.0 | - |
+| 100 | 12.6 | 122.9 | 0 | 23.0 | 973 / 1,048 | 1,641 | 804 | 10 | 19.0% | 5.7 | - |
+| 250 | 1,477.6 | 12,549.6 | 0 | 68.9 | 1,064 / 1,145 | 1,733 | 1,499 | 44 | 24.9% | 10.9 | p99 > 1 s |
+
+### Rails, railwatch-cloud `71020d3` (the image production last ran), 10% busy apps
+
+| apps | busy apps | p50 ms | p99 ms | not 200 | CPU % of 2 threads | steady / peak private MiB | RSS MiB | fds | oldest ready job s | rest busy | load max | breaks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 10 | 1 | 7.8 | 56.6 | 0 | 3.4 | 828 / 852 | 1,503 | 315 | 1 | 5.4% | 2.3 | - |
+| 25 | 3 | 7.4 | 36.4 | 0 | 6.4 | 868 / 892 | 1,536 | 516 | 1 | 8.2% | 3.7 | - |
+| 50 | 5 | 8.0 | 39.2 | 0 | 11.5 | 956 / 1,001 | 1,625 | 850 | 3 | 9.1% | 4.5 | - |
+| 100 | 10 | 13.1 | 124.9 | 0 | 27.8 | 1,009 / 1,062 | 1,693 | 827 | 8 | 2.3% | 2.0 | - |
+| 250 | 25 | 9,410.2 | 28,027.0 | 2,099 | 86.5 | 1,122 / 1,244 | 1,874 | 4,007 | 60 | 6.1% | 6.2 | p99 > 1 s, drops |
+
+### Rails best case (Track G)
+
+| apps | p50 ms | p99 ms | not 200 | CPU % of 2 threads | steady / peak private MiB | RSS MiB | fds | oldest ready job s | rest busy | load max | breaks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 10 | 7.7 | 26.2 | 0 | 2.7 | 796 / 815 | 1,468 | 311 | 0 | 2.1% | 1.7 | - |
+| 25 | 7.9 | 27.3 | 0 | 5.0 | 833 / 873 | 1,531 | 502 | 0 | 2.4% | 0.6 | - |
+| 50 | 8.0 | 27.4 | 0 | 8.8 | 936 / 997 | 1,614 | 831 | 1 | 2.2% | 1.2 | - |
+| 100 | 8.5 | 38.5 | 0 | 16.5 | 1,052 / 1,125 | 1,770 | 1,479 | 1 | 2.3% | 2.2 | - |
+| 150 | 9.1 | 93.3 | 0 | 25.6 | 1,121 / 1,203 | 1,907 | 2,146 | 2 | 2.4% | 2.3 | - |
+| 250 | 12.0 | 1,338.3 | 0 | 48.7 | 1,324 / 1,444 | 2,180 | 3,568 | 9 | 2.5% | 4.0 | p99 > 1 s |
+
+In the 10%-busy mixes, every tenth app sends the busy profile
+(rebulk-system's shape, about 4.7x a typical app's records).
+
+**The busy mix moves neither limit.** Rust still fits 250 apps and Rails still
+fits 100.
+- **Rust, 500 apps, busy mix:** killed for memory about 250 s sooner than the
+  all-typical run (about 290 s against 540 s). The extra records from busy
+  apps reach the cap faster.
+- **Rails, 250 apps, busy mix:** falls behind for good, not just in bursts.
+  - Requests in flight rose all run: 194 at 1 min, about 1,000-1,140 from
+    5 to 8 min, 2,441 at 10 min.
+  - CPU stayed at 97-103% for the last three minutes.
+  - Queued jobs reached 410, the oldest at 60 s.
+  - 2,099 sends got no answer within 60 s, all in the last 40 s; none were
+    server errors.
+  - The all-typical run swung between 45% and 100% CPU and kept up overall.
+    The busy mix's extra work (+20-25% CPU at 50-100 apps) left no slack to
+    drain between bursts.
+
+## Load profile: derived from production, read-only
+
+Source: production (5.161.187.226), each tenant's `core/2026-11-13.sqlite3`
+(a full UTC day), table `ingest_batches` plus per-type `count(*)`.
+- The production host has no `sqlite3` binary, so the queries ran in
+  `python3 -I` with `sqlite3.connect("file:...?mode=ro", uri=True)`:
+  `SELECT count(*)`, `sum()` and `GROUP BY` over `received_at` only.
+- Nothing was copied off the server. Request and job counts were
+  cross-checked with the Railwatch MCP (`query_requests`, `list_jobs`).
+
+| tenant | events / day | batches / day | health-only batches | data batches | data batch size p50 / p90 / p99 / max | events / min p50 / p90 / max |
+|---|---:|---:|---:|---:|---|---|
+| rebulk-system production (busy) | 1,181,309 | 73,296 | 48,648 | 24,648 | 20 / 92 / 523 / 2,913 | 434 / 1,707 / 6,043 |
+| rebulk-crm production (typical) | 253,362 | 24,019 | 22,895 | 1,124 | 63 / 575 / 616 / 2,965 | 16 / 696 / 3,852 |
+| rebulk-crm customer | 23,766 | 23,093 | 23,037 | 56 | 6 / 28 / 44 / 46 | 16 / 16 / 201 |
+| lantern-cloud production | 23,037 | 23,037 | 23,037 | 0 | - | 16 / 16 / 19 |
+
+**The mix.** What production sends, per day (2026-11-13):
+- rebulk-system:
+  - query 812,420; cache_event 116,706; transaction 62,744; health 51,844;
+    broadcast 43,002;
+  - request 34,588; n_plus_one 15,663; outgoing_request 13,033;
+    view_render 7,195; session 6,770; log 6,479; scheduled_task 5,570;
+  - visit 2,359; job_attempt 836; enqueued_job 777; and fewer than 500 each
+    of the rest.
+- rebulk-crm production:
+  - query 178,310; transaction 29,253; health 23,040; n_plus_one 6,228;
+    outgoing_request 6,060; cache_event 4,523;
+  - job_attempt 2,226; enqueued_job 1,741; scheduled_task 1,281; log 547.
+- Queries are 69-70% of all records on both.
+- Logs are far fewer than the bench in Track C assumed: 0.5% of records
+  against its 2 per execution.
+
+**Burst pattern.** Two kinds:
+- **Every minute:**
+  - In rebulk-system, the 5-second buckets at :00, :05 and :10 carry 10.5%,
+    12.4% and 8.3% of the day's data batches, against 7.1-8.1% for the other
+    nine buckets. Their batches are 1.4-1.9x the mean size.
+  - rebulk-crm production's bursts are sharper: 40% of its data batches land
+    at :00-:05.
+- **Hourly:** rebulk-system's busiest hour was about 2.1x its median hour
+  (84,891 vs 40,456 events), around 15:00 UTC.
+
+**The two profiles** (`bench/scale/profiles.json`):
+- **Typical app = rebulk-crm production.**
+  - A 1-record `health` batch every 3.75 s.
+  - 0.78 data batches per minute as a Poisson process, weighted by
+    production's 12 five-second buckets.
+  - Batch sizes drawn from its 101 size quantiles, scaled per bucket.
+  - Each execution is filled with rebulk-crm's per-type counts per execution.
+- **Busy app = rebulk-system production**, the same way: a health batch every
+  1.67 s, 17.1 data batches per minute.
+
+**rw-load `--profile`** (`crates/load/src/scale.rs`).
+
+> **Known bias in the results above.** Every step in this document ran
+> before a load-generator fix (commit `1d3f626`, from review). The generator
+> cut each data batch at its target size, which dropped the tail of the batch's
+> last execution. That tail is the later record types: transactions, n+1s,
+> outgoing requests, cache events.
+> - Simulating the cut with the same profiles, the records sent were 79.7%
+>   queries for the typical app, against 77.4% intended; the busy app 77.7%
+>   against 71.9%.
+> - The record count and the batch count per app were unaffected, so the
+>   offered rate is right; only the mix within a batch is off.
+> - Queries are the cheapest kind for both servers to store, so the bias,
+>   if anything, flatters both a little and is the same for both.
+> - Steps run after the fix record `records_offered` and `send_late_*`; older
+>   rows do not have those fields.
+
+
+- Every app runs on its own schedule, open loop: a batch is sent when it is
+  due, whether or not the previous one was answered. A slow server shows as
+  latency and requests in flight, not as a lower offered rate.
+- A send not answered within 60 s counts as dropped.
+- Delivered load matched the profile: at 25 apps the typical profile stored
+  43,738 records in 600 s, which is 225-252k records per app per day against
+  rebulk-crm's 253k.
+
+## Disk per app: not measurable in a 10-minute step
+
+**What the data shows:** a 10-minute step is too short to give a
+per-app-per-day disk figure for either side. I am not reporting one.
+
+- **Most of what is written is WAL.** At the end of each step, the `-wal` and
+  `-shm` files held:
+
+  | | WAL + shm at the end | database files at the end |
+  |---|---:|---:|
+  | Rust, 10-500 apps | 7.0-7.6 MiB **per app** | 19-1,009 MiB |
+  | Rails, 10-50 apps | 4.5-5.6 MiB per app | 16-72 MiB |
+  | Rails, 250 apps | 0.5 MiB per app | 378 MiB |
+
+  A WAL is reused once it reaches its checkpoint size, so it is a fixed cost
+  per open file, not growth. Rust keeps several files per tenant (meta, and the
+  day's core and detail), each with its own WAL. That is why its WAL total
+  scales with apps and holds near 7.5 MiB each. Rails checkpoints more as it
+  gets busier, so its WAL total shrinks at 250 apps.
+- **The database files themselves grow too little to time.**
+  - Rust's database files grew 1.0-7.1% over the second half of each step.
+  - Second-half growth per record came out 126-252 bytes on Rust and 524-707
+    on Rails.
+  - Whole-run growth per record came out 1,177-1,326 on Rust and 848-924 on
+    Rails.
+  - The two methods disagree by 2-10x and in opposite directions between the
+    sides. The whole-run figure includes each new tenant's empty files and
+    their first pages. The second-half figure depends on when SQLite moved
+    pages from the WAL into the main file.
+  - Neither is a rate I would extrapolate to a day.
+- **What a day costs is better read from production:**
+  - rebulk-crm production, the typical-app shape, writes 150-181 MiB/day per
+    tenant (2026-11-07 to 2026-11-13, core + detail, from `ls -l`).
+  - rebulk-system writes 569-881 MiB/day.
+  - Both are on Rust 0.2.18, ext4. Production has no Rails tenant to compare.
+- **The bench's records are also smaller than real ones.** They are built from
+  the gem's small wire fixtures, so their SQL text, log lines and payloads are
+  shorter than a real app's. So even a clean rate here would understate
+  production.
+- **To measure it properly:** run one step at a fixed app count for several
+  hours, and read the database files after a `wal_checkpoint(TRUNCATE)`. That
+  would also settle whether Rust's per-day files cost more than Rails' single
+  file at many small tenants. Track C saw 1,549 against 1,041 MiB per million
+  events at 50 apps; not re-measured here. This is a TODO.
+
+What the data does show about disk: **at the same app count, Rust held about
+7.5 MiB of WAL per tenant at any moment, and Rails 0.5-5.6 MiB.** On a host
+sized close to its disk, that is real space: about 1.9 GB of WAL at 250 apps
+for Rust. It is not counted as growth.
+
+## The shared-disk run: rebulk, before the move
+
+The sweep first ran on rebulk (AMD 9955HX), with the data directory on a
+loop-mounted ext4 image on rebulk's shared btrfs root. Other people's work ran
+on the other cores.
+
+| side | apps | p99 ms | not 200 | CPU % | steady private MiB | breaks |
+|---|---:|---:|---:|---:|---:|---|
+| Rust main | 10 | 25.9 | 0 | 0.2 | 142 | - |
+| Rust main | 25 | 35.1 | 0 | 0.5 | 262 | - |
+| Rust main | 50 | **2,500.5** | 0 | 0.8 | 588 | p99 > 1 s |
+| Rust #90 (local `e2b7892`) | 10 | 25.3 | 0 | 0.2 | 121 | - |
+| Rust #90 (local `e2b7892`) | 25 | 447.0 | 0 | 0.5 | 326 | - |
+
+**It was the disk.** The same Rust main binary, at the same 50 apps on the
+steady disk on framework, had a p99 of **8.8 ms**. On rebulk:
+- At 50 apps:
+  - Even 1-record health pings had a p99 of 2,379 ms and a max of 8,106 ms.
+  - The server's own cgroup showed CPU pressure and IO pressure of 0.00.
+  - Host IO pressure (`full avg10`) reached 12.6% while sampled.
+- At 25 apps (#90), a per-second 4 KiB write + `fdatasync` on the bench disk
+  took p50 8.4 ms, **p99 560 ms and max 7,117 ms**.
+  - 3 of the 4 ten-second windows with an ingest max above 1 s had a sync
+    above 2 s within 20 s.
+  - The fourth was the first 10 s of a fresh server.
+- That is what decided the move to a RAM-backed disk with a fixed write delay.
+- The raw files stayed on rebulk when it went offline. These rows come from
+  the step summaries
+  ([`rebulk-shared-disk-2026-11-14.txt`](../bench/results/scale/rebulk-shared-disk-2026-11-14.txt)).
+
+## Incident: rebulk was knocked offline
+
+At about 19:15 CT on 2026-11-14, stopping the rebulk sweep took rebulk off the
+tailnet.
+
+- The stop command looked the runner up by matching its name, and that also
+  matched the shell running the command.
+- It returned the wrong process group (954), and SIGTERM was sent as root to
+  that whole group without checking what it was.
+- The ssh session dropped at once. Since then rebulk shows offline in
+  tailscale and does not answer ping or ssh.
+- A low-numbered process group on that box is a long-running system service,
+  most likely `tailscaled` or `sshd`. A clean exit on SIGTERM does not trigger
+  `Restart=on-failure`, so it did not come back.
+- It needs a fix at rebulk's console. Which service it was is not confirmed.
+- **What the bench may have left there:** the sweep runner may still be
+  cycling, confining other slices to CPUs 0-11,16-27 during each sweep. Each
+  sweep's trap releases that, and so does a reboot.
+
+**Changed since then:**
+- No signal goes to a process group.
+- No PID is signalled unless the harness wrote it or started it in the same
+  command.
+- No `pkill` or `pgrep` runs as root.
+- Every long runner is a `systemd-run --unit=rw-scale-*` unit and is stopped
+  only with `systemctl stop`.
+- The harness signals only the two sampler processes it starts itself, by the
+  PID it recorded.
+
+## Machine and noise
+
+**framework** (all the steady-disk results):
+- AMD Ryzen AI 9 HX 370: 12 cores, 24 threads; CPU n and n+12 share a core.
+- 30 GB RAM, btrfs root, Linux 7.2, Docker 29.7.2 (cgroup v2, systemd driver).
+- **Server under test:** `bench-server.slice`, CPUs **11 and 23** (one
+  physical core and its SMT sibling, "2 threads"), `MemoryMax=4G`, no swap.
+  Rails' web and jobs containers share it; Rust is one process.
+- **Load generator:** `bench-load.slice`, CPUs 6-10 and 18-22 (cores 6-10).
+- **Other work:** Track G (`rwg-*`) and Track H (`rwh-*`) worked on CPUs 0-5
+  and 12-17 from about 21:30 on.
+  - Those CPUs were 2-9% busy for Rust main and #90's first three steps.
+  - They were **17-25% busy** for every Rails step, for #90 at 100 apps, and
+    for the mixed sweeps.
+  - The highest load average during a step was 22.6, during Rust main's
+    500-app step; Rails' 250-app step saw 10.9.
+  - The server's CPUs were never shared, but memory bandwidth, the L3 and the
+    kernel were.
+- **Disk:**
+  - ext4 on a 10 GB zram device (lz4), behind dm-delay with 1 ms on every
+    write bio. Reads are not delayed. It is the disk Track C used.
+  - Its 4 KiB `fdatasync`, sampled every second in every step: p50
+    0.7-0.9 ms, p99 1.3-2.1 ms; Rails at 250 apps 4.8 ms, when the server's
+    own writes were heaviest.
+  - The worst single sync per step was 2-36 ms, and above 4 ms in only 6 of
+    the 11 steps checked. Against rebulk's shared disk (p99 560 ms, max
+    7,117 ms) that is steady.
+  - It is fair to both sides, but it is not a real NVMe.
+
+**Breaks**, defined before any run: p99 above 1 s, any send not answered with
+200, falling behind for more than 60 s, or out of memory. Since added: a 200
+that stored fewer records than it was sent (records_ok below records_offered,
+also "drops"; the one step where it happens already had drops) and any failed
+Rails job ("failed_jobs").
+- Falling behind means one of three things:
+  - Rails' oldest ready job older than 60 s;
+  - a post-load tail longer than 60 s;
+  - a tail that never went idle.
+- No step had a dropped send without also being killed for memory.
+
+## Not run, and follow-ups
+
+- Rails best at 350 and 500 apps: the sweep stops at the first broken step
+  (250).
+- Rust next at 150 apps: its sweep used the standard counts.
+- The THP A/B with `thp_ab.sh` as fixed (own slice per process): dry-run on
+  archie, not rerun on framework. The results above come from the version at
+  `acced1a`, run by hand.
+- TODO: rerun the Rust sweeps once Track E (perf/ingest, PR #89) lands on
+  main.
+- TODO: a multi-hour step at 250 and 500 apps, to see whether growth levels
+  off over hours and to measure disk per day.
+- TODO: split CPU from thread/GVL saturation in Rails best's minute burst
+  (finer CPU sampling, or Puma's backlog).
+
+## Reproduce
+
+```sh
+# binaries (from each tree, separate target dirs)
+cargo +1.99.1 build --release -p railwatch-server -p railwatch-load       # perf/scale = origin/main + bench
+git worktree add --detach ../rw-membuild f4ad31b && (cd ../rw-membuild &&
+  CARGO_TARGET_DIR=$HOME/.cache/rw-scale/target-memory cargo +1.99.1 build --release -p railwatch-server)
+mkdir -p ~/.cache/rw-scale/bin && cp target/release/{railwatch,rw-load} ~/.cache/rw-scale/bin/ &&
+  mv ~/.cache/rw-scale/bin/railwatch ~/.cache/rw-scale/bin/railwatch-main
+cp ~/.cache/rw-scale/target-memory/release/railwatch ~/.cache/rw-scale/bin/railwatch-memory
+# Rails image: railwatch-cloud @ 71020d3, as in docs/RAILS-VS-RUST.md
+mkdir -p /tmp/rw-71020d3 && git -C ~/src/railwatch-cloud archive 71020d3 | tar -x -C /tmp/rw-71020d3
+docker build -t railwatch-cloud-baseline:71020d3 /tmp/rw-71020d3
+
+# check the topology and set SERVER_CPUS / LOAD_CPUS to one core + sibling / other cores
+lscpu -e=CPU,CORE
+
+# everything, as one stoppable unit (sweeps run one at a time; each cleans up after itself)
+sudo systemd-run --unit=rw-scale-all --uid=$(id -u) --gid=$(id -g) --setenv=HOME=$HOME \
+  --setenv=SWEEPS="rust 0; rust-memory 0; rails 0; rust 10; rails 10" \
+  --property=KillMode=mixed --property=TimeoutStopSec=180 --working-directory=$PWD \
+  bench/scale/runall.sh
+journalctl -u rw-scale-all -f
+sudo systemctl stop rw-scale-all           # to stop early
+
+# one step by hand: bench/scale/reserve.sh on; bench/scale/disk.sh up;
+#   bench/scale/step.sh rust 50; bench/scale/disk.sh down; bench/scale/reserve.sh off
+# on a shared box, SHARED=1 bench/scale/reserve.sh on also confines every other slice
+python3 -I bench/scale/stalls.py bench/results/scale/raw/<run>   # disk stalls vs slow windows
+```

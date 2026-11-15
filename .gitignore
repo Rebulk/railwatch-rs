@@ -8,3 +8,5 @@ dist/
 .cache/
 .pnpm-store/
 frontend/dist-site/
+# generated per machine by bench/rails-vs-rust/lib.sh (rvr_secrets); never commit
+bench/rails-vs-rust/.secrets.env
