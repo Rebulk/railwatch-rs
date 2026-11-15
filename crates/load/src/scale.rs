@@ -18,7 +18,9 @@
 //! several), so a slow server shows up as latency and in-flight growth, not as
 //! a lower offered rate. A send not answered within --request-timeout counts
 //! as dropped (status "error"), and so does one that finds --max-in-flight
-//! sends already outstanding ("client_full").
+//! sends already outstanding ("client_full"). Latency percentiles count only
+//! sends scheduled after --warmup seconds (a fresh server's first seconds,
+//! e.g. Puma and YJIT warming up); drops count for the whole run.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -170,6 +172,7 @@ pub async fn run(args: Vec<String>) {
     let mut url = "http://127.0.0.1:8790".to_string();
     let (mut tokens_file, mut profile_file, mut out) = (None, None, None);
     let (mut duration, mut busy_every, mut seed, mut timeout_s, mut max_in_flight) = (600.0f64, 0usize, 1u64, 60.0f64, 8192usize);
+    let mut warmup = 0.0f64;
     let mut i = 0;
     while i < args.len() {
         let next = |i: &mut usize| -> String {
@@ -185,9 +188,10 @@ pub async fn run(args: Vec<String>) {
             "--seed" => seed = next(&mut i).parse().unwrap_or_else(|_| die("bad --seed")),
             "--request-timeout" => timeout_s = next(&mut i).parse().unwrap_or_else(|_| die("bad --request-timeout")),
             "--max-in-flight" => max_in_flight = next(&mut i).parse().unwrap_or_else(|_| die("bad --max-in-flight")),
+            "--warmup" => warmup = next(&mut i).parse().unwrap_or_else(|_| die("bad --warmup")),
             "--out" => out = Some(next(&mut i)),
             other => die(&format!(
-                "--profile mode: unknown option {other} (takes --url --tokens --profile --duration --busy-every --seed --request-timeout --max-in-flight --out)"
+                "--profile mode: unknown option {other} (takes --url --tokens --profile --duration --busy-every --seed --request-timeout --max-in-flight --warmup --out)"
             )),
         }
         i += 1;
@@ -313,7 +317,7 @@ pub async fn run(args: Vec<String>) {
     }
     sampler.abort();
     let in_flight_timeline = sampler.await.unwrap_or_default();
-    report(&samples, duration, tokens.len(), busy_apps, max_seen.load(Ordering::Relaxed), &in_flight_timeline, timeout_s, out.as_deref());
+    report(&samples, warmup, duration, tokens.len(), busy_apps, max_seen.load(Ordering::Relaxed), &in_flight_timeline, timeout_s, out.as_deref());
 }
 
 fn lat_stats(mut v: Vec<f64>) -> Value {
@@ -323,8 +327,19 @@ fn lat_stats(mut v: Vec<f64>) -> Value {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn report(samples: &[Sample], duration: f64, apps: usize, busy_apps: usize, max_in_flight: usize, in_flight: &[usize], timeout_s: f64, out: Option<&str>) {
+fn report(
+    samples: &[Sample],
+    warmup: f64,
+    duration: f64,
+    apps: usize,
+    busy_apps: usize,
+    max_in_flight: usize,
+    in_flight: &[usize],
+    timeout_s: f64,
+    out: Option<&str>,
+) {
     let ok = |s: &&Sample| s.status == 200;
+    let measured = |s: &&Sample| s.status == 200 && s.at >= warmup;
     let mut status_counts: BTreeMap<String, usize> = BTreeMap::new();
     for s in samples {
         let k = match s.status {
@@ -334,7 +349,7 @@ fn report(samples: &[Sample], duration: f64, apps: usize, busy_apps: usize, max_
         };
         *status_counts.entry(k).or_default() += 1;
     }
-    let ok_lat = |f: &dyn Fn(&Sample) -> bool| lat_stats(samples.iter().filter(ok).filter(|s| f(s)).map(|s| s.latency_ms).collect());
+    let ok_lat = |f: &dyn Fn(&Sample) -> bool| lat_stats(samples.iter().filter(measured).filter(|s| f(s)).map(|s| s.latency_ms).collect());
     let records_ok: usize = samples.iter().filter(ok).map(|s| s.records).sum();
     let not_ok = samples.iter().filter(|s| s.status != 200).count();
     let over_3s = samples.iter().filter(|s| s.status == 200 && s.latency_ms > 3000.0).count();
@@ -354,9 +369,9 @@ fn report(samples: &[Sample], duration: f64, apps: usize, busy_apps: usize, max_
                    "max_ms": l.last().copied().unwrap_or(0.0)})
         })
         .collect();
-    let all: Vec<f64> = samples.iter().filter(ok).map(|s| s.latency_ms).collect();
+    let all: Vec<f64> = samples.iter().filter(measured).map(|s| s.latency_ms).collect();
     let summary = json!({
-        "mode": "profile", "apps": apps, "busy_apps": busy_apps, "duration_s": duration,
+        "mode": "profile", "warmup_s": warmup, "apps": apps, "busy_apps": busy_apps, "duration_s": duration,
         "posts": samples.len(), "ok": samples.len() - not_ok, "not_ok": not_ok, "status_counts": status_counts,
         "records_ok": records_ok, "records_per_s": records_ok as f64 / duration, "batches_per_s": samples.len() as f64 / duration,
         "over_3s": over_3s, "max_in_flight": max_in_flight, "request_timeout_s": timeout_s,
