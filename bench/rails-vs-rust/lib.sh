@@ -23,6 +23,10 @@ MNT=${BENCH_MNT:-/mnt/rvr}
 # cgroup directory (bench/scale/ uses bench-server.slice inside bench.slice).
 RVR_SLICE=${RVR_SLICE:-rvr.slice}
 SLICE=${RVR_SLICE_PATH:-/sys/fs/cgroup/$RVR_SLICE}
+# The containers run as the invoking user, so the data dir it creates (and
+# the Rust seed files `env create` writes as that user) are writable inside.
+# Was a fixed 1000:1000, which only worked when the host user was UID 1000.
+RVR_USER=${RVR_USER:-$(id -u):$(id -g)}
 RAILS_PORT=8781   # Thruster's HTTP_PORT, host network
 RUST_PORT=8795
 SECRETS=$RVR_HERE/.secrets.env
@@ -51,7 +55,7 @@ rvr_wait() {
 # rvr_start_rails DATA_DIR: fresh web + jobs on DATA_DIR (bind mount at /rails/storage)
 rvr_start_rails() {
   local data=$1; rvr_secrets; mkdir -p "$data"
-  local common=(--cgroup-parent "$RVR_SLICE" --cpuset-cpus "$SERVER_CPUS" --network host --user 1000:1000
+  local common=(--cgroup-parent "$RVR_SLICE" --cpuset-cpus "$SERVER_CPUS" --network host --user "$RVR_USER"
     --env-file "$SECRETS" -e RAILS_MAX_THREADS=5 -e WEB_CONCURRENCY=2 -e RAILS_LOG_TO_STDOUT=true
     -e LITESTREAM_INSTALL_DIR=/usr/local/bin -e MAX_REQUEST_BODY=67108864
     -e RAILWATCH_ALLOWED_HOSTS=127.0.0.1,localhost -e HTTP_PORT=$RAILS_PORT -e TARGET_PORT=3781
@@ -94,7 +98,7 @@ rvr_start_rust() {
   : > "$out"
   for i in $(seq 1 "$n"); do RAILWATCH_DATA_DIR=$data "$RUST_BIN" env create "e$i" | grep -o 'rw_[A-Za-z0-9]*' >> "$out"; done
   local skb; skb=$(sed -n 's/^RAILWATCH_SECRET_KEY_BASE=//p' "$SECRETS")
-  docker run -d --name rvr-rust --cgroup-parent "$RVR_SLICE" --cpuset-cpus "$SERVER_CPUS" --network host --user 1000:1000 \
+  docker run -d --name rvr-rust --cgroup-parent "$RVR_SLICE" --cpuset-cpus "$SERVER_CPUS" --network host --user "$RVR_USER" \
     -v "$RUST_BIN:/usr/local/bin/railwatch:ro" -v "$data:/data" -e RAILWATCH_DATA_DIR=/data -e PORT=$RUST_PORT \
     -e RAILWATCH_SECRET_KEY_BASE="$skb" -e RAILWATCH_TRUST_PROXY=1 -e RAILWATCH_RATE_LIMIT_ENV="${RUST_ENV_LIMIT:-0}" \
     ${RUST_EXTRA_ENV:-} debian:13 railwatch serve >/dev/null
