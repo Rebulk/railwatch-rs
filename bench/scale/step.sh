@@ -4,7 +4,7 @@
 # production-shaped, open-loop traffic. Prints one JSON line and appends it
 # to $RESULTS. Needs reserve.sh on and disk.sh up first (sweep.sh does both).
 #
-#   bench/scale/step.sh rails|rust|rust-memory|rust-mem-ingest APPS [BUSY_EVERY]
+#   bench/scale/step.sh rails|rails-best|rust|rust-memory|rust-mem-ingest|rust-next APPS [BUSY_EVERY]
 #
 # Sampled every SAMPLE_S (2) seconds while the load runs: slice CPU, anon,
 # memory.current, summed VmRSS and open fds of the server processes, Rails'
@@ -27,12 +27,19 @@ case "$side" in
 rust) RUST_BIN=$BIN/railwatch-main ;;
 rust-memory) RUST_BIN=$BIN/railwatch-memory ;;
 rust-mem-ingest) RUST_BIN=$BIN/railwatch-mem-ingest ;;
+# rust-next: Track H's binary, dropped in as $BIN/railwatch-next
+rust-next) RUST_BIN=$BIN/railwatch-next ;;
 rails) ;;
-*) echo "side: rails|rust|rust-memory|rust-mem-ingest" >&2; exit 2 ;;
+# rails-best: Track G's image; RAILS_IMAGE (and any RAILS_EXTRA_ENV, a
+# docker --env-file of non-secret settings) come from the caller
+rails-best) [ -n "${RAILS_BEST_IMAGE:-}" ] || { echo "rails-best: set RAILS_BEST_IMAGE" >&2; exit 2; }
+  export RAILS_IMAGE=$RAILS_BEST_IMAGE ;;
+*) echo "side: rails|rails-best|rust|rust-memory|rust-mem-ingest|rust-next" >&2; exit 2 ;;
 esac
 DURATION=${DURATION:-600} SAMPLE_S=${SAMPLE_S:-2}
 RESULTS=${RESULTS:-$RVR_ROOT/bench/results/scale/steps.jsonl}
 mkdir -p "$(dirname "$RESULTS")"
+case "$side" in rails*) is_rails=1 ;; *) is_rails=0 ;; esac
 run=$(date +%Y%m%dT%H%M%S)-$side-$apps-b$busy_every
 data=$MNT/$run
 [ "$(findmnt -no FSTYPE "$MNT" 2>/dev/null)" = ext4 ] || { echo "step: $MNT is not the bench ext4 (disk.sh up)" >&2; exit 1; }
@@ -42,7 +49,7 @@ sudo find "$MNT" -mindepth 1 -maxdepth 1 -name '20*' -exec rm -rf {} +
 
 echo "== $run: starting server, seeding $apps apps ($(date +%T))" >&2
 t_seed=$(date +%s)
-if [ "$side" = rails ]; then
+if [ "$is_rails" = 1 ]; then
   rvr_start_rails "$data"
   rvr_seed_rails "$apps" "$work/tokens"
   url=http://127.0.0.1:$RAILS_PORT
@@ -65,7 +72,7 @@ rest_list() { python3 -I -c 'import sys; print(" ".join(str(c) for p in sys.argv
 REST_CPUS=" $(rest_list) "
 host_busy() { awk -v want="$REST_CPUS" '/^cpu[0-9]/{c=substr($1,4); if (index(want, " " c " ")) {t=0; for(i=2;i<=NF;i++) t+=$i; b+=t-$5-$6; a+=t}} END{print b, a}' /proc/stat; }
 queue() {
-  [ "$side" = rails ] || { echo "- -"; return; }
+  [ "$is_rails" = 1 ] || { echo "- -"; return; }
   sqlite3 "file:$data/production_queue.sqlite3?mode=ro" \
     "SELECT count(*), coalesce(CAST((julianday('now') - julianday(min(created_at))) * 86400 AS INT), 0) FROM solid_queue_ready_executions" 2>/dev/null | tr '|' ' ' || echo "? ?"
 }
@@ -79,6 +86,8 @@ date +%s.%N > "$work/load_t0"
     sleep "$SAMPLE_S"
   done ) > "$work/samples" &
 sampler=$!
+( m=999999999; while :; do a=$(awk '/^MemAvailable/{print int($2/1024)}' /proc/meminfo); [ "$a" -lt "$m" ] && m=$a && echo $m > "$work/memavail_min"; sleep 5; done ) &
+memmon=$!
 python3 -I "$HERE/fsync_probe.py" "$MNT" > "$work/fsync" &
 probe=$!
 # disk at the middle of the load window: growth over the second half is the
@@ -87,7 +96,7 @@ probe=$!
 # it reaches its checkpoint size, so on fresh files it inflates a short run)
 db_bytes() { find "$data" -type f ! -name "*-wal" ! -name "*-shm" -printf "%s\n" | awk "{t+=\$1} END{print t+0}"; }
 ( sleep $((DURATION / 2)); du -sb "$data" | cut -f1 > "$work/disk_mid"; db_bytes > "$work/db_mid" ) &
-trap 'kill $sampler $probe 2>/dev/null || true' EXIT
+trap 'kill $sampler $probe $memmon 2>/dev/null || true' EXIT
 echo "== $run: load ${DURATION}s ($(date +%T))" >&2
 # in bench-load.slice: the caller sits in user.slice, which reserve.sh keeps
 # off the reserved CPUs, so a plain taskset there is refused.
@@ -105,7 +114,7 @@ while [ $quiet -lt 6 ] && [ $t -lt "${TAIL_MAX:-300}" ]; do
   prev=$now
 done
 tail_idle=$([ $quiet -ge 6 ] && echo True || echo False)
-kill $sampler 2>/dev/null || true
+kill $sampler $memmon 2>/dev/null || true
 cpu2=$(rvr_cpu_us)
 read -r q_end qage_end < <(queue)
 after_anon=$(rvr_anon)
@@ -114,7 +123,7 @@ tel1=$(du -sb "$data/telemetry" | cut -f1)
 db1=$(db_bytes)
 oom=$(awk '/^oom_kill /{print $2}' "$SLICE/memory.events")
 failed_jobs=None
-[ "$side" = rails ] && failed_jobs=$(sqlite3 "file:$data/production_queue.sqlite3?mode=ro" "SELECT count(*) FROM solid_queue_failed_executions")
+[ "$is_rails" = 1 ] && failed_jobs=$(sqlite3 "file:$data/production_queue.sqlite3?mode=ro" "SELECT count(*) FROM solid_queue_failed_executions")
 exited=$(docker ps -a --filter "name=rvr-" --filter status=exited --format '{{.Names}}' | tr '\n' ' ')
 
 python3 -I - "$work/load.json" "$work/samples" "$work/fsync" <<PY | tee -a "$RESULTS"
@@ -159,6 +168,9 @@ row = {
   "disk_per_app_day_mib": round(($disk1 - $(cat "$work/disk_mid" 2>/dev/null || echo 0)) / apps * 86400 / (dur / 2) / 2**20, 1),
   "host_busy_pct_rest": round(($hb1 - $hb0) / max(1, ($ha1 - $ha0)) * 100, 1),
   "loadavg_max": max(float(s[8]) for s in S),
+  "loadavg_mean": round(sum(float(s[8]) for s in S) / len(S), 2),
+  "host_mem_available_min_mib": $(cat "$work/memavail_min" 2>/dev/null || echo None),
+  "rails_image": "${RAILS_IMAGE:-}" if $is_rails else None, "rust_bin_sha256": "$( [ -n "${RUST_BIN:-}" ] && sha256sum "$RUST_BIN" | cut -c1-12 )" or None,
 }
 # breaks (defined in docs/SCALE.md): p99 > 1 s, any drop, > 60 s behind, OOM
 why = []

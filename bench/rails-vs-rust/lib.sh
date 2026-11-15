@@ -55,6 +55,9 @@ rvr_start_rails() {
     -v "$data:/rails/storage")
   [ "${RAILS_ENV_LIMIT:-off}" = off ] && common+=(-v "$RVR_HERE/rails/zz_bench_no_environment_limit.rb:/rails/config/initializers/zz_bench_no_environment_limit.rb:ro")
   [ -n "${RAILS_EXTRA_MOUNTS:-}" ] && eval "common+=($RAILS_EXTRA_MOUNTS)"
+  # RAILS_EXTRA_ENV: an extra --env-file (non-secret settings, e.g. a tuned
+  # image's Puma/writer knobs) for both roles
+  [ -n "${RAILS_EXTRA_ENV:-}" ] && common+=(--env-file "$RAILS_EXTRA_ENV")
   docker run -d --name rvr-rails "${common[@]}" "$RAILS_IMAGE" >/dev/null
   rvr_wait "http://127.0.0.1:$RAILS_PORT/up"
   docker run -d --name rvr-rails-jobs "${common[@]}" "$RAILS_IMAGE" bin/jobs >/dev/null
