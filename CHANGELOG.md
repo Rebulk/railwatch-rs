@@ -22,9 +22,11 @@ since the decision that this is the one Railwatch server. The Rails app
   savepoint, so private memory stays flat at 500 apps instead of growing
   until the cap (#92).
 - WAL checkpoints move off the ingest writer to one background
-  checkpointer thread. Each WAL is capped: past 8000 pages (32 MB) the
-  writer checkpoints inline, as SQLite's autocheckpoint would (#92,
-  docs/PERF.md "Background checkpointer").
+  checkpointer thread, with a cap: past 8000 pages (32 MB) the writer
+  checkpoints inline, as SQLite's autocheckpoint would. The cap is best
+  effort: a long reader that pins frames, or a failed checkpoint, can
+  leave a WAL above it, as with the autocheckpoint (#92, docs/PERF.md
+  "Background checkpointer").
 - No transparent huge pages for the server process: `PR_SET_THP_DISABLE`,
   the same as `MIMALLOC_ALLOW_THP=0`. On a THP-`always` host this about
   halves memory under ingest (#89).
