@@ -83,6 +83,12 @@ bin/rails generate railwatch:install --url=https://monitor.example.com --prompt-
 bin/rails railwatch:doctor
 ```
 
+The generator writes `RAILWATCH_INGEST_URL` and `RAILWATCH_TOKEN` to `.env`
+only when the app loads dotenv and Git ignores `.env`. Otherwise it prints
+them, and you set them where the app gets its environment (Kamal secrets,
+your platform's env, or Rails credentials) and restart before running the
+doctor. Without a token the agent sends nothing.
+
 Requests, jobs and exceptions appear in the dashboard at
 `https://monitor.example.com` a couple of seconds after they happen. For
 the dashboard inside the app with nothing else to run, the
@@ -94,8 +100,8 @@ railwatch-cloud, is kept as a frozen reference.
 
 ## How it compares with the Rails server
 
-Same box for both: 2 threads and 4 GiB in a systemd slice on an AMD Ryzen 7
-8745HS workstation, the same disk, the same load generator, and a
+Same box for both: 2 threads (one core and its SMT sibling) and 4 GiB in a
+systemd slice on an AMD Ryzen AI 9 HX 370 workstation, the same disk, the same load generator, and a
 typical-app traffic profile taken from production. Rust is PR #92
 (`46fa311`), and Rails is the tuned railwatch-cloud #261. Each step ran
 for 10 minutes. Full method, raw results and the root cause of each limit
@@ -104,8 +110,8 @@ are in [docs/SCALE.md](docs/SCALE.md) and
 
 | | Rust (this repo) | Rails, tuned (#261) | Rails, stock |
 |---|---:|---:|---:|
-| apps that fit on 2 threads / 4 GiB | **500** | about 150-200 | about 100 |
-| what runs out first | memory (page cache at 500) | CPU, in each minute's burst | CPU |
+| apps that fit on 2 threads / 4 GiB | **500, the largest step run** (limit not reached) | about 150-200 (broke at 250) | about 100 (broke at 250) |
+| what limits it | not found yet; at 500, private memory was flat at about 1.5 GiB and page cache filled the rest of the cap | CPU, in each minute's burst | CPU |
 | p99 at 100 apps | 10.6 ms | 38.5 ms | 122.9 ms |
 | CPU at 100 apps (% of 2 threads) | 2.7 | 16.5 | 23.0 |
 | private memory at 100 apps (steady) | 262 MiB | 1,052 MiB | 973 MiB |

@@ -38,8 +38,10 @@ since the decision that this is the one Railwatch server. The Rails app
   (docs/SCALE.md, #91).
 - The marketing site moved to railwatch.dev as a static build (#79).
 
-**Upgrading** from v0.2.x: `sudo railwatch upgrade`, or `railwatch-swap`
-behind kamal-proxy. The control DB gains the uptime tables (migration 4,
+**Upgrading** from v0.2.x: `sudo railwatch upgrade`. Behind kamal-proxy,
+copy the new binary to `bin/railwatch.new` first, then run `railwatch-swap`.
+Without `railwatch.new` it only restarts the current binary
+(deploy/kamal-proxy/README.md). The control DB gains the uptime tables (migration 4,
 applied on start). Telemetry files need no migration.
 
 ## v0.2.19 (2026-11-01)
