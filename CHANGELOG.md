@@ -5,23 +5,37 @@ tag). This file is the human summary. Versions follow semver; a `-rc.N`
 tag is a release candidate (marked pre-release, not "latest", so
 `install.sh` and `railwatch upgrade` do not pick it up).
 
-## v0.3.0 (unreleased; v0.3.0-rc.1 runs railwatch.rebulk.com since 2026-11-16)
+## v0.3.0 (2026-11-16)
 
 This is the first release since railwatch.rebulk.com moved off Rails, and
 since the decision that this is the one Railwatch server. The Rails app
 (railwatch-cloud) is now a frozen reference.
 
 **Memory and scale** (2 threads / 4 GiB: 250 apps -> 500; docs/SCALE.md)
+- Memory per tenant is about 3.5x smaller: steady private memory per app
+  fell from 8.8 to 2.5 MiB (10 -> 100 apps). At 500 apps on 2 threads /
+  4 GiB the server holds steady at about 1.5 GiB of private memory, where
+  v0.2.x was killed at the cap (docs/SCALE.md).
 - Server memory is bounded: idle connections close, and readers and rollup
   accumulators are capped across tenants (#90).
-- Each tenant's memory is fixed at the root. A background WAL checkpointer
-  runs, and there is no per-batch savepoint, so private memory stays flat
-  at 500 apps instead of growing until the cap (#92).
+- Each tenant's memory is fixed at the root. There is no per-batch
+  savepoint, so private memory stays flat at 500 apps instead of growing
+  until the cap (#92).
+- WAL checkpoints move off the ingest writer to one background
+  checkpointer thread, with a cap: past 8000 pages (32 MB) the writer
+  checkpoints inline, as SQLite's autocheckpoint would. The cap is best
+  effort: a long reader that pins frames, or a failed checkpoint, can
+  leave a WAL above it, as with the autocheckpoint (#92, docs/PERF.md
+  "Background checkpointer").
 - No transparent huge pages for the server process: `PR_SET_THP_DISABLE`,
   the same as `MIMALLOC_ALLOW_THP=0`. On a THP-`always` host this about
-  halves memory under ingest. Ingest also parses with 9-12% less CPU per
-  event (#89).
-- Reads by day open only the day files inside the window (#87).
+  halves memory under ingest (#89).
+- Faster ingest: parsing takes 9-12% less CPU per event (#89), and the
+  writer thread's CPU per 1k events fell from 34.5 to 20.8 ms at one batch
+  per transaction. At 50 apps the server took 17,211 events/s, against
+  13,889 before (#92).
+- Dashboard reads by day open only the day files inside the window, not
+  every file the tenant has (#87).
 - New tenant files make seven indexes partial, at 0.82 -> 0.79 GB per
   million events. Existing files are not altered (#86, DIFFERENCES #16).
 
