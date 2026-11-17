@@ -436,7 +436,13 @@ if [ "$FIRST_RUN" = 1 ]; then
   if [ -n "$PASSWORD_FILE" ]; then
     [ -r "$PASSWORD_FILE" ] || die "--password-file $PASSWORD_FILE: not readable"
     exec 3< "$PASSWORD_FILE"
-  elif [ "$PASSWORD_STDIN" = 0 ] && [ ! -t 0 ] && [ -r /dev/tty ] && [ "$YES" = 0 ]; then exec 3< /dev/tty
+  elif [ "$PASSWORD_STDIN" = 0 ] && [ ! -t 0 ] && [ "$YES" = 0 ]; then
+    # `[ -r /dev/tty ]` passes with no controlling terminal (a container,
+    # cloud-init, CI); only opening it tells, and a failed `exec` redirect
+    # ends a POSIX shell outright, so try it in a subshell first.
+    (exec 3< /dev/tty) 2> /dev/null \
+      || die "no terminal to ask for the admin password: pass --password-file PATH, or run this from an interactive shell (--password-stdin works only when install.sh is run as a file, not through curl | sh, where stdin is the script)"
+    exec 3< /dev/tty
   else exec 3<&0; fi
   # The binary reads the env file itself (as data) and, run as root,
   # becomes the owner of the data dir before touching it.

@@ -75,6 +75,68 @@ The binary is the whole app: `RAILWATCH_DATA_DIR=./data railwatch setup`,
 then `railwatch serve`. Any process supervisor works; socket activation
 (`LISTEN_FDS`) is used when present.
 
+## Docker
+
+The same binary as a container image, for x86_64 and arm64, published with
+every release: `ghcr.io/rebulk/railwatch:vX.Y.Z` (and `:latest`). It holds
+the release binary and its licences, nothing else (no shell), runs as uid
+10001, and keeps everything in the `/data` volume.
+
+```sh
+docker run -d --name railwatch --restart unless-stopped \
+  -p 127.0.0.1:8790:8790 -v railwatch:/data \
+  -e RAILWATCH_URL=https://monitor.example.com -e RAILWATCH_TRUST_PROXY=1 \
+  ghcr.io/rebulk/railwatch:latest
+docker exec -it railwatch railwatch setup    # once: admin, app, ingest token
+```
+
+Or in Compose:
+
+```yaml
+services:
+  railwatch:
+    image: ghcr.io/rebulk/railwatch:latest
+    restart: unless-stopped
+    ports: ["127.0.0.1:8790:8790"]   # only the proxy on this host reaches it
+    volumes: [railwatch:/data]
+    environment:
+      RAILWATCH_URL: https://monitor.example.com
+      RAILWATCH_TRUST_PROXY: "1"   # behind a proxy that sets X-Forwarded-For
+volumes:
+  railwatch:
+```
+
+It serves plain HTTP on :8790: put your proxy in front of it for HTTPS
+(Caddy, Traefik, nginx, kamal-proxy). Publish the port on `127.0.0.1` only,
+as above, so nothing reaches Railwatch except through that proxy; with a
+proxy that runs in a container too, publish no port at all and put both on
+one private Docker network. That is also what makes
+`RAILWATCH_TRUST_PROXY=1` safe: the server then counts per-IP rate limits by
+`X-Forwarded-For` (without it every client looks like the proxy and shares
+one limit), and only a client that can reach the server directly could forge
+that header. Leave it unset if nothing in front sets `X-Forwarded-For`. For HTTPS from Railwatch itself, use
+the installer above on a VM. `RAILWATCH_URL` is the address people and the
+Rails app use; every other setting in the [reference](#configuration-reference)
+works as an environment variable here too, and every CLI command runs with
+`docker exec railwatch railwatch <command>` (`doctor`, `backup`,
+`env create <name>`...).
+
+`setup` asks for the admin password on the terminal (`-it`). Scripted:
+`docker exec -i railwatch railwatch setup --email you@example.com --password-stdin < password.txt`.
+
+Upgrade by pulling a new tag and recreating the container; `railwatch
+upgrade` is for the installed layout, not the image. The server drains
+on `docker stop` (SIGTERM; give it `-t 15`). Back up the `railwatch`
+volume or turn on [S3 backups](#backups).
+
+Verify an image the way you verify the tarballs (see [Releases](#releases)):
+
+```sh
+cosign verify ghcr.io/rebulk/railwatch:vX.Y.Z \
+  --certificate-identity-regexp '^https://github.com/Rebulk/railwatch-rs/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
 ## HTTPS: why it is built in
 
 The installer used to put Caddy in front. It now serves TLS from the binary
@@ -155,7 +217,7 @@ refused). `railwatch doctor` prints every setting and where it came from.
 
 ## Running behind an app
 
-For the railwatch-server gem, or anything else that runs this server next
+For the railwatch-sidecar gem, or anything else that runs this server next
 to one Rails app and shows the dashboard inside it (at `/railwatch`, behind
 the app's own login). A normal install needs none of this, and all three
 settings are off by default.
@@ -183,7 +245,7 @@ claims: {"email": "ada@example.com", "name": "Ada", "role": "admin" | "member", 
 ```
 
 (base64url without padding, `exp` at most 300 seconds ahead; the
-railwatch-server gem signs a fresh one per request, valid for 60 s).
+railwatch-sidecar gem signs a fresh one per request, valid for 60 s).
 
 The security model:
 
@@ -224,7 +286,7 @@ The security model:
   one (readable or not), is the only credential looked at: a bad token is
   401, not a fall back to the header.
   Which requests the proxy signs is the proxy's choice: the
-  railwatch-server gem signs these two routes only in development, for a
+  railwatch-sidecar gem signs these two routes only in development, for a
   request from the same machine, unless the app opts in.
 - **Replay**: there is no nonce. A header captured in transit can be
   replayed until its `exp`, at most 300 s (60 s from the gem), the same

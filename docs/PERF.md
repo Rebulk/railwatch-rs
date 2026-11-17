@@ -226,7 +226,7 @@ wrong (both were checked by breaking them).
 
 ## Bounded memory and disk (branch bounded-disk-memory, from main 3a09c49)
 
-For a server on the monitored app's own box (the railwatch-server gem). A stress test of that
+For a server on the monitored app's own box (the railwatch-sidecar gem). A stress test of that
 setup found anonymous RSS of 1.3-1.8 GB under dashboard load, 0.95 GB still held when idle, a
 rollup accumulator that could reach ~3 GB, and disk bounded only by retention (time).
 

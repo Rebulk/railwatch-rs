@@ -56,3 +56,18 @@ fn install_sh_refuses_a_downgrade_without_the_flag() {
     assert!(line.contains(r#"[ "$ALLOW_DOWNGRADE" = 0 ]"#), "only --allow-downgrade skips it: {line}");
     assert!(script.contains("--allow-downgrade) ALLOW_DOWNGRADE=1"));
 }
+
+/// With no controlling terminal (a container, cloud-init, CI) under
+/// `curl | sh`, `[ -r /dev/tty ]` still passes and the open fails; the
+/// script must say what to pass, not die on a bare "cannot open /dev/tty".
+/// The probe is a subshell: a failed `exec` redirect ends a POSIX shell.
+#[test]
+fn install_sh_explains_a_missing_terminal() {
+    let script = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/install.sh")).unwrap();
+    let probe = script.find("(exec 3< /dev/tty) 2> /dev/null").expect("the subshell probe");
+    let open = script.find("    exec 3< /dev/tty\n").expect("the real open");
+    assert!(probe < open, "probed before the shell's own descriptor is opened");
+    assert!(script[probe..open].contains("--password-file"), "the message names the fix");
+    let code = script.lines().filter(|l| !l.trim_start().starts_with('#'));
+    assert!(code.into_iter().all(|l| !l.contains("[ -r /dev/tty ]")), "-r passes without a terminal");
+}

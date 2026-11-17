@@ -5,6 +5,19 @@ tag). This file is the human summary. Versions follow semver; a `-rc.N`
 tag is a release candidate (marked pre-release, not "latest", so
 `install.sh` and `railwatch upgrade` do not pick it up).
 
+## Unreleased
+
+- **Docker image**: `ghcr.io/rebulk/railwatch:vX.Y.Z` and `:latest`, for
+  x86_64 and arm64, published by the release workflow from the release's
+  own tarballs (checked against SHA256SUMS) and signed with cosign
+  keyless. No shell, runs as uid 10001, data in `/data`, plain HTTP on
+  :8790 for your proxy. docs/SELF-HOST.md, "Docker".
+- install.sh: with no terminal to ask for the admin password (a
+  container, cloud-init, CI), it now says to pass `--password-file` or
+  `--password-stdin` instead of failing with "cannot open /dev/tty".
+- Docs: the gem that runs this server inside a Rails app is now
+  `railwatch-sidecar` (renamed from `railwatch-server`).
+
 ## v0.3.0 (2026-11-16)
 
 This is the first release since railwatch.rebulk.com moved off Rails, and

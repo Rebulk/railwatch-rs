@@ -2,7 +2,7 @@
 
 The `railwatch` binary is also a command-line client for any Railwatch
 server: the hosted one, a self-hosted one, or the server a Rails app embeds
-in development (the railwatch-server gem). Each command calls the server's
+in development (the railwatch-sidecar gem). Each command calls the server's
 MCP tools (`POST <server>/mcp`, JSON-RPC), so it shows the same data an
 agent gets over MCP. An agent with a shell (Codex, Claude Code, a CI job)
 can use it with no MCP set up.
@@ -31,7 +31,7 @@ The endpoint comes from the first of these that is set:
 2. `RAILWATCH_URL`
 3. the URL saved by `railwatch login`
 4. `http://localhost:${PORT:-3000}${RAILWATCH_SERVER_MOUNT_PATH:-/railwatch}/mcp`,
-   the railwatch-server gem's development mount. An app that mounts the
+   the railwatch-sidecar gem's development mount. An app that mounts the
    dashboard elsewhere (the CRM uses `/monitoring`) already sets
    `RAILWATCH_SERVER_MOUNT_PATH`, and the client reads it.
 

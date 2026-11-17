@@ -126,7 +126,7 @@ URL there**).
   random characters), or choose one (3 to 64 lowercase letters, digits and
   hyphens). The route is outside the dashboard's session: no sign-in, no
   cookies. With `base_path` set it is under that path like every page, so
-  a server mounted behind an app's own login (the railwatch-server gem) is
+  a server mounted behind an app's own login (the railwatch-sidecar gem) is
   only public if that app forwards `/status/` without its login.
 - It shows the overall status (all operational, some down, all down, or
   "not yet known" until a public monitor has had a check), each

@@ -45,6 +45,17 @@ re-running the command) upgrades with zero dropped ingest posts: systemd
 holds the sockets across the restart. `--no-tls` puts it behind your own
 proxy instead; `--backup-s3-*` turns on backups.
 
+**Docker** (x86_64 and arm64, plain HTTP for a proxy on the same host):
+
+```sh
+docker run -d --name railwatch -p 127.0.0.1:8790:8790 -v railwatch:/data \
+  -e RAILWATCH_URL=https://monitor.example.com -e RAILWATCH_TRUST_PROXY=1 \
+  ghcr.io/rebulk/railwatch:latest
+docker exec -it railwatch railwatch setup
+```
+
+Compose, upgrades and image verification: docs/SELF-HOST.md, "Docker".
+
 **Alerts are part of setup, on purpose.** Pass one of `--alert-webhook URL
 [--alert-webhook-secret S]`, `--alert-slack URL`, `--alert-email ADDR` (to
 `install.sh` or `railwatch setup`) and that destination gets `new_issue`,
@@ -92,7 +103,7 @@ doctor. Without a token the agent sends nothing.
 Requests, jobs and exceptions appear in the dashboard at
 `https://monitor.example.com` a couple of seconds after they happen. For
 the dashboard inside the app with nothing else to run, the
-[railwatch-server](https://github.com/Rebulk/railwatch-server) gem runs this
+[railwatch-sidecar](https://github.com/Rebulk/railwatch-sidecar) gem runs this
 same binary next to Puma. Railwatch has one engine: this server is
 Railwatch Cloud (railwatch.rebulk.com, since 2026-10-18), the self-hosted
 install, and the embedded one. The Rails app it replaced,

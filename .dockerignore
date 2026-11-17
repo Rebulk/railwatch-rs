@@ -1,0 +1,4 @@
+# The image takes only the release tarballs (--build-context dist=...);
+# nothing from the repository goes in it.
+*
+!Dockerfile
