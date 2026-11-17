@@ -45,11 +45,12 @@ re-running the command) upgrades with zero dropped ingest posts: systemd
 holds the sockets across the restart. `--no-tls` puts it behind your own
 proxy instead; `--backup-s3-*` turns on backups.
 
-**Docker** (x86_64 and arm64, plain HTTP for your own proxy):
+**Docker** (x86_64 and arm64, plain HTTP for a proxy on the same host):
 
 ```sh
-docker run -d --name railwatch -p 8790:8790 -v railwatch:/data \
-  -e RAILWATCH_URL=https://monitor.example.com ghcr.io/rebulk/railwatch:latest
+docker run -d --name railwatch -p 127.0.0.1:8790:8790 -v railwatch:/data \
+  -e RAILWATCH_URL=https://monitor.example.com -e RAILWATCH_TRUST_PROXY=1 \
+  ghcr.io/rebulk/railwatch:latest
 docker exec -it railwatch railwatch setup
 ```
 

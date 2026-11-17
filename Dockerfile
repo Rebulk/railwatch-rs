@@ -9,8 +9,9 @@
 #
 # Run it (docs/SELF-HOST.md, "Docker"):
 #
-#   docker run -d --name railwatch -p 8790:8790 -v railwatch:/data \
-#     -e RAILWATCH_URL=https://monitor.example.com ghcr.io/rebulk/railwatch:latest
+#   docker run -d --name railwatch -p 127.0.0.1:8790:8790 -v railwatch:/data \
+#     -e RAILWATCH_URL=https://monitor.example.com -e RAILWATCH_TRUST_PROXY=1 \
+#     ghcr.io/rebulk/railwatch:latest
 #   docker exec -it railwatch railwatch setup     # once: the admin, the app, the token
 #
 # Serves plain HTTP on :8790 for the proxy in front of it (Caddy, Traefik,

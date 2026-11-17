@@ -84,8 +84,8 @@ the release binary and its licences, nothing else (no shell), runs as uid
 
 ```sh
 docker run -d --name railwatch --restart unless-stopped \
-  -p 8790:8790 -v railwatch:/data \
-  -e RAILWATCH_URL=https://monitor.example.com \
+  -p 127.0.0.1:8790:8790 -v railwatch:/data \
+  -e RAILWATCH_URL=https://monitor.example.com -e RAILWATCH_TRUST_PROXY=1 \
   ghcr.io/rebulk/railwatch:latest
 docker exec -it railwatch railwatch setup    # once: admin, app, ingest token
 ```
@@ -97,7 +97,7 @@ services:
   railwatch:
     image: ghcr.io/rebulk/railwatch:latest
     restart: unless-stopped
-    ports: ["8790:8790"]
+    ports: ["127.0.0.1:8790:8790"]   # only the proxy on this host reaches it
     volumes: [railwatch:/data]
     environment:
       RAILWATCH_URL: https://monitor.example.com
@@ -107,7 +107,14 @@ volumes:
 ```
 
 It serves plain HTTP on :8790: put your proxy in front of it for HTTPS
-(Caddy, Traefik, nginx, kamal-proxy). For HTTPS from Railwatch itself, use
+(Caddy, Traefik, nginx, kamal-proxy). Publish the port on `127.0.0.1` only,
+as above, so nothing reaches Railwatch except through that proxy; with a
+proxy that runs in a container too, publish no port at all and put both on
+one private Docker network. That is also what makes
+`RAILWATCH_TRUST_PROXY=1` safe: the server then counts per-IP rate limits by
+`X-Forwarded-For` (without it every client looks like the proxy and shares
+one limit), and only a client that can reach the server directly could forge
+that header. Leave it unset if nothing in front sets `X-Forwarded-For`. For HTTPS from Railwatch itself, use
 the installer above on a VM. `RAILWATCH_URL` is the address people and the
 Rails app use; every other setting in the [reference](#configuration-reference)
 works as an environment variable here too, and every CLI command runs with
