@@ -370,7 +370,10 @@ fn render(method: &Method, req_headers: &HeaderMap, status: StatusCode, body: &V
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     }
     if status != StatusCode::NOT_MODIFIED {
-        h.insert("content-security-policy", HeaderValue::from_static("base-uri 'self'; object-src 'none'; frame-ancestors 'none'"));
+        h.insert(
+            "content-security-policy",
+            HeaderValue::from_static("base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self'; connect-src 'self'; form-action 'self'"),
+        );
     }
     // Rack's content-length; Rack::Head and Rack::ConditionalGet answer
     // without one.

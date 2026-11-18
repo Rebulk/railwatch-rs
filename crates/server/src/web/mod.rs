@@ -82,6 +82,8 @@ pub struct WebState {
     pub mcp_preauth_limit: FixedWindow<IpAddr>,
     /// Api::BaseController's rate_limit: 600 a minute per user, per controller.
     pub api_rate_limit: FixedWindow<(&'static str, i64)>,
+    /// Every page's Content-Security-Policy (document::content_security_policy).
+    pub csp: axum::http::HeaderValue,
 }
 
 impl WebState {
@@ -91,6 +93,12 @@ impl WebState {
         let cursor_key = crate::dashboard::CursorKey(cursor_key_bytes(&secret));
         let readers = crate::dashboard::pool::ReadPools::with_max(tenants.dir(), crate::dashboard::pool::PER_TENANT, config.max_read_connections);
         let mailer = config.smtp.as_ref().map(mailer::Mailer::new).transpose()?;
+        let google_origin = config.google.as_ref().and_then(|g| {
+            let u = reqwest::Url::parse(&google_oauth2::endpoints(g).authorize).ok()?;
+            Some(u.origin().ascii_serialization())
+        });
+        let csp = axum::http::HeaderValue::from_str(&document::content_security_policy(google_origin.as_deref()))
+            .map_err(|_| "google_issuer: not usable in a Content-Security-Policy".to_string())?;
         Ok(WebState {
             control,
             keys,
@@ -109,6 +117,7 @@ impl WebState {
             settings_cipher: crate::alerts::integration::SettingsCipher::new(&secret),
             mcp_preauth_limit: mcp::preauth_limit(),
             api_rate_limit: api::rate_limit(),
+            csp,
             config,
         })
     }

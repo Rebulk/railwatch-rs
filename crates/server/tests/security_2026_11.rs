@@ -364,3 +364,63 @@ fn alert_delivery_ignores_proxy_environment_variables() {
     assert!(result.is_err(), "nothing listens at the destination");
     assert!(proxy.accept().is_err(), "the delivery went through the proxy");
 }
+
+// ---------------------------------------------------------------------------
+// Finding 15: Content-Security-Policy
+
+fn directive<'a>(csp: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    csp.split(';').map(str::trim).find_map(|d| d.strip_prefix(name).filter(|r| r.is_empty() || r.starts_with(' ')).map(|r| r.split_whitespace().collect()))
+}
+
+/// The sha256 CSP source of each inline script a page runs (not the
+/// Inertia page data, which is JSON and never executed).
+fn inline_script_hashes(html: &str) -> Vec<String> {
+    use base64::Engine;
+    use sha2::Digest;
+    let mut out = vec![];
+    let mut rest = html;
+    while let Some(i) = rest.find("<script") {
+        let tag_end = rest[i..].find('>').unwrap() + i;
+        let tag = &rest[i..tag_end];
+        let close = rest[tag_end..].find("</script>").unwrap() + tag_end;
+        if !tag.contains(" src=") && !tag.contains("application/json") {
+            let body = &rest[tag_end + 1..close];
+            out.push(format!("'sha256-{}'", base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(body.as_bytes()))));
+        }
+        rest = &rest[close..];
+    }
+    out
+}
+
+/// Pages say where scripts, connections and form posts may go: scripts only
+/// from this server plus the one inline dark-mode script by hash (no
+/// 'unsafe-inline'), so injected markup cannot run script; connections and
+/// forms only back to this server.
+#[test]
+fn pages_allow_only_this_servers_scripts_and_the_dark_mode_script_by_hash() {
+    let s = start("csp", "invite");
+    let password = control::base58(16);
+    let ada = user(&s, "Ada", "ada@example.com", &password, true);
+    let account = s.control.tx(|tx| control::create_account(tx, "Acme", ada)).unwrap();
+    s.control.tx(|tx| control::insert_application(tx, account, "Shop", "shop", "SHOP", None, "main")).unwrap();
+    let mut b = Browser::default();
+    let sign_in = b.get(&s, "/sign_in");
+    b.sign_in(&s, "ada@example.com", &password);
+    let dashboard = b.get(&s, "/dashboard");
+    assert_eq!(dashboard.status, 200);
+    for (page, r) in [("sign-in", &sign_in), ("dashboard", &dashboard)] {
+        let csp = r.header("content-security-policy").expect("a CSP");
+        let scripts = directive(csp, "script-src").unwrap_or_else(|| panic!("{page}: no script-src in {csp}"));
+        assert!(scripts.contains(&"'self'") && !scripts.contains(&"'unsafe-inline'"), "{page}: {csp}");
+        let inline = inline_script_hashes(&r.body);
+        assert!(!inline.is_empty(), "{page} has the dark-mode script");
+        for h in &inline {
+            assert!(scripts.contains(&h.as_str()), "{page}: inline script {h} is not allowed by {csp}");
+        }
+        assert_eq!(directive(csp, "connect-src"), Some(vec!["'self'"]), "{page}: {csp}");
+        assert_eq!(directive(csp, "form-action").map(|v| v[0]), Some("'self'"), "{page}: {csp}");
+        for kept in ["base-uri", "object-src", "frame-ancestors"] {
+            assert!(directive(csp, kept).is_some(), "{page}: {kept} kept");
+        }
+    }
+}
