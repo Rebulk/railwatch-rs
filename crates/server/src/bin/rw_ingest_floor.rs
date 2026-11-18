@@ -28,7 +28,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn cpu_secs() -> f64 {
     // SAFETY: getrusage fills the struct it is given.
     let mut r: libc::rusage = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut r) };
+    // This thread's CPU on Linux; elsewhere (RUSAGE_THREAD is Linux-only)
+    // the process's, which for this single-threaded bench is the same.
+    #[cfg(target_os = "linux")]
+    let who = libc::RUSAGE_THREAD;
+    #[cfg(not(target_os = "linux"))]
+    let who = libc::RUSAGE_SELF;
+    unsafe { libc::getrusage(who, &mut r) };
     let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     tv(r.ru_utime) + tv(r.ru_stime)
 }
