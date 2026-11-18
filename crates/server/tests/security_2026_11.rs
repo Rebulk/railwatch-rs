@@ -211,3 +211,65 @@ fn adding_a_member_invites_them_instead_of_joining_them_without_consent() {
     assert_eq!(existing_flash["notice"], "Invitation sent to alice@example.com", "{existing_flash}");
     assert_eq!(stranger_flash["notice"], "Invitation sent to nobody@example.com");
 }
+
+// ---------------------------------------------------------------------------
+// Finding 13
+
+/// The link a password reset mails (controllers::signed_token), built here
+/// because without SMTP the server no longer logs it.
+fn reset_sid(s: &Server, user_id: i64) -> String {
+    let digest: String = s.control.with(|x| x.query_row("SELECT password_digest FROM users WHERE id = ?", [user_id], |r| r.get(0))).unwrap();
+    let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 600;
+    let value = format!("{user_id}.{exp}");
+    let mac = s.state.keys.sign("password_reset", &format!("{value}.{}", &digest[19..29]));
+    format!("{value}.{}", mac.rsplit_once("--").unwrap().1)
+}
+
+/// With open sign-up anyone can register an address they do not own; the
+/// account stays unverified. The address's real owner proves it with a
+/// password reset, which takes the account over: verified, the squatter's
+/// password, sessions and tokens gone.
+#[test]
+fn a_password_reset_takes_an_unverified_account_back_from_whoever_signed_up_with_the_address() {
+    let s = start("squat", "open");
+    let squatter_password = control::base58(16);
+    let mut squatter = Browser::default();
+    let r = squatter.post(
+        &s,
+        "/sign_up",
+        &format!("name=Mallory&email=victim%40example.com&password={squatter_password}&password_confirmation={squatter_password}&terms=1"),
+    );
+    assert_eq!((r.status, r.location()), (302, "/dashboard"), "the squatter signs up");
+    let id: i64 = s.control.with(|x| x.query_row("SELECT id FROM users WHERE email = 'victim@example.com'", [], |r| r.get(0))).unwrap();
+    s.control.tx(|tx| control::issue_api_token(tx, id, "squat", &["api".into(), "read".into()], None, None, None)).unwrap();
+
+    // The owner asks for a reset: it is sent (the request is claimed).
+    let mut owner = Browser::default();
+    owner.post(&s, "/identity/password_reset", "email=victim%40example.com");
+    let sent: Option<String> = s.control.with(|x| x.query_row("SELECT password_reset_sent_at FROM users WHERE id = ?", [id], |r| r.get(0))).unwrap();
+    assert!(sent.is_some(), "a reset goes to an unverified address too");
+
+    let new_password = control::base58(16);
+    let token = owner.csrf(&s);
+    let r = owner.request(
+        &s,
+        "PATCH",
+        "/identity/password_reset",
+        Some(&format!("sid={}&password={new_password}&password_confirmation={new_password}", reset_sid(&s, id))),
+        &[("X-CSRF-Token", &token)],
+    );
+    assert_eq!((r.status, r.location()), (302, "/sign_in"), "{}", r.body);
+    let (verified, sessions, tokens): (bool, i64, i64) = s
+        .control
+        .with(|x| {
+            x.query_row(
+                "SELECT verified, (SELECT COUNT(*) FROM sessions WHERE user_id = ?1), (SELECT COUNT(*) FROM api_tokens WHERE user_id = ?1) FROM users WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+        })
+        .unwrap();
+    assert_eq!((verified, sessions, tokens), (true, 0, 0), "the owner's now: verified, the squatter's sessions and tokens gone");
+    assert_eq!(squatter.get(&s, "/dashboard").location(), "/sign_in", "the squatter is signed out");
+    owner.sign_in(&s, "victim@example.com", &new_password);
+}

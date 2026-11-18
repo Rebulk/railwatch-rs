@@ -481,6 +481,9 @@ async fn password_reset_edit(cx: Ctx, p: Params) -> Response {
 
 /// Always the same answer: whether the address exists is not for a
 /// stranger to learn. One email per 10 minutes per user (claim by UPDATE).
+/// An unverified user gets one too: with open sign-up anyone can register
+/// an address they do not own, and the reset is how its owner takes it back
+/// (password_reset_update).
 async fn password_reset_create(cx: Ctx, p: Params) -> Response {
     guard!(rate_limited(&cx, &cx.state.email_limit, "/identity/password_reset/new", "Too many password reset requests. Try again later."));
     let email = control::normalize_email(&p.s("email"));
@@ -488,7 +491,7 @@ async fn password_reset_create(cx: Ctx, p: Params) -> Response {
         .state
         .db(move |c| {
             c.with(|x| {
-                let Some(u) = control::find_user_by_email(x, &email)?.filter(|u| u.verified) else { return Ok(None) };
+                let Some(u) = control::find_user_by_email(x, &email)? else { return Ok(None) };
                 let cutoff = crate::time::quoted_date_micros(crate::time::now_micros() - 600_000_000);
                 let n = x.execute(
                     "UPDATE users SET password_reset_sent_at = ?1 WHERE id = ?2 AND (password_reset_sent_at IS NULL OR password_reset_sent_at <= ?3)",
@@ -506,7 +509,7 @@ async fn password_reset_create(cx: Ctx, p: Params) -> Response {
         Ok(None) => {}
         Err(e) => return internal(e),
     }
-    cx.redirect(Redirect::to("/sign_in").notice("If that address has a verified account, check your email for reset instructions"))
+    cx.redirect(Redirect::to("/sign_in").notice("If that address has an account, check your email for reset instructions"))
 }
 
 async fn password_reset_update(cx: Ctx, p: Params) -> Response {
@@ -523,7 +526,23 @@ async fn password_reset_update(cx: Ctx, p: Params) -> Response {
     if !errors.is_empty() {
         return cx.redirect(Redirect::to(format!("/identity/password_reset/edit?sid={sid}")).errors(errors));
     }
-    match cx.state.db(move |c| c.with(|x| control::set_password(x, user.id, &password, None))).await {
+    // The link reached the mailbox, which proves the address. An unverified
+    // user may have been someone else's sign-up with it: verified now, and
+    // whoever signed up loses their sessions (set_password) and tokens.
+    let r = cx
+        .state
+        .db(move |c| {
+            c.tx(|tx| {
+                control::set_password(tx, user.id, &password, None)?;
+                if !user.verified {
+                    tx.execute("UPDATE users SET verified = 1, updated_at = ? WHERE id = ?", params![now_db(), user.id])?;
+                    tx.execute("DELETE FROM api_tokens WHERE user_id = ?", [user.id])?;
+                }
+                Ok(())
+            })
+        })
+        .await;
+    match r {
         Ok(()) => cx.redirect(Redirect::to("/sign_in").notice("Your password was reset successfully. Please sign in")),
         Err(e) => internal(e),
     }
