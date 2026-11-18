@@ -133,9 +133,9 @@ A proxy on a public address in front of another proxy (a CDN that connects
 to your Caddy over the internet) is not recognised as a proxy, so its
 address becomes the client: put the CDN's own client header into
 `X-Forwarded-For` at the inner proxy instead, or connect them privately.
-With Docker, a port published on `0.0.0.0` reaches the container through
-Docker's private bridge, so it too looks like a proxy: publish on
-`127.0.0.1` only, as above. For HTTPS from Railwatch itself, use
+With Docker, a published port can reach the container from the bridge's
+private gateway address (Docker's userland proxy does this), which then
+looks like a proxy: publish on `127.0.0.1` only, as above. For HTTPS from Railwatch itself, use
 the installer above on a VM. `RAILWATCH_URL` is the address people and the
 Rails app use; every other setting in the [reference](#configuration-reference)
 works as an environment variable here too, and every CLI command runs with
