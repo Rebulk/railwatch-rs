@@ -1,9 +1,10 @@
 //! UserMailer (password_reset, email_verification) and InvitationMailer
 //! (invite) over SMTP with lettre; DigestMailer's multipart digest goes
 //! out through `send_alternative` (web/digest_mailer.rs). Without SMTP configured nothing is sent:
-//! the link is logged at WARN instead, so a self-hoster without mail can
-//! still reset a password from the server log (and `railwatch doctor` says
-//! mail is off). Delivery runs in the background (`deliver_later`).
+//! the recipient and subject are logged at WARN, never the body, whose
+//! links (reset, verification, invitation) would let anyone who reads the
+//! log take over an account (`railwatch doctor` says mail is off). Delivery
+//! runs in the background (`deliver_later`).
 
 use std::time::Duration;
 
@@ -78,11 +79,11 @@ impl Mailer {
     }
 }
 
-/// `deliver_later`: sends in the background, or logs the mail when SMTP
-/// is off. Failures are logged at ERROR with the recipient (never silent).
+/// `deliver_later`: sends in the background, or logs its recipient and
+/// subject (never the body: it holds the link) when SMTP is off. Failures are logged at ERROR with the recipient (never silent).
 pub fn deliver_later(mailer: Option<Mailer>, mail: Mail) {
     match mailer {
-        None => tracing::warn!(to = mail.to, subject = mail.subject, body = mail.text, "SMTP is not configured; email not sent"),
+        None => tracing::warn!(to = mail.to, subject = mail.subject, "SMTP is not configured; email not sent"),
         Some(m) => {
             tokio::spawn(async move {
                 match m.send(&mail).await {
@@ -119,5 +120,41 @@ pub fn invite(base_url: &str, to: &str, inviter: &str, account: &str, token: &st
         text: format!(
             "{inviter} invited you to join {account} on Railwatch.\n\nAccept the invitation (it expires in 7 days):\n{base_url}/invitations/{token}\n"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Without SMTP the mail is logged, not sent: anyone who reads the log
+    /// must not be able to reset a password or accept an invitation with
+    /// what it says.
+    #[test]
+    fn unsent_mail_logs_the_recipient_and_subject_but_never_the_link() {
+        let out = Captured::default();
+        let w = out.clone();
+        let subscriber = tracing_subscriber::fmt().with_writer(move || w.clone()).with_ansi(false).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            deliver_later(None, password_reset("https://rw.example.com", "ada@example.com", "s3cr3t-sid"));
+            deliver_later(None, invite("https://rw.example.com", "bob@example.com", "Ada", "Acme", "inv-t0ken"));
+        });
+        let log = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("ada@example.com") && log.contains("Reset your password") && log.contains("bob@example.com"), "{log}");
+        assert!(!log.contains("s3cr3t-sid") && !log.contains("inv-t0ken"), "{log}");
     }
 }

@@ -221,8 +221,9 @@ cloud-only page driven in a real browser.
    (`<user>.<expiry>.<mac>`), not Rails' `generates_token_for`. Same lifetimes
    (20 min, 2 days); the reset token is bound to the bcrypt salt, so it dies
    when the password changes, as Rails'.
-8. **Email without SMTP is logged, not sent** (WARN, full body). `railwatch
-   doctor` says so. Plain-text emails; Rails sends HTML templates.
+8. **Email without SMTP is logged, not sent** (WARN, recipient and subject
+   only: the body's reset, verification and invitation links are never
+   logged). `railwatch doctor` says so. Plain-text emails; Rails sends HTML templates.
 9. **The marketing home page and legal pages are not served here.** They
    are a static site (frontend/site, deployed to railwatch.dev); `/`
    redirects to the dashboard or sign-in, and the sign-up form links to
