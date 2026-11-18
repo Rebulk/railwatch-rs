@@ -69,6 +69,8 @@ pub struct WebState {
     pub sign_up_limit: FixedWindow<IpAddr>,
     /// PasswordResets/EmailVerifications: 20 an hour per IP.
     pub email_limit: FixedWindow<IpAddr>,
+    /// Opening an email verification link (unauthenticated): 20 an hour per IP.
+    pub verification_limit: FixedWindow<IpAddr>,
     /// Provisioning (accounts/applications/environments): 30/hour/user.
     pub provisioning_limit: FixedWindow<i64>,
     /// IntegrationsController#send_test: 5 a minute per user.
@@ -101,6 +103,7 @@ impl WebState {
             sign_in_email_limit: FixedWindow::with_window(10, Duration::from_secs(300)),
             sign_up_limit: FixedWindow::with_window(10, Duration::from_secs(3600)),
             email_limit: FixedWindow::with_window(20, Duration::from_secs(3600)),
+            verification_limit: FixedWindow::with_window(20, Duration::from_secs(3600)),
             provisioning_limit: FixedWindow::with_window(30, Duration::from_secs(3600)),
             send_test_limit: FixedWindow::with_window(5, Duration::from_secs(60)),
             settings_cipher: crate::alerts::integration::SettingsCipher::new(&secret),

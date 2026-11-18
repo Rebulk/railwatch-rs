@@ -302,3 +302,27 @@ fn per_ip_limits_key_on_the_client_behind_two_proxies_not_on_the_edge_proxy() {
     assert_eq!(attempt("198.51.100.1"), limited, "the 11th sign-up in an hour from one client");
     assert_ne!(attempt("198.51.100.2"), limited, "another client behind the same proxies is not limited");
 }
+
+// ---------------------------------------------------------------------------
+// Finding 15: the email verification link
+
+/// Opening verification links is unauthenticated: it is rate-limited per
+/// client like the other identity endpoints, so guessing or hammering it
+/// is bounded.
+#[test]
+fn opening_email_verification_links_is_rate_limited_per_client() {
+    let s = start("verify-limit", "invite");
+    let password = control::base58(16);
+    user(&s, "Ada", "ada@example.com", &password, false);
+    let mut b = Browser::default();
+    b.sign_in(&s, "ada@example.com", &password);
+    let alerts: Vec<String> = (0..21)
+        .map(|_| {
+            let r = b.get(&s, "/identity/email_verification?sid=1.9999999999.bad");
+            assert_eq!(r.status, 302);
+            b.flash_after(&s, &r)["alert"].as_str().unwrap_or("").to_string()
+        })
+        .collect();
+    assert!(alerts[..20].iter().all(|a| a == "That email verification link is invalid"), "{alerts:?}");
+    assert_eq!(alerts[20], "Too many verification attempts. Try again later.");
+}

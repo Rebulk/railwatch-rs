@@ -176,6 +176,15 @@ fn verify_token(cx: &Ctx, purpose: &str, token: &str, bind_for: impl Fn(i64) -> 
     cx.state.keys.verify(purpose, &cookie).map(|_| id)
 }
 
+/// The one user a signed token names (its leading id), and `column` of
+/// theirs to verify it against: never the whole users table.
+async fn token_user(cx: &Ctx, token: &str, column: &'static str) -> Option<(i64, String)> {
+    let id: i64 = token.split('.').next()?.parse().ok()?;
+    let sql = format!("SELECT {column} FROM users WHERE id = ?");
+    let value: Option<String> = cx.state.db(move |c| c.with(|x| x.query_row(&sql, [id], |r| r.get(0)).optional())).await.ok().flatten();
+    value.map(|v| (id, v))
+}
+
 fn reset_bind(digest: &str) -> String {
     // `password_salt.last(10)`: bcrypt's salt is characters 7..29.
     digest.get(19..29).unwrap_or(digest).to_string()
@@ -435,14 +444,11 @@ async fn destructive_authentication(cx: &Ctx, password: &str) -> bool {
 // Identity
 
 async fn email_verification_show(cx: Ctx, p: Params) -> Response {
+    guard!(rate_limited(&cx, &cx.state.verification_limit, "/settings/email", "Too many verification attempts. Try again later."));
     let sid = p.s("sid");
-    let state = cx.state.clone();
-    let user = {
-        let users: Vec<(i64, String)> = state
-            .db(|c| c.with(|x| x.prepare("SELECT id, email FROM users")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()))
-            .await
-            .unwrap_or_default();
-        verify_token(&cx, "email_verification", &sid, |id| users.iter().find(|(u, _)| *u == id).map(|(_, e)| e.clone()))
+    let user = match token_user(&cx, &sid, "email").await {
+        Some((uid, email)) => verify_token(&cx, "email_verification", &sid, |id| (id == uid).then(|| email.clone())),
+        None => None,
     };
     match user {
         Some(id) => {
@@ -465,9 +471,8 @@ async fn password_reset_new(cx: Ctx) -> Response {
 }
 
 async fn reset_user(cx: &Ctx, sid: &str) -> Option<control::User> {
-    let users: Vec<(i64, String)> =
-        cx.state.db(|c| c.with(|x| x.prepare("SELECT id, password_digest FROM users")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())).await.ok()?;
-    let id = verify_token(cx, "password_reset", sid, |id| users.iter().find(|(u, _)| *u == id).map(|(_, d)| reset_bind(d)))?;
+    let (uid, digest) = token_user(cx, sid, "password_digest").await?;
+    let id = verify_token(cx, "password_reset", sid, |id| (id == uid).then(|| reset_bind(&digest)))?;
     cx.state.db(move |c| c.with(|x| control::find_user(x, id))).await.ok().flatten()
 }
 
