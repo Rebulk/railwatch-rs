@@ -212,20 +212,39 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
 }
 
 fn client_ip(state: &AppState, req: &Request) -> IpAddr {
-    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()).unwrap_or(IpAddr::from([127, 0, 0, 1]));
-    if state.trust_proxy {
-        // The client is the last address before our trusted proxy: Rails'
-        // RemoteIp drops trusted (private) hops from the right.
-        if let Some(xff) = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            let hops: Vec<IpAddr> = xff.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-            if let Some(ip) = hops.iter().rev().find(|ip| !trusted(ip)).or(hops.first()) {
-                return *ip;
-            }
-        }
-    }
-    peer
+    client_address(req, state.trust_proxy)
 }
 
+/// The client address of a request, for the web pages and ingest alike.
+/// Without `trust_proxy`: the TCP peer. With it, X-Forwarded-For is read
+/// only when the peer is itself a trusted hop (loopback or a private
+/// address: the proxy in front), so a client that reaches the port directly
+/// cannot choose its own address. Then, as Rails' RemoteIp, the right-most
+/// address that is not a trusted hop is the client; every entry left of it
+/// was written by the client and is ignored. All trusted: the left-most.
+pub fn client_address(req: &Request, trust_proxy: bool) -> IpAddr {
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()).unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    let xff = req.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join(",");
+    forwarded_client(peer, trust_proxy.then_some(xff.as_str()))
+}
+
+fn forwarded_client(peer: IpAddr, xff: Option<&str>) -> IpAddr {
+    let peer = canonical(peer);
+    let Some(xff) = xff.filter(|_| trusted(&peer)) else { return peer };
+    let hops: Vec<IpAddr> = xff.split(',').filter_map(|s| s.trim().parse().ok()).map(canonical).collect();
+    hops.iter().rev().find(|ip| !trusted(ip)).or(hops.first()).copied().unwrap_or(peer)
+}
+
+/// An IPv4-mapped IPv6 address (a dual-stack socket's view of an IPv4
+/// peer) as the IPv4 address it is.
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// Rails' default trusted proxies: loopback and private networks.
 fn trusted(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
@@ -802,6 +821,29 @@ async fn sourcemaps(state: &Arc<AppState>, env: Environment, headers: &HeaderMap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One rule for every per-IP limit: the client is the right-most
+    /// forwarded address that is not one of our own proxies, and only a
+    /// proxy (a private or loopback peer) may say who the client is.
+    #[test]
+    fn the_client_is_the_right_most_forwarded_address_that_is_not_a_proxy() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let proxy = ip("127.0.0.1");
+        // Two proxies (an edge on the private network, then the local one).
+        assert_eq!(forwarded_client(proxy, Some("198.51.100.1, 10.0.0.2")), ip("198.51.100.1"));
+        // A client's own X-Forwarded-For is to the left of what the proxy appended.
+        assert_eq!(forwarded_client(proxy, Some("1.2.3.4, 198.51.100.1")), ip("198.51.100.1"));
+        assert_eq!(forwarded_client(ip("10.0.0.2"), Some("garbage, 198.51.100.1, 192.168.1.1")), ip("198.51.100.1"));
+        // All private: the left-most.
+        assert_eq!(forwarded_client(proxy, Some("192.168.1.5, 10.0.0.2")), ip("192.168.1.5"));
+        // A peer that is not a proxy reached us directly: its header is its own.
+        assert_eq!(forwarded_client(ip("203.0.113.9"), Some("1.2.3.4")), ip("203.0.113.9"));
+        assert_eq!(forwarded_client(ip("::ffff:203.0.113.9"), Some("1.2.3.4")), ip("203.0.113.9"));
+        assert_eq!(forwarded_client(ip("::ffff:127.0.0.1"), Some("198.51.100.1")), ip("198.51.100.1"));
+        // trust_proxy off, or no usable header: the peer.
+        assert_eq!(forwarded_client(proxy, None), proxy);
+        assert_eq!(forwarded_client(proxy, Some("unknown")), proxy);
+    }
 
     #[test]
     fn routes_like_rails() {

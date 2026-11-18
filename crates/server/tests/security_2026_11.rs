@@ -37,6 +37,10 @@ impl Drop for Server {
 }
 
 fn start(name: &str, signup: &str) -> Server {
+    start_with(name, signup, false)
+}
+
+fn start_with(name: &str, signup: &str, trust_proxy: bool) -> Server {
     let dir = std::env::temp_dir().join(format!("rw-sec2611-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -47,6 +51,7 @@ fn start(name: &str, signup: &str) -> Server {
             std::env::set_var("RAILWATCH_SECRET_KEY_BASE", SECRET);
             std::env::set_var("RAILWATCH_URL", "http://127.0.0.1");
             std::env::set_var("RAILWATCH_SIGNUP", signup);
+            std::env::set_var("RAILWATCH_TRUST_PROXY", if trust_proxy { "1" } else { "0" });
             std::env::remove_var("RAILWATCH_CONFIG");
         }
         Config::load().expect("config")
@@ -272,4 +277,28 @@ fn a_password_reset_takes_an_unverified_account_back_from_whoever_signed_up_with
     assert_eq!((verified, sessions, tokens), (true, 0, 0), "the owner's now: verified, the squatter's sessions and tokens gone");
     assert_eq!(squatter.get(&s, "/dashboard").location(), "/sign_in", "the squatter is signed out");
     owner.sign_in(&s, "victim@example.com", &new_password);
+}
+
+// ---------------------------------------------------------------------------
+// Finding 8
+
+/// Behind two proxies (a CDN, then a local proxy) every request reaches the
+/// server from the local proxy with `X-Forwarded-For: <client>, <cdn>`. The
+/// per-IP limits must key on the client, or one client's attempts lock out
+/// everyone behind the same edge.
+#[test]
+fn per_ip_limits_key_on_the_client_behind_two_proxies_not_on_the_edge_proxy() {
+    let s = start_with("xff", "open", true);
+    let attempt = |client: &str| {
+        let mut b = Browser::default();
+        let token = b.csrf(&s);
+        let r = b.request(&s, "POST", "/sign_up", Some("name=x"), &[("X-CSRF-Token", &token), ("X-Forwarded-For", &format!("{client}, 10.0.0.2"))]);
+        b.flash_after(&s, &r)["alert"].as_str().unwrap_or("").to_string()
+    };
+    let limited = "Too many sign-up attempts. Try again later.";
+    for _ in 0..10 {
+        assert_ne!(attempt("198.51.100.1"), limited);
+    }
+    assert_eq!(attempt("198.51.100.1"), limited, "the 11th sign-up in an hour from one client");
+    assert_ne!(attempt("198.51.100.2"), limited, "another client behind the same proxies is not limited");
 }

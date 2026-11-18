@@ -114,7 +114,28 @@ one private Docker network. That is also what makes
 `RAILWATCH_TRUST_PROXY=1` safe: the server then counts per-IP rate limits by
 `X-Forwarded-For` (without it every client looks like the proxy and shares
 one limit), and only a client that can reach the server directly could forge
-that header. Leave it unset if nothing in front sets `X-Forwarded-For`. For HTTPS from Railwatch itself, use
+that header. Leave it unset if nothing in front sets `X-Forwarded-For`.
+
+How the client address is read with `RAILWATCH_TRUST_PROXY=1` (the same rule
+for sign-in, sign-up, password resets, MCP and ingest):
+
+- `X-Forwarded-For` counts only when the connection comes from a proxy: a
+  loopback or private address (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`,
+  `192.168.0.0/16`, `::1`, `fc00::/7`). A public address that connects
+  directly is its own client, whatever the header says.
+- The client is the right-most address in the header that is not one of
+  those: each proxy appends the address it saw, so anything to its left was
+  written by the client and is ignored. Two proxies in front (a CDN, then
+  Caddy) work as long as the inner ones are on private addresses.
+- If every address is private (all on your LAN), the left-most one counts.
+
+A proxy on a public address in front of another proxy (a CDN that connects
+to your Caddy over the internet) is not recognised as a proxy, so its
+address becomes the client: put the CDN's own client header into
+`X-Forwarded-For` at the inner proxy instead, or connect them privately.
+With Docker, a port published on `0.0.0.0` reaches the container through
+Docker's private bridge, so it too looks like a proxy: publish on
+`127.0.0.1` only, as above. For HTTPS from Railwatch itself, use
 the installer above on a VM. `RAILWATCH_URL` is the address people and the
 Rails app use; every other setting in the [reference](#configuration-reference)
 works as an environment variable here too, and every CLI command runs with

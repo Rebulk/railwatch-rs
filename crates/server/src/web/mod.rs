@@ -33,12 +33,12 @@ pub mod sessions_oauth;
 pub mod status_page;
 pub mod uptime;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{ConnectInfo, Request};
+use axum::extract::Request;
 
 use crate::config::{Config, Signup};
 use crate::control::Control;
@@ -114,16 +114,9 @@ impl WebState {
         self.config.signup == Signup::Open
     }
 
-    /// The client address (Phase 1's rule: XFF only with trust_proxy).
+    /// The client address: ingest's rule (http::client_address).
     pub fn client_ip(&self, req: &Request) -> IpAddr {
-        let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()).unwrap_or(IpAddr::from([127, 0, 0, 1]));
-        if self.config.trust_proxy
-            && let Some(xff) = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok())
-            && let Some(ip) = xff.split(',').filter_map(|s| s.trim().parse::<IpAddr>().ok()).next_back()
-        {
-            return ip;
-        }
-        peer
+        crate::http::client_address(req, self.config.trust_proxy)
     }
 
     /// Runs a blocking control-DB closure off the async runtime.
