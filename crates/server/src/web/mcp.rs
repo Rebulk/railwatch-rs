@@ -2164,9 +2164,18 @@ impl Mcp<'_> {
              FROM alerts a INNER JOIN integrations n ON n.id = a.integration_id",
         );
         let mut wheres = format!(" WHERE n.account_id IN ({acc})");
+        let restricted = self.token.application_id.is_some();
+        if restricted || Self::application_identity_given(a) {
+            sql.push_str(" INNER JOIN alert_rules r ON r.id = a.alert_rule_id");
+        }
+        // A token restricted to one application sees only that one's alerts.
+        if restricted {
+            let (apps, app_binds) = self.applications_sql();
+            wheres.push_str(&format!(" AND r.application_id IN ({apps})"));
+            binds.extend(app_binds);
+        }
         if Self::application_identity_given(a) {
             let Some(app) = self.resolve_application(a)? else { return Ok("[]".into()) };
-            sql.push_str(" INNER JOIN alert_rules r ON r.id = a.alert_rule_id");
             wheres.push_str(" AND r.application_id = ?");
             binds.push(app.id.into());
         }
@@ -2206,7 +2215,13 @@ impl Mcp<'_> {
                 None => Value::Null,
             };
             let issue = match issue_id {
-                Some(iid) => self.query_issues(&format!("{ISSUE_SELECT} WHERE i.id = ?"), vec![iid.into()])?.pop().map_or(Value::Null, |i| {
+                Some(iid) => {
+                    let (scope, mut ib) = self.issues_scope_sql();
+                    ib.push(iid.into());
+                    self.query_issues(&format!("{scope} AND i.id = ?"), ib)?
+                }
+                .pop()
+                .map_or(Value::Null, |i| {
                     crate::obj! {
                         "key" => i.key.clone(), "canonical_key" => i.canonical_key(), "issue_id" => i.id,
                         "title" => i.title.clone(), "environment" => i.environment_name.clone(), "url" => self.url(&format!("/issues/{}", i.id)),
@@ -4411,6 +4426,49 @@ mod tests {
     /// No tool's result is bigger than the cap, however much data the
     /// environment holds: each one is called on an environment seeded past
     /// it, and must still return valid JSON.
+    /// A token restricted to one application lists only that application's
+    /// alerts, and an alert's issue only when the token may see the issue.
+    #[test]
+    fn an_application_token_lists_only_its_own_applications_alerts() {
+        let f = seeded("alerts-app-token");
+        let account: i64 = f.c.with(|x| x.query_row("SELECT account_id FROM applications WHERE id = ?", [f.app], |r| r.get(0))).unwrap();
+        let other = f.c.tx(|tx| insert_application(tx, account, "Admin", "admin", "ADM", None, "main")).unwrap();
+        let (other_env, _) = f.c.tx(|tx| create_environment(tx, other, "production")).unwrap();
+        f.c.with(|x| {
+            x.execute(
+                "INSERT INTO issues (application_id, environment_id, number, title, kind, status, group_hash, occurrences, affected_users,
+                   first_seen_at, last_seen_at, created_at, updated_at)
+                 VALUES (?1, ?2, 1, 'Secret admin failure', 'exception', 'open', 'gadm', 1, 1, '2026-10-14 03:00:00', '2026-10-14 03:00:00', '2026-10-14 03:00:00', '2026-10-14 03:00:00')",
+                params![other, other_env],
+            )?;
+            let issue = x.last_insert_rowid();
+            x.execute(
+                "INSERT INTO integrations (account_id, created_at, enabled, kind, name, settings, updated_at)
+                 VALUES (?, '2026-01-01', 1, 'webhook', 'hook', '{\"url\":\"https://example.com/h\"}', '2026-01-01')",
+                [account],
+            )?;
+            let integ = x.last_insert_rowid();
+            x.execute(
+                "INSERT INTO alert_rules (application_id, created_at, event, filters, integration_id, updated_at) VALUES (?, '2026-01-01', 'new_issue', '{}', ?, '2026-01-01')",
+                params![other, integ],
+            )?;
+            let rule = x.last_insert_rowid();
+            x.execute(
+                "INSERT INTO alerts (alert_rule_id, created_at, event, integration_id, issue_id, status, updated_at) VALUES (?, '2026-01-01', 'new_issue', ?, ?, 'sent', '2026-01-01')",
+                params![rule, integ, issue],
+            )
+        })
+        .unwrap();
+        // The account-wide token sees the alert and its issue.
+        let all = f.tool("list_alerts", json!({}));
+        assert_eq!(all[0]["issue"]["title"], "Secret admin failure", "{all}");
+        // A token restricted to "shop" sees neither.
+        f.c.with(|x| x.execute("UPDATE api_tokens SET application_id = ?", [f.app])).unwrap();
+        assert_eq!(f.tool("list_issues", json!({})), json!([]), "the issue is out of the token's reach");
+        let scoped = f.tool("list_alerts", json!({}));
+        assert_eq!(scoped, json!([]), "another application's alert");
+    }
+
     #[test]
     fn no_tool_result_exceeds_the_cap() {
         let f = seeded("cap");
