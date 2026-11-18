@@ -7,13 +7,14 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
-- A password reset link is bound to the address it was sent to as well as
-  the password: changing your email makes an earlier link stop working, so
-  it can no longer verify the new address.
-- With `RAILWATCH_TRUST_PROXY`, the client is the right-most
-  `X-Forwarded-For` entry (what the proxy in front saw); private entries are
-  no longer skipped, so a LAN client cannot pick its own rate-limit address.
-  Name the further proxies of a chain in the new `RAILWATCH_TRUSTED_PROXIES`.
+## v0.3.4 (2026-11-18)
+
+- The server builds for macOS again. Two Linux-only calls added in v0.3.1
+  (`prctl` for transparent huge pages, and `RUSAGE_THREAD` in the ingest-floor
+  bench) are now Linux-only, so the railwatch-sidecar gem's macOS builds work.
+  Linux behaviour is unchanged. CI now type-checks every binary on macOS.
+
+## v0.3.3 (2026-11-18)
 
 **Security fixes from the 2026-11 review**
 - `GET /api/v1/.../executions/:id` leaves out the client IP, user agent and
@@ -32,11 +33,15 @@ tag is a release candidate (marked pre-release, not "latest", so
 - With open sign-up, a password reset to an address taken by someone
   else's unverified sign-up hands the account to the address's owner:
   verified, the other party's sessions and tokens removed.
-- `RAILWATCH_TRUST_PROXY`: one client-address rule for the dashboard,
-  MCP and ingest. `X-Forwarded-For` is read only from a loopback or private
-  peer, and the right-most non-private address is the client, so per-IP
-  limits work behind two proxies and cannot be dodged by connecting
-  directly (docs/SELF-HOST.md).
+- A password reset link is bound to the address it was sent to as well as
+  the password: changing your email makes an earlier link stop working, so
+  it can no longer verify the new address.
+- `RAILWATCH_TRUST_PROXY`: one client-address rule for the dashboard, MCP
+  and ingest. `X-Forwarded-For` is read only from a loopback or private
+  peer (the proxy in front), and the client is its right-most entry, what
+  that proxy saw. Private entries are not skipped, so a LAN client cannot
+  pick its own rate-limit address. Name further proxies of a chain in the
+  new `RAILWATCH_TRUSTED_PROXIES` (docs/SELF-HOST.md).
 - Opening an email verification link is rate-limited (20 an hour per
   client) and no longer reads every user.
 - Pages send `script-src 'self'` with the dark-mode script's hash,
@@ -45,11 +50,16 @@ tag is a release candidate (marked pre-release, not "latest", so
   around the SSRF guard.
 - `railwatch doctor` masks the SMTP username.
 
+## v0.3.2 (2026-11-18)
+
 - **Moving to a new host name**: `RAILWATCH_REDIRECT_HOSTS` lists old names
   whose pages 308 to `RAILWATCH_URL` (same path and query), while
   telemetry, the API, MCP and the live channel keep answering on them.
   Railwatch Cloud now lives at app.railwatch.dev, with railwatch.rebulk.com
   redirecting.
+
+## v0.3.1 (2026-11-18)
+
 - **Docker image**: `ghcr.io/rebulk/railwatch:vX.Y.Z` and `:latest`, for
   x86_64 and arm64, published by the release workflow from the release's
   own tarballs (checked against SHA256SUMS) and signed with cosign
