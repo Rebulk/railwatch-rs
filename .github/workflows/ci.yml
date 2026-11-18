@@ -49,6 +49,23 @@ jobs:
       - name: test
         run: cargo test --locked
 
+  # The railwatch-sidecar gem ships this server for macOS too. Type-checking
+  # on a macOS runner catches a Linux-only call (prctl, v0.3.1-v0.3.3) before
+  # a sidecar release finds it. `cargo check` needs the embedded frontend
+  # dir to exist, not to be built.
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
+      - name: frontend dir
+        run: mkdir -p frontend/dist/.vite && echo '{}' > frontend/dist/.vite/manifest.json
+      - name: cargo check (macOS)
+        run: cargo check --locked -p railwatch-server --bins
+
   audit:
     runs-on: ubuntu-24.04
     steps:
