@@ -198,8 +198,13 @@ fn main() -> ExitCode {
     // compacted memory to find them on page faults (9% of server CPU at 50
     // apps; docs/PERF.md "Ingest floor"). Same as MIMALLOC_ALLOW_THP=0, which
     // mimalloc reads before main. Fails harmlessly where unsupported.
+    // Linux only: prctl does not exist on macOS (the darwin railwatch-sidecar
+    // gems build this binary there).
     // SAFETY: a process attribute; no pointers are passed.
-    unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0)
+    };
     railwatch_server::memory::configure();
     // The client reads no server configuration and runs as whoever calls it.
     let argv: Vec<String> = std::env::args().skip(1).collect();

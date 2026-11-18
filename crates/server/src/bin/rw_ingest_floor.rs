@@ -37,7 +37,10 @@ fn main() {
     // As the server's main: no transparent huge pages, so the floor pays
     // the same page-fault cost it is compared against.
     // SAFETY: a process attribute; no pointers are passed.
-    unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0)
+    };
     railwatch_server::memory::configure();
     let a: Vec<String> = std::env::args().skip(1).collect();
     if a.len() < 2 {
