@@ -37,10 +37,12 @@ fn host_of(req: &Request) -> Option<String> {
 
 /// Where `req` should go instead, or None to serve it here.
 pub fn target(redirect_hosts: &[String], url: &str, req: &Request) -> Option<String> {
-    // Nested under a base path, this router sees the path without it; the
-    // redirect and the machine check use the request as it arrived.
+    // Nested under a base path, this router sees the path without it
+    // (`/mcp` for `/railwatch/mcp`): that is what names a machine endpoint.
+    // The redirect goes to the request as it arrived (OriginalUri), prefix
+    // and query included.
     let uri = req.extensions().get::<axum::extract::OriginalUri>().map_or(req.uri(), |o| &o.0);
-    if redirect_hosts.is_empty() || is_machine(uri.path()) {
+    if redirect_hosts.is_empty() || is_machine(req.uri().path()) || is_machine(uri.path()) {
         return None;
     }
     let host = host_of(req)?;
@@ -98,6 +100,30 @@ mod tests {
         // A page whose name only starts like a machine prefix still moves.
         assert!(target(&hosts(), NEW, &req("railwatch.rebulk.com", "/upgrade-notes")).is_some());
         assert!(target(&hosts(), NEW, &req("railwatch.rebulk.com", "/apis")).is_some());
+    }
+
+    /// What the pages router sees under `base_path = /railwatch`: the path
+    /// without the prefix, with the full one in OriginalUri.
+    fn mounted(host: &str, original: &str) -> Request {
+        let inner = original.strip_prefix("/railwatch").filter(|p| !p.is_empty()).unwrap_or("/");
+        let mut r = req(host, inner);
+        r.extensions_mut().insert(axum::extract::OriginalUri(original.parse().unwrap()));
+        r
+    }
+
+    #[test]
+    fn under_a_base_path_machine_endpoints_stay_and_pages_keep_their_prefix() {
+        for path in ["/railwatch/mcp", "/railwatch/api/v1/issues", "/railwatch/cable", "/railwatch/.well-known/mcp.json", "/railwatch/beacon"] {
+            assert_eq!(target(&hosts(), NEW, &mounted("railwatch.rebulk.com", path)), None, "{path}");
+        }
+        assert_eq!(
+            target(&hosts(), NEW, &mounted("railwatch.rebulk.com", "/railwatch/apps/1?tab=issues")).as_deref(),
+            Some("https://app.railwatch.dev/railwatch/apps/1?tab=issues")
+        );
+        assert_eq!(
+            target(&hosts(), NEW, &mounted("railwatch.rebulk.com", "/railwatch/sign_in")).as_deref(),
+            Some("https://app.railwatch.dev/railwatch/sign_in")
+        );
     }
 
     #[test]
