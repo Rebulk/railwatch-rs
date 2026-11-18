@@ -11,7 +11,7 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-export VITE_APP_URL="${VITE_APP_URL:-https://railwatch.rebulk.com}"
+export VITE_APP_URL="${VITE_APP_URL:-https://app.railwatch.dev}"
 pnpm exec vite build --config vite.site.config.ts
 
 # The app's icons (the screenshots and og.png come from site/public).

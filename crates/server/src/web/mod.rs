@@ -27,6 +27,7 @@ pub mod mcp;
 pub(crate) mod mcp_summary;
 pub mod params;
 pub mod proxy_auth;
+pub mod redirect_host;
 pub mod session;
 pub mod sessions_oauth;
 pub mod status_page;
@@ -169,7 +170,10 @@ pub fn router(state: Arc<WebState>) -> Router {
     let router = if mounted { router.route("/beacon", axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT })) } else { router };
     // Outermost: X-Railwatch-Proxy-Auth is checked and removed before any
     // route (pages, cable, MCP, API) sees the request.
-    router.layer(axum::middleware::from_fn_with_state(state.clone(), proxy_auth::layer)).with_state(state)
+    let router = router.layer(axum::middleware::from_fn_with_state(state.clone(), proxy_auth::layer));
+    // Outside that: pages asked for on a host name being retired move to
+    // `url` before anything else runs (redirect_host.rs).
+    router.layer(axum::middleware::from_fn_with_state(state.clone(), redirect_host::layer)).with_state(state)
 }
 
 /// `router` under `base_path` (when set), with `fallback` (the ingest API)

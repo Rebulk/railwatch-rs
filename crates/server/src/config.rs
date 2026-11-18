@@ -47,6 +47,12 @@ pub struct Config {
     /// the printed RAILWATCH_INGEST_URL, the Secure cookie flag and the
     /// Origin check. Default `http://<bind>`.
     pub url: String,
+    /// Other host names this server answers on whose browser pages move to
+    /// `url` (`RAILWATCH_REDIRECT_HOSTS`, comma-separated): a 308 to the
+    /// same path on `url`. Telemetry and machine endpoints (/ingest, /up,
+    /// /api, /mcp, /cable, /.well-known, the beacon) are served on them as
+    /// before, so apps and agents configured with the old name keep working.
+    pub redirect_hosts: Vec<String>,
     pub signup: Signup,
     pub smtp: Option<Smtp>,
     pub google: Option<Google>,
@@ -287,6 +293,15 @@ impl Config {
         let bind = get("bind", &["RAILWATCH_BIND"]).unwrap_or_else(|| format!("127.0.0.1:{port}"));
         let url_given = get("url", &["RAILWATCH_URL"]);
         let url = url_given.clone().unwrap_or_else(|| format!("http://{bind}")).trim_end_matches('/').to_string();
+        let redirect_hosts: Vec<String> = get("redirect_hosts", &["RAILWATCH_REDIRECT_HOSTS"])
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        if let Some(bad) = redirect_hosts.iter().find(|h| h.contains(['/', ':', ' '])) {
+            return Err(format!("redirect_hosts: {bad:?} is not a bare host name (no scheme, port or path)"));
+        }
         let signup = match get("signup", &["RAILWATCH_SIGNUP"]).as_deref().map(str::trim) {
             None | Some("invite") | Some("invite-only") | Some("invite_only") => Signup::InviteOnly,
             Some("open") => Signup::Open,
@@ -453,6 +468,7 @@ impl Config {
             data_dir,
             bind,
             url,
+            redirect_hosts,
             signup,
             smtp,
             google,
@@ -574,6 +590,7 @@ impl Config {
             ("data_dir".into(), self.data_dir.display().to_string(), src("data_dir")),
             ("bind".into(), self.bind.clone(), src("bind")),
             ("url".into(), self.url.clone(), src("url")),
+            ("redirect_hosts".into(), if self.redirect_hosts.is_empty() { "(none)".into() } else { self.redirect_hosts.join(", ") }, src("redirect_hosts")),
             ("signup".into(), format!("{:?}", self.signup), src("signup")),
             ("trust_proxy".into(), self.trust_proxy.to_string(), src("trust_proxy")),
             ("rate_limit_ip".into(), self.rate_limit_ip.to_string(), src("rate_limit_ip")),
