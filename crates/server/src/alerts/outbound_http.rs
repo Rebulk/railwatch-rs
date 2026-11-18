@@ -185,6 +185,9 @@ async fn post_inner(url: &str, body: String, headers: &[(&str, String)], kind: K
         }
     }
     let mut builder = reqwest::Client::builder()
+        // The address was checked and is pinned here: a proxy from the
+        // environment (HTTPS_PROXY) would connect elsewhere.
+        .no_proxy()
         .resolve(&t.host, addrs[0])
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))

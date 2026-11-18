@@ -326,3 +326,41 @@ fn opening_email_verification_links_is_rate_limited_per_client() {
     assert!(alerts[..20].iter().all(|a| a == "That email verification link is invalid"), "{alerts:?}");
     assert_eq!(alerts[20], "Too many verification attempts. Try again later.");
 }
+
+// ---------------------------------------------------------------------------
+// Finding 15: alert delivery and proxies
+
+/// The alert client checks and pins the destination's address itself (the
+/// SSRF guard); an HTTPS_PROXY in the server's environment must not route
+/// deliveries around that, so the client ignores proxy variables.
+#[test]
+fn alert_delivery_ignores_proxy_environment_variables() {
+    let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let vars = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
+    unsafe {
+        for v in vars {
+            std::env::set_var(v, format!("http://{}", proxy.local_addr().unwrap()));
+        }
+        std::env::remove_var("NO_PROXY");
+        std::env::remove_var("no_proxy");
+        std::env::set_var("RAILWATCH_ALLOW_PRIVATE_ALERT_TARGETS", "1");
+    }
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let result = rt.block_on(railwatch_server::alerts::outbound_http::post_json(
+        &format!("https://127.0.0.1:{closed}/hook"),
+        "{}".into(),
+        &[],
+        railwatch_server::alerts::outbound_http::Kind::Webhook,
+    ));
+    unsafe {
+        for v in vars {
+            std::env::remove_var(v);
+        }
+        std::env::remove_var("RAILWATCH_ALLOW_PRIVATE_ALERT_TARGETS");
+    }
+    assert!(result.is_err(), "nothing listens at the destination");
+    assert!(proxy.accept().is_err(), "the delivery went through the proxy");
+}
