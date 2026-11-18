@@ -669,7 +669,7 @@ impl Config {
             None => rows.push(("smtp".into(), "(not configured: emails are not sent)".into(), "default".into())),
             Some(s) => {
                 rows.push(("smtp_address".into(), format!("{}:{} ({})", s.address, s.port, s.security), src("smtp_address")));
-                rows.push(("smtp_username".into(), s.username.clone().unwrap_or_default(), src("smtp_username")));
+                rows.push(("smtp_username".into(), if s.username.is_some() { "(set)".into() } else { String::new() }, src("smtp_username")));
                 rows.push(("smtp_password".into(), if s.password.is_some() { "(set)".into() } else { String::new() }, src("smtp_password")));
                 rows.push(("smtp_from".into(), s.from.clone(), src("smtp_from")));
             }
@@ -754,6 +754,26 @@ mod tests {
         assert!(read_proxy_secret(&file("blank", b"   \n")).is_err(), "whitespace is not a secret");
         assert!(read_proxy_secret(dir.join("missing").to_str().unwrap()).is_err(), "an unreadable file stops the server");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `railwatch doctor` output is pasted into issues and chats: an SMTP
+    /// username can be half of a credential (SES's is an access key id), so
+    /// it is masked like the password.
+    #[test]
+    fn doctor_masks_the_smtp_username_and_password() {
+        let mut c = cfg("127.0.0.1:8790", "http://127.0.0.1:8790", false);
+        c.smtp = Some(Smtp {
+            address: "smtp.example.com".into(),
+            port: 587,
+            username: Some("AKIAEXAMPLEUSER".into()),
+            password: Some("s3cret".into()),
+            security: "starttls".into(),
+            from: "rw@example.com".into(),
+        });
+        let rows = c.describe();
+        let shown = |k: &str| rows.iter().find(|(key, _, _)| key == k).map(|(_, v, _)| v.clone());
+        assert_eq!((shown("smtp_username"), shown("smtp_password")), (Some("(set)".into()), Some("(set)".into())));
+        assert!(!format!("{rows:?}").contains("AKIAEXAMPLEUSER"));
     }
 
     #[test]
