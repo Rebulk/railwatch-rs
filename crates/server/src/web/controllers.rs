@@ -765,15 +765,7 @@ async fn account_destroy(cx: Ctx, Path(id): Path<i64>, p: Params) -> Response {
                     .prepare("SELECT e.slug FROM environments e JOIN applications a ON a.id = e.application_id WHERE a.account_id = ?")?
                     .query_map([id], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
-                let apps: Vec<i64> =
-                    tx.prepare("SELECT id FROM applications WHERE account_id = ?")?.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-                for app in apps {
-                    delete_application_rows(tx, app)?;
-                }
-                tx.execute("DELETE FROM invitations WHERE account_id = ?", [id])?;
-                tx.execute("DELETE FROM api_tokens WHERE account_id = ?", [id])?;
-                tx.execute("DELETE FROM memberships WHERE account_id = ?", [id])?;
-                tx.execute("DELETE FROM accounts WHERE id = ?", [id])?;
+                delete_account_rows(tx, id)?;
                 Ok(slugs)
             })
         })
@@ -790,8 +782,44 @@ async fn account_destroy(cx: Ctx, Path(id): Path<i64>, p: Params) -> Response {
     cx.redirect(Redirect::to(if next.is_some() { "/dashboard" } else { "/accounts/new" }).notice(format!("{name} and its telemetry are being deleted")))
 }
 
+fn delete_account_rows(tx: &rusqlite::Connection, id: i64) -> rusqlite::Result<()> {
+    let apps: Vec<i64> = tx.prepare("SELECT id FROM applications WHERE account_id = ?")?.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    for app in apps {
+        delete_application_rows(tx, app)?;
+    }
+    let integrations: Vec<i64> =
+        tx.prepare("SELECT id FROM integrations WHERE account_id = ?")?.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    for i in integrations {
+        crate::alerts::integration::destroy(tx, i)?;
+    }
+    tx.execute("DELETE FROM invitations WHERE account_id = ?", [id])?;
+    tx.execute("DELETE FROM api_tokens WHERE account_id = ?", [id])?;
+    tx.execute("DELETE FROM memberships WHERE account_id = ?", [id])?;
+    tx.execute("DELETE FROM accounts WHERE id = ?", [id])?;
+    Ok(())
+}
+
+/// The issues `filter` selects (an SQL condition on `issues` with one `?`)
+/// and what hangs off them: alerts, comments, activities. An issue elsewhere
+/// that was merged into one of them is reopened, its target gone.
+fn delete_issue_rows(tx: &rusqlite::Connection, filter: &str, id: i64) -> rusqlite::Result<()> {
+    let ids = format!("SELECT id FROM issues WHERE {filter}");
+    tx.execute(
+        &format!("UPDATE issues SET merged_into_id = NULL, status = 'open' WHERE merged_into_id IN ({ids}) AND NOT ({filter})"),
+        rusqlite::params![id, id],
+    )?;
+    tx.execute(&format!("UPDATE alerts SET summary_alert_id = NULL WHERE summary_alert_id IN (SELECT id FROM alerts WHERE issue_id IN ({ids}))"), [id])?;
+    for table in ["alerts", "comments", "issue_activities"] {
+        tx.execute(&format!("DELETE FROM {table} WHERE issue_id IN ({ids})"), [id])?;
+    }
+    tx.execute(&format!("UPDATE issues SET merged_into_id = NULL WHERE {filter}"), [id])?;
+    tx.execute(&format!("DELETE FROM issues WHERE {filter}"), [id])?;
+    Ok(())
+}
+
 fn delete_environment_rows(tx: &rusqlite::Connection, env: i64) -> rusqlite::Result<()> {
-    for table in ["deploys", "saved_views", "ingest_usage_months", "ingest_followup_receipts"] {
+    delete_issue_rows(tx, "environment_id = ?", env)?;
+    for table in ["deploys", "saved_views", "ingest_usage_months", "ingest_followup_receipts", "anomaly_rules", "thresholds"] {
         tx.execute(&format!("DELETE FROM {table} WHERE environment_id = ?"), [env])?;
     }
     tx.execute("DELETE FROM environments WHERE id = ?", [env])?;
@@ -801,6 +829,10 @@ fn delete_environment_rows(tx: &rusqlite::Connection, env: i64) -> rusqlite::Res
 fn delete_application_rows(tx: &rusqlite::Connection, app: i64) -> rusqlite::Result<()> {
     let envs: Vec<i64> =
         tx.prepare("SELECT id FROM environments WHERE application_id = ?")?.query_map([app], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    delete_issue_rows(tx, "application_id = ?", app)?;
+    tx.execute("UPDATE alerts SET summary_alert_id = NULL WHERE summary_alert_id IN (SELECT id FROM alerts WHERE alert_rule_id IN (SELECT id FROM alert_rules WHERE application_id = ?))", [app])?;
+    tx.execute("DELETE FROM alerts WHERE alert_rule_id IN (SELECT id FROM alert_rules WHERE application_id = ?)", [app])?;
+    tx.execute("DELETE FROM alert_rules WHERE application_id = ?", [app])?;
     for e in envs {
         delete_environment_rows(tx, e)?;
     }
@@ -1802,6 +1834,100 @@ mod tests {
         let keys: Vec<&str> = recent.iter().map(|i| i["key"].as_str().unwrap()).collect();
         assert_eq!(keys, ["SHOP-2", "SHOP-1"], "open only, this account only, latest first");
         assert_eq!((recent[0]["application"].as_str(), recent[0]["environment"].as_str()), (Some("Shop"), Some("production")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An account, application or environment with issues, comments,
+    /// alerts, rules and integrations deletes cleanly (every row under it
+    /// goes, and its tokens stop working) instead of failing on a foreign
+    /// key and leaving it all behind.
+    #[test]
+    fn deleting_an_account_application_or_environment_with_issues_and_alerts_removes_everything_under_it() {
+        let dir = std::env::temp_dir().join(format!("rw-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let user = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
+        let account = c.tx(|tx| create_account(tx, "Acme", user)).unwrap();
+        // One application with everything that can hang off it.
+        let populate = |name: &str, slug: &str| -> (i64, i64) {
+            let app = c.tx(|tx| insert_application(tx, account, name, slug, &slug.to_uppercase(), None, "main")).unwrap();
+            let (env, _) = c.tx(|tx| create_environment(tx, app, "production")).unwrap();
+            c.with(|x| {
+                for n in [1, 2] {
+                    x.execute(
+                        "INSERT INTO issues (application_id, environment_id, number, title, status, group_hash, first_seen_at, last_seen_at, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, 'Boom', 'open', 'g' || ?3, '2026-10-14 03:00:00', '2026-10-14 03:00:00', '2026-10-14 03:00:00', '2026-10-14 03:00:00')",
+                        rusqlite::params![app, env, n],
+                    )?;
+                }
+                let issue = x.last_insert_rowid();
+                x.execute("UPDATE issues SET status = 'merged', merged_into_id = ? WHERE application_id = ? AND id != ?", rusqlite::params![issue, app, issue])?;
+                x.execute(
+                    "INSERT INTO comments (issue_id, body, user_id, created_at, updated_at) VALUES (?, 'x', ?, '2026-10-14', '2026-10-14')",
+                    rusqlite::params![issue, user],
+                )?;
+                x.execute("INSERT INTO issue_activities (issue_id, kind, user_id, created_at) VALUES (?, 'status', ?, '2026-10-14')", rusqlite::params![issue, user])?;
+                x.execute(
+                    "INSERT INTO integrations (account_id, created_at, enabled, kind, name, settings, updated_at) VALUES (?, '2026-01-01', 1, 'webhook', ?, '{}', '2026-01-01')",
+                    rusqlite::params![account, name],
+                )?;
+                let integ = x.last_insert_rowid();
+                x.execute(
+                    "INSERT INTO alert_rules (application_id, created_at, event, filters, integration_id, updated_at) VALUES (?, '2026-01-01', 'new_issue', '{}', ?, '2026-01-01')",
+                    rusqlite::params![app, integ],
+                )?;
+                let rule = x.last_insert_rowid();
+                x.execute(
+                    "INSERT INTO alerts (alert_rule_id, created_at, event, integration_id, issue_id, status, updated_at) VALUES (?, '2026-01-01', 'new_issue', ?, ?, 'sent', '2026-01-01')",
+                    rusqlite::params![rule, integ, issue],
+                )?;
+                x.execute(
+                    "INSERT INTO anomaly_rules (environment_id, metric, target_kind, created_at, updated_at) VALUES (?, 'p95', 'route', '2026-01-01', '2026-01-01')",
+                    [env],
+                )?;
+                x.execute(
+                    "INSERT INTO thresholds (environment_id, \"limit\", target_kind, created_at, updated_at) VALUES (?, 1.0, 'route', '2026-01-01', '2026-01-01')",
+                    [env],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            (app, env)
+        };
+        let count = |sql: &str, id: i64| -> i64 { c.with(|x| x.query_row(sql, [id], |r| r.get(0))).unwrap() };
+
+        let (_, env) = populate("Env", "env");
+        c.tx(|tx| Ok(delete_environment_rows(tx, env)?)).expect("an environment with issues deletes");
+        assert_eq!(count("SELECT COUNT(*) FROM issues WHERE environment_id = ?", env), 0);
+
+        let (app, _) = populate("Shop", "shop");
+        let scopes: Vec<String> = ["api", "read"].iter().map(|s| s.to_string()).collect();
+        c.tx(|tx| crate::control::issue_api_token(tx, user, "app", &scopes, None, Some(app), None)).unwrap();
+        c.tx(|tx| Ok(delete_application_rows(tx, app)?)).expect("an application with issues and alerts deletes");
+        assert_eq!(count("SELECT COUNT(*) FROM issues WHERE application_id = ?", app), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM alert_rules WHERE application_id = ?", app), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM api_tokens WHERE name = 'app' AND revoked_at IS NULL AND ?", 1), 0, "its token is revoked");
+
+        populate("Admin", "admin");
+        c.tx(|tx| crate::control::issue_api_token(tx, user, "acct", &scopes, Some(account), None, None)).unwrap();
+        c.tx(|tx| Ok(delete_account_rows(tx, account)?)).expect("an account with issues, alerts and integrations deletes");
+        for table in [
+            "accounts",
+            "applications",
+            "environments",
+            "issues",
+            "comments",
+            "issue_activities",
+            "alerts",
+            "alert_rules",
+            "integrations",
+            "anomaly_rules",
+            "thresholds",
+        ] {
+            assert_eq!(count(&format!("SELECT COUNT(*) FROM {table} WHERE ? = ?1"), 1), 0, "{table} is empty");
+        }
+        assert_eq!(count("SELECT COUNT(*) FROM api_tokens WHERE account_id = ?", account), 0, "its tokens are gone");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
