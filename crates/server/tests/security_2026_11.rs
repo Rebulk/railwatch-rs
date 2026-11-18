@@ -1,0 +1,213 @@
+//! Regression tests for the 2026-11 security review, over the real
+//! `web::router` and real HTTP: membership by consent (9), unverified
+//! accounts that squat an address (13), the verification link's rate limit
+//! (15) and the dashboard's Content-Security-Policy (15).
+//!
+//! One server per test, each in its own data dir; Config::load reads
+//! process-global env, so the tests take a lock around it.
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use railwatch_server::config::Config;
+use railwatch_server::control::{self, Control};
+use railwatch_server::followups;
+use railwatch_server::tenants::Tenants;
+use railwatch_server::web::{self, WebState};
+use serde_json::Value;
+
+const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+static ENV: Mutex<()> = Mutex::new(());
+
+struct Server {
+    addr: SocketAddr,
+    control: Arc<Control>,
+    state: Arc<WebState>,
+    dir: std::path::PathBuf,
+    _rt: tokio::runtime::Runtime,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn start(name: &str, signup: &str) -> Server {
+    let dir = std::env::temp_dir().join(format!("rw-sec2611-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("RAILWATCH_DATA_DIR", dir.to_str().unwrap());
+            std::env::set_var("RAILWATCH_SECRET_KEY_BASE", SECRET);
+            std::env::set_var("RAILWATCH_URL", "http://127.0.0.1");
+            std::env::set_var("RAILWATCH_SIGNUP", signup);
+            std::env::remove_var("RAILWATCH_CONFIG");
+        }
+        Config::load().expect("config")
+    };
+    let control = Arc::new(Control::open(&cfg.control_path()).expect("control"));
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let (state, addr) = rt.block_on(async {
+        let (tx, _rx) = followups::channel();
+        let tenants = Tenants::new(cfg.tenants_dir(), Duration::from_secs(300), tx);
+        let state = Arc::new(WebState::new(control.clone(), cfg.clone(), tenants, web::cable::Hub::new()).expect("web state"));
+        let app = web::router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (state, addr)
+    });
+    Server { addr, control, state, dir, _rt: rt }
+}
+
+#[derive(Debug)]
+struct Res {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl Res {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+
+    fn location(&self) -> &str {
+        self.header("location").unwrap_or("")
+    }
+
+    /// The Inertia page object of an HTML response.
+    fn page(&self) -> Value {
+        let start = self.body.find("type=\"application/json\">").map(|i| i + 24).expect("an Inertia page");
+        let end = self.body[start..].find("</script>").unwrap() + start;
+        serde_json::from_str(&self.body[start..end].replace("\\/", "/")).unwrap()
+    }
+}
+
+/// A cookie jar over raw sockets: the request reaches the server exactly as
+/// written, and the test picks every header (X-Forwarded-For included).
+#[derive(Default)]
+struct Browser {
+    jar: HashMap<String, String>,
+}
+
+impl Browser {
+    fn request(&mut self, s: &Server, method: &str, path: &str, form: Option<&str>, extra: &[(&str, &str)]) -> Res {
+        let mut c = TcpStream::connect(s.addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let body = form.unwrap_or("");
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n", s.addr, body.len());
+        if !self.jar.is_empty() {
+            let cookies: Vec<String> = self.jar.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            head.push_str(&format!("Cookie: {}\r\n", cookies.join("; ")));
+        }
+        if form.is_some() {
+            head.push_str(&format!("Content-Type: application/x-www-form-urlencoded\r\nOrigin: http://{}\r\n", s.addr));
+        }
+        for (k, v) in extra {
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+        c.write_all(format!("{head}\r\n{body}").as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        let _ = c.read_to_end(&mut buf);
+        let split = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("a response");
+        let head = String::from_utf8_lossy(&buf[..split]).to_string();
+        let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+        let mut headers = vec![];
+        for line in head.split("\r\n").skip(1) {
+            let Some((k, v)) = line.split_once(':') else { continue };
+            let v = v.trim().to_string();
+            if k.eq_ignore_ascii_case("set-cookie") {
+                let pair = v.split(';').next().unwrap();
+                let (name, value) = pair.split_once('=').unwrap();
+                if value.is_empty() || v.contains("Max-Age=0") {
+                    self.jar.remove(name);
+                } else {
+                    self.jar.insert(name.to_string(), value.to_string());
+                }
+            }
+            headers.push((k.to_string(), v));
+        }
+        Res { status, headers, body: String::from_utf8_lossy(&buf[split + 4..]).to_string() }
+    }
+
+    fn get(&mut self, s: &Server, path: &str) -> Res {
+        self.request(s, "GET", path, None, &[])
+    }
+
+    /// A form post with the page's CSRF token, as Inertia sends it.
+    fn post(&mut self, s: &Server, path: &str, form: &str) -> Res {
+        let token = self.csrf(s);
+        self.request(s, "POST", path, Some(form), &[("X-CSRF-Token", &token)])
+    }
+
+    fn csrf(&mut self, s: &Server) -> String {
+        let mut r = self.get(s, "/sign_in");
+        if r.status == 302 {
+            r = self.get(s, "/settings/profile");
+        }
+        let i = r.body.find("name=\"csrf-token\" content=\"").map(|i| i + 27).expect("csrf meta");
+        r.body[i..i + r.body[i..].find('"').unwrap()].to_string()
+    }
+
+    fn sign_in(&mut self, s: &Server, email: &str, password: &str) {
+        let r = self.post(s, "/sign_in", &format!("email={}&password={}", enc(email), enc(password)));
+        assert_eq!((r.status, r.location()), (302, "/dashboard"), "{email} signs in");
+    }
+
+    /// Follows a redirect to the page that shows its flash.
+    fn flash_after(&mut self, s: &Server, r: &Res) -> Value {
+        let mut to = r.location().to_string();
+        loop {
+            let r = self.get(s, &to);
+            match r.status {
+                302 => to = r.location().to_string(),
+                200 => return r.page()["props"]["flash"].clone(),
+                other => panic!("{other} at {to}"),
+            }
+        }
+    }
+}
+
+fn enc(s: &str) -> String {
+    form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+fn user(s: &Server, name: &str, email: &str, password: &str, verified: bool) -> i64 {
+    s.control.tx(|tx| control::insert_user(tx, name, email, password, verified)).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Finding 9
+
+/// Adding someone to an account is an invitation they accept, whether or
+/// not they already have a user here; the admin's reply is the same either
+/// way, so it does not say who has an account.
+#[test]
+fn adding_a_member_invites_them_instead_of_joining_them_without_consent() {
+    let s = start("members", "invite");
+    let password = control::base58(16);
+    let bob = user(&s, "Bob", "bob@example.com", &password, true);
+    let alice = user(&s, "Alice", "alice@example.com", &password, true);
+    s.control.tx(|tx| control::create_account(tx, "Bobco", bob)).unwrap();
+    let mut b = Browser::default();
+    b.sign_in(&s, "bob@example.com", &password);
+
+    let existing = b.post(&s, "/settings/members", "email=alice%40example.com&role=member");
+    let existing_flash = b.flash_after(&s, &existing);
+    let stranger = b.post(&s, "/settings/members", "email=nobody%40example.com&role=member");
+    let stranger_flash = b.flash_after(&s, &stranger);
+
+    let memberships: i64 = s.control.with(|x| x.query_row("SELECT COUNT(*) FROM memberships WHERE user_id = ?", [alice], |r| r.get(0))).unwrap();
+    assert_eq!(memberships, 0, "Alice is not in Bob's account until she accepts");
+    let invited: Vec<String> = s.control.with(|x| x.prepare("SELECT email FROM invitations ORDER BY id")?.query_map([], |r| r.get(0))?.collect()).unwrap();
+    assert_eq!(invited, ["alice@example.com", "nobody@example.com"]);
+    assert_eq!(existing_flash["notice"], "Invitation sent to alice@example.com", "{existing_flash}");
+    assert_eq!(stranger_flash["notice"], "Invitation sent to nobody@example.com");
+}

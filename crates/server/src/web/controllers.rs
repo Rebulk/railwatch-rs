@@ -1625,29 +1625,24 @@ async fn members_create(cx: Ctx, p: Params) -> Response {
     let inviter = cx.current.user.clone().expect("authenticated");
     let account_name = cx.current.account.as_ref().map(|a| a.name.clone()).unwrap_or_default();
     enum Out {
-        Added(String),
         Invited(control::NewInvitation),
         Invalid(Vec<(String, String)>),
     }
     let e2 = email.clone();
+    // Always an invitation the person accepts, even when they already have
+    // a user here: joining an account is their choice, and the same answer
+    // either way does not tell the admin who has an account.
     let r = cx
         .state
         .db(move |c| {
-            c.tx(|tx| {
-                if let Some(u) = control::find_user_by_email(tx, &e2)?.filter(|u| u.verified) {
-                    control::insert_membership(tx, account, u.id, &role)?;
-                    return Ok(Out::Added(u.name));
-                }
-                match control::create_invitation(tx, account, inviter.id, &e2, &role) {
-                    Ok(inv) => Ok(Out::Invited(inv)),
-                    Err(ModelError::Invalid(e)) => Ok(Out::Invalid(e)),
-                    Err(e) => Err(e),
-                }
+            c.tx(|tx| match control::create_invitation(tx, account, inviter.id, &e2, &role) {
+                Ok(inv) => Ok(Out::Invited(inv)),
+                Err(ModelError::Invalid(e)) => Ok(Out::Invalid(e)),
+                Err(e) => Err(e),
             })
         })
         .await;
     match r {
-        Ok(Out::Added(name)) => cx.redirect(Redirect::to("/settings/members").notice(format!("{name} added"))),
         Ok(Out::Invited(inv)) => {
             let user = cx.current.user.as_ref().map(|u| u.name.clone()).unwrap_or_default();
             mailer::deliver_later(cx.state.mailer.clone(), mailer::invite(&cx.state.config.pages_url(), &email, &user, &account_name, &inv.token));
