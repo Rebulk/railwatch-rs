@@ -44,7 +44,7 @@ mod compare;
 #[path = "mcp_records.rs"]
 mod records;
 #[path = "mcp_security.rs"]
-mod security;
+pub(super) mod security;
 #[path = "mcp_sessions.rs"]
 mod sessions;
 #[path = "mcp_uptime.rs"]

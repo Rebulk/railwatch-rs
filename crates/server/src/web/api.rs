@@ -920,6 +920,12 @@ impl Api<'_> {
                 .ok_or_else(not_found)?;
             Ok(crate::dashboard::execution_presenter::props(conn, &exe, &ctx, &control)?)
         })?;
+        // Personal data needs the security scope, as on MCP's get_execution.
+        let mut props = props;
+        if !self.token.allows(super::mcp::security::SECURITY_SCOPE) {
+            super::mcp::security::strip_personal_fields(&mut props["execution"]["detail"]);
+            props["access"] = super::mcp::security::access_json(false);
+        }
         ok(props)
     }
 
@@ -2499,6 +2505,34 @@ mod tests {
         assert!(none["data"].as_array().unwrap().is_empty());
         // Without a request key the table is the rollups' as before (no scan).
         assert!(get(&f, &format!("{base}/requests"), "read_only").1.get("scan").is_none());
+    }
+
+    /// One execution over the API: the client address, user agent and
+    /// X-Forwarded-For are personal data, so only a token with the security
+    /// scope gets them (as MCP's get_execution); the rest of the detail stays.
+    #[test]
+    fn an_execution_on_the_api_hides_the_client_ip_and_user_agent_without_the_security_scope() {
+        let f = fixture("execution-personal");
+        let slug: String = f.c.with(|x| x.query_row("SELECT slug FROM environments WHERE id = ?", [f.env], |r| r.get(0))).unwrap();
+        let conn = crate::tenants::open_tenant(&f.dir.join("telemetry").join(format!("{slug}.sqlite3"))).unwrap();
+        let detail = json!({"ip": "198.51.100.7", "user_agent": "curl/8", "path": "/orders",
+            "headers": {"X-Forwarded-For": "198.51.100.7, 10.0.0.1", "Referer": "https://example.com/"}});
+        conn.execute(
+            "INSERT INTO executions (execution_id, kind, name, method, group_hash, status, occurred_at, duration, detail) VALUES ('ex1', 'request', 'GET /orders', 'GET', 'g', 200, ?1, 1000, ?2)",
+            params![qt(NOW - 60_000_000), detail.to_string()],
+        )
+        .unwrap();
+        let path = format!("/api/v1/applications/{}/environments/{}/executions/ex1", f.app, f.env);
+        let (status, plain) = get(&f, &path, "read_only");
+        assert_eq!(status, 200, "{plain}");
+        let d = &plain["execution"]["detail"];
+        assert_eq!((d.get("ip"), d.get("user_agent"), d["headers"].get("X-Forwarded-For")), (None, None, None), "{plain}");
+        assert_eq!((d["path"].as_str(), d["headers"]["Referer"].as_str()), (Some("/orders"), Some("https://example.com/")));
+        assert!(!plain.to_string().contains("198.51.100.7"), "{plain}");
+        assert_eq!(plain["access"]["client_fields"], false);
+        let (_, full) = get(&f, &path, "security");
+        assert_eq!(full["execution"]["detail"], detail, "the security scope sees it all");
+        assert!(full.get("access").is_none());
     }
 
     /// The API takes `a|b` and answers a key or value the resource does not
