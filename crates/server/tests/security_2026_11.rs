@@ -41,6 +41,10 @@ fn start(name: &str, signup: &str) -> Server {
 }
 
 fn start_with(name: &str, signup: &str, trust_proxy: bool) -> Server {
+    start_full(name, signup, trust_proxy, None)
+}
+
+fn start_full(name: &str, signup: &str, trust_proxy: bool, trusted_proxies: Option<&str>) -> Server {
     let dir = std::env::temp_dir().join(format!("rw-sec2611-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -52,6 +56,10 @@ fn start_with(name: &str, signup: &str, trust_proxy: bool) -> Server {
             std::env::set_var("RAILWATCH_URL", "http://127.0.0.1");
             std::env::set_var("RAILWATCH_SIGNUP", signup);
             std::env::set_var("RAILWATCH_TRUST_PROXY", if trust_proxy { "1" } else { "0" });
+            match trusted_proxies {
+                Some(v) => std::env::set_var("RAILWATCH_TRUSTED_PROXIES", v),
+                None => std::env::remove_var("RAILWATCH_TRUSTED_PROXIES"),
+            }
             std::env::remove_var("RAILWATCH_CONFIG");
         }
         Config::load().expect("config")
@@ -223,10 +231,11 @@ fn adding_a_member_invites_them_instead_of_joining_them_without_consent() {
 /// The link a password reset mails (controllers::signed_token), built here
 /// because without SMTP the server no longer logs it.
 fn reset_sid(s: &Server, user_id: i64) -> String {
-    let digest: String = s.control.with(|x| x.query_row("SELECT password_digest FROM users WHERE id = ?", [user_id], |r| r.get(0))).unwrap();
+    let (digest, email): (String, String) =
+        s.control.with(|x| x.query_row("SELECT password_digest, email FROM users WHERE id = ?", [user_id], |r| Ok((r.get(0)?, r.get(1)?)))).unwrap();
     let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 600;
     let value = format!("{user_id}.{exp}");
-    let mac = s.state.keys.sign("password_reset", &format!("{value}.{}", &digest[19..29]));
+    let mac = s.state.keys.sign("password_reset", &format!("{value}.{}", railwatch_server::web::controllers::reset_bind(&digest, &email)));
     format!("{value}.{}", mac.rsplit_once("--").unwrap().1)
 }
 
@@ -279,6 +288,46 @@ fn a_password_reset_takes_an_unverified_account_back_from_whoever_signed_up_with
     owner.sign_in(&s, "victim@example.com", &new_password);
 }
 
+/// A reset link proves the mailbox it was SENT to. One requested for your
+/// own address must not verify an address you change to afterwards: the
+/// link is bound to the email as well as the password, so it stops working
+/// when either changes.
+#[test]
+fn a_reset_link_sent_to_an_old_address_cannot_verify_a_new_one() {
+    let s = start("reset-email-swap", "open");
+    let password = control::base58(16);
+    user(&s, "Mallory", "mallory@example.com", &password, true);
+    let id: i64 = s.control.with(|x| x.query_row("SELECT id FROM users WHERE email = 'mallory@example.com'", [], |r| r.get(0))).unwrap();
+
+    // The link the server mails her for her own address (signed exactly as
+    // password_reset_create signs it, from her row as it is now).
+    let link = reset_sid(&s, id);
+    let mut b = Browser::default();
+
+    // She changes her email to someone else's address: unverified now.
+    b.sign_in(&s, "mallory@example.com", &password);
+    let token = b.csrf(&s);
+    let r = b.request(&s, "PATCH", "/settings/email", Some(&format!("email=victim%40example.com&password_challenge={password}")), &[("X-CSRF-Token", &token)]);
+    assert_eq!(r.status, 302, "{}", r.body);
+    let verified: bool = s.control.with(|x| x.query_row("SELECT verified FROM users WHERE id = ?", [id], |r| r.get(0))).unwrap();
+    assert!(!verified, "a changed address starts unverified");
+
+    // The old link must no longer work, so it cannot mark victim@ verified.
+    let new_password = control::base58(16);
+    let mut other = Browser::default();
+    let token = other.csrf(&s);
+    let r = other.request(
+        &s,
+        "PATCH",
+        "/identity/password_reset",
+        Some(&format!("sid={link}&password={new_password}&password_confirmation={new_password}")),
+        &[("X-CSRF-Token", &token)],
+    );
+    assert_eq!(r.location(), "/identity/password_reset/new", "the link is refused: {}", r.body);
+    let verified: bool = s.control.with(|x| x.query_row("SELECT verified FROM users WHERE id = ?", [id], |r| r.get(0))).unwrap();
+    assert!(!verified, "victim@example.com is not verified by a link sent to mallory@");
+}
+
 // ---------------------------------------------------------------------------
 // Finding 8
 
@@ -288,7 +337,9 @@ fn a_password_reset_takes_an_unverified_account_back_from_whoever_signed_up_with
 /// everyone behind the same edge.
 #[test]
 fn per_ip_limits_key_on_the_client_behind_two_proxies_not_on_the_edge_proxy() {
-    let s = start_with("xff", "open", true);
+    // The edge proxy is on the private network and named as a proxy
+    // (RAILWATCH_TRUSTED_PROXIES), so its entry is skipped.
+    let s = start_full("xff", "open", true, Some("10.0.0.0/8"));
     let attempt = |client: &str| {
         let mut b = Browser::default();
         let token = b.csrf(&s);
@@ -301,6 +352,26 @@ fn per_ip_limits_key_on_the_client_behind_two_proxies_not_on_the_edge_proxy() {
     }
     assert_eq!(attempt("198.51.100.1"), limited, "the 11th sign-up in an hour from one client");
     assert_ne!(attempt("198.51.100.2"), limited, "another client behind the same proxies is not limited");
+}
+
+/// A client on the proxy's own network writes a public address before the
+/// one the proxy appends. With no chain configured it is limited by the
+/// address the proxy saw, so a fresh forged address each time does not
+/// reset its limit.
+#[test]
+fn a_lan_client_cannot_reset_its_limit_by_forging_x_forwarded_for() {
+    let s = start_with("xff-lan", "open", true);
+    let attempt = |forged: &str| {
+        let mut b = Browser::default();
+        let token = b.csrf(&s);
+        let r = b.request(&s, "POST", "/sign_up", Some("name=x"), &[("X-CSRF-Token", &token), ("X-Forwarded-For", &format!("{forged}, 192.168.1.20"))]);
+        b.flash_after(&s, &r)["alert"].as_str().unwrap_or("").to_string()
+    };
+    let limited = "Too many sign-up attempts. Try again later.";
+    for i in 0..10 {
+        assert_ne!(attempt(&format!("198.51.100.{i}")), limited);
+    }
+    assert_eq!(attempt("198.51.100.99"), limited, "the 11th attempt from 192.168.1.20 is limited whatever it forges");
 }
 
 // ---------------------------------------------------------------------------

@@ -59,6 +59,11 @@ pub struct Config {
     /// Hex; default: generated once into `<data_dir>/secret_key_base`.
     pub secret_key_base: Option<String>,
     pub trust_proxy: bool,
+    /// RAILWATCH_TRUSTED_PROXIES: comma-separated addresses or networks of
+    /// the proxies BEHIND the one in front (a chain: CDN -> Caddy). Empty:
+    /// only the proxy that connects is trusted, and the right-most
+    /// X-Forwarded-For entry is the client.
+    pub trusted_proxies: Vec<crate::http::IpNet>,
     pub rate_limit_ip: u64,
     pub rate_limit_env: u64,
     pub tenant_idle_seconds: u64,
@@ -340,6 +345,15 @@ impl Config {
         };
         let secret_key_base = get("secret_key_base", &["RAILWATCH_SECRET_KEY_BASE"]);
         let trust_proxy = get("trust_proxy", &["RAILWATCH_TRUST_PROXY"]).is_some_and(|v| truthy(&v));
+        let trusted_proxies = match get("trusted_proxies", &["RAILWATCH_TRUSTED_PROXIES"]) {
+            None => Vec::new(),
+            Some(v) => v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| crate::http::IpNet::parse(s).ok_or_else(|| format!("trusted_proxies: {s:?} is not an address or network (10.0.0.5, 10.0.0.0/8)")))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         let rate_limit_ip = num(get("rate_limit_ip", &["RAILWATCH_RATE_LIMIT_IP"]), "rate_limit_ip", 2_400)?;
         let rate_limit_env = num(get("rate_limit_env", &["RAILWATCH_RATE_LIMIT_ENV"]), "rate_limit_env", 600)?;
         let tenant_idle_seconds = num(get("tenant_idle_seconds", &["RAILWATCH_TENANT_IDLE_SECONDS"]), "tenant_idle_seconds", 300)?;
@@ -474,6 +488,7 @@ impl Config {
             google,
             secret_key_base,
             trust_proxy,
+            trusted_proxies,
             rate_limit_ip,
             rate_limit_env,
             tenant_idle_seconds,
@@ -593,6 +608,15 @@ impl Config {
             ("redirect_hosts".into(), if self.redirect_hosts.is_empty() { "(none)".into() } else { self.redirect_hosts.join(", ") }, src("redirect_hosts")),
             ("signup".into(), format!("{:?}", self.signup), src("signup")),
             ("trust_proxy".into(), self.trust_proxy.to_string(), src("trust_proxy")),
+            (
+                "trusted_proxies".into(),
+                if self.trusted_proxies.is_empty() {
+                    "(none: the proxy that connects, and the right-most X-Forwarded-For entry)".into()
+                } else {
+                    self.trusted_proxies.iter().map(|n| format!("{}/{}", n.addr, n.prefix)).collect::<Vec<_>>().join(", ")
+                },
+                src("trusted_proxies"),
+            ),
             ("rate_limit_ip".into(), self.rate_limit_ip.to_string(), src("rate_limit_ip")),
             ("rate_limit_env".into(), self.rate_limit_env.to_string(), src("rate_limit_env")),
             ("tenant_idle_seconds".into(), self.tenant_idle_seconds.to_string(), src("tenant_idle_seconds")),

@@ -185,9 +185,12 @@ async fn token_user(cx: &Ctx, token: &str, column: &'static str) -> Option<(i64,
     value.map(|v| (id, v))
 }
 
-fn reset_bind(digest: &str) -> String {
-    // `password_salt.last(10)`: bcrypt's salt is characters 7..29.
-    digest.get(19..29).unwrap_or(digest).to_string()
+/// What a password reset link is bound to: the password (bcrypt's salt,
+/// `password_salt.last(10)`, characters 19..29) AND the address it was sent
+/// to. A link stops working when either changes, so one requested for your
+/// own address cannot verify an address you change to afterwards.
+pub fn reset_bind(digest: &str, email: &str) -> String {
+    format!("{}:{}", digest.get(19..29).unwrap_or(digest), email)
 }
 
 // ---------------------------------------------------------------------------
@@ -471,9 +474,10 @@ async fn password_reset_new(cx: Ctx) -> Response {
 }
 
 async fn reset_user(cx: &Ctx, sid: &str) -> Option<control::User> {
-    let (uid, digest) = token_user(cx, sid, "password_digest").await?;
-    let id = verify_token(cx, "password_reset", sid, |id| (id == uid).then(|| reset_bind(&digest)))?;
-    cx.state.db(move |c| c.with(|x| control::find_user(x, id))).await.ok().flatten()
+    let id: i64 = sid.split('.').next()?.parse().ok()?;
+    let user = cx.state.db(move |c| c.with(|x| control::find_user(x, id))).await.ok().flatten()?;
+    verify_token(cx, "password_reset", sid, |tid| (tid == user.id).then(|| reset_bind(&user.password_digest, &user.email)))?;
+    Some(user)
 }
 
 async fn password_reset_edit(cx: Ctx, p: Params) -> Response {
@@ -508,7 +512,7 @@ async fn password_reset_create(cx: Ctx, p: Params) -> Response {
         .await;
     match claimed {
         Ok(Some(u)) => {
-            let sid = signed_token(&cx, "password_reset", u.id, &reset_bind(&u.password_digest), 20 * 60);
+            let sid = signed_token(&cx, "password_reset", u.id, &reset_bind(&u.password_digest, &u.email), 20 * 60);
             mailer::deliver_later(cx.state.mailer.clone(), mailer::password_reset(&cx.state.config.pages_url(), &u.email, &sid));
         }
         Ok(None) => {}
@@ -538,17 +542,25 @@ async fn password_reset_update(cx: Ctx, p: Params) -> Response {
         .state
         .db(move |c| {
             c.tx(|tx| {
+                // The link checked above is re-checked against the row inside
+                // the write: an email or password change in between ends it.
+                let (digest, email): (String, String) =
+                    tx.query_row("SELECT password_digest, email FROM users WHERE id = ?", [user.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                if reset_bind(&digest, &email) != reset_bind(&user.password_digest, &user.email) {
+                    return Ok(false);
+                }
                 control::set_password(tx, user.id, &password, None)?;
                 if !user.verified {
                     tx.execute("UPDATE users SET verified = 1, updated_at = ? WHERE id = ?", params![now_db(), user.id])?;
                     tx.execute("DELETE FROM api_tokens WHERE user_id = ?", [user.id])?;
                 }
-                Ok(())
+                Ok(true)
             })
         })
         .await;
     match r {
-        Ok(()) => cx.redirect(Redirect::to("/sign_in").notice("Your password was reset successfully. Please sign in")),
+        Ok(true) => cx.redirect(Redirect::to("/sign_in").notice("Your password was reset successfully. Please sign in")),
+        Ok(false) => cx.redirect(Redirect::to("/identity/password_reset/new").alert("That password reset link is invalid")),
         Err(e) => internal(e),
     }
 }

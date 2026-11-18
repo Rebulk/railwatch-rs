@@ -123,16 +123,24 @@ for sign-in, sign-up, password resets, MCP and ingest):
   loopback or private address (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`,
   `192.168.0.0/16`, `::1`, `fc00::/7`). A public address that connects
   directly is its own client, whatever the header says.
-- The client is the right-most address in the header that is not one of
-  those: each proxy appends the address it saw, so anything to its left was
-  written by the client and is ignored. Two proxies in front (a CDN, then
-  Caddy) work as long as the inner ones are on private addresses.
-- If every address is private (all on your LAN), the left-most one counts.
+- The client is the RIGHT-MOST address in the header: the one the proxy in
+  front saw and appended. Anything to its left was written by someone else,
+  the client included, and is never believed, even when it is a private
+  address. So a client on your LAN cannot write a public address and get a
+  fresh rate limit with every request.
+- More than one proxy (a CDN, then Caddy): name the inner ones in
+  `RAILWATCH_TRUSTED_PROXIES` (comma-separated addresses or networks, such as
+  `10.0.0.0/8`). Right-most entries from those are skipped and the next one
+  is the client. A named proxy may also connect from a public address.
+  Without it, the second proxy's address counts as the client, and every
+  client behind it shares one limit.
 
-A proxy on a public address in front of another proxy (a CDN that connects
-to your Caddy over the internet) is not recognised as a proxy, so its
-address becomes the client: put the CDN's own client header into
-`X-Forwarded-For` at the inner proxy instead, or connect them privately.
+A CDN that connects to your Caddy over the internet: either name the CDN's
+published address ranges in `RAILWATCH_TRUSTED_PROXIES`, or have Caddy put
+the CDN's own client header into `X-Forwarded-For` only if Caddy accepts
+connections from the CDN alone (an allowlist of its published addresses).
+Otherwise a client that reaches Caddy directly can set that header and
+choose the address Railwatch counts. Or connect them privately.
 With Docker, a published port can reach the container from the bridge's
 private gateway address (Docker's userland proxy does this), which then
 looks like a proxy: publish on `127.0.0.1` only, as above. For HTTPS from Railwatch itself, use
@@ -207,6 +215,7 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `BIND` / `PORT` | `127.0.0.1:8790` | used only without systemd's sockets |
 | `DATA_DIR` | `./data` (`/var/lib/railwatch` under the installer) | |
 | `TRUST_PROXY` | off | key the per-IP limit on `X-Forwarded-For` |
+| `TRUSTED_PROXIES` | | further proxies of a chain (addresses or networks, comma-separated) whose `X-Forwarded-For` entries are skipped; see [Docker](#docker) |
 | `SIGNUP` | `invite` | `open` lets anyone create an account |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | | both turn on "Continue with Google" ([below](#sign-in-with-google)) |
 | `SMTP_ADDRESS`, `_PORT` (587), `_USERNAME`, `_PASSWORD`, `_SECURITY` (`starttls`/`tls`/`none`), `_FROM` | | password resets, invitations, email alerts, the weekly digest ([below](#weekly-digest)) |

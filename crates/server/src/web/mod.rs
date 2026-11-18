@@ -128,7 +128,7 @@ impl WebState {
 
     /// The client address: ingest's rule (http::client_address).
     pub fn client_ip(&self, req: &Request) -> IpAddr {
-        crate::http::client_address(req, self.config.trust_proxy)
+        crate::http::client_address(req, self.config.trust_proxy, &self.config.trusted_proxies)
     }
 
     /// Runs a blocking control-DB closure off the async runtime.

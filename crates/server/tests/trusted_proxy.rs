@@ -85,6 +85,7 @@ async fn mounted_under_a_base_path_behind_a_trusted_proxy() {
         ip_limit: FixedWindow::new(0),
         env_limit: FixedWindow::new(0),
         trust_proxy: false,
+        trusted_proxies: Vec::new(),
         sourcemaps_dir: dir.join("sourcemaps"),
         cpu: Arc::new(tokio::sync::Semaphore::new(2)),
         disk: Default::default(),

@@ -7,6 +7,14 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- A password reset link is bound to the address it was sent to as well as
+  the password: changing your email makes an earlier link stop working, so
+  it can no longer verify the new address.
+- With `RAILWATCH_TRUST_PROXY`, the client is the right-most
+  `X-Forwarded-For` entry (what the proxy in front saw); private entries are
+  no longer skipped, so a LAN client cannot pick its own rate-limit address.
+  Name the further proxies of a chain in the new `RAILWATCH_TRUSTED_PROXIES`.
+
 **Security fixes from the 2026-11 review**
 - `GET /api/v1/.../executions/:id` leaves out the client IP, user agent and
   `X-Forwarded-For` unless the token has the `security` scope, as MCP's
