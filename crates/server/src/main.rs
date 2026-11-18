@@ -1344,6 +1344,7 @@ fn serve() -> ExitCode {
             ip_limit: FixedWindow::new(cfg.rate_limit_ip),
             env_limit: FixedWindow::new(cfg.rate_limit_env),
             trust_proxy: cfg.trust_proxy,
+            trusted_proxies: cfg.trusted_proxies.clone(),
             sourcemaps_dir: cfg.data_dir.join("sourcemaps"),
             cpu: Arc::new(tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(4, |n| n.get()))),
             disk: disk.clone(),

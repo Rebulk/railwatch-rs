@@ -508,6 +508,18 @@ impl Mcp<'_> {
     }
 }
 
+/// A raw request `detail` for a reader without the security scope: the
+/// fields `merge_request_fields` leaves out without access (ip, user_agent,
+/// the X-Forwarded-For header) are removed; the rest stays as recorded.
+pub(in crate::web) fn strip_personal_fields(detail: &mut Value) {
+    let Some(d) = detail.as_object_mut() else { return };
+    d.remove("ip");
+    d.remove("user_agent");
+    if let Some(Value::Object(h)) = d.get_mut("headers") {
+        h.retain(|name, _| !name.eq_ignore_ascii_case("X-Forwarded-For"));
+    }
+}
+
 /// Request fields from `detail` onto a request row. `full`: get_execution's
 /// detail, which adds the url, the halted callback and the unpermitted keys.
 pub(super) fn merge_request_fields(v: &mut Value, detail: &Value, access: bool, full: bool) {
@@ -554,7 +566,7 @@ pub(super) fn merge_request_fields(v: &mut Value, detail: &Value, access: bool, 
     }
 }
 
-pub(super) fn access_json(access: bool) -> Value {
+pub(in crate::web) fn access_json(access: bool) -> Value {
     if access { json!({"client_fields": true}) } else { json!({"client_fields": false, "missing": MISSING}) }
 }
 

@@ -65,7 +65,9 @@ fn blank(v: &Value) -> bool {
 }
 
 /// IntegrationsController#integration_props: never the secrets themselves.
-fn integration_props(i: &Integration) -> Value {
+/// `admin`: the viewer can manage integrations; anyone else sees only the
+/// host of a webhook URL (its path or query may be a credential).
+fn integration_props(i: &Integration, admin: bool) -> Value {
     let mut settings: Map<String, Value> = i
         .settings
         .iter()
@@ -75,12 +77,21 @@ fn integration_props(i: &Integration) -> Value {
     if i.kind == "slack" {
         settings.insert("webhook_url".into(), json!("configured"));
     }
+    let mut destination = i.destination();
+    if i.kind == "webhook" && !admin {
+        let host = |u: &str| reqwest::Url::parse(u).ok().and_then(|u| u.host_str().map(str::to_string));
+        destination = destination.as_deref().and_then(host);
+        if let Some(Value::String(u)) = settings.get("url") {
+            let h = host(u).map_or(Value::Null, Value::String);
+            settings.insert("url".into(), h);
+        }
+    }
     if i.kind == "linear" && ["api_key", "access_token"].iter().any(|k| i.settings.get(*k).is_some_and(|v| !blank(v))) {
         settings.insert("credential".into(), json!("configured"));
     }
     json!({
         "id": i.id, "kind": i.kind, "name": i.name, "enabled": i.enabled,
-        "destination": i.destination(), "last_delivered_at": t_json_opt(i.last_delivered_at.clone()),
+        "destination": destination, "last_delivered_at": t_json_opt(i.last_delivered_at.clone()),
         "last_received_at": t_json_opt(i.last_received_at.clone()), "last_synced_at": t_json_opt(i.last_synced_at.clone()),
         // A secret this server cannot decrypt is the integration's problem
         // to show, ahead of any older delivery error.
@@ -107,12 +118,14 @@ fn alert_rules_props(x: &Connection, account: i64) -> rusqlite::Result<Vec<Value
 
 async fn index(cx: Ctx) -> Response {
     let account = guard!(require_account(&cx));
+    let user = cx.user_id();
     let cipher = cipher(&cx);
     let data = cx
         .state
         .db(move |c| {
             c.with(|x| {
-                let integrations: Vec<Value> = integration::for_account(x, Some(&cipher), account)?.iter().map(integration_props).collect();
+                let admin = matches!(crate::control::membership_role(x, account, user)?.as_deref(), Some("owner" | "admin"));
+                let integrations: Vec<Value> = integration::for_account(x, Some(&cipher), account)?.iter().map(|i| integration_props(i, admin)).collect();
                 let alert_rules = alert_rules_props(x, account)?;
                 let apps: Vec<(i64, String)> = x
                     .prepare("SELECT id, name FROM applications WHERE account_id = ? ORDER BY name, id")?
@@ -428,11 +441,35 @@ mod tests {
             last_synced_at: None,
             last_error: None,
         };
-        let p = integration_props(&i);
+        let p = integration_props(&i, true);
         assert!(!p.to_string().contains("s3cret"));
-        assert_eq!(p["destination"], "https://example.com/h", "the destination is shown, as Rails does");
+        assert_eq!(p["destination"], "https://example.com/h", "the destination is shown to an admin, as Rails does");
         let s =
             Integration { kind: "slack".into(), settings: json!({"webhook_url": "https://hooks.slack.com/services/T/B1/x"}).as_object().unwrap().clone(), ..i };
-        assert_eq!(integration_props(&s)["settings"], json!({"webhook_url": "configured"}));
+        assert_eq!(integration_props(&s, true)["settings"], json!({"webhook_url": "configured"}));
+    }
+
+    /// A webhook URL often carries its own credential (`?token=...`): a
+    /// member who cannot edit integrations sees only where it goes.
+    #[test]
+    fn members_see_only_the_host_of_a_webhook_url() {
+        let i = Integration {
+            id: 1,
+            account_id: 1,
+            kind: "webhook".into(),
+            name: "Hook".into(),
+            enabled: true,
+            settings: json!({"url": "https://example.com/hook?token=t0ps3cret"}).as_object().unwrap().clone(),
+            settings_error: None,
+            last_delivered_at: None,
+            last_received_at: None,
+            last_synced_at: None,
+            last_error: None,
+        };
+        let member = integration_props(&i, false);
+        assert!(!member.to_string().contains("t0ps3cret"), "{member}");
+        assert_eq!((member["destination"].as_str(), member["settings"]["url"].as_str()), (Some("example.com"), Some("example.com")));
+        let admin = integration_props(&i, true);
+        assert_eq!(admin["destination"], "https://example.com/hook?token=t0ps3cret", "an admin manages it, so sees it whole");
     }
 }

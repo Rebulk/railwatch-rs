@@ -33,12 +33,12 @@ pub mod sessions_oauth;
 pub mod status_page;
 pub mod uptime;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{ConnectInfo, Request};
+use axum::extract::Request;
 
 use crate::config::{Config, Signup};
 use crate::control::Control;
@@ -69,6 +69,8 @@ pub struct WebState {
     pub sign_up_limit: FixedWindow<IpAddr>,
     /// PasswordResets/EmailVerifications: 20 an hour per IP.
     pub email_limit: FixedWindow<IpAddr>,
+    /// Opening an email verification link (unauthenticated): 20 an hour per IP.
+    pub verification_limit: FixedWindow<IpAddr>,
     /// Provisioning (accounts/applications/environments): 30/hour/user.
     pub provisioning_limit: FixedWindow<i64>,
     /// IntegrationsController#send_test: 5 a minute per user.
@@ -80,6 +82,8 @@ pub struct WebState {
     pub mcp_preauth_limit: FixedWindow<IpAddr>,
     /// Api::BaseController's rate_limit: 600 a minute per user, per controller.
     pub api_rate_limit: FixedWindow<(&'static str, i64)>,
+    /// Every page's Content-Security-Policy (document::content_security_policy).
+    pub csp: axum::http::HeaderValue,
 }
 
 impl WebState {
@@ -89,6 +93,12 @@ impl WebState {
         let cursor_key = crate::dashboard::CursorKey(cursor_key_bytes(&secret));
         let readers = crate::dashboard::pool::ReadPools::with_max(tenants.dir(), crate::dashboard::pool::PER_TENANT, config.max_read_connections);
         let mailer = config.smtp.as_ref().map(mailer::Mailer::new).transpose()?;
+        let google_origin = config.google.as_ref().and_then(|g| {
+            let u = reqwest::Url::parse(&google_oauth2::endpoints(g).authorize).ok()?;
+            Some(u.origin().ascii_serialization())
+        });
+        let csp = axum::http::HeaderValue::from_str(&document::content_security_policy(google_origin.as_deref()))
+            .map_err(|_| "google_issuer: not usable in a Content-Security-Policy".to_string())?;
         Ok(WebState {
             control,
             keys,
@@ -101,11 +111,13 @@ impl WebState {
             sign_in_email_limit: FixedWindow::with_window(10, Duration::from_secs(300)),
             sign_up_limit: FixedWindow::with_window(10, Duration::from_secs(3600)),
             email_limit: FixedWindow::with_window(20, Duration::from_secs(3600)),
+            verification_limit: FixedWindow::with_window(20, Duration::from_secs(3600)),
             provisioning_limit: FixedWindow::with_window(30, Duration::from_secs(3600)),
             send_test_limit: FixedWindow::with_window(5, Duration::from_secs(60)),
             settings_cipher: crate::alerts::integration::SettingsCipher::new(&secret),
             mcp_preauth_limit: mcp::preauth_limit(),
             api_rate_limit: api::rate_limit(),
+            csp,
             config,
         })
     }
@@ -114,16 +126,9 @@ impl WebState {
         self.config.signup == Signup::Open
     }
 
-    /// The client address (Phase 1's rule: XFF only with trust_proxy).
+    /// The client address: ingest's rule (http::client_address).
     pub fn client_ip(&self, req: &Request) -> IpAddr {
-        let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()).unwrap_or(IpAddr::from([127, 0, 0, 1]));
-        if self.config.trust_proxy
-            && let Some(xff) = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok())
-            && let Some(ip) = xff.split(',').filter_map(|s| s.trim().parse::<IpAddr>().ok()).next_back()
-        {
-            return ip;
-        }
-        peer
+        crate::http::client_address(req, self.config.trust_proxy, &self.config.trusted_proxies)
     }
 
     /// Runs a blocking control-DB closure off the async runtime.

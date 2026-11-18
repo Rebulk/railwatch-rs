@@ -46,8 +46,9 @@ here that differs is a bug.
    Solid Cache). Configurable: `RAILWATCH_RATE_LIMIT_IP` (2,400),
    `RAILWATCH_RATE_LIMIT_ENV` (600); 0 disables.
 4. **Client IP.** `X-Forwarded-For` is honoured only with
-   `RAILWATCH_TRUST_PROXY=1`, and then the rightmost non-private address wins
-   (Rails' RemoteIp with its default trusted proxies). Without it, the socket
+   `RAILWATCH_TRUST_PROXY=1` and only from a loopback or private peer, and
+   then the rightmost non-private address wins (Rails' RemoteIp with its
+   default trusted proxies; docs/SELF-HOST.md). Without it, the socket
    address. The local Rails baseline trusts XFF from the docker bridge, which is
    why `rw-load --xff-rotate` exists.
 5. **Writes are coalesced.** Up to 64 queued batches (or ~20k rows) of one
@@ -221,8 +222,9 @@ cloud-only page driven in a real browser.
    (`<user>.<expiry>.<mac>`), not Rails' `generates_token_for`. Same lifetimes
    (20 min, 2 days); the reset token is bound to the bcrypt salt, so it dies
    when the password changes, as Rails'.
-8. **Email without SMTP is logged, not sent** (WARN, full body). `railwatch
-   doctor` says so. Plain-text emails; Rails sends HTML templates.
+8. **Email without SMTP is logged, not sent** (WARN, recipient and subject
+   only: the body's reset, verification and invitation links are never
+   logged). `railwatch doctor` says so. Plain-text emails; Rails sends HTML templates.
 9. **The marketing home page and legal pages are not served here.** They
    are a static site (frontend/site, deployed to railwatch.dev); `/`
    redirects to the dashboard or sign-in, and the sign-up form links to

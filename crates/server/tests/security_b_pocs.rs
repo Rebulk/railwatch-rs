@@ -56,6 +56,7 @@ fn start() -> Server {
                 ip_limit: FixedWindow::new(0),
                 env_limit: FixedWindow::new(0),
                 trust_proxy: false,
+                trusted_proxies: Vec::new(),
                 sourcemaps_dir: d2.join("sourcemaps"),
                 cpu: Arc::new(tokio::sync::Semaphore::new(4)),
                 disk: Default::default(),

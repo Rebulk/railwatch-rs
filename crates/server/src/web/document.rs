@@ -24,6 +24,20 @@ const DARK_MODE_SCRIPT: &str = r#"
       );
     "#;
 
+/// The pages' Content-Security-Policy: scripts from this server and the
+/// dark-mode script above by its hash (never 'unsafe-inline'), connections
+/// (fetch, the live channel) and form posts back to this server.
+/// `form_origin`: the sign-in provider's origin, where "Continue with
+/// Google"'s form post is redirected (browsers check a form's redirects
+/// against form-action too).
+pub fn content_security_policy(form_origin: Option<&str>) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let hash = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(DARK_MODE_SCRIPT.as_bytes()));
+    let forms = form_origin.map_or(String::new(), |o| format!(" {o}"));
+    format!("base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self' 'sha256-{hash}'; connect-src 'self'; form-action 'self'{forms}")
+}
+
 pub fn render(view: &omega::View<'_>) -> String {
     let m = assets::manifest();
     let csrf = view.data.get(CSRF).and_then(|v| v.as_str()).unwrap_or("");

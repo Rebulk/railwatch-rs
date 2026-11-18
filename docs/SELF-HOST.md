@@ -114,7 +114,36 @@ one private Docker network. That is also what makes
 `RAILWATCH_TRUST_PROXY=1` safe: the server then counts per-IP rate limits by
 `X-Forwarded-For` (without it every client looks like the proxy and shares
 one limit), and only a client that can reach the server directly could forge
-that header. Leave it unset if nothing in front sets `X-Forwarded-For`. For HTTPS from Railwatch itself, use
+that header. Leave it unset if nothing in front sets `X-Forwarded-For`.
+
+How the client address is read with `RAILWATCH_TRUST_PROXY=1` (the same rule
+for sign-in, sign-up, password resets, MCP and ingest):
+
+- `X-Forwarded-For` counts only when the connection comes from a proxy: a
+  loopback or private address (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`,
+  `192.168.0.0/16`, `::1`, `fc00::/7`). A public address that connects
+  directly is its own client, whatever the header says.
+- The client is the RIGHT-MOST address in the header: the one the proxy in
+  front saw and appended. Anything to its left was written by someone else,
+  the client included, and is never believed, even when it is a private
+  address. So a client on your LAN cannot write a public address and get a
+  fresh rate limit with every request.
+- More than one proxy (a CDN, then Caddy): name the inner ones in
+  `RAILWATCH_TRUSTED_PROXIES` (comma-separated addresses or networks, such as
+  `10.0.0.0/8`). Right-most entries from those are skipped and the next one
+  is the client. A named proxy may also connect from a public address.
+  Without it, the second proxy's address counts as the client, and every
+  client behind it shares one limit.
+
+A CDN that connects to your Caddy over the internet: either name the CDN's
+published address ranges in `RAILWATCH_TRUSTED_PROXIES`, or have Caddy put
+the CDN's own client header into `X-Forwarded-For` only if Caddy accepts
+connections from the CDN alone (an allowlist of its published addresses).
+Otherwise a client that reaches Caddy directly can set that header and
+choose the address Railwatch counts. Or connect them privately.
+With Docker, a published port can reach the container from the bridge's
+private gateway address (Docker's userland proxy does this), which then
+looks like a proxy: publish on `127.0.0.1` only, as above. For HTTPS from Railwatch itself, use
 the installer above on a VM. `RAILWATCH_URL` is the address people and the
 Rails app use; every other setting in the [reference](#configuration-reference)
 works as an environment variable here too, and every CLI command runs with
@@ -186,6 +215,7 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `BIND` / `PORT` | `127.0.0.1:8790` | used only without systemd's sockets |
 | `DATA_DIR` | `./data` (`/var/lib/railwatch` under the installer) | |
 | `TRUST_PROXY` | off | key the per-IP limit on `X-Forwarded-For` |
+| `TRUSTED_PROXIES` | | further proxies of a chain (addresses or networks, comma-separated) whose `X-Forwarded-For` entries are skipped; see [Docker](#docker) |
 | `SIGNUP` | `invite` | `open` lets anyone create an account |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | | both turn on "Continue with Google" ([below](#sign-in-with-google)) |
 | `SMTP_ADDRESS`, `_PORT` (587), `_USERNAME`, `_PASSWORD`, `_SECURITY` (`starttls`/`tls`/`none`), `_FROM` | | password resets, invitations, email alerts, the weekly digest ([below](#weekly-digest)) |

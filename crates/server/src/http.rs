@@ -44,6 +44,8 @@ pub struct AppState {
     pub ip_limit: FixedWindow<IpAddr>,
     pub env_limit: FixedWindow<i64>,
     pub trust_proxy: bool,
+    /// RAILWATCH_TRUSTED_PROXIES: further proxies of a chain (client_address).
+    pub trusted_proxies: Vec<IpNet>,
     pub sourcemaps_dir: PathBuf,
     /// Bounds parse+map (CPU-bound) to one batch per core. Without it every
     /// in-flight request runs on the blocking pool at once and they all
@@ -212,21 +214,88 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
 }
 
 fn client_ip(state: &AppState, req: &Request) -> IpAddr {
-    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()).unwrap_or(IpAddr::from([127, 0, 0, 1]));
-    if state.trust_proxy {
-        // The client is the last address before our trusted proxy: Rails'
-        // RemoteIp drops trusted (private) hops from the right.
-        if let Some(xff) = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            let hops: Vec<IpAddr> = xff.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-            if let Some(ip) = hops.iter().rev().find(|ip| !trusted(ip)).or(hops.first()) {
-                return *ip;
-            }
-        }
-    }
-    peer
+    client_address(req, state.trust_proxy, &state.trusted_proxies)
 }
 
-fn trusted(ip: &IpAddr) -> bool {
+/// The client address of a request, for the web pages and ingest alike.
+/// Without `trust_proxy`: the TCP peer. With it, X-Forwarded-For is read
+/// only when the peer is the proxy in front (loopback or a private
+/// address), so a client that reaches the port directly cannot choose its
+/// own address. The client is then the RIGHT-MOST entry: the address that
+/// proxy saw and appended. Every entry to its left was written by someone
+/// else (the client included) and is never believed, even when it is
+/// private: a LAN client's own entry must not be skipped as "a proxy", or
+/// the forged public address before it would become its identity.
+///
+/// `trusted_proxies` (RAILWATCH_TRUSTED_PROXIES) names the further proxies
+/// of a chain (a CDN, then Caddy): right-most entries that are one of them
+/// are skipped, and the next one is the client. Never inferred from "is
+/// private".
+pub fn client_address(req: &Request, trust_proxy: bool, trusted_proxies: &[IpNet]) -> IpAddr {
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()).unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    let xff = req.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join(",");
+    forwarded_client(peer, trust_proxy.then_some(xff.as_str()), trusted_proxies)
+}
+
+fn forwarded_client(peer: IpAddr, xff: Option<&str>, trusted_proxies: &[IpNet]) -> IpAddr {
+    let peer = canonical(peer);
+    let Some(xff) = xff.filter(|_| local(&peer) || in_any(&peer, trusted_proxies)) else { return peer };
+    let hops: Vec<IpAddr> =
+        xff.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.parse().ok().map(canonical)).collect::<Option<Vec<_>>>().unwrap_or_default();
+    hops.iter().rev().find(|ip| !in_any(ip, trusted_proxies)).copied().unwrap_or(peer)
+}
+
+/// A network a proxy may be on: an address with its prefix length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpNet {
+    pub addr: IpAddr,
+    pub prefix: u8,
+}
+
+impl IpNet {
+    /// `10.0.0.5`, `10.0.0.0/8`, `fd00::/8`.
+    pub fn parse(s: &str) -> Option<IpNet> {
+        let (a, p) = s.trim().split_once('/').map_or((s.trim(), None), |(a, p)| (a, Some(p)));
+        let addr = canonical(a.parse().ok()?);
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = match p {
+            Some(p) => p.parse().ok().filter(|p: &u8| *p <= max)?,
+            None => max,
+        };
+        Some(IpNet { addr, prefix })
+    }
+
+    fn contains(&self, ip: &IpAddr) -> bool {
+        let keep = |bits: u32| if self.prefix == 0 { 0 } else { !0u128 << (bits - u32::from(self.prefix)) };
+        match (self.addr, canonical(*ip)) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = keep(32) as u32;
+                (u32::from(net) & mask) == (u32::from(ip) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = keep(128);
+                (u128::from(net) & mask) == (u128::from(ip) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn in_any(ip: &IpAddr, nets: &[IpNet]) -> bool {
+    nets.iter().any(|n| n.contains(ip))
+}
+
+/// An IPv4-mapped IPv6 address (a dual-stack socket's view of an IPv4
+/// peer) as the IPv4 address it is.
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// Loopback and private networks: where the proxy in front connects from.
+fn local(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
         IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
@@ -802,6 +871,71 @@ async fn sourcemaps(state: &Arc<AppState>, env: Environment, headers: &HeaderMap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One rule for every per-IP limit: only the proxy that connects (a
+    /// loopback or private peer) may say who the client is, and what it says
+    /// is the RIGHT-MOST entry, the address it saw. Further proxies of a chain
+    /// are skipped only when configured.
+    #[test]
+    fn the_client_is_the_address_the_proxy_in_front_saw() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let none: &[IpNet] = &[];
+        let proxy = ip("127.0.0.1");
+        // One proxy: what it appended.
+        assert_eq!(forwarded_client(proxy, Some("198.51.100.1"), none), ip("198.51.100.1"));
+        // A client's own X-Forwarded-For is to the left of what the proxy appended.
+        assert_eq!(forwarded_client(proxy, Some("1.2.3.4, 198.51.100.1"), none), ip("198.51.100.1"));
+        // A peer that is not a proxy reached us directly: its header is its own.
+        assert_eq!(forwarded_client(ip("203.0.113.9"), Some("1.2.3.4"), none), ip("203.0.113.9"));
+        assert_eq!(forwarded_client(ip("::ffff:203.0.113.9"), Some("1.2.3.4"), none), ip("203.0.113.9"));
+        assert_eq!(forwarded_client(ip("::ffff:127.0.0.1"), Some("198.51.100.1"), none), ip("198.51.100.1"));
+        // trust_proxy off, or no usable header: the peer.
+        assert_eq!(forwarded_client(proxy, None, none), proxy);
+        assert_eq!(forwarded_client(proxy, Some("unknown"), none), proxy);
+        assert_eq!(forwarded_client(proxy, Some("garbage, 198.51.100.1"), none), proxy, "a header with junk in it is not believed at all");
+    }
+
+    /// The review's case: a LAN client sends `X-Forwarded-For: 198.51.100.77`
+    /// and the proxy appends the client's own private address. The client is
+    /// that private address, never the public one it wrote, or it could pick
+    /// a fresh rate-limit identity on every request.
+    #[test]
+    fn a_lan_client_cannot_choose_its_rate_limit_identity() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let none: &[IpNet] = &[];
+        assert_eq!(forwarded_client(ip("127.0.0.1"), Some("198.51.100.77, 192.168.1.20"), none), ip("192.168.1.20"));
+        assert_eq!(forwarded_client(ip("10.0.0.2"), Some("198.51.100.78, 10.0.0.9"), none), ip("10.0.0.9"));
+    }
+
+    /// A chain (CDN -> Caddy -> Railwatch): the inner proxies are named, so
+    /// their entries are skipped and the next one is the client. Nothing is
+    /// skipped just for being private.
+    #[test]
+    fn named_proxies_of_a_chain_are_skipped() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let chain = [IpNet::parse("10.0.0.0/8").unwrap()];
+        assert_eq!(forwarded_client(ip("127.0.0.1"), Some("1.2.3.4, 198.51.100.1, 10.0.0.2"), &chain), ip("198.51.100.1"));
+        // A configured proxy may connect directly, from a public address.
+        let cdn = [IpNet::parse("203.0.113.0/24").unwrap()];
+        assert_eq!(forwarded_client(ip("203.0.113.5"), Some("198.51.100.1"), &cdn), ip("198.51.100.1"));
+        // Every entry a named proxy: the peer.
+        assert_eq!(forwarded_client(ip("127.0.0.1"), Some("10.0.0.3, 10.0.0.2"), &chain), ip("127.0.0.1"));
+        // Without the chain named, the right-most entry is still the client.
+        assert_eq!(forwarded_client(ip("127.0.0.1"), Some("198.51.100.1, 10.0.0.2"), &[]), ip("10.0.0.2"));
+    }
+
+    #[test]
+    fn proxy_networks_parse_and_match() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let n = IpNet::parse("10.1.0.0/16").unwrap();
+        assert!(n.contains(&ip("10.1.200.3")) && !n.contains(&ip("10.2.0.1")) && !n.contains(&ip("::1")));
+        assert!(IpNet::parse("10.0.0.5").unwrap().contains(&ip("10.0.0.5")));
+        assert!(!IpNet::parse("10.0.0.5").unwrap().contains(&ip("10.0.0.6")));
+        assert!(IpNet::parse("fd00::/8").unwrap().contains(&ip("fd12::1")));
+        assert!(IpNet::parse("0.0.0.0/0").unwrap().contains(&ip("198.51.100.1")));
+        assert_eq!(IpNet::parse("10.0.0.0/33"), None);
+        assert_eq!(IpNet::parse("nope"), None);
+    }
 
     #[test]
     fn routes_like_rails() {

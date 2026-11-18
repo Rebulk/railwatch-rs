@@ -301,7 +301,7 @@ async fn middleware(State(state): State<Arc<WebState>>, mut req: Request, next: 
     h.insert("x-frame-options", HeaderValue::from_static("SAMEORIGIN"));
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
     h.insert("referrer-policy", HeaderValue::from_static("strict-origin-when-cross-origin"));
-    h.insert("content-security-policy", HeaderValue::from_static("base-uri 'self'; object-src 'none'; frame-ancestors 'none'"));
+    h.insert("content-security-policy", state.csp.clone());
     if !h.contains_key(header::CACHE_CONTROL) {
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     }

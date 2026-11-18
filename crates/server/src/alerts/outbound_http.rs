@@ -167,11 +167,12 @@ pub struct Response {
 
 /// post_json: `body` is sent as given (a signed body is the sent body).
 pub async fn post_json(url: &str, body: String, headers: &[(&str, String)], kind: Kind) -> Result<Response, String> {
-    tokio::time::timeout(RESPONSE_TIMEOUT, post_inner(url, body, headers, kind)).await.map_err(|_| "destination response timed out".to_string())?
+    tokio::time::timeout(RESPONSE_TIMEOUT, post_inner(url, body, headers, kind, Policy::from_env()))
+        .await
+        .map_err(|_| "destination response timed out".to_string())?
 }
 
-async fn post_inner(url: &str, body: String, headers: &[(&str, String)], kind: Kind) -> Result<Response, String> {
-    let policy = Policy::from_env();
+async fn post_inner(url: &str, body: String, headers: &[(&str, String)], kind: Kind, policy: Policy) -> Result<Response, String> {
     let t = validate_with(url, kind, policy).map_err(|e| e.0)?;
     let addrs: Vec<SocketAddr> =
         tokio::net::lookup_host((t.host.as_str(), t.port)).await.map_err(|e| format!("destination hostname could not be resolved: {e}"))?.collect();
@@ -184,6 +185,9 @@ async fn post_inner(url: &str, body: String, headers: &[(&str, String)], kind: K
         }
     }
     let mut builder = reqwest::Client::builder()
+        // The address was checked and is pinned here: a proxy from the
+        // environment (HTTPS_PROXY) would connect elsewhere.
+        .no_proxy()
         .resolve(&t.host, addrs[0])
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
@@ -196,13 +200,14 @@ async fn post_inner(url: &str, body: String, headers: &[(&str, String)], kind: K
     for (k, v) in headers {
         req = req.header(*k, v);
     }
-    let mut res = req.send().await.map_err(|e| e.to_string())?;
+    // Never the URL in an error: it is stored, shown and logged.
+    let mut res = req.send().await.map_err(|e| e.without_url().to_string())?;
     if res.content_length().is_some_and(|l| l as usize > MAX_RESPONSE_BYTES) {
         return Err(format!("destination response exceeded {MAX_RESPONSE_BYTES} bytes"));
     }
     let status = res.status().as_u16();
     let mut out = Vec::new();
-    while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
+    while let Some(chunk) = res.chunk().await.map_err(|e| e.without_url().to_string())? {
         if out.len() + chunk.len() > MAX_RESPONSE_BYTES {
             return Err(format!("destination response exceeded {MAX_RESPONSE_BYTES} bytes"));
         }
@@ -249,6 +254,17 @@ mod tests {
             assert!(validate_with(bad, Kind::Webhook, lan).is_err(), "{bad}");
         }
         assert!(validate_with("https://10.0.0.5/services/a/b/c", Kind::Slack, lan).is_err());
+    }
+
+    /// reqwest's errors end in "for url (<the url>)": a webhook's query or
+    /// a Slack path is its credential, and the error is stored where members
+    /// read it and logged.
+    #[tokio::test]
+    async fn a_failed_delivery_error_does_not_carry_the_destination_url() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let url = format!("https://127.0.0.1:{port}/hook?token=t0ps3cret");
+        let err = post_inner(&url, "{}".into(), &[], Kind::Webhook, Policy { allow_private: true }).await.err().expect("nothing listens there");
+        assert!(!err.contains("t0ps3cret") && !err.contains("/hook"), "{err}");
     }
 
     #[test]
