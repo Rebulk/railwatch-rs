@@ -7,6 +7,36 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+**Security fixes from the 2026-11 review**
+- `GET /api/v1/.../executions/:id` leaves out the client IP, user agent and
+  `X-Forwarded-For` unless the token has the `security` scope, as MCP's
+  `get_execution` already did.
+- MCP `list_alerts` with a token restricted to one application lists only
+  that application's alerts and issues.
+- Integrations: members see only the host of a webhook URL (admins still see
+  it whole), and delivery errors no longer include the destination URL.
+- Without SMTP, the log line for an unsent email has the recipient and
+  subject only, never the reset, verification or invitation link.
+- Deleting an account, application or environment with issues, alerts or
+  integrations no longer fails on a foreign key; everything under it goes.
+- Adding a member always sends an invitation, also to someone who already
+  has a user, and the reply no longer says whether they did.
+- With open sign-up, a password reset to an address taken by someone
+  else's unverified sign-up hands the account to the address's owner:
+  verified, the other party's sessions and tokens removed.
+- `RAILWATCH_TRUST_PROXY`: one client-address rule for the dashboard,
+  MCP and ingest. `X-Forwarded-For` is read only from a loopback or private
+  peer, and the right-most non-private address is the client, so per-IP
+  limits work behind two proxies and cannot be dodged by connecting
+  directly (docs/SELF-HOST.md).
+- Opening an email verification link is rate-limited (20 an hour per
+  client) and no longer reads every user.
+- Pages send `script-src 'self'` with the dark-mode script's hash,
+  `connect-src 'self'` and `form-action 'self'` in their CSP.
+- Alert delivery ignores `HTTPS_PROXY`/`ALL_PROXY`, so a proxy cannot route
+  around the SSRF guard.
+- `railwatch doctor` masks the SMTP username.
+
 - **Moving to a new host name**: `RAILWATCH_REDIRECT_HOSTS` lists old names
   whose pages 308 to `RAILWATCH_URL` (same path and query), while
   telemetry, the API, MCP and the live channel keep answering on them.
