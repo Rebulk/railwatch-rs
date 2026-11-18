@@ -182,6 +182,7 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `TLS_CERT_FILE`, `TLS_KEY_FILE` | | serve a certificate you manage instead of ACME |
 | `TLS_REDIRECT_BIND` | `<host>:80` when bind is :443 | the http to https redirect listener; `off` disables it |
 | `URL` | `https://<TLS_DOMAIN>`, else `http://<bind>` | public URL: links, cookies, the printed ingest URL |
+| `REDIRECT_HOSTS` | | old host names, comma-separated, when you move `URL`: their pages get a 308 to the same path on `URL`; `/ingest`, `/up`, `/api`, `/mcp`, `/cable` and `/.well-known` are still served on them, so apps and agents set up with the old name keep working. Keep the old name's DNS and certificate |
 | `BIND` / `PORT` | `127.0.0.1:8790` | used only without systemd's sockets |
 | `DATA_DIR` | `./data` (`/var/lib/railwatch` under the installer) | |
 | `TRUST_PROXY` | off | key the per-IP limit on `X-Forwarded-For` |

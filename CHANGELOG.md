@@ -7,6 +7,11 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- **Moving to a new host name**: `RAILWATCH_REDIRECT_HOSTS` lists old names
+  whose pages 308 to `RAILWATCH_URL` (same path and query), while
+  telemetry, the API, MCP and the live channel keep answering on them.
+  Railwatch Cloud now lives at app.railwatch.dev, with railwatch.rebulk.com
+  redirecting.
 - **Docker image**: `ghcr.io/rebulk/railwatch:vX.Y.Z` and `:latest`, for
   x86_64 and arm64, published by the release workflow from the release's
   own tarballs (checked against SHA256SUMS) and signed with cosign

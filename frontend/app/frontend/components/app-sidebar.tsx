@@ -52,7 +52,7 @@ const mainNavItems = (embedded: boolean): NavItem[] => [
 const footerNavItems = (embedded: boolean): NavItem[] => [
   {
     title: "Documentation",
-    href: embedded ? "https://railwatch.rebulk.com/docs" : "/docs",
+    href: embedded ? "https://app.railwatch.dev/docs" : "/docs",
     icon: BookOpen,
   },
 ]
