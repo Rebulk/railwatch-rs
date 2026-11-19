@@ -98,6 +98,9 @@ tag is a release candidate (marked pre-release, not "latest", so
   count toward `MAX_DATA_BYTES`, and deleting an environment, application or
   account deletes them. Before, an ingest token could fill the disk with
   maps, paused or not, and they outlived their environment.
+- Dashboard, API and MCP reads stop after 30 seconds per request (SQLite
+  interrupts the query and the request fails), so one tenant's runaway query
+  cannot hold the read connections that all tenants share.
 - Grouping an exception into an issue, or changing an issue's status, no
   longer panics when the issue (or its environment) was deleted a moment
   earlier. That panic ran while holding the control database lock and could

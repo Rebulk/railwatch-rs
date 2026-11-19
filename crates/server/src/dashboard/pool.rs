@@ -33,6 +33,33 @@ pub const PER_TENANT: usize = 4;
 /// pages over several tenants kept closing each other's readers, and a
 /// union reader takes ~100 ms to open.
 pub const MAX_OPEN: usize = 16;
+/// How long one checkout (a page, an API call, an MCP tool) may run
+/// queries on a pooled reader before SQLite interrupts it (GA review
+/// 2026-11-19 T6): readers are shared across tenants, and one tenant's
+/// unbounded query must not hold them. The slowest real page measured
+/// 2.7 s on a large tenant.
+pub const QUERY_LIMIT: Duration = Duration::from_secs(30);
+
+/// Monotonic nanoseconds since the first call, for the deadlines.
+fn now_nanos() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+/// Has the connection interrupt its statement once `deadline` (now_nanos;
+/// 0 is none) has passed. Checked every few thousand VM steps.
+fn install_deadline(conn: &mut Connection) -> rusqlite::Result<Arc<std::sync::atomic::AtomicU64>> {
+    let deadline = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let d = deadline.clone();
+    conn.progress_handler(
+        10_000,
+        Some(move || {
+            let at = d.load(std::sync::atomic::Ordering::Relaxed);
+            at != 0 && now_nanos() > at
+        }),
+    )?;
+    Ok(deadline)
+}
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -47,6 +74,8 @@ pub fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
 /// per-day directory with the list of files it has attached.
 struct Pooled {
     conn: Connection,
+    /// When this checkout's queries are interrupted (install_deadline).
+    deadline: Arc<std::sync::atomic::AtomicU64>,
     days: Option<(PathBuf, crate::storage::reader::Attached)>,
     /// When it last went back to its pool.
     idle_since: Instant,
@@ -54,18 +83,25 @@ struct Pooled {
 
 /// Opens a reader for whatever layout the environment has.
 pub fn open_tenant_reader(tenants_dir: &Path, slug: &str) -> rusqlite::Result<Connection> {
-    open_pooled(tenants_dir, slug).map(|p| p.conn)
+    open_pooled(tenants_dir, slug).map(|p| {
+        // Not pooled (background work): no time limit.
+        let mut conn = p.conn;
+        let _ = conn.progress_handler(0, None::<fn() -> bool>);
+        conn
+    })
 }
 
 fn open_pooled(tenants_dir: &Path, slug: &str) -> rusqlite::Result<Pooled> {
-    match crate::storage::Layout::detect(tenants_dir, slug) {
+    let (mut conn, days) = match crate::storage::Layout::detect(tenants_dir, slug) {
         Some(crate::storage::Layout::Days(dir)) => {
             let (conn, attached) = crate::storage::reader::open(&dir)?;
             conn.set_prepared_statement_cache_capacity(crate::storage::reader::STATEMENT_CACHE);
-            Ok(Pooled { conn, days: Some((dir, attached)), idle_since: Instant::now() })
+            (conn, Some((dir, attached)))
         }
-        _ => Ok(Pooled { conn: open_reader(&tenants_dir.join(format!("{slug}.sqlite3")))?, days: None, idle_since: Instant::now() }),
-    }
+        _ => (open_reader(&tenants_dir.join(format!("{slug}.sqlite3")))?, None),
+    };
+    let deadline = install_deadline(&mut conn)?;
+    Ok(Pooled { conn, deadline, days, idle_since: Instant::now() })
 }
 
 struct TenantPool {
@@ -97,6 +133,8 @@ pub struct ReadPools {
     max_open: usize,
     total: Arc<Mutex<usize>>,
     pools: Arc<Mutex<HashMap<String, Arc<TenantPool>>>>,
+    /// QUERY_LIMIT, unless `set_query_limit` changed it.
+    query_limit: Duration,
 }
 
 /// A checked-out connection; goes back to its pool on drop.
@@ -115,6 +153,7 @@ impl std::ops::Deref for Reader {
 impl Drop for Reader {
     fn drop(&mut self) {
         if let Some(mut c) = self.conn.take() {
+            c.deadline.store(0, std::sync::atomic::Ordering::Relaxed);
             // A reader busy while its day files were deleted (retention, the
             // disk budget) is closed on return rather than kept idle: its
             // handles would hold the deleted files' space until its next
@@ -148,7 +187,19 @@ impl ReadPools {
 
     /// Up to `per_tenant` readers per tenant and `max_open` across tenants.
     pub fn with_max(dir: PathBuf, per_tenant: usize, max_open: usize) -> ReadPools {
-        ReadPools { dir, per_tenant: per_tenant.max(1), max_open: max_open.max(1), total: Default::default(), pools: Default::default() }
+        ReadPools {
+            dir,
+            per_tenant: per_tenant.max(1),
+            max_open: max_open.max(1),
+            total: Default::default(),
+            pools: Default::default(),
+            query_limit: QUERY_LIMIT,
+        }
+    }
+
+    /// How long one checkout may run queries (QUERY_LIMIT by default).
+    pub fn set_query_limit(&mut self, limit: Duration) {
+        self.query_limit = limit;
     }
 
     /// Readers open now, idle or checked out, across tenants.
@@ -242,6 +293,12 @@ impl ReadPools {
         n
     }
 
+    /// A reader handed out, its deadline armed for this checkout.
+    fn checked_out(&self, c: Pooled, pool: Arc<TenantPool>) -> Reader {
+        c.deadline.store(now_nanos() + self.query_limit.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        Reader { conn: Some(c), pool }
+    }
+
     pub fn get(&self, slug: &str) -> rusqlite::Result<Reader> {
         let pool = self
             .pools
@@ -269,7 +326,7 @@ impl ReadPools {
                     pool.closed(1);
                     return Err(e);
                 }
-                return Ok(Reader { conn: Some(c), pool });
+                return Ok(self.checked_out(c, pool));
             }
             {
                 let mut open = pool.open.lock().unwrap();
@@ -280,7 +337,7 @@ impl ReadPools {
                         *total += 1;
                         drop((open, total));
                         return match open_pooled(&self.dir, slug) {
-                            Ok(c) => Ok(Reader { conn: Some(c), pool }),
+                            Ok(c) => Ok(self.checked_out(c, pool)),
                             Err(e) => {
                                 pool.closed(1);
                                 Err(e)
@@ -383,6 +440,24 @@ mod tests {
         pools.close_idle(Duration::ZERO);
         assert_eq!(pools.pools.lock().unwrap().keys().cloned().collect::<Vec<_>>(), vec!["b".to_string()]);
         drop(b);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One checkout cannot hold a shared reader past the time limit: a
+    /// runaway query is interrupted, the reader goes back to the pool
+    /// usable, and the next checkout gets a fresh allowance (T6).
+    #[test]
+    fn a_query_past_the_time_limit_is_interrupted_and_the_reader_stays_usable() {
+        let root = tenants("deadline", &["a"]);
+        let mut pools = ReadPools::with_max(root.clone(), 1, 1);
+        pools.set_query_limit(Duration::from_millis(200));
+        let runaway = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) FROM n";
+        let started = Instant::now();
+        let r = pools.get("a").unwrap().query_row(runaway, [], |r| r.get::<_, i64>(0));
+        assert!(matches!(r, Err(rusqlite::Error::SqliteFailure(ref f, _)) if f.code == rusqlite::ErrorCode::OperationInterrupted), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "interrupted near the limit: {:?}", started.elapsed());
+        let n: i64 = pools.get("a").unwrap().query_row("SELECT count(*) FROM executions", [], |r| r.get(0)).unwrap();
+        assert_eq!((n, pools.open_count()), (0, 1), "the same reader, usable again");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
