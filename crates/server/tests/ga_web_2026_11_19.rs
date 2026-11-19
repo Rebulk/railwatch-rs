@@ -4,8 +4,6 @@
 //! One server per test, each in its own data dir; Config::load reads
 //! process-global env, so the tests take a lock around it.
 
-#![allow(dead_code)] // TEMP: helpers for the next tests
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -27,7 +25,76 @@ struct Server {
     addr: SocketAddr,
     control: Arc<Control>,
     dir: std::path::PathBuf,
+    /// Every recipient and message the SMTP server received.
+    mail: Inbox,
     _rt: tokio::runtime::Runtime,
+}
+
+impl Server {
+    /// Waits (briefly: mail is sent in the background) for `n` mails.
+    fn mails(&self, n: usize) -> Vec<(String, String)> {
+        for _ in 0..200 {
+            if self.mail.lock().unwrap().len() >= n {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.mail.lock().unwrap().clone()
+    }
+}
+
+/// (recipient, message) of every mail sent.
+type Inbox = Arc<Mutex<Vec<(String, String)>>>;
+
+/// A minimal SMTP server: records (RCPT TO, DATA) of every mail.
+fn smtp_sink(rt: &tokio::runtime::Runtime) -> (u16, Inbox) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mail = Arc::new(Mutex::new(Vec::new()));
+    let out = mail.clone();
+    rt.spawn(async move {
+        loop {
+            let Ok((c, _)) = listener.accept().await else { return };
+            let out = out.clone();
+            tokio::spawn(async move {
+                let (r, mut w) = c.into_split();
+                let mut lines = BufReader::new(r).lines();
+                let _ = w.write_all(b"220 sink\r\n").await;
+                let (mut to, mut data, mut body) = (String::new(), false, String::new());
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if data {
+                        if line == "." {
+                            data = false;
+                            out.lock().unwrap().push((std::mem::take(&mut to), std::mem::take(&mut body)));
+                            let _ = w.write_all(b"250 ok\r\n").await;
+                        } else {
+                            body.push_str(&line);
+                            body.push('\n');
+                        }
+                        continue;
+                    }
+                    let u = line.to_ascii_uppercase();
+                    let reply: &[u8] = if u.starts_with("EHLO") {
+                        b"250 sink\r\n"
+                    } else if u.starts_with("RCPT TO:") {
+                        to = line[8..].trim().trim_matches(['<', '>']).to_string();
+                        b"250 ok\r\n"
+                    } else if u.starts_with("DATA") {
+                        data = true;
+                        b"354 go\r\n"
+                    } else if u.starts_with("QUIT") {
+                        let _ = w.write_all(b"221 bye\r\n").await;
+                        return;
+                    } else {
+                        b"250 ok\r\n"
+                    };
+                    let _ = w.write_all(reply).await;
+                }
+            });
+        }
+    });
+    (port, mail)
 }
 
 impl Drop for Server {
@@ -48,9 +115,14 @@ fn start(name: &str, signup: &str, proxy: bool) -> Server {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let (smtp_port, mail) = smtp_sink(&rt);
     let cfg = {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
+            std::env::set_var("RAILWATCH_SMTP_ADDRESS", "127.0.0.1");
+            std::env::set_var("RAILWATCH_SMTP_PORT", smtp_port.to_string());
+            std::env::set_var("RAILWATCH_SMTP_SECURITY", "none");
             std::env::set_var("RAILWATCH_DATA_DIR", dir.to_str().unwrap());
             std::env::set_var("RAILWATCH_SECRET_KEY_BASE", SECRET);
             std::env::set_var("RAILWATCH_URL", "http://127.0.0.1");
@@ -68,7 +140,6 @@ fn start(name: &str, signup: &str, proxy: bool) -> Server {
         Config::load().expect("config")
     };
     let control = Arc::new(Control::open(&cfg.control_path()).expect("control"));
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let addr = rt.block_on(async {
         let (tx, _rx) = followups::channel();
         let tenants = Tenants::new(cfg.tenants_dir(), Duration::from_secs(300), tx);
@@ -79,7 +150,7 @@ fn start(name: &str, signup: &str, proxy: bool) -> Server {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         addr
     });
-    Server { addr, control, dir, _rt: rt }
+    Server { addr, control, dir, mail, _rt: rt }
 }
 
 #[derive(Debug)]
@@ -189,19 +260,6 @@ impl Browser {
     fn sign_in(&mut self, s: &Server, email: &str, password: &str) {
         let r = self.post(s, "/sign_in", &format!("email={}&password={}", enc(email), enc(password)));
         assert_eq!((r.status, r.location()), (302, "/dashboard"), "{email} signs in");
-    }
-
-    /// Follows a redirect to the page that shows its flash.
-    fn flash_after(&mut self, s: &Server, r: &Res) -> Value {
-        let mut to = r.location().to_string();
-        loop {
-            let r = self.get(s, &to);
-            match r.status {
-                302 => to = r.location().to_string(),
-                200 => return r.page()["props"]["flash"].clone(),
-                other => panic!("{other} at {to}"),
-            }
-        }
     }
 }
 
@@ -368,4 +426,133 @@ fn proxied_mcp_sees_only_the_bound_account_not_the_first_one() {
     assert!(!r.body.contains("OTH") && !r.body.contains("OtherCo"), "the user's own account is not the proxy's: {}", r.body);
     let joined: i64 = one(&s, "SELECT count(*) FROM memberships WHERE account_id = ? AND user_id = ?", [host, boss]);
     assert_eq!(joined, 1, "joined the bound account");
+}
+
+// ---------------------------------------------------------------------------
+// Hunt H2, tenancy I2: what a removed member keeps
+
+/// Acme with Alice (owner) and Adam (admin, signed in as `adam`).
+fn acme(s: &Server) -> (i64, i64, i64, String) {
+    let password = control::base58(16);
+    let alice = user(s, "Alice", "alice@acme.test", &password, true);
+    let account = s.control.tx(|tx| control::create_account(tx, "Acme", alice)).unwrap();
+    let adam = user(s, "Adam", "adam@acme.test", &password, true);
+    s.control.tx(|tx| control::insert_membership(tx, account, adam, "admin")).unwrap();
+    (account, alice, adam, password)
+}
+
+/// A removed admin's pending invitations go with them, so they cannot come
+/// back (as admin) through an invitation they sent to an address they own.
+#[test]
+fn removing_an_admin_withdraws_the_invitations_they_sent() {
+    let s = start("h2-remove", "open", false);
+    let (account, _, adam, password) = acme(&s);
+    let mut a = Browser::default();
+    a.sign_in(&s, "adam@acme.test", &password);
+    assert_eq!(a.post(&s, "/settings/members", "email=alt%40evil.test&role=admin").status, 302);
+    let mails = s.mails(1);
+    let link = mails.iter().find(|(to, _)| to == "alt@evil.test").map(|(_, b)| b.clone()).expect("the invitation mail");
+    let token = link.split("/invitations/").nth(1).unwrap().split_whitespace().next().unwrap().trim_end_matches('=').to_string();
+    let found = s.control.with(|x| control::find_invitation_by_token(x, &token)).unwrap();
+    assert!(found.is_some(), "the token from the mail is the invitation's: {link}");
+
+    let mut alice = Browser::default();
+    alice.sign_in(&s, "alice@acme.test", &password);
+    let membership: i64 = one(&s, "SELECT id FROM memberships WHERE account_id = ? AND user_id = ?", [account, adam]);
+    assert_eq!(alice.send(&s, "DELETE", &format!("/settings/members/{membership}"), "").status, 302);
+    assert_eq!(one::<i64>(&s, "SELECT count(*) FROM invitations WHERE inviter_id = ?", [adam]), 0, "withdrawn with him");
+
+    // The address he controls signs up with the invitation: no way in.
+    let mut alt = Browser::default();
+    let r = alt.get(&s, &format!("/invitations/{token}"));
+    assert_eq!(r.status, 302, "an unknown invitation: {}", r.body);
+    let p = control::base58(16);
+    alt.post(&s, "/sign_up", &format!("name=Alt&email=alt%40evil.test&password={p}&password_confirmation={p}&terms=1&invitation_token={token}"));
+    let joined: i64 =
+        one(&s, "SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id WHERE u.email = 'alt@evil.test' AND m.account_id = ?", [account]);
+    assert_eq!(joined, 0, "not back in Acme");
+}
+
+/// Making an admin a member also withdraws the invitations they sent.
+#[test]
+fn demoting_an_admin_withdraws_the_invitations_they_sent() {
+    let s = start("h2-demote", "open", false);
+    let (account, alice, adam, password) = acme(&s);
+    s.control.tx(|tx| control::create_invitation(tx, account, adam, "alt@evil.test", "admin")).unwrap();
+    s.control.tx(|tx| control::create_invitation(tx, account, alice, "keep@acme.test", "member")).unwrap();
+    let mut b = Browser::default();
+    b.sign_in(&s, "alice@acme.test", &password);
+    let membership: i64 = one(&s, "SELECT id FROM memberships WHERE account_id = ? AND user_id = ?", [account, adam]);
+    assert_eq!(b.send(&s, "PATCH", &format!("/settings/members/{membership}"), "role=member").status, 302);
+    let left: Vec<String> = s.control.with(|x| x.prepare("SELECT email FROM invitations")?.query_map([], |r| r.get(0))?.collect()).unwrap();
+    assert_eq!(left, ["keep@acme.test"], "only the demoted admin's are withdrawn");
+}
+
+/// A removed member's tokens restricted to that account (or one of its
+/// applications) are revoked; their other tokens are untouched.
+#[test]
+fn removing_a_member_revokes_their_tokens_for_that_account() {
+    let s = start("i2-tokens", "open", false);
+    let (account, _, adam, password) = acme(&s);
+    let app = s.control.tx(|tx| control::insert_application(tx, account, "Shop", "shop", "SHOP", None, "main")).unwrap();
+    let own = s.control.tx(|tx| control::create_account(tx, "AdamCo", adam)).unwrap();
+    let scopes: Vec<String> = ["api", "read"].map(String::from).to_vec();
+    let issue = |acc: Option<i64>, ap: Option<i64>| s.control.tx(|tx| control::issue_api_token(tx, adam, "t", &scopes, acc, ap, None)).unwrap().0;
+    let (for_account, for_app, for_own, everywhere) = (issue(Some(account), None), issue(None, Some(app)), issue(Some(own), None), issue(None, None));
+
+    let mut b = Browser::default();
+    b.sign_in(&s, "alice@acme.test", &password);
+    let membership: i64 = one(&s, "SELECT id FROM memberships WHERE account_id = ? AND user_id = ?", [account, adam]);
+    assert_eq!(b.send(&s, "DELETE", &format!("/settings/members/{membership}"), "").status, 302);
+    let revoked = |id: i64| one::<bool>(&s, "SELECT revoked_at IS NOT NULL FROM api_tokens WHERE id = ?", [id]);
+    assert_eq!((revoked(for_account), revoked(for_app)), (true, true), "Acme's tokens are revoked");
+    assert_eq!((revoked(for_own), revoked(everywhere)), (false, false), "his own account's and his unrestricted token stay");
+}
+
+// ---------------------------------------------------------------------------
+// Hunt H3: an invitation needs the invited mailbox
+
+/// Setting your email to the invited address (allowed with your own
+/// password, unverified) does not let you accept the invitation.
+#[test]
+fn an_unverified_email_change_cannot_claim_an_invitation() {
+    let s = start("h3", "open", false);
+    let (account, alice, _, _) = acme(&s);
+    let inv = s.control.tx(|tx| control::create_invitation(tx, account, alice, "newhire@corp.test", "admin")).unwrap();
+    let eve_password = control::base58(16);
+    user(&s, "Eve", "eve@evil.test", &eve_password, true);
+    let mut eve = Browser::default();
+    eve.sign_in(&s, "eve@evil.test", &eve_password);
+    let r = eve.send(&s, "PATCH", "/settings/email", &format!("email=newhire%40corp.test&password_challenge={eve_password}"));
+    assert_eq!(r.status, 302);
+    let r = eve.get(&s, &format!("/invitations/{}", inv.token));
+    assert_eq!(r.status, 302);
+    let joined: i64 =
+        one(&s, "SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id WHERE u.email = 'newhire@corp.test' AND m.account_id = ?", [account]);
+    assert_eq!(joined, 0, "Eve is not in Acme");
+    assert_eq!(one::<Option<String>>(&s, "SELECT accepted_at FROM invitations WHERE id = ?", [inv.id]), None, "the invitation is still the real hire's");
+}
+
+// ---------------------------------------------------------------------------
+// Security PLAUSIBLE 3: email change
+
+/// Changing the email tells the old address and signs out the user's other
+/// sessions (a stolen one included); the session that made the change stays.
+#[test]
+fn an_email_change_notifies_the_old_address_and_ends_other_sessions() {
+    let s = start("email-change", "open", false);
+    let password = control::base58(16);
+    user(&s, "Ada", "ada@example.com", &password, true);
+    let mut stolen = Browser::default();
+    stolen.sign_in(&s, "ada@example.com", &password);
+    let mut b = Browser::default();
+    b.sign_in(&s, "ada@example.com", &password);
+    let r = b.send(&s, "PATCH", "/settings/email", &format!("email=ada2%40example.com&password_challenge={password}"));
+    assert_eq!(r.status, 302);
+    let mails = s.mails(2);
+    let old = mails.iter().find(|(to, _)| to == "ada@example.com").expect("the old address is told");
+    assert!(old.1.contains("ada2@example.com"), "{}", old.1);
+    assert!(mails.iter().any(|(to, _)| to == "ada2@example.com"), "the new address gets its verification link");
+    assert_eq!(stolen.get(&s, "/dashboard").location(), "/sign_in", "the other session is signed out");
+    assert_ne!(b.get(&s, "/settings/email").status, 302, "the changing session stays");
 }

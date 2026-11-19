@@ -801,13 +801,25 @@ pub fn find_invitation_by_token(c: &Connection, raw: &str) -> rusqlite::Result<O
 #[derive(Debug, PartialEq)]
 pub enum AcceptError {
     RecipientMismatch,
+    /// The user's address is not verified: anyone can set their email to an
+    /// unused address with their own password, so an unverified match does
+    /// not prove they own the invited mailbox.
+    Unverified,
     Unavailable,
 }
 
 /// Invitation#accept!: the conditional UPDATE is the linearisation point.
+/// Only for a user who verified the invited address, and only while the
+/// inviter is still an admin or owner of the account.
 pub fn accept_invitation(tx: &Connection, inv: &Invitation, user: &User, raw: &str) -> ModelResult<Result<(), AcceptError>> {
     if inv.email != normalize_email(&user.email) {
         return Ok(Err(AcceptError::RecipientMismatch));
+    }
+    if !user.verified {
+        return Ok(Err(AcceptError::Unverified));
+    }
+    if !matches!(membership_role(tx, inv.account_id, inv.inviter_id)?.as_deref(), Some("owner" | "admin")) {
+        return Ok(Err(AcceptError::Unavailable));
     }
     let now = now_db();
     let claimed = tx.execute(
@@ -819,6 +831,22 @@ pub fn accept_invitation(tx: &Connection, inv: &Invitation, user: &User, raw: &s
     }
     insert_membership(tx, inv.account_id, user.id, &inv.role)?;
     Ok(Ok(()))
+}
+
+/// What a user loses with their place in an account (removed, or an admin
+/// made a member): the invitations they sent there, so they cannot come
+/// back through one, and (when removed) their tokens restricted to that
+/// account or one of its applications.
+pub fn withdraw_access(tx: &Connection, account_id: i64, user_id: i64, removed: bool) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM invitations WHERE account_id = ? AND inviter_id = ? AND accepted_at IS NULL", params![account_id, user_id])?;
+    if removed {
+        tx.execute(
+            "UPDATE api_tokens SET revoked_at = ?1, updated_at = ?1 WHERE user_id = ?2 AND revoked_at IS NULL
+               AND (account_id = ?3 OR application_id IN (SELECT id FROM applications WHERE account_id = ?3))",
+            params![now_db(), user_id, account_id],
+        )?;
+    }
+    Ok(())
 }
 
 /// ApiToken.issue!: "rwp_" + base58(40), SHA-256 digest stored.
@@ -999,6 +1027,32 @@ mod tests {
         assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &newbie, &inv.token)).unwrap(), Ok(()));
         assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &newbie, &inv.token)).unwrap(), Err(AcceptError::Unavailable));
         assert_eq!(c.with(|x| membership_role(x, account, newbie.id)).unwrap().as_deref(), Some("member"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// GA hunt H3 and H2: the address must be verified (anyone can set
+    /// their email to an unused address), and the inviter must still be an
+    /// admin or owner of the account when it is accepted.
+    #[test]
+    fn an_invitation_needs_a_verified_recipient_and_an_inviter_still_in_charge() {
+        let (dir, c) = temp();
+        let owner = c.tx(|tx| insert_user(tx, "Owner", "o@example.com", &test_password(), true)).unwrap();
+        let account = c.tx(|tx| create_account(tx, "Acme", owner)).unwrap();
+        let inv = c.tx(|tx| create_invitation(tx, account, owner, "new@example.com", "admin")).unwrap();
+        let found = c.with(|x| find_invitation_by_token(x, &inv.token)).unwrap().unwrap();
+        let squatter = c.tx(|tx| insert_user(tx, "Eve", "new@example.com", &test_password(), false)).unwrap();
+        let squatter = c.with(|x| find_user(x, squatter)).unwrap().unwrap();
+        assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &squatter, &inv.token)).unwrap(), Err(AcceptError::Unverified));
+        assert_eq!(c.with(|x| membership_role(x, account, squatter.id)).unwrap(), None);
+
+        let admin = c.tx(|tx| insert_user(tx, "Adam", "adam@example.com", &test_password(), true)).unwrap();
+        c.tx(|tx| insert_membership(tx, account, admin, "admin")).unwrap();
+        let inv = c.tx(|tx| create_invitation(tx, account, admin, "alt@example.com", "admin")).unwrap();
+        let alt = c.tx(|tx| insert_user(tx, "Alt", "alt@example.com", &test_password(), true)).unwrap();
+        let alt = c.with(|x| find_user(x, alt)).unwrap().unwrap();
+        c.with(|x| x.execute("UPDATE memberships SET role = 'member' WHERE user_id = ?", [admin])).unwrap();
+        let found = c.with(|x| find_invitation_by_token(x, &inv.token)).unwrap().unwrap();
+        assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &alt, &inv.token)).unwrap(), Err(AcceptError::Unavailable), "the inviter is no longer an admin");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

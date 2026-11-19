@@ -610,6 +610,9 @@ async fn invitation_show(cx: Ctx, Path(token): Path<String>) -> Response {
                 Ok(Err(AcceptError::RecipientMismatch)) => {
                     cx.redirect(Redirect::to("/dashboard").alert("This invitation was sent to a different email address."))
                 }
+                Ok(Err(AcceptError::Unverified)) => {
+                    cx.redirect(Redirect::to("/settings/email").alert("Verify your email address first, then open the invitation link again."))
+                }
                 Ok(Err(AcceptError::Unavailable)) => cx.redirect(Redirect::to("/dashboard").alert("That invitation has expired or was already used.")),
                 Err(e) => internal(e),
             }
@@ -1608,12 +1611,23 @@ async fn email_update(cx: Ctx, p: Params) -> Response {
         return cx.redirect(Redirect::to("/settings/email"));
     }
     let uid = user.id;
+    let keep = cx.current.session.as_ref().map(|s| s.id);
+    let new_email = email.clone();
+    // Like a password change, an email change ends the user's other
+    // sessions (someone else's stolen one included).
     let r = cx
         .state
-        .db(move |c| c.with(|x| x.execute("UPDATE users SET email = ?, verified = 0, updated_at = ? WHERE id = ?", params![email, now_db(), uid])))
+        .db(move |c| {
+            c.with(|x| {
+                x.execute("UPDATE users SET email = ?, verified = 0, updated_at = ? WHERE id = ?", params![email, now_db(), uid])?;
+                x.execute("DELETE FROM sessions WHERE user_id = ? AND id IS NOT ?", params![uid, keep])
+            })
+        })
         .await;
     match r {
         Ok(_) => {
+            // The old address hears about it, so a change it did not make is noticed.
+            mailer::deliver_later(cx.state.mailer.clone(), mailer::email_changed(&user.email, &new_email));
             send_verification(&cx, uid).await;
             cx.redirect(Redirect::to("/settings/email").notice("Your email has been changed"))
         }
@@ -1734,9 +1748,13 @@ async fn members_update(cx: Ctx, Path(id): Path<i64>, p: Params) -> Response {
                 match current.as_deref() {
                     None => Ok(None),
                     Some("owner") => Ok(Some(true)),
-                    Some(_) => {
+                    Some(was) => {
                         if role == "admin" || role == "member" {
                             tx.execute("UPDATE memberships SET role = ?, updated_at = ? WHERE id = ?", params![role, now_db(), id])?;
+                            if was == "admin" && role == "member" {
+                                let user: i64 = tx.query_row("SELECT user_id FROM memberships WHERE id = ?", [id], |r| r.get(0))?;
+                                control::withdraw_access(tx, account, user, false)?;
+                            }
                         }
                         Ok(Some(false))
                     }
@@ -1764,7 +1782,9 @@ async fn members_destroy(cx: Ctx, Path(id): Path<i64>) -> Response {
                     None => Ok(None),
                     Some("owner") => Ok(Some(true)),
                     Some(_) => {
+                        let user: i64 = tx.query_row("SELECT user_id FROM memberships WHERE id = ?", [id], |r| r.get(0))?;
                         tx.execute("DELETE FROM memberships WHERE id = ?", [id])?;
+                        control::withdraw_access(tx, account, user, true)?;
                         Ok(Some(false))
                     }
                 }

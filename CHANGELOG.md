@@ -25,6 +25,15 @@ tag is a release candidate (marked pre-release, not "latest", so
   longer takes the server down for every account until a restart. The lock
   is recovered, the issue update answers 404, and `/up` now answers 503 when
   the control database does not, so a health check sees a wedged server.
+- Invitations: accepting one needs a verified email (anyone could set their
+  unverified email to the invited address and take the invitation), and an
+  inviter who is no longer an admin or owner cannot bring anyone in.
+  Removing an admin, or making them a member, withdraws the invitations
+  they sent.
+- Removing a member revokes their API tokens restricted to that account or
+  one of its applications.
+- Changing your email now tells the old address and signs out your other
+  sessions, as a password change does.
 
 ## v0.3.4 (2026-11-18)
 

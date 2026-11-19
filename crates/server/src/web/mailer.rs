@@ -120,6 +120,17 @@ pub fn email_verification(base_url: &str, to: &str, sid: &str) -> Mail {
     }
 }
 
+/// To the old address after an email change.
+pub fn email_changed(old: &str, new: &str) -> Mail {
+    Mail {
+        to: old.into(),
+        subject: "Your Railwatch email address was changed".into(),
+        text: format!(
+            "The email address of your Railwatch user was changed from {old} to {new}, and your other sessions were signed out.\n\nIf you did not do this, reset your password and contact your Railwatch administrator.\n"
+        ),
+    }
+}
+
 pub fn invite(base_url: &str, to: &str, inviter: &str, account: &str, token: &str) -> Mail {
     Mail {
         to: to.into(),
