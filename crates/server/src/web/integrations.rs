@@ -120,11 +120,12 @@ async fn index(cx: Ctx) -> Response {
     let account = guard!(require_account(&cx));
     let user = cx.user_id();
     let cipher = cipher(&cx);
+    let current = cx.current.clone();
     let data = cx
         .state
         .db(move |c| {
             c.with(|x| {
-                let admin = matches!(crate::control::membership_role(x, account, user)?.as_deref(), Some("owner" | "admin"));
+                let admin = matches!(current.effective_role(crate::control::membership_role(x, account, user)?).as_deref(), Some("owner" | "admin"));
                 let integrations: Vec<Value> = integration::for_account(x, Some(&cipher), account)?.iter().map(|i| integration_props(i, admin)).collect();
                 let alert_rules = alert_rules_props(x, account)?;
                 let apps: Vec<(i64, String)> = x
@@ -197,12 +198,20 @@ async fn update(cx: Ctx, Path(id): Path<i64>, p: Params) -> Response {
     let name = if p.has("name") { p.s("name") } else { found.name.clone() };
     let enabled = if p.has("enabled") { p.bool("enabled").unwrap_or(false) } else { found.enabled };
     let mut settings = found.settings.clone();
-    for (k, v) in permitted_settings(&p) {
+    let given = permitted_settings(&p);
+    let sets_recipient = given.get("to").is_some_and(|v| !blank(v));
+    for (k, v) in given {
         if !blank(&v) {
             settings.insert(k, v);
         }
     }
-    let errors = integration::validate(&found.kind, &name, &settings);
+    let mut errors = integration::validate(&found.kind, &name, &settings);
+    // A recipient saved before it was checked does not stop an admin from
+    // disabling, renaming or deleting the integration; only setting it, or
+    // turning it back on, must pass.
+    if !sets_recipient && !(enabled && !found.enabled) {
+        errors.retain(|(_, m)| m != integration::RECIPIENT_INVALID);
+    }
     if !errors.is_empty() {
         return cx.redirect(Redirect::to(INDEX).errors(errors));
     }

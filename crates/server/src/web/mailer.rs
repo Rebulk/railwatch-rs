@@ -95,6 +95,13 @@ pub fn deliver_later(mailer: Option<Mailer>, mail: Mail) {
     }
 }
 
+/// Telemetry text (an issue title is an exception message the monitored
+/// app's users can choose) on one line before it goes into a mail body:
+/// every CR and LF becomes a space, so no line break in it reaches SMTP.
+pub fn one_line(s: &str) -> String {
+    s.replace("\r\n", " ").replace(['\r', '\n'], " ")
+}
+
 pub fn password_reset(base_url: &str, to: &str, sid: &str) -> Mail {
     Mail {
         to: to.into(),
@@ -110,6 +117,17 @@ pub fn email_verification(base_url: &str, to: &str, sid: &str) -> Mail {
         to: to.into(),
         subject: "Verify your email".into(),
         text: format!("Confirm that {to} is your email address for Railwatch:\n{base_url}/identity/email_verification?sid={sid}\n"),
+    }
+}
+
+/// To the old address after an email change.
+pub fn email_changed(old: &str, new: &str) -> Mail {
+    Mail {
+        to: old.into(),
+        subject: "Your Railwatch email address was changed".into(),
+        text: format!(
+            "The email address of your Railwatch user was changed from {old} to {new}, and your other sessions were signed out.\n\nIf you did not do this, reset your password and contact your Railwatch administrator.\n"
+        ),
     }
 }
 
@@ -139,6 +157,12 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn telemetry_text_is_put_on_one_line() {
+        assert_eq!(one_line("a\r.\r\nMAIL FROM:<x@evil.test>\nb\rc"), "a . MAIL FROM:<x@evil.test> b c");
+        assert_eq!(one_line("plain"), "plain");
     }
 
     /// Without SMTP the mail is logged, not sent: anyone who reads the log

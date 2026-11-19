@@ -49,16 +49,20 @@ fn t(micros: Option<i64>) -> Value {
 
 /// The page's props: every monitor with its state, uptime windows, 90
 /// days and chart, the recent incidents and the status page settings.
-pub fn props(c: &rusqlite::Connection, env: i64, now: i64, window: &str, base_url: &str) -> rusqlite::Result<Value> {
+/// `admin`: the viewer manages the account; anyone else sees a monitor's
+/// URL as its host only (uptime::shown_url).
+pub fn props(c: &rusqlite::Connection, env: i64, now: i64, window: &str, base_url: &str, admin: bool) -> rusqlite::Result<Value> {
     let (from, bucket) = chart_range(window, now);
     let mut monitors = Vec::new();
+    let mut urls = std::collections::HashMap::new();
     for m in uptime::monitors(c, env)? {
+        urls.insert(m.id, m.url.clone());
         monitors.push(json!({
-            "id": m.id, "name": m.name, "url": m.url, "method": m.method, "expected_status": m.expected_status, "keyword": m.keyword,
+            "id": m.id, "name": m.name, "url": uptime::shown_url(&m.url, admin), "method": m.method, "expected_status": m.expected_status, "keyword": m.keyword,
             "timeout_seconds": m.timeout_seconds, "interval_seconds": m.interval_seconds, "enabled": m.enabled,
             "public": m.public, "public_name": m.public_name, "public_url": m.public_url,
             "status": m.status, "status_since": t(uptime::status_since(c, &m)?),
-            "last_checked_at": t(m.last_checked_at), "last_status_code": m.last_status_code, "last_latency_ms": m.last_latency_ms, "last_error": m.last_error,
+            "last_checked_at": t(m.last_checked_at), "last_status_code": m.last_status_code, "last_latency_ms": m.last_latency_ms, "last_error": m.last_error.as_deref().map(|e| uptime::shown_text(e, &m.url, admin)),
             "uptime": uptime::uptime_windows(c, m.id, now)?,
             "days": uptime::daily(c, m.id, now, uptime::DAILY_DAYS)?,
             "latency": uptime::latency_series(c, m.id, from, bucket)?,
@@ -68,7 +72,8 @@ pub fn props(c: &rusqlite::Connection, env: i64, now: i64, window: &str, base_ur
         .iter()
         .map(|i| {
             json!({"id": i.id, "monitor_id": i.monitor_id, "monitor": i.monitor, "started_at": t(Some(i.started_at)), "ended_at": t(i.ended_at),
-                   "duration_seconds": i.duration_secs(now), "cause": i.cause, "detail": i.detail})
+                   "duration_seconds": i.duration_secs(now), "cause": i.cause,
+                   "detail": i.detail.as_deref().map(|d| uptime::shown_text(d, urls.get(&i.monitor_id).map_or("", String::as_str), admin))})
         })
         .collect();
     let page =
@@ -90,21 +95,21 @@ async fn index(cx: Ctx, Path((app, env)): Path<(i64, i64)>, p: Params) -> Respon
     // figures always show all four.
     let window = if p.s("window") == "7d" { "7d" } else { "24h" };
     let base = cx.state.config.pages_url();
-    let props = match cx.state.db(move |c| c.with(|x| props(x, env, now, window, &base))).await {
-        Ok(v) => v,
-        Err(e) => return internal(e),
-    };
-    let mut shared = window_props(&Params::from_query(Some(&format!("window={window}"))), now);
-    shared["environment"] = scoped.props.clone();
-    shared["saved_views"] = json!([]);
     let user = cx.user_id();
     let account = cx.account_id();
     let admin = cx
         .state
         .db(move |c| c.with(|x| crate::control::membership_role(x, account, user)))
         .await
-        .map(|r| matches!(r.as_deref(), Some("owner" | "admin")))
+        .map(|r| matches!(cx.current.effective_role(r).as_deref(), Some("owner" | "admin")))
         .unwrap_or(false);
+    let props = match cx.state.db(move |c| c.with(|x| props(x, env, now, window, &base, admin))).await {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    let mut shared = window_props(&Params::from_query(Some(&format!("window={window}"))), now);
+    shared["environment"] = scoped.props.clone();
+    shared["saved_views"] = json!([]);
     let mut props = props;
     props["can_manage"] = json!(admin);
     cx.render("uptime/index", props, Some(shared)).await
@@ -187,7 +192,8 @@ async fn update(cx: Ctx, Path((app, env, id)): Path<(i64, i64, i64)>, p: Params)
         return cx.redirect(Redirect::to(back).errors(errors));
     }
     let now = time::now_micros();
-    match cx.state.db(move |c| c.with(|x| uptime::update(x, id, &m, now))).await {
+    // One transaction: the new URL and the old one's scrub land together.
+    match cx.state.db(move |c| c.tx(|x| Ok(uptime::update(x, id, &m, now)?))).await {
         Ok(()) => cx.redirect(Redirect::to(back).notice("Monitor updated")),
         Err(e) => internal(e),
     }

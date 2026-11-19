@@ -234,7 +234,7 @@ pub fn from_omniauth(tx: &rusqlite::Connection, auth: &Identity, signup_open: bo
     if !control::valid_email(&email) {
         return Ok(Err(Refused::Invalid));
     }
-    let name = auth.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&email).to_string();
+    let name = auth.name.as_deref().map(control::clean_name).filter(|n| !n.is_empty()).unwrap_or_else(|| control::clean_name(&email));
     let mut random = [0u8; 32];
     getrandom::fill(&mut random).expect("random");
     let id = match control::insert_user(tx, &name, &email, &crate::ingest::receipt_headers::hex(&random), true) {

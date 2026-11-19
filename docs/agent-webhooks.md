@@ -145,8 +145,17 @@ works too.
    `ANTHROPIC_API_KEY` and `RAILWATCH_TOKEN`, and the variable
    `RAILWATCH_URL`. The token is a Railwatch API & MCP token made at
    Settings > Profile, with the scopes `mcp`, `read` and `write` (`write`
-   is for `add_comment`). Name it for the workflow, so its comments say
-   where they came from. `workflow_dispatch` lets you try the workflow by
+   is for `add_comment`), restricted to the application's account. Name it
+   for the workflow, so its comments say where they came from.
+
+   Telemetry is text other people wrote: an exception message, a log
+   line or a request path can say "ignore previous instructions and ...".
+   Railwatch never acts on it, and every MCP tool that returns it tells the
+   agent to read it as data, but the agent is a model. Give an agent that
+   runs on its own (here, on every new issue) the fewest scopes that do its
+   job: `mcp` and `read` only, unless it must comment, and never the
+   `security` scope it does not need. A read-only token cannot change an
+   issue whatever the telemetry says. `workflow_dispatch` lets you try the workflow by
    hand with any issue key.
 2. **The relay.** Run `relay.py` behind HTTPS with
    `RAILWATCH_WEBHOOK_SECRET`, `GITHUB_REPOSITORY=owner/repo`, and

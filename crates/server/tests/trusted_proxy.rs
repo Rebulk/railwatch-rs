@@ -69,6 +69,8 @@ async fn mounted_under_a_base_path_behind_a_trusted_proxy() {
     let (app_id, env_id, token) = {
         let owner = control.tx(|tx| control::insert_user(tx, "Owner", "owner@example.com", &control::base58(16), true)).unwrap();
         let account = control.tx(|tx| control::create_account(tx, "Acme", owner)).unwrap();
+        // What `setup` does: the proxy fronts this account.
+        control.tx(|tx| proxy_auth::bind_account(tx, account)).unwrap();
         let app = control.tx(|tx| control::insert_application(tx, account, "Shop", "shop", "SHOP", None, "main")).unwrap();
         let (env, token) = control.tx(|tx| control::create_environment(tx, app, "production")).unwrap();
         (app, env, token)

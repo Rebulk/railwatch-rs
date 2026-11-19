@@ -417,3 +417,44 @@ async fn without_the_self_host_flag_a_local_server_is_never_contacted() {
     assert_eq!(out.failure, Some(Failure::Blocked), "{out:?}");
     assert_eq!(out.status_code, None, "refused before connecting");
 }
+
+/// PR #106 review: a URL ending in a quote (accepted, and percent-encoded
+/// when probed) is scrubbed from the alerts' JSON without breaking it, and
+/// a failed scrub leaves the URL unchanged too (one transaction).
+#[test]
+fn changing_a_url_that_ends_in_a_quote_keeps_alert_payloads_valid_json() {
+    let f = fixture("quote-url");
+    let old = "https://example.com/up?token=SECRET\"";
+    let m = MonitorInput { name: "Health".into(), url: old.into(), ..Default::default() };
+    let id = f.control.with(|x| insert(x, f.env, &m)).unwrap().unwrap();
+    let payload = serde_json::json!({"monitor_id": id, "url": old, "detail": format!("failed ({old})")}).to_string();
+    f.control
+        .with(|x| {
+            x.execute(
+                "INSERT INTO alerts (event, integration_id, payload, status, created_at, updated_at) VALUES ('monitor_down', 1, ?, 'sent', 't', 't')",
+                [&payload],
+            )
+        })
+        .unwrap();
+    let new = MonitorInput { url: "https://example.com/up".into(), ..m.clone() };
+    f.control.tx(|x| Ok(update(x, id, &new, T0)?)).unwrap();
+    let stored: String = f.control.with(|x| x.query_row("SELECT payload FROM alerts", [], |r| r.get(0))).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stored).unwrap_or_else(|e| panic!("invalid JSON {stored:?}: {e}"));
+    assert_eq!(v["url"], "example.com", "{stored}");
+    assert!(!stored.contains("SECRET"), "{stored}");
+
+    // A scrub that fails rolls the URL change back with it.
+    let again = MonitorInput { url: "https://example.com/other?token=SECRET2".into(), ..m.clone() };
+    f.control
+        .with(|x| {
+            x.execute(
+                "INSERT INTO uptime_incidents (monitor_id, started_at, cause, detail) VALUES (?, 1, 'connect', 'failed (https://example.com/up)')",
+                [id],
+            )?;
+            x.execute_batch("CREATE TRIGGER no_scrub BEFORE UPDATE ON uptime_incidents BEGIN SELECT RAISE(ABORT, 'refused'); END")
+        })
+        .unwrap();
+    assert!(f.control.tx(|x| Ok(update(x, id, &again, T0)?)).is_err());
+    let url: String = f.control.with(|x| x.query_row("SELECT url FROM uptime_monitors WHERE id = ?", [id], |r| r.get(0))).unwrap();
+    assert_eq!(url, "https://example.com/up", "nothing half-done");
+}

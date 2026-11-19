@@ -39,9 +39,15 @@
 #   --app NAME --env NAME  first application and environment (My app / production)
 #   --alert-webhook URL [--alert-webhook-secret S] | --alert-slack URL | --alert-email ADDR
 #                          where "your app stopped reporting" and new-issue alerts go
+#   --alert-webhook-secret-file PATH | --alert-slack-file PATH
+#                          the same, read from a file (- is stdin): kept out of `ps`
 #   --backup-s3-endpoint URL --backup-s3-bucket B --backup-s3-access-key-id K
 #   --backup-s3-secret-access-key S [--backup-s3-region R] [--backup-s3-prefix P]
 #                          S3-compatible backups (AWS, R2, B2, MinIO), every 5 min
+#   --backup-s3-secret-access-key-file PATH
+#                          the secret key read from a file (- is stdin): kept out of `ps`.
+#                          A secret on the command line is visible to every local user
+#                          while the installer runs; prefer the -file forms.
 #   --version vX.Y.Z       install this release (default: the one this script came from)
 #   --binary PATH          install this local binary instead of downloading
 #   --release-url URL      download from URL/<file> instead of GitHub (a mirror, or tests); https only
@@ -66,6 +72,8 @@ RAILWATCH_SHA256_AARCH64=
 DOMAIN="" EMAIL="" URL="" NO_TLS=0 APP="" ENVNAME="" PASSWORD_STDIN=0 PASSWORD_FILE="" ALLOW_PRIVATE=0 MEMORY_MAX=""
 VERSION=$RAILWATCH_VERSION_DEFAULT BINARY="" RELEASE_URL="" ACME_DIRECTORY="" ACME_CA_FILE="" UPGRADE_ONLY=0 YES=0 ALLOW_HTTP=0 ALLOW_DOWNGRADE=0
 ALERT_ARGS="" S3_ENDPOINT="" S3_BUCKET="" S3_KEY="" S3_SECRET="" S3_REGION="" S3_PREFIX=""
+# Passed to `railwatch setup` through its environment, never its argv.
+ALERT_WEBHOOK_SECRET="" ALERT_SLACK=""
 BIN=/usr/local/bin/railwatch ETC=/etc/railwatch ENVFILE=/etc/railwatch/railwatch.env DATA=/var/lib/railwatch
 UNITS=/etc/systemd/system
 
@@ -74,6 +82,16 @@ step() { printf '\n==> %s\n' "$*"; }
 # Single-quoted for a shell word (alert args are passed through `eval set`).
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 need() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value"; }
+# A secret from a file, or stdin for `-`: its first line, without the line
+# break, into the variable named $3. Not in a $(...) subshell, where `die`
+# would end only the subshell and the option be taken as empty.
+secret_from() {
+  v=""
+  if [ "$2" = - ]; then IFS= read -r v || true
+  else [ -r "$2" ] || die "$1 $2: not readable"; IFS= read -r v < "$2" || true; fi
+  [ -n "$v" ] || die "$1: empty"
+  eval "$3=\$v"
+}
 started=$(date +%s)
 
 while [ $# -gt 0 ]; do
@@ -86,11 +104,16 @@ while [ $# -gt 0 ]; do
     --env) need "$@"; ENVNAME=$2; shift 2 ;;
     --password-stdin) PASSWORD_STDIN=1; shift ;;
     --password-file) need "$@"; PASSWORD_FILE=$2; shift 2 ;;
-    --alert-webhook|--alert-webhook-secret|--alert-slack|--alert-email) need "$@"; ALERT_ARGS="$ALERT_ARGS $1 $(q "$2")"; shift 2 ;;
+    --alert-webhook|--alert-email) need "$@"; ALERT_ARGS="$ALERT_ARGS $1 $(q "$2")"; shift 2 ;;
+    --alert-webhook-secret) need "$@"; ALERT_WEBHOOK_SECRET=$2; shift 2 ;;
+    --alert-webhook-secret-file) need "$@"; secret_from "$1" "$2" ALERT_WEBHOOK_SECRET; shift 2 ;;
+    --alert-slack) need "$@"; ALERT_SLACK=$2; shift 2 ;;
+    --alert-slack-file) need "$@"; secret_from "$1" "$2" ALERT_SLACK; shift 2 ;;
     --backup-s3-endpoint) need "$@"; S3_ENDPOINT=$2; shift 2 ;;
     --backup-s3-bucket) need "$@"; S3_BUCKET=$2; shift 2 ;;
     --backup-s3-access-key-id) need "$@"; S3_KEY=$2; shift 2 ;;
     --backup-s3-secret-access-key) need "$@"; S3_SECRET=$2; shift 2 ;;
+    --backup-s3-secret-access-key-file) need "$@"; secret_from "$1" "$2" S3_SECRET; shift 2 ;;
     --backup-s3-region) need "$@"; S3_REGION=$2; shift 2 ;;
     --backup-s3-prefix) need "$@"; S3_PREFIX=$2; shift 2 ;;
     --version) need "$@"; VERSION=$2; shift 2 ;;
@@ -104,7 +127,7 @@ while [ $# -gt 0 ]; do
     --upgrade) UPGRADE_ONLY=1; shift ;;
     --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
     --yes|-y) YES=1; shift ;;
-    -h|--help) sed -n '2,59p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || echo "see docs/SELF-HOST.md"; exit 0 ;;
+    -h|--help) sed -n '2,61p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || echo "see docs/SELF-HOST.md"; exit 0 ;;
     *) die "unknown option $1 (--help)" ;;
   esac
 done
@@ -122,7 +145,7 @@ case "$RELEASE_URL" in
   *) [ "$ALLOW_HTTP" = 1 ] || die "--release-url must be https (--allow-http-release-url is for tests)" ;;
 esac
 # Values go into a KEY=VALUE file the binary parses one line at a time.
-for v in "$DOMAIN" "$EMAIL" "$URL" "$ACME_DIRECTORY" "$MEMORY_MAX" "$S3_ENDPOINT" "$S3_BUCKET" "$S3_KEY" "$S3_SECRET" "$S3_REGION" "$S3_PREFIX"; do
+for v in "$DOMAIN" "$EMAIL" "$URL" "$ACME_DIRECTORY" "$MEMORY_MAX" "$S3_ENDPOINT" "$S3_BUCKET" "$S3_KEY" "$S3_SECRET" "$S3_REGION" "$S3_PREFIX" "$ALERT_WEBHOOK_SECRET" "$ALERT_SLACK"; do
   case "$v" in *"
 "*|*"$(printf '\r')"*) die "option values cannot contain line breaks" ;; esac
 done
@@ -422,7 +445,7 @@ fi
 # ---------------------------------------------------------------------------
 if [ "$FIRST_RUN" = 1 ]; then
   step "first-time setup (admin, account, application, environment, alerts)"
-  [ -n "$ALERT_ARGS" ] || echo "note: no --alert-webhook/--alert-slack/--alert-email: nothing will alert you when the app goes down (add one in Settings > Integrations)."
+  [ -n "$ALERT_ARGS$ALERT_SLACK" ] || echo "note: no --alert-webhook/--alert-slack/--alert-email: nothing will alert you when the app goes down (add one in Settings > Integrations)."
   set -- setup
   [ -n "$EMAIL" ] && set -- "$@" --email "$EMAIL"
   [ -n "$APP" ] && set -- "$@" --app "$APP"
@@ -446,7 +469,8 @@ if [ "$FIRST_RUN" = 1 ]; then
   else exec 3<&0; fi
   # The binary reads the env file itself (as data) and, run as root,
   # becomes the owner of the data dir before touching it.
-  ( cd / && RAILWATCH_ENV_FILE="$ENVFILE" "$BIN" "$@" <&3 ) > "$TMP/setup.out" \
+  ( cd / && RAILWATCH_ENV_FILE="$ENVFILE" RAILWATCH_SETUP_ALERT_WEBHOOK_SECRET="$ALERT_WEBHOOK_SECRET" RAILWATCH_SETUP_ALERT_SLACK="$ALERT_SLACK" \
+      "$BIN" "$@" <&3 ) > "$TMP/setup.out" \
     || { cat "$TMP/setup.out"; die "railwatch setup failed"; }
   exec 3<&-
 fi

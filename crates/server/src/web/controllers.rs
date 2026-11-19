@@ -117,12 +117,28 @@ pub(crate) async fn require_admin(cx: &Ctx) -> Result<i64, Response> {
     let account = require_account(cx)?;
     let user = cx.user_id();
     let role = cx.state.db(move |c| c.with(|x| control::membership_role(x, account, user))).await.map_err(internal)?;
+    let role = cx.current.effective_role(role);
     if matches!(role.as_deref(), Some("owner" | "admin")) { Ok(account) } else { Err(StatusCode::FORBIDDEN.into_response()) }
+}
+
+/// A trusted proxy's request stays in the proxy's account: no new account,
+/// no other account (proxy_auth).
+fn refuse_proxied(cx: &Ctx) -> Result<(), Response> {
+    if cx.current.is_proxied() { Err((StatusCode::FORBIDDEN, "Not available through the trusted proxy").into_response()) } else { Ok(()) }
 }
 
 fn rate_limited(cx: &Ctx, limit: &crate::rate_limit::FixedWindow<std::net::IpAddr>, to: &str, alert: &str) -> Result<(), Response> {
     let ip: std::net::IpAddr = cx.current.ip.parse().unwrap_or(std::net::IpAddr::from([127, 0, 0, 1]));
     if limit.exceeded(&ip) { Err(cx.redirect(Redirect::to(to).alert(alert))) } else { Ok(()) }
+}
+
+/// The invitation throttle (WebState::invitation_*_limit): one more email
+/// for this user and account, or a redirect back saying to wait.
+fn invitations_limited(cx: &Ctx, account: i64) -> Result<(), Response> {
+    // Both are counted, so neither several admins nor several accounts get around it.
+    let by_user = cx.state.invitation_user_limit.exceeded(&cx.user_id());
+    let by_account = cx.state.invitation_account_limit.exceeded(&account);
+    if by_user || by_account { Err(cx.redirect(Redirect::to("/settings/members").alert("Too many invitations sent. Try again later."))) } else { Ok(()) }
 }
 
 /// The provisioning throttle (30/hour per user), `provisioning_rate_limited`.
@@ -588,6 +604,9 @@ async fn invitation_show(cx: Ctx, Path(token): Path<String>) -> Response {
         Ok(None) => return cx.redirect(Redirect::to("/sign_in").alert("That invitation has expired or was already used.")),
         Err(e) => return internal(e),
     };
+    if cx.current.is_proxied() {
+        return cx.redirect(Redirect::to("/dashboard").alert("Invitations to other accounts cannot be accepted through the app you signed in with."));
+    }
     match cx.current.user.clone() {
         Some(user) => {
             let account_id = inv.account_id;
@@ -599,6 +618,9 @@ async fn invitation_show(cx: Ctx, Path(token): Path<String>) -> Response {
                 }
                 Ok(Err(AcceptError::RecipientMismatch)) => {
                     cx.redirect(Redirect::to("/dashboard").alert("This invitation was sent to a different email address."))
+                }
+                Ok(Err(AcceptError::Unverified)) => {
+                    cx.redirect(Redirect::to("/settings/email").alert("Verify your email address first, then open the invitation link again."))
                 }
                 Ok(Err(AcceptError::Unavailable)) => cx.redirect(Redirect::to("/dashboard").alert("That invitation has expired or was already used.")),
                 Err(e) => internal(e),
@@ -731,11 +753,13 @@ fn request_sparkline(tenants: &std::path::Path, slug: &str) -> (Vec<i64>, f64) {
 
 async fn account_new(cx: Ctx) -> Response {
     guard!(authenticate(&cx));
+    guard!(refuse_proxied(&cx));
     cx.render("accounts/new", json!({}), None).await
 }
 
 async fn account_create(cx: Ctx, p: Params) -> Response {
     guard!(authenticate(&cx));
+    guard!(refuse_proxied(&cx));
     guard!(provisioning(&cx));
     let name = p.s("name");
     let user = cx.user_id();
@@ -753,6 +777,7 @@ async fn account_create(cx: Ctx, p: Params) -> Response {
 
 async fn account_switch(cx: Ctx, Path(id): Path<i64>) -> Response {
     guard!(authenticate(&cx));
+    guard!(refuse_proxied(&cx));
     let user = cx.user_id();
     match cx.state.db(move |c| c.with(|x| control::membership_role(x, id, user))).await {
         Ok(Some(_)) => {
@@ -768,6 +793,8 @@ async fn account_switch(cx: Ctx, Path(id): Path<i64>) -> Response {
 /// environments and their telemetry files (DestroyAccountJob, inline).
 async fn account_destroy(cx: Ctx, Path(id): Path<i64>, p: Params) -> Response {
     guard!(authenticate(&cx));
+    // Only an owner deletes an account, and a proxy never signs for one.
+    guard!(refuse_proxied(&cx));
     let user = cx.user_id();
     let found = cx
         .state
@@ -1335,6 +1362,8 @@ async fn profile_show(cx: Ctx) -> Response {
     guard!(authenticate(&cx));
     let user = cx.current.user.clone().expect("authenticated");
     let uid = user.id;
+    // Through the trusted proxy, tokens can name the proxy's account only.
+    let pinned = cx.current.is_proxied().then(|| cx.current.account.as_ref().map(|a| a.id).unwrap_or(0));
     let data = cx
         .state
         .db(move |c| {
@@ -1344,9 +1373,11 @@ async fn profile_show(cx: Ctx) -> Response {
                         "SELECT t.id, t.name, t.scopes, t.expires_at, t.last_used_at, t.revoked_at, t.created_at,
                                 ap.name, apa.name, a.name
                          FROM api_tokens t LEFT JOIN applications ap ON ap.id = t.application_id LEFT JOIN accounts apa ON apa.id = ap.account_id
-                         LEFT JOIN accounts a ON a.id = t.account_id WHERE t.user_id = ? ORDER BY t.created_at DESC",
+                         LEFT JOIN accounts a ON a.id = t.account_id
+                         WHERE t.user_id = ?1 AND (?2 IS NULL OR t.account_id = ?2 OR ap.account_id = ?2)
+                         ORDER BY t.created_at DESC",
                     )?
-                    .query_map([uid], |r| {
+                    .query_map(params![uid, pinned], |r| {
                         let restriction = match (r.get::<_, Option<String>>(7)?, r.get::<_, Option<String>>(8)?, r.get::<_, Option<String>>(9)?) {
                             (Some(app), Some(acct), _) => format!("Application: {acct} / {app}"),
                             (_, _, Some(acct)) => format!("Account: {acct}"),
@@ -1358,10 +1389,12 @@ async fn profile_show(cx: Ctx) -> Response {
                                   "revoked_at": t_json_opt(r.get(5)?), "created_at": t_json(&r.get::<_, String>(6)?)}))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut targets = vec![json!({"value": "", "label": "All my accounts and applications"})];
+                let mut targets = if pinned.is_some() { vec![] } else { vec![json!({"value": "", "label": "All my accounts and applications"})] };
                 let accounts: Vec<(i64, String)> = x
-                    .prepare("SELECT a.id, a.name FROM accounts a JOIN memberships m ON m.account_id = a.id WHERE m.user_id = ? ORDER BY a.name")?
-                    .query_map([uid], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .prepare(
+                        "SELECT a.id, a.name FROM accounts a JOIN memberships m ON m.account_id = a.id WHERE m.user_id = ?1 AND (?2 IS NULL OR a.id = ?2) ORDER BY a.name",
+                    )?
+                    .query_map(params![uid, pinned], |r| Ok((r.get(0)?, r.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
                 for (id, name) in &accounts {
                     targets.push(json!({"value": format!("account:{id}"), "label": format!("Account: {name}")}));
@@ -1373,7 +1406,13 @@ async fn profile_show(cx: Ctx) -> Response {
                         targets.push(json!({"value": format!("application:{aid}"), "label": format!("Application: {name} / {aname}")}));
                     }
                 }
-                let blocking: Vec<Value> = sole_owned_accounts(x, uid)?.into_iter().map(|(id, name)| json!({"id": id, "name": name})).collect();
+                // Through the proxy, nothing of the user's other accounts is
+                // shown: its tokens above, and its names here.
+                let blocking: Vec<Value> = sole_owned_accounts(x, uid)?
+                    .into_iter()
+                    .filter(|(id, _)| pinned.is_none_or(|p| p == *id))
+                    .map(|(id, name)| json!({"id": id, "name": name}))
+                    .collect();
                 Ok((tokens, targets, blocking))
             })
         })
@@ -1399,10 +1438,7 @@ async fn profile_update(cx: Ctx, p: Params) -> Response {
     let editor = if p.has("editor") { p.s("editor") } else { user.editor.clone() };
     let root = if p.has("editor_root") { p.presence("editor_root") } else { user.editor_root.clone() };
     let digest = if p.has("weekly_digest") { p.bool("weekly_digest").unwrap_or(false) } else { user.weekly_digest };
-    let mut errors = Vec::new();
-    if name.trim().is_empty() {
-        errors.push(("name".to_string(), "can't be blank".to_string()));
-    }
+    let mut errors = control::name_errors(&name);
     if !EDITORS.contains(&editor.as_str()) {
         errors.push(("editor".to_string(), "is not included in the list".to_string()));
     }
@@ -1439,6 +1475,12 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
     let name = p.presence("name").unwrap_or_else(|| "API & MCP token".into());
     let scopes = if p.has("scopes_present") { p.strings("scopes") } else { ["api", "mcp", "read", "write"].map(String::from).to_vec() };
     let replace = p.i64("replace_token_id");
+    // Through the trusted proxy: a token for the proxy's account (or an
+    // application in it) only, never one for all of the user's accounts.
+    let pinned = cx.current.is_proxied().then(|| cx.current.account.as_ref().map(|a| a.id).unwrap_or(0));
+    // ...and with no more than the role the proxy signed, whatever the
+    // user's own membership is (an owner signed as a member).
+    let ceiling = cx.current.proxy_role.clone();
     enum Out {
         Bad,
         Ok(String, bool),
@@ -1474,15 +1516,34 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
                     }
                     _ => return Ok(Out::Bad),
                 };
+                if let Some(bound) = pinned {
+                    let in_bound = match (account, app) {
+                        (Some(a), _) => a == bound,
+                        (None, Some(a)) => tx.query_row("SELECT account_id = ? FROM applications WHERE id = ?", params![bound, a], |r| r.get(0))?,
+                        (None, None) => false,
+                    };
+                    if !in_bound {
+                        return Ok(Out::Bad);
+                    }
+                }
                 if let Some(rid) = replace {
-                    let mine: bool =
-                        tx.query_row("SELECT 1 FROM api_tokens WHERE id = ? AND user_id = ?", params![rid, uid], |_| Ok(true)).optional()?.unwrap_or(false);
+                    let mine: bool = tx
+                        .query_row(&format!("SELECT 1 FROM api_tokens WHERE id = ?1 AND user_id = ?2 AND {TOKEN_IN_BOUND}"), params![rid, uid, pinned], |_| {
+                            Ok(true)
+                        })
+                        .optional()?
+                        .unwrap_or(false);
                     if !mine {
                         return Ok(Out::Bad);
                     }
                 }
                 let raw = match control::issue_api_token(tx, uid, &name, &scopes, account, app, expires_at) {
-                    Ok((_, raw)) => raw,
+                    Ok((id, raw)) => {
+                        if let Some(role) = &ceiling {
+                            tx.execute("UPDATE api_tokens SET role_ceiling = ? WHERE id = ?", params![role, id])?;
+                        }
+                        raw
+                    }
                     Err(ModelError::Invalid(e)) => return Ok(Out::Invalid(e)),
                     Err(e) => return Err(e),
                 };
@@ -1509,15 +1570,19 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
     }
 }
 
+/// An api_tokens row a request may replace or revoke, with ?3 the trusted
+/// proxy's account (NULL for a native sign-in: any of the user's tokens):
+/// through the proxy, only tokens restricted to that account or an
+/// application in it, never one for the user's other accounts.
+const TOKEN_IN_BOUND: &str = "(?3 IS NULL OR account_id = ?3 OR application_id IN (SELECT id FROM applications WHERE account_id = ?3))";
+
 async fn profile_revoke_token(cx: Ctx, p: Params) -> Response {
     guard!(authenticate(&cx));
     let uid = cx.user_id();
     let Some(id) = p.i64("token_id") else { return not_found() };
-    match cx
-        .state
-        .db(move |c| c.with(|x| x.execute("UPDATE api_tokens SET revoked_at = ?1, updated_at = ?1 WHERE id = ?2 AND user_id = ?3", params![now_db(), id, uid])))
-        .await
-    {
+    let pinned = cx.current.is_proxied().then(|| cx.current.account.as_ref().map(|a| a.id).unwrap_or(0));
+    let sql = format!("UPDATE api_tokens SET revoked_at = ?4, updated_at = ?4 WHERE id = ?1 AND user_id = ?2 AND {TOKEN_IN_BOUND}");
+    match cx.state.db(move |c| c.with(|x| x.execute(&sql, params![id, uid, pinned, now_db()]))).await {
         Ok(0) => not_found(),
         Ok(_) => cx.redirect(Redirect::to("/settings/profile").notice("API token revoked.")),
         Err(e) => internal(e),
@@ -1576,16 +1641,28 @@ async fn email_update(cx: Ctx, p: Params) -> Response {
         return cx.redirect(Redirect::to("/settings/email"));
     }
     let uid = user.id;
+    let keep = cx.current.session.as_ref().map(|s| s.id);
+    let new_email = email.clone();
+    // Like a password change, an email change ends the user's other
+    // sessions (someone else's stolen one included).
     let r = cx
         .state
-        .db(move |c| c.with(|x| x.execute("UPDATE users SET email = ?, verified = 0, updated_at = ? WHERE id = ?", params![email, now_db(), uid])))
+        .db(move |c| {
+            // One transaction: the new email never stands without the sign-out.
+            c.tx(|x| {
+                x.execute("UPDATE users SET email = ?, verified = 0, updated_at = ? WHERE id = ?", params![email, now_db(), uid])?;
+                Ok(x.execute("DELETE FROM sessions WHERE user_id = ? AND id IS NOT ?", params![uid, keep])?)
+            })
+        })
         .await;
     match r {
         Ok(_) => {
+            // The old address hears about it, so a change it did not make is noticed.
+            mailer::deliver_later(cx.state.mailer.clone(), mailer::email_changed(&user.email, &new_email));
             send_verification(&cx, uid).await;
             cx.redirect(Redirect::to("/settings/email").notice("Your email has been changed"))
         }
-        Err(rusqlite::Error::SqliteFailure(f, _)) if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE => {
+        Err(ModelError::Sql(rusqlite::Error::SqliteFailure(f, _))) if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE => {
             cx.redirect(Redirect::to("/settings/email").error("email", "has already been taken"))
         }
         Err(e) => internal(e),
@@ -1617,6 +1694,7 @@ async fn sessions_index(cx: Ctx) -> Response {
 async fn members_index(cx: Ctx) -> Response {
     let account = guard!(require_account(&cx));
     let uid = cx.user_id();
+    let proxy_role = cx.current.proxy_role.clone();
     let data = cx
         .state
         .db(move |c| {
@@ -1635,7 +1713,7 @@ async fn members_index(cx: Ctx) -> Response {
                                   "expires_at": t_json(&r.get::<_, String>(3)?)}))
                     })?
                     .collect::<rusqlite::Result<_>>()?;
-                let owner = control::membership_role(x, account, uid)?.as_deref() == Some("owner");
+                let owner = proxy_role.is_none() && control::membership_role(x, account, uid)?.as_deref() == Some("owner");
                 Ok((members, invitations, owner))
             })
         })
@@ -1656,6 +1734,7 @@ async fn members_index(cx: Ctx) -> Response {
 
 async fn members_create(cx: Ctx, p: Params) -> Response {
     let account = guard!(require_admin(&cx).await);
+    guard!(invitations_limited(&cx, account));
     let email = control::normalize_email(&p.s("email"));
     let role = Some(p.s("role")).filter(|r| r == "admin" || r == "member").unwrap_or_else(|| "member".into());
     let inviter = cx.current.user.clone().expect("authenticated");
@@ -1701,9 +1780,13 @@ async fn members_update(cx: Ctx, Path(id): Path<i64>, p: Params) -> Response {
                 match current.as_deref() {
                     None => Ok(None),
                     Some("owner") => Ok(Some(true)),
-                    Some(_) => {
+                    Some(was) => {
                         if role == "admin" || role == "member" {
                             tx.execute("UPDATE memberships SET role = ?, updated_at = ? WHERE id = ?", params![role, now_db(), id])?;
+                            if was == "admin" && role == "member" {
+                                let user: i64 = tx.query_row("SELECT user_id FROM memberships WHERE id = ?", [id], |r| r.get(0))?;
+                                control::withdraw_access(tx, account, user, false)?;
+                            }
                         }
                         Ok(Some(false))
                     }
@@ -1731,7 +1814,9 @@ async fn members_destroy(cx: Ctx, Path(id): Path<i64>) -> Response {
                     None => Ok(None),
                     Some("owner") => Ok(Some(true)),
                     Some(_) => {
+                        let user: i64 = tx.query_row("SELECT user_id FROM memberships WHERE id = ?", [id], |r| r.get(0))?;
                         tx.execute("DELETE FROM memberships WHERE id = ?", [id])?;
+                        control::withdraw_access(tx, account, user, true)?;
                         Ok(Some(false))
                     }
                 }
@@ -1750,6 +1835,8 @@ async fn members_destroy(cx: Ctx, Path(id): Path<i64>) -> Response {
 /// admin, in one transaction.
 async fn members_transfer(cx: Ctx, Path(id): Path<i64>) -> Response {
     let account = guard!(require_account(&cx));
+    // Ownership moves only by the owner's own sign-in, never by a proxy's claim.
+    guard!(refuse_proxied(&cx));
     let uid = cx.user_id();
     let r = cx
         .state
@@ -1796,6 +1883,7 @@ async fn invitation_destroy(cx: Ctx, Path(id): Path<i64>) -> Response {
 /// Invitation#resend!: a new token, 7 more days, the email again.
 async fn invitation_resend(cx: Ctx, Path(id): Path<i64>) -> Response {
     let account = guard!(require_admin(&cx).await);
+    guard!(invitations_limited(&cx, account));
     let token = control::base58(32);
     let t = token.clone();
     let r = cx

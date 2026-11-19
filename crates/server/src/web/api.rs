@@ -1348,18 +1348,23 @@ impl Api<'_> {
     /// windows, the last 90 days and recent incidents. Rust-only.
     fn uptime(&self, e: &Scoped) -> R<Rendered> {
         let now = self.now;
+        let account: i64 = self.control(|c| c.query_row("SELECT account_id FROM applications WHERE id = ?", [e.application_id], |r| r.get(0)))?;
+        let admin = self.token.is_admin_of(self.env.control, account);
         let t = |m: Option<i64>| jt(m);
         let (monitors, incidents) = self.control(|c| {
             let mut out = Vec::new();
+            let mut urls = std::collections::HashMap::new();
             for m in crate::uptime::monitors(c, e.id)? {
+                urls.insert(m.id, m.url.clone());
                 out.push(crate::obj! {
-                    "id" => m.id, "name" => m.name.clone(), "url" => m.url.clone(), "method" => m.method.clone(),
+                    "id" => m.id, "name" => m.name.clone(), "url" => js(crate::uptime::shown_url(&m.url, admin).as_deref()), "method" => m.method.clone(),
                     "expected_status" => db::ji(m.expected_status), "keyword" => js(m.keyword.as_deref()),
                     "interval_seconds" => m.interval_seconds, "timeout_seconds" => m.timeout_seconds,
                     "enabled" => m.enabled, "public" => m.public, "status" => m.status.clone(),
                     "status_since" => t(crate::uptime::status_since(c, &m)?),
                     "last_checked_at" => t(m.last_checked_at), "last_status_code" => db::ji(m.last_status_code),
-                    "last_latency_ms" => db::ji(m.last_latency_ms), "last_error" => js(m.last_error.as_deref()),
+                    "last_latency_ms" => db::ji(m.last_latency_ms),
+                    "last_error" => js(m.last_error.as_deref().map(|x| crate::uptime::shown_text(x, &m.url, admin)).as_deref()),
                     "uptime" => crate::uptime::uptime_windows(c, m.id, now)?,
                     "days" => crate::uptime::daily(c, m.id, now, crate::uptime::DAILY_DAYS)?,
                 });
@@ -1370,7 +1375,8 @@ impl Api<'_> {
                     crate::obj! {
                         "id" => i.id, "monitor_id" => i.monitor_id, "monitor" => i.monitor.clone(),
                         "started_at" => t(Some(i.started_at)), "ended_at" => t(i.ended_at), "duration_seconds" => i.duration_secs(now),
-                        "cause" => i.cause.clone(), "detail" => js(i.detail.as_deref()),
+                        "cause" => i.cause.clone(),
+                        "detail" => js(i.detail.as_deref().map(|d| crate::uptime::shown_text(d, urls.get(&i.monitor_id).map_or("", String::as_str), admin)).as_deref()),
                     }
                 })
                 .collect();
@@ -1480,7 +1486,10 @@ impl Api<'_> {
                     })
                 },
             )
-        })
+            .optional()
+        })?
+        // Gone since it was found (deleted with its environment): a 404, not a 500.
+        .ok_or_else(not_found)
     }
 
     /// issue_json(i, full: true)
@@ -1554,22 +1563,26 @@ impl Api<'_> {
             if !matches!(status.as_str(), "resolved" | "ignored" | "open") {
                 return Err(unprocessable("status", "must be one of open, resolved, ignored"));
             }
-            let merged = self.write(|c| {
-                let i = issue_model::find(c, id)?.expect("issue");
-                match status.as_str() {
-                    "resolved" => {
-                        issue_model::resolve_by(c, &i, None, actor)?;
+            // The issue can be deleted (its environment, app or account)
+            // between find_issue and here: a 404, never a panic under the lock.
+            let merged = self
+                .write(|c| {
+                    let Some(i) = issue_model::find(c, id)? else { return Ok(Err(())) };
+                    match status.as_str() {
+                        "resolved" => {
+                            issue_model::resolve_by(c, &i, None, actor)?;
+                        }
+                        "ignored" => {
+                            issue_model::ignore(c, &i, actor)?;
+                        }
+                        _ if i.status == "merged" => return Ok(Ok(Some(()))),
+                        _ => {
+                            issue_model::reopen(c, &i, actor)?;
+                        }
                     }
-                    "ignored" => {
-                        issue_model::ignore(c, &i, actor)?;
-                    }
-                    _ if i.status == "merged" => return Ok(Some(())),
-                    _ => {
-                        issue_model::reopen(c, &i, actor)?;
-                    }
-                }
-                Ok(None)
-            })?;
+                    Ok(Ok(None))
+                })?
+                .map_err(|()| not_found())?;
             if merged.is_some() {
                 // unmerge! raises InvalidMerge on a broken chain: a 422 with
                 // its message on status.
@@ -1582,10 +1595,12 @@ impl Api<'_> {
         }
         if p.present("priority") {
             let priority = p.s("priority");
-            let valid = self.write(|c| {
-                let i = issue_model::find(c, id)?.expect("issue");
-                issue_model::set_priority(c, &i, &priority, actor)
-            })?;
+            let valid = self
+                .write(|c| match issue_model::find(c, id)? {
+                    Some(i) => issue_model::set_priority(c, &i, &priority, actor).map(Some),
+                    None => Ok(None),
+                })?
+                .ok_or_else(not_found)?;
             if !valid {
                 return Err(unprocessable("priority", "is not included in the list"));
             }
@@ -1612,10 +1627,11 @@ impl Api<'_> {
             } else {
                 None
             };
-            self.write(|c| {
-                let i = issue_model::find(c, id)?.expect("issue");
-                issue_model::set_assignee(c, &i, to.as_ref().map(|(u, n)| (*u, n.as_str())), actor)
-            })?;
+            self.write(|c| match issue_model::find(c, id)? {
+                Some(i) => issue_model::set_assignee(c, &i, to.as_ref().map(|(u, n)| (*u, n.as_str())), actor).map(Some),
+                None => Ok(None),
+            })?
+            .ok_or_else(not_found)?;
         }
         ok(self.issue_full(id)?)
     }
@@ -1938,6 +1954,73 @@ mod tests {
         assert_eq!(get(&f, "/api/v1/issues?status=bogus", "full").1["meta"]["total"], 2);
         assert_eq!(get(&f, "/api/v1/issues?q=broken", "full").1["meta"]["total"], 2);
         assert_eq!(get(&f, "/api/v1/issues?assignee_id=abc", "full").1["meta"]["total"], 0, "assignee_id = NULL");
+    }
+
+    /// GA hunt H1: the issue is deleted (its environment, by another
+    /// session) between the scope check and a later write of the same
+    /// PATCH. That is a 404, not a panic holding the control lock, and the
+    /// next request, anyone's, works.
+    #[test]
+    fn an_issue_deleted_mid_update_is_a_404_and_the_server_keeps_working() {
+        let f = fixture("vanish");
+        // The race, made deterministic: the status write's activity deletes
+        // the issue, so the priority write's re-read finds nothing.
+        f.c.with(|x| {
+            x.execute_batch(
+                "CREATE TEMP TRIGGER vanish AFTER INSERT ON issue_activities WHEN NEW.kind = 'status' BEGIN
+                   DELETE FROM issue_activities WHERE issue_id = NEW.issue_id;
+                   DELETE FROM alerts WHERE issue_id = NEW.issue_id;
+                   DELETE FROM issues WHERE id = NEW.issue_id;
+                 END",
+            )
+        })
+        .unwrap();
+        let path = format!("/api/v1/issues/{}", f.issue);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            req(&f, Method::PATCH, &path, Some("full"), Some(json!({"status": "resolved", "priority": "high"})))
+        }));
+        let r = r.expect("no panic");
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        f.c.with(|x| x.execute_batch("DROP TRIGGER vanish")).unwrap();
+        let (status, list) = get(&f, "/api/v1/issues", "full");
+        assert_eq!(status, 200, "the next request works");
+        assert_eq!(list["meta"]["total"], 1, "{list}");
+    }
+
+    /// PR #106 review: a status-only PATCH whose issue goes away with that
+    /// one write: the closing read is a 404 too, not a 500.
+    #[test]
+    fn an_issue_deleted_by_the_last_write_is_a_404() {
+        let f = fixture("vanish-last");
+        f.c.with(|x| {
+            x.execute_batch(
+                "CREATE TEMP TRIGGER vanish AFTER INSERT ON issue_activities WHEN NEW.kind = 'status' BEGIN
+                   DELETE FROM issue_activities WHERE issue_id = NEW.issue_id;
+                   DELETE FROM alerts WHERE issue_id = NEW.issue_id;
+                   DELETE FROM issues WHERE id = NEW.issue_id;
+                 END",
+            )
+        })
+        .unwrap();
+        let r = req(&f, Method::PATCH, &format!("/api/v1/issues/{}", f.issue), Some("full"), Some(json!({"status": "resolved"})));
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+    }
+
+    /// PR #106 review: an issue deleted between the last check and the
+    /// closing read (no lock is held in between) is a 404 from that read.
+    #[test]
+    fn an_issue_deleted_before_the_closing_read_is_a_404() {
+        let f = fixture("vanish-read");
+        let token = Token::from_authorization(&f.c, Some(&format!("Bearer {}", f.tokens["full"])), NOW).unwrap().unwrap();
+        let params = Params { map: Map::new() };
+        let env = Env { control: &f.c, tenants: &f.tenants, readers: &f.readers, cursor_key: &f.key };
+        let api = Api { env: &env, now: NOW, token, params: &params };
+        assert!(api.issue_full(f.issue).is_ok());
+        f.c.with(|x| x.execute_batch(&format!("DELETE FROM issue_activities WHERE issue_id = {0}; DELETE FROM issues WHERE id = {0}", f.issue))).unwrap();
+        match api.issue_full(f.issue) {
+            Err(Halt::Json(status, _)) | Err(Halt::Page(status)) => assert_eq!(status, StatusCode::NOT_FOUND),
+            Ok(v) => panic!("the deleted issue was read: {v}"),
+        }
     }
 
     #[test]

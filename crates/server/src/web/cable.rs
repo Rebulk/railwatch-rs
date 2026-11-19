@@ -17,6 +17,11 @@
 //!   {"event":"ingested","at":...,"counts":{...}}}`, re-authorized before
 //!   it is sent (EnvironmentChannel#transmit_authorized).
 //!
+//! Limits (the protocol only needs small commands): a message or frame is
+//! at most MAX_MESSAGE_BYTES (the connection is closed past it), an
+//! identifier at most MAX_IDENTIFIER_BYTES, and a connection holds at most
+//! MAX_SUBSCRIPTIONS; a subscribe past either is rejected, never stored.
+//!
 //! Broadcasts come from the ingest commit path (followups.rs), at most one
 //! per environment every 2 s (Ingest::Batch::THROTTLE_WINDOW). They are a
 //! "data changed, refetch" ping, not the data.
@@ -36,6 +41,13 @@ use tokio::sync::broadcast;
 
 use super::WebState;
 use super::cookies;
+
+/// The largest WebSocket message or frame a client may send.
+pub const MAX_MESSAGE_BYTES: usize = 4096;
+/// The longest subscribe identifier kept (the frontend's is ~40 bytes).
+pub const MAX_IDENTIFIER_BYTES: usize = 256;
+/// Subscriptions per connection (one page subscribes to one environment).
+pub const MAX_SUBSCRIPTIONS: usize = 16;
 
 pub const THROTTLE: Duration = Duration::from_secs(2);
 const PING_EVERY: Duration = Duration::from_secs(3);
@@ -97,37 +109,43 @@ pub async fn upgrade(
     let origin_ok = super::session::same_origin(&headers);
     // Verified (and the header removed) by proxy_auth::layer.
     let proxied = proxied.map(|axum::Extension(p)| p.0);
+    // (session, user, the one account a proxied connection may watch)
     let user = match (origin_ok, proxied, session_id) {
-        (true, Some(claims), _) => state.db(move |c| c.tx(|tx| super::proxy_auth::resolve(tx, &claims))).await.ok().map(|(s, u)| (s.id, u.id)),
-        (true, None, Some(sid)) => state.db(move |c| c.with(|x| crate::control::find_session(x, sid))).await.ok().flatten().map(|s| (s.id, s.user_id)),
+        (true, Some(claims), _) => {
+            state.db(move |c| c.tx(|tx| super::proxy_auth::resolve(tx, &claims))).await.ok().map(|(s, u, account)| (s.id, u.id, Some(account)))
+        }
+        (true, None, Some(sid)) => state.db(move |c| c.with(|x| crate::control::find_session(x, sid))).await.ok().flatten().map(|s| (s.id, s.user_id, None)),
         _ => None,
     };
-    ws.protocols(["actioncable-v1-json"]).on_upgrade(move |socket| run(socket, state, user))
+    ws.protocols(["actioncable-v1-json"])
+        .max_message_size(MAX_MESSAGE_BYTES)
+        .max_frame_size(MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| run(socket, state, user))
 }
 
 fn text(v: Value) -> Message {
     Message::Text(Utf8Bytes::from(v.to_string()))
 }
 
-/// EnvironmentChannel#authorized?
-fn authorized(state: &WebState, session_id: i64, user_id: i64, env_id: i64) -> bool {
+/// EnvironmentChannel#authorized?, within `only` (a proxied connection's account).
+fn authorized(state: &WebState, session_id: i64, user_id: i64, only: Option<i64>, env_id: i64) -> bool {
     state
         .control
         .with(|x| {
             x.query_row(
                 "SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?1 AND user_id = ?2)
                     AND EXISTS (SELECT 1 FROM environments e JOIN applications ap ON ap.id = e.application_id
-                                JOIN memberships m ON m.account_id = ap.account_id WHERE e.id = ?3 AND m.user_id = ?2)",
-                params![session_id, user_id, env_id],
+                                JOIN memberships m ON m.account_id = ap.account_id WHERE e.id = ?3 AND m.user_id = ?2 AND (?4 IS NULL OR ap.account_id = ?4))",
+                params![session_id, user_id, env_id, only],
                 |r| r.get::<_, bool>(0),
             )
         })
         .unwrap_or(false)
 }
 
-async fn run(socket: WebSocket, state: Arc<WebState>, user: Option<(i64, i64)>) {
+async fn run(socket: WebSocket, state: Arc<WebState>, user: Option<(i64, i64, Option<i64>)>) {
     let (mut tx, mut rx) = socket.split();
-    let Some((session_id, user_id)) = user else {
+    let Some((session_id, user_id, only)) = user else {
         let _ = tx.send(text(json!({"type": "disconnect", "reason": "unauthorized", "reconnect": false}))).await;
         let _ = tx.close().await;
         return;
@@ -161,8 +179,9 @@ async fn run(socket: WebSocket, state: Arc<WebState>, user: Option<(i64, i64)>) 
                             .then(|| id["id"].as_i64().or_else(|| id["id"].as_str().and_then(|s| s.parse().ok())))
                             .flatten();
                         let st = state.clone();
-                        let ok = match env {
-                            Some(e) => tokio::task::spawn_blocking(move || authorized(&st, session_id, user_id, e)).await.unwrap_or(false),
+                        let room = identifier.len() <= MAX_IDENTIFIER_BYTES && (subs.len() < MAX_SUBSCRIPTIONS || subs.contains_key(&identifier));
+                        let ok = match env.filter(|_| room) {
+                            Some(e) => tokio::task::spawn_blocking(move || authorized(&st, session_id, user_id, only, e)).await.unwrap_or(false),
                             None => false,
                         };
                         let reply = if ok {
@@ -186,7 +205,7 @@ async fn run(socket: WebSocket, state: Arc<WebState>, user: Option<(i64, i64)>) 
                 let targets: Vec<String> = subs.iter().filter(|(_, e)| **e == env).map(|(i, _)| i.clone()).collect();
                 if targets.is_empty() { continue; }
                 let st = state.clone();
-                let still = tokio::task::spawn_blocking(move || authorized(&st, session_id, user_id, env)).await.unwrap_or(false);
+                let still = tokio::task::spawn_blocking(move || authorized(&st, session_id, user_id, only, env)).await.unwrap_or(false);
                 let message: Value = serde_json::from_str(&msg).unwrap_or(Value::Null);
                 for identifier in targets {
                     if still {

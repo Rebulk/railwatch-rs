@@ -176,6 +176,30 @@ pub struct Monitor {
     pub last_error: Option<String>,
 }
 
+/// What a viewer may see of a monitor's URL: all of it for an account
+/// admin, else only its host. A health-check URL often carries a
+/// credential (`?token=`, a signed URL), the same rule as webhook URLs
+/// (web/integrations.rs).
+pub fn shown_url(url: &str, admin: bool) -> Option<String> {
+    if admin { Some(url.to_string()) } else { reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)) }
+}
+
+/// A check error or incident detail for the same viewer: the monitor's URL
+/// in it (errors recorded before probe errors dropped it) as shown_url.
+pub fn shown_text(text: &str, url: &str, admin: bool) -> String {
+    if admin || url.is_empty() {
+        return text.to_string();
+    }
+    let parsed = reqwest::Url::parse(url).ok();
+    let shown = shown_url(url, false).unwrap_or_default();
+    // The URL as stored, and as reqwest prints it (normalised).
+    let mut out = text.replace(url, &shown);
+    if let Some(u) = parsed {
+        out = out.replace(u.as_str(), &shown);
+    }
+    out
+}
+
 impl Monitor {
     pub fn request(&self) -> probe::Request {
         probe::Request {
@@ -274,8 +298,13 @@ pub fn insert(c: &Connection, environment_id: i64, m: &MonitorInput) -> rusqlite
 
 /// Updates a monitor's settings. Disabling pauses it (an open incident is
 /// closed now, without an alert); enabling a paused one starts from pending.
+/// A new URL scrubs the old one (forget_url): call it in a transaction so
+/// the two land together.
 pub fn update(c: &Connection, id: i64, m: &MonitorInput, now_micros: i64) -> rusqlite::Result<()> {
-    let was_enabled: bool = c.query_row("SELECT enabled FROM uptime_monitors WHERE id = ?", [id], |r| r.get(0))?;
+    let (was_enabled, old_url): (bool, String) = c.query_row("SELECT enabled, url FROM uptime_monitors WHERE id = ?", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if old_url != m.url.trim() {
+        forget_url(c, id, &old_url)?;
+    }
     c.execute(
         "UPDATE uptime_monitors SET name = ?2, url = ?3, method = ?4, expected_status = ?5, keyword = ?6, timeout_seconds = ?7,
            interval_seconds = ?8, enabled = ?9, public = ?10, public_name = ?11, public_url = ?12, updated_at = ?13 WHERE id = ?1",
@@ -302,6 +331,36 @@ pub fn update(c: &Connection, id: i64, m: &MonitorInput, now_micros: i64) -> rus
         c.execute("UPDATE uptime_monitors SET status = 'pending', failures = 0, failing_since = NULL WHERE id = ?", [id])?;
     }
     Ok(())
+}
+
+/// A monitor's previous URL, which may carry a credential, out of what
+/// outlives the change: its incidents' details and last error (recorded
+/// when probe errors repeated the URL) and its alerts' payloads. Readers
+/// mask only the current URL (shown_text), so the old one is replaced by
+/// its host here, for everyone.
+fn forget_url(c: &Connection, id: i64, old: &str) -> rusqlite::Result<()> {
+    let host = shown_url(old, false).unwrap_or_default();
+    let normalized = reqwest::Url::parse(old).ok().map(|u| u.to_string()).filter(|n| n != old);
+    for form in std::iter::once(old.to_string()).chain(normalized) {
+        c.execute("UPDATE uptime_incidents SET detail = replace(detail, ?2, ?3) WHERE monitor_id = ?1 AND instr(detail, ?2) > 0", params![id, form, host])?;
+        c.execute("UPDATE uptime_monitors SET last_error = replace(last_error, ?2, ?3) WHERE id = ?1 AND instr(last_error, ?2) > 0", params![id, form, host])?;
+        // Alerts keep the payload as JSON text: replace the URL as JSON
+        // writes it inside a string (escapes and all, without its quotes).
+        let (json_form, json_host) = (json_string_body(&form), json_string_body(&host));
+        c.execute(
+            "UPDATE alerts SET payload = replace(payload, ?2, ?3)
+             WHERE event IN ('monitor_down', 'monitor_recovered') AND json_extract(payload, '$.monitor_id') = ?1 AND instr(payload, ?2) > 0",
+            params![id, json_form, json_host],
+        )?;
+    }
+    Ok(())
+}
+
+/// `s` as JSON encodes it within a string: exactly the two delimiting
+/// quotes removed (an escaped quote at either end stays).
+fn json_string_body(s: &str) -> String {
+    let quoted = serde_json::to_string(s).expect("a string encodes");
+    quoted[1..quoted.len() - 1].to_string()
 }
 
 /// Deletes a monitor with its checks, rollups and incidents (ON DELETE CASCADE).

@@ -36,8 +36,10 @@ pub fn routes() -> Router<S> {
 
 /// `account_alerts` (scoped through the integration, so "Send test" alerts
 /// with no rule show too), the q filter's event/status, newest 200.
-/// `environment`: the env page's scope.
-pub fn rows(x: &Connection, account: i64, environment: Option<i64>, q: &str) -> rusqlite::Result<Vec<Value>> {
+/// `environment`: the env page's scope. `admin`: the viewer manages the
+/// account; anyone else sees an uptime alert's monitor URL as its host only
+/// (uptime::shown_url), in `url` and in the `message` that repeats it.
+pub fn rows(x: &Connection, account: i64, environment: Option<i64>, q: &str, admin: bool) -> rusqlite::Result<Vec<Value>> {
     let parsed = crate::dashboard::filter_query::parse(Some(q));
     let mut sql = String::from(
         "SELECT a.id, a.event, a.status, a.sent_at, a.error, a.payload, a.created_at, i.kind, i.name, s.id, ap.issue_prefix || '-' || s.number, s.title
@@ -62,7 +64,17 @@ pub fn rows(x: &Connection, account: i64, environment: Option<i64>, q: &str) -> 
     sql.push_str(" ORDER BY a.created_at DESC, a.id DESC LIMIT 200");
     x.prepare(&sql)?
         .query_map(rusqlite::params_from_iter(binds), |r| {
-            let payload: Value = serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or(json!({}));
+            let mut payload: Value = serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or(json!({}));
+            if !admin && let Some(url) = payload.get("url").and_then(Value::as_str).map(str::to_string) {
+                let shown = crate::uptime::shown_url(&url, false);
+                // `detail` is the probe error, which once repeated the URL.
+                for key in ["message", "detail"] {
+                    if let Some(Value::String(m)) = payload.get_mut(key) {
+                        *m = crate::uptime::shown_text(m, &url, false);
+                    }
+                }
+                payload["url"] = shown.map_or(Value::Null, Value::String);
+            }
             let issue = match r.get::<_, Option<i64>>(9)? {
                 Some(id) => json!({"id": id, "key": r.get::<_, Option<String>>(10)?, "title": r.get::<_, Option<String>>(11)?}),
                 None => Value::Null,
@@ -86,10 +98,18 @@ async fn index(cx: Ctx, RawQuery(q): RawQuery) -> Response {
     let account = guard!(require_account(&cx));
     let q = Params::from_query(q.as_deref()).s("q");
     let q2 = q.clone();
-    match cx.state.db(move |c| c.with(|x| rows(x, account, None, &q2))).await {
+    let admin = viewer_is_admin(&cx).await;
+    match cx.state.db(move |c| c.with(|x| rows(x, account, None, &q2, admin))).await {
         Ok(alerts) => cx.render("alerts/index", props(alerts, &q), None).await,
         Err(e) => internal(e),
     }
+}
+
+/// Whether the signed-in viewer manages the current account.
+pub(crate) async fn viewer_is_admin(cx: &Ctx) -> bool {
+    let (Some(user), Some(account)) = (cx.current.user.as_ref().map(|u| u.id), cx.current.account.as_ref().map(|a| a.id)) else { return false };
+    let role = cx.state.db(move |c| c.with(|x| crate::control::membership_role(x, account, user))).await.ok().flatten();
+    matches!(cx.current.effective_role(role).as_deref(), Some("owner" | "admin"))
 }
 
 async fn retry(cx: Ctx, Path(id): Path<i64>) -> Response {
@@ -153,14 +173,18 @@ mod tests {
         .unwrap();
         let ids = |v: Vec<Value>| v.iter().map(|a| a["id"].as_i64().unwrap()).collect::<Vec<_>>();
         assert_eq!(
-            ids(c.with(|x| rows(x, account, Some(prod), "")).unwrap()),
+            ids(c.with(|x| rows(x, account, Some(prod), "", true)).unwrap()),
             [3, 1],
             "prod's issue alert + its silence; not staging's, not the test, not another account's"
         );
-        assert_eq!(ids(c.with(|x| rows(x, account, None, "")).unwrap()), [5, 4, 3, 2, 1], "account-wide: every alert of this account's integrations");
-        assert_eq!(ids(c.with(|x| rows(x, account, None, "status:failed")).unwrap()), [3]);
-        assert_eq!(ids(c.with(|x| rows(x, account, None, "event:silent_environment status:bogus")).unwrap()), [4, 3], "unknown status is ignored, as Rails");
-        let one = c.with(|x| rows(x, account, Some(prod), "")).unwrap();
+        assert_eq!(ids(c.with(|x| rows(x, account, None, "", true)).unwrap()), [5, 4, 3, 2, 1], "account-wide: every alert of this account's integrations");
+        assert_eq!(ids(c.with(|x| rows(x, account, None, "status:failed", true)).unwrap()), [3]);
+        assert_eq!(
+            ids(c.with(|x| rows(x, account, None, "event:silent_environment status:bogus", true)).unwrap()),
+            [4, 3],
+            "unknown status is ignored, as Rails"
+        );
+        let one = c.with(|x| rows(x, account, Some(prod), "", true)).unwrap();
         assert_eq!(one[1]["issue"], json!({"id": 1, "key": "SHOP-7", "title": "Boom"}));
         assert_eq!(one[0]["issue"], Value::Null);
         assert_eq!(one[0]["integration"], json!({"kind": "webhook", "name": "Hook"}));

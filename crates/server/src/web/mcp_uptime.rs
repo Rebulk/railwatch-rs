@@ -14,18 +14,21 @@ impl Mcp<'_> {
         let limit = clamp(a.get("incidents"), 10, 50)?;
         let only = a.presence("monitor");
         let now = self.now;
+        let admin = self.environment_admin(env.application_id);
         let t = |m: i64| json!(crate::time::iso8601(m.div_euclid(1_000_000)));
         let (monitors, incidents, page) = self.env.control.with(|c| {
             let mut out = Vec::new();
             let mut matched = None;
+            let mut urls = std::collections::HashMap::new();
             for m in uptime::monitors(c, env.id)? {
+                urls.insert(m.id, m.url.clone());
                 if only.as_deref().is_some_and(|n| !n.eq_ignore_ascii_case(&m.name)) {
                     continue;
                 }
                 matched = Some(m.id);
                 let mut v = Map::new();
                 v.insert("name".into(), json!(m.name));
-                v.insert("url".into(), json!(m.url));
+                v.insert("url".into(), json!(uptime::shown_url(&m.url, admin)));
                 v.insert("status".into(), json!(m.status));
                 if let Some(s) = uptime::status_since(c, &m)? {
                     v.insert("since".into(), t(s));
@@ -40,7 +43,7 @@ impl Mcp<'_> {
                         last.insert("latency_ms".into(), json!(ms));
                     }
                     if let Some(e) = &m.last_error {
-                        last.insert("error".into(), json!(e));
+                        last.insert("error".into(), json!(uptime::shown_text(e, &m.url, admin)));
                     }
                     v.insert("last_check".into(), Value::Object(last));
                 }
@@ -89,7 +92,7 @@ impl Mcp<'_> {
                     v.insert("duration_seconds".into(), json!(i.duration_secs(now)));
                     v.insert("cause".into(), json!(i.cause));
                     if let Some(d) = i.detail {
-                        v.insert("detail".into(), json!(d));
+                        v.insert("detail".into(), json!(uptime::shown_text(&d, urls.get(&i.monitor_id).map_or("", String::as_str), admin)));
                     }
                     Value::Object(v)
                 })

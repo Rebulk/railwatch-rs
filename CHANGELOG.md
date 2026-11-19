@@ -7,6 +7,74 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+**Security fixes from the 2026-11-19 GA review**
+- lettre 0.11.23 → 0.11.24 (RUSTSEC-2026-0560 to 0565). An exception
+  message with a bare CR or LF could end an email alert's DATA early on a
+  lenient SMTP relay and run its own SMTP commands on the server's session.
+  Issue titles in email alerts and the weekly digest are now also put on one
+  line, and an email integration's recipient must be one plain address
+  (checked when it is set or the integration is enabled, so an older one
+  can still be disabled or deleted).
+- Trusted proxy (railwatch-sidecar): a proxied user stays in the proxy's
+  account with the role the proxy signed. They can no longer switch into,
+  create, delete or mint tokens for the user's other accounts, and an owner
+  signed as `member` acts as a member. The proxy's account is now stored
+  (`railwatch setup` binds the account it creates; an existing data dir is
+  bound to its lowest account on upgrade). If it is deleted, proxied
+  requests are refused instead of joining whichever account is first.
+  `railwatch setup` moves the binding to the account it creates when the
+  bound account has no members (one `railwatch env create` made before the
+  upgrade), and refuses, naming the account, when it has. A token created
+  through the proxy keeps the signed role as its ceiling
+  (`api_tokens.role_ceiling`, a new nullable column; existing tokens are
+  unchanged), so an owner signed as a member gets a member's token.
+- A panic in one request while it held the control database (for example
+  `PATCH /api/v1/issues/:id` racing the deletion of its environment) no
+  longer takes the server down for every account until a restart. The lock
+  is recovered, the issue update answers 404, and `/up` now answers 503 when
+  the control database does not, so a health check sees a wedged server.
+- Invitations: accepting one needs a verified email (anyone could set their
+  unverified email to the invited address and take the invitation), and an
+  inviter who is no longer an admin or owner cannot bring anyone in.
+  Removing an admin, or making them a member, withdraws the invitations
+  they sent.
+- Removing a member revokes their API tokens restricted to that account or
+  one of its applications. Through the trusted proxy, a user can replace or
+  revoke only tokens of the proxy's account, and the proxy demoting an
+  admin to member withdraws their pending invitations.
+- Changing your email now tells the old address and signs out your other
+  sessions, as a password change does.
+- Uptime monitors: members, and API/MCP tokens of members, see only the
+  host of a monitor's URL (on the Uptime page, MCP `uptime`, REST
+  `.../uptime`, and in uptime alerts on the Alerts pages), as for webhook
+  URLs; admins still see it whole. A failed check's error no longer repeats
+  the URL, nor does an uptime alert's `detail`. Changing a monitor's URL
+  replaces the old one with its host in that monitor's incidents, last
+  error and alerts.
+- Invitation emails (new and resent) are rate-limited to 20 an hour per
+  inviting user and per account. User and account names are at most 100
+  characters with no line breaks or control characters on every path that
+  sets them (sign-up, profile, new account, setup, Google sign-in, trusted
+  proxy), since they go into invitation subjects and bodies.
+- MCP: a string argument over 4 KB (64 KB for `add_comment`'s body) is
+  refused as invalid params (-32602) by every tool, instead of a long
+  `search_requests` query failing as an internal error.
+- Every MCP tool that returns telemetry (issue titles, exception messages,
+  log lines, paths, headers) now says in its description to read it as
+  data, never as instructions. docs/agent-webhooks.md recommends read-only,
+  account-restricted tokens for agents that run on their own.
+- `install.sh`: `--alert-webhook-secret-file`, `--alert-slack-file` and
+  `--backup-s3-secret-access-key-file` (a path, or `-` for stdin) keep
+  secrets out of `ps`; the old flags still work. The webhook secret and
+  Slack URL now reach `railwatch setup` through its environment
+  (`RAILWATCH_SETUP_ALERT_WEBHOOK_SECRET`, `RAILWATCH_SETUP_ALERT_SLACK`),
+  not its command line.
+- Frontend build: follow-redirects 1.16.1 -> 1.16.3 (pnpm override
+  `^1.16.2`). It is a build-time dependency of axios only and not in the
+  shipped bundle; `pnpm audit` is clean.
+- `/cable` bounds what one connection can make the server keep: messages up
+  to 4 KiB, subscribe identifiers up to 256 bytes, 16 subscriptions.
+
 ## v0.3.4 (2026-11-18)
 
 - The server builds for macOS again. Two Linux-only calls added in v0.3.1

@@ -38,6 +38,26 @@ pub struct Current {
     pub account: Option<Account>,
     pub user_agent: Option<String>,
     pub ip: String,
+    /// A trusted proxy's request (proxy_auth): the role it claimed. Such a
+    /// request is pinned to the proxy's account (`account`) and acts with
+    /// this role at most, whatever else the user is or has.
+    pub proxy_role: Option<String>,
+}
+
+impl Current {
+    /// The role to act with in the current account: the membership's, or
+    /// for a proxied request the claimed role (an owner signed as `member`
+    /// is a member here; ownership stays in the database).
+    pub fn effective_role(&self, membership: Option<String>) -> Option<String> {
+        match (&self.proxy_role, membership) {
+            (Some(claimed), Some(_)) => Some(claimed.clone()),
+            (_, m) => m,
+        }
+    }
+
+    pub fn is_proxied(&self) -> bool {
+        self.proxy_role.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -192,37 +212,44 @@ async fn middleware(State(state): State<Arc<WebState>>, mut req: Request, next: 
     let user_agent = req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(str::to_string);
     // Verified (and the header removed) by proxy_auth::layer.
     let proxied = req.extensions().get::<super::proxy_auth::Proxied>().map(|p| p.0.clone());
+    let proxy_role = proxied.as_ref().map(|c| c.role.clone());
 
     let resolved = state
         .db(move |c| {
             if let Some(claims) = proxied {
-                return c
-                    .tx(|tx| {
-                        let (s, u) = super::proxy_auth::resolve(tx, &claims)?;
-                        let account = find_account(tx, u.id, account_pref)?;
-                        Ok((Some(s), Some(u), account))
-                    })
-                    .map_err(|e| match e {
-                        control::ModelError::Sql(e) => e,
-                        // No account yet: setup has not run.
-                        control::ModelError::Invalid(m) => rusqlite::Error::InvalidParameterName(format!("trusted proxy: {m:?}")),
-                    });
+                let r = c.tx(|tx| {
+                    let (s, u, bound) = super::proxy_auth::resolve(tx, &claims)?;
+                    // Pinned to the proxy's account: never the account
+                    // cookie's choice among the user's other memberships.
+                    let account = find_account(tx, u.id, Some(bound))?.filter(|a| a.id == bound);
+                    Ok((Some(s), Some(u), account))
+                });
+                return match r {
+                    Ok(r) => Ok(Ok(r)),
+                    Err(control::ModelError::Sql(e)) => Err(e),
+                    // The proxy's account is gone, or setup has not run.
+                    Err(control::ModelError::Invalid(m)) => Ok(Err(m.into_iter().map(|(_, m)| m).collect::<Vec<_>>().join(", "))),
+                };
             }
             c.with(|conn| {
                 let Some(s) = session_id.map(|id| control::find_session(conn, id)).transpose()?.flatten() else {
-                    return Ok((None, None, None));
+                    return Ok(Ok((None, None, None)));
                 };
                 let user = control::find_user(conn, s.user_id)?;
                 let account = match &user {
                     Some(u) => find_account(conn, u.id, account_pref)?,
                     None => None,
                 };
-                Ok((Some(s), user, account))
+                Ok(Ok((Some(s), user, account)))
             })
         })
         .await;
     let (sess, user, account) = match resolved {
-        Ok(r) => r,
+        Ok(Ok(r)) => r,
+        Ok(Err(why)) => {
+            tracing::warn!(why, "trusted proxy request refused");
+            return (StatusCode::FORBIDDEN, "Forbidden: the trusted proxy has no account on this server").into_response();
+        }
         Err(e) => {
             tracing::error!(error = %e, "resolving the session failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response();
@@ -231,7 +258,7 @@ async fn middleware(State(state): State<Arc<WebState>>, mut req: Request, next: 
     // A session row without its user (deleted) is no session.
     let sess = sess.filter(|_| user.is_some());
     let had_session_cookie = session_id.is_some();
-    let current = Arc::new(Current { session: sess, user, account, user_agent, ip });
+    let current = Arc::new(Current { session: sess, user, account, user_agent, ip, proxy_role });
 
     let token = csrf_token(&session);
     let method = req.method().clone();

@@ -25,9 +25,16 @@
 //!   stops being, an owner: ownership moves only by transfer in Settings.
 //! - A valid header makes the request that user's, whatever cookies it
 //!   carries: created on first sight (verified, with a random password
-//!   nobody knows), a member of the server's first account only, with one
+//!   nobody knows), a member of the proxy's account only, with one
 //!   long-lived session row reused on every request. CSRF is unchanged:
 //!   a state-changing request still needs the session's token.
+//! - The proxy's account is bound in the control database (`trusted_proxy`,
+//!   control_schema): the account `railwatch setup` created. A proxied
+//!   request is pinned to it (session::Current::proxied): it cannot switch
+//!   to, create or mint tokens for another account, even when the email
+//!   is also a member elsewhere, and it acts with the claimed role, never
+//!   as an owner. With no bound account (deleted, or none yet) proxied
+//!   requests are refused; nobody is joined to some other account.
 //! - /mcp and /api/v1 take the same claims in place of a token
 //!   (mcp::Token::from_request): that user's dashboard access, refused
 //!   when the browser marks the request cross-origin (no CSRF token there).
@@ -43,15 +50,13 @@ use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 
-use crate::control::{self, Session, User};
+use crate::control::{self, MAX_NAME_CHARS, Session, User};
 
 pub const HEADER: &str = "x-railwatch-proxy-auth";
 /// The longest a signed header may be valid for.
 pub const MAX_TTL_SECS: i64 = 300;
 /// A header longer than this is refused before it is decoded.
 const MAX_HEADER_BYTES: usize = 4096;
-/// User.name's limit in the sign-up form.
-const MAX_NAME_CHARS: usize = 100;
 /// The user agent of the session row a proxied user is given.
 pub const SESSION_AGENT: &str = "railwatch trusted proxy";
 
@@ -132,21 +137,62 @@ pub async fn layer(state: axum::extract::State<std::sync::Arc<super::WebState>>,
     }
 }
 
-/// The session and user for verified claims, creating what is missing.
-/// Reads first and writes only on a change, so the common request is a few
-/// SELECTs. Proxied users belong to the server's first account (the one
-/// `railwatch setup` created) and only that one: the proxy fronts one app.
-pub fn resolve(c: &Connection, claims: &Claims) -> control::ModelResult<(Session, User)> {
-    let account: i64 = c
-        .query_row("SELECT id FROM accounts ORDER BY id LIMIT 1", [], |r| r.get(0))
-        .optional()?
-        .ok_or_else(|| control::ModelError::Invalid(vec![("base".into(), "no account yet: run `railwatch setup`".into())]))?;
+/// The account a trusted proxy's users belong to: the bound one, if it
+/// still exists. Never another account in its place.
+pub fn bound_account(c: &Connection) -> rusqlite::Result<Option<i64>> {
+    c.query_row("SELECT a.id FROM trusted_proxy t JOIN accounts a ON a.id = t.account_id WHERE t.id = 1", [], |r| r.get(0)).optional()
+}
+
+/// Binds the trusted proxy to `account`, the one `railwatch setup` creates.
+/// An existing binding is replaced only when nobody can sign in to the
+/// account it names (no members: deleted, or made by `railwatch env create`
+/// before setup ran, which the upgrade bound as the lowest account); one
+/// that people use is refused, naming it, rather than silently kept or
+/// moved under them.
+pub fn bind_account(c: &Connection, account: i64) -> control::ModelResult<()> {
+    let bound: Option<(i64, Option<String>, i64)> = c
+        .query_row(
+            "SELECT t.account_id, a.name, (SELECT count(*) FROM memberships m WHERE m.account_id = t.account_id)
+             FROM trusted_proxy t LEFT JOIN accounts a ON a.id = t.account_id WHERE t.id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    match bound {
+        Some((id, _, _)) if id == account => Ok(()),
+        Some((id, Some(name), members)) if members > 0 => Err(control::ModelError::Invalid(vec![(
+            "base".into(),
+            format!(
+                "the trusted proxy is bound to account {id} ({name:?}), which has members; \
+                 sign in and use that account, or delete it (Settings > Members) before running setup"
+            ),
+        )])),
+        _ => {
+            c.execute(
+                "INSERT INTO trusted_proxy (id, account_id, created_at) VALUES (1, ?1, ?2)
+                 ON CONFLICT (id) DO UPDATE SET account_id = ?1, created_at = ?2",
+                params![account, control::now_db()],
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// The session, user and account for verified claims, creating what is
+/// missing. Reads first and writes only on a change, so the common request
+/// is a few SELECTs. Proxied users belong to the proxy's bound account (the
+/// one `railwatch setup` created) and only that one: the proxy fronts one
+/// app. Invalid when that account is gone or was never bound.
+pub fn resolve(c: &Connection, claims: &Claims) -> control::ModelResult<(Session, User, i64)> {
+    let account = bound_account(c)?.ok_or_else(|| {
+        control::ModelError::Invalid(vec![("base".into(), "the trusted proxy's account does not exist (deleted, or `railwatch setup` has not run)".into())])
+    })?;
     let user = match control::find_user_by_email(c, &claims.email)? {
         Some(u) => u,
         None => {
             let mut b = [0u8; 32];
             getrandom::fill(&mut b).expect("random");
-            let name = if claims.name.trim().is_empty() { claims.email.clone() } else { claims.name.clone() };
+            let name = control::clean_name(if claims.name.trim().is_empty() { &claims.email } else { &claims.name });
             let id = control::insert_user(c, &name, &claims.email, &URL_SAFE_NO_PAD.encode(b), true)?;
             tracing::info!(user = id, email = %control::normalize_email(&claims.email), "trusted proxy: created user");
             control::find_user(c, id)?.expect("just created")
@@ -165,6 +211,10 @@ pub fn resolve(c: &Connection, claims: &Claims) -> control::ModelResult<(Session
                 "UPDATE memberships SET role = ?, updated_at = ? WHERE account_id = ? AND user_id = ?",
                 params![claims.role, control::now_db(), account, user.id],
             )?;
+            // As members_update: a demoted admin's pending invitations go.
+            if r == "admin" && claims.role == "member" {
+                control::withdraw_access(c, account, user.id, false)?;
+            }
         }
         Some(_) => {}
     }
@@ -175,7 +225,7 @@ pub fn resolve(c: &Connection, claims: &Claims) -> control::ModelResult<(Session
         Some(id) => id,
         None => control::create_session(c, user.id, Some(SESSION_AGENT), None)?,
     };
-    Ok((control::find_session(c, session)?.expect("session row"), user))
+    Ok((control::find_session(c, session)?.expect("session row"), user, account))
 }
 
 #[cfg(test)]
@@ -224,6 +274,50 @@ mod tests {
         assert!(verify(SECRET, truncated, 1_000).is_err());
     }
 
+    /// PR #106 review: an account made by `railwatch env create` before the
+    /// upgrade is bound by the migration (lowest id). Setup, run after, must
+    /// leave the proxy on the account it creates; an account with members
+    /// is never taken from under them.
+    #[test]
+    fn setup_rebinds_the_proxy_from_an_empty_account_and_refuses_a_used_one() {
+        let dir = std::env::temp_dir().join(format!("rw-proxy-bind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let control = control::Control::open(&dir.join("control.sqlite3")).unwrap();
+        let orphan = control.tx(|tx| control::insert_account(tx, "default", "default", 30)).unwrap();
+        control.with(|x| x.execute("INSERT INTO trusted_proxy (id, account_id, created_at) VALUES (1, ?, 'x')", [orphan])).unwrap();
+        let owner = control.tx(|tx| control::insert_user(tx, "Owner", "owner@example.com", &control::test_password(), true)).unwrap();
+        let made = control.tx(|tx| control::create_account(tx, "Acme", owner)).unwrap();
+        control.tx(|tx| bind_account(tx, made)).unwrap();
+        assert_eq!(control.with(bound_account).unwrap(), Some(made), "moved off the account nobody uses");
+
+        let other = control.tx(|tx| control::create_account(tx, "Other", owner)).unwrap();
+        let err = control.tx(|tx| bind_account(tx, other)).unwrap_err().to_string();
+        assert!(err.contains("Acme") && err.contains("has members"), "{err}");
+        assert_eq!(control.with(bound_account).unwrap(), Some(made), "a used account keeps the proxy");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// PR #106 review: the proxy demoting an admin to member withdraws the
+    /// invitations they sent, as Settings > Members does.
+    #[test]
+    fn a_proxy_demotion_withdraws_the_admins_invitations() {
+        let dir = std::env::temp_dir().join(format!("rw-proxy-demote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let control = control::Control::open(&dir.join("control.sqlite3")).unwrap();
+        let owner = control.tx(|tx| control::insert_user(tx, "Owner", "owner@example.com", &control::test_password(), true)).unwrap();
+        let account = control.tx(|tx| control::create_account(tx, "Acme", owner)).unwrap();
+        control.tx(|tx| bind_account(tx, account)).unwrap();
+        let c = |role: &str| Claims { email: "ada@example.com".into(), name: "Ada".into(), role: role.into(), exp: 0 };
+        let (_, ada, _) = control.tx(|tx| resolve(tx, &c("admin"))).unwrap();
+        control.tx(|tx| control::create_invitation(tx, account, ada.id, "alt@evil.test", "admin")).unwrap();
+        control.tx(|tx| resolve(tx, &c("member"))).unwrap();
+        let left: i64 = control.with(|x| x.query_row("SELECT count(*) FROM invitations", [], |r| r.get(0))).unwrap();
+        assert_eq!(left, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn first_sight_provisions_once_and_role_follows_the_proxy() {
         let dir = std::env::temp_dir().join(format!("rw-proxy-auth-{}", std::process::id()));
@@ -231,11 +325,13 @@ mod tests {
         let control = control::Control::open(&dir.join("control.sqlite3")).unwrap();
         let owner = control.tx(|tx| control::insert_user(tx, "Owner", "owner@example.com", &control::test_password(), true)).unwrap();
         let account = control.tx(|tx| control::create_account(tx, "Acme", owner)).unwrap();
+        control.tx(|tx| bind_account(tx, account)).unwrap();
         let c = |role: &str| Claims { email: "Ada@Example.com".into(), name: "Ada".into(), role: role.into(), exp: 0 };
 
-        let (s1, u1) = control.tx(|tx| resolve(tx, &c("member"))).unwrap();
+        let (s1, u1, a1) = control.tx(|tx| resolve(tx, &c("member"))).unwrap();
+        assert_eq!(a1, account);
         assert_eq!((u1.email.as_str(), u1.verified, s1.user_id), ("ada@example.com", true, u1.id));
-        let (s2, u2) = control.tx(|tx| resolve(tx, &c("admin"))).unwrap();
+        let (s2, u2, _) = control.tx(|tx| resolve(tx, &c("admin"))).unwrap();
         assert_eq!((s2.id, u2.id), (s1.id, u1.id), "the same user and session row every time");
         let role = |user: i64| -> String {
             control.with(|x| x.query_row("SELECT role FROM memberships WHERE account_id = ? AND user_id = ?", params![account, user], |r| r.get(0))).unwrap()
@@ -247,10 +343,10 @@ mod tests {
 
         // A second account (made in the UI) is not the proxy's to grant.
         let other = control.tx(|tx| control::create_account(tx, "Other", owner)).unwrap();
-        let (_, eve) = control.tx(|tx| resolve(tx, &Claims { email: "eve@example.com".into(), name: "Eve".into(), role: "admin".into(), exp: 0 })).unwrap();
+        let (_, eve, _) = control.tx(|tx| resolve(tx, &Claims { email: "eve@example.com".into(), name: "Eve".into(), role: "admin".into(), exp: 0 })).unwrap();
         let accounts: Vec<i64> =
             control.with(|x| x.prepare("SELECT account_id FROM memberships WHERE user_id = ?")?.query_map([eve.id], |r| r.get(0))?.collect()).unwrap();
-        assert_eq!(accounts, vec![account], "proxied users join the first account only, never {other}");
+        assert_eq!(accounts, vec![account], "proxied users join the bound account only, never {other}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

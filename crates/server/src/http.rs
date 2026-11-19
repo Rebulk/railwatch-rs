@@ -138,6 +138,14 @@ fn route(method: &Method, path: &str) -> Option<Action> {
 async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let path = req.uri().path().to_string();
     if path == "/up" && matches!(*req.method(), Method::GET | Method::HEAD) {
+        // Healthy only if the control database answers (one small read),
+        // so a wedged process fails its health check and gets restarted.
+        let control = state.control.clone();
+        let db_ok =
+            tokio::task::spawn_blocking(move || control.with(|c| c.query_row("SELECT count(*) FROM railwatch_migrations", [], |r| r.get::<_, i64>(0)))).await;
+        if !matches!(db_ok, Ok(Ok(_))) {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         return (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/html; charset=utf-8")],

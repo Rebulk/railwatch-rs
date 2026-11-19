@@ -75,6 +75,11 @@ pub struct WebState {
     pub provisioning_limit: FixedWindow<i64>,
     /// IntegrationsController#send_test: 5 a minute per user.
     pub send_test_limit: FixedWindow<i64>,
+    /// Invitation emails (new and resent): 20 an hour per inviting user,
+    /// and 20 an hour per account, so they cannot mail-bomb a list
+    /// through the server's SMTP identity.
+    pub invitation_user_limit: FixedWindow<i64>,
+    pub invitation_account_limit: FixedWindow<i64>,
     /// Encrypts integration secrets (alerts::integration).
     pub settings_cipher: crate::alerts::integration::SettingsCipher,
     /// McpController's preauth-ip limit: 300 a minute per IP, before the
@@ -114,6 +119,8 @@ impl WebState {
             verification_limit: FixedWindow::with_window(20, Duration::from_secs(3600)),
             provisioning_limit: FixedWindow::with_window(30, Duration::from_secs(3600)),
             send_test_limit: FixedWindow::with_window(5, Duration::from_secs(60)),
+            invitation_user_limit: FixedWindow::with_window(20, Duration::from_secs(3600)),
+            invitation_account_limit: FixedWindow::with_window(20, Duration::from_secs(3600)),
             settings_cipher: crate::alerts::integration::SettingsCipher::new(&secret),
             mcp_preauth_limit: mcp::preauth_limit(),
             api_rate_limit: api::rate_limit(),

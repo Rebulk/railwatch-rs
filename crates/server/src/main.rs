@@ -43,6 +43,8 @@ const USAGE: &str = "usage:
   railwatch serve
   railwatch setup [--email E] [--password-stdin] [--name NAME] [--account NAME] [--app NAME] [--env NAME]
                   [--alert-webhook URL [--alert-webhook-secret S]] [--alert-slack URL] [--alert-email ADDR]
+                  (the secret and the Slack URL may instead come from RAILWATCH_SETUP_ALERT_WEBHOOK_SECRET
+                  and RAILWATCH_SETUP_ALERT_SLACK, kept off the command line)
   railwatch env list
   railwatch env create <slug> [--retention-days N]
   railwatch env import <slug> <token_digest> [--retention-days N]
@@ -498,6 +500,8 @@ fn setup(rest: &[&str]) -> ExitCode {
     let result = control.tx(|tx| {
         let user = control::insert_user(tx, &name, &email, &password, true)?;
         let account = control::create_account(tx, &account, user)?;
+        // A trusted proxy (if one is ever configured) fronts this account only.
+        web::proxy_auth::bind_account(tx, account)?;
         let (slug, prefix) = control::application_defaults(&app, None);
         let app = control::insert_application(tx, account, app.trim(), &slug, &prefix, None, "main")?;
         let (env_id, token) = control::create_environment(tx, app, &env)?;
@@ -569,7 +573,13 @@ fn setup_alerts(rest: &[&str], cfg: &Config) -> Result<SetupAlerts, String> {
         out.push((kind, name.to_string(), settings));
         Ok(())
     };
-    let secret = flag(rest, "--alert-webhook-secret");
+    // The secrets may come through the environment instead of argv, where
+    // `ps` and /proc/<pid>/cmdline show them to every local user
+    // (install.sh passes them so); /proc/<pid>/environ is the owner's only.
+    let from_env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let env_secret = from_env("RAILWATCH_SETUP_ALERT_WEBHOOK_SECRET");
+    let env_slack = from_env("RAILWATCH_SETUP_ALERT_SLACK");
+    let secret = flag(rest, "--alert-webhook-secret").or(env_secret.as_deref());
     if secret.is_some() && flag(rest, "--alert-webhook").is_none() {
         return Err("--alert-webhook-secret needs --alert-webhook".into());
     }
@@ -580,7 +590,7 @@ fn setup_alerts(rest: &[&str], cfg: &Config) -> Result<SetupAlerts, String> {
         }
         add("webhook", "Webhook", pairs)?;
     }
-    if let Some(url) = flag(rest, "--alert-slack") {
+    if let Some(url) = flag(rest, "--alert-slack").or(env_slack.as_deref()) {
         add("slack", "Slack", vec![("webhook_url", url.to_string())])?;
     }
     if let Some(addr) = flag(rest, "--alert-email") {

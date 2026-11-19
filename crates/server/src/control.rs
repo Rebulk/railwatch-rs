@@ -140,6 +140,32 @@ fn invalid<T>(attr: &str, message: &str) -> ModelResult<T> {
     Err(ModelError::Invalid(vec![(attr.into(), message.into())]))
 }
 
+/// The longest user or account name (User.name's limit in the sign-up form).
+/// Names go into email subjects and bodies (invitations), so they are short
+/// and have no control characters.
+pub const MAX_NAME_CHARS: usize = 100;
+
+/// A user's or account's name: present, at most MAX_NAME_CHARS, no control
+/// characters (a line break included).
+pub fn name_errors(name: &str) -> Vec<(String, String)> {
+    let name = name.trim();
+    if name.is_empty() {
+        vec![("name".into(), "can't be blank".into())]
+    } else if name.chars().count() > MAX_NAME_CHARS {
+        vec![("name".into(), format!("is too long (maximum is {MAX_NAME_CHARS} characters)"))]
+    } else if name.chars().any(char::is_control) {
+        vec![("name".into(), "can't contain line breaks or control characters".into())]
+    } else {
+        Vec::new()
+    }
+}
+
+/// A name from elsewhere (an identity provider) made acceptable: control
+/// characters become spaces, then it is cut to MAX_NAME_CHARS.
+pub fn clean_name(name: &str) -> String {
+    name.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().chars().take(MAX_NAME_CHARS).collect::<String>().trim().to_string()
+}
+
 fn unique_violation(e: &rusqlite::Error) -> bool {
     matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
 }
@@ -210,12 +236,12 @@ impl Control {
     }
 
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> rusqlite::Result<T> {
-        f(&self.conn.lock().unwrap())
+        f(&self.conn())
     }
 
     /// A write that may fail validation, in one IMMEDIATE transaction.
     pub fn tx<T>(&self, f: impl FnOnce(&rusqlite::Transaction) -> ModelResult<T>) -> ModelResult<T> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let out = f(&tx)?;
         tx.commit()?;
@@ -338,8 +364,24 @@ impl Control {
         })
     }
 
+    /// The one control connection, for every account. A panic while it was
+    /// held (a handler bug) must not take the server down for everyone: the
+    /// lock is recovered, not unwrapped. The connection itself is sound (a
+    /// rusqlite Transaction rolls back when the panic drops it); anything
+    /// a bare `BEGIN` left open is rolled back here.
     pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap()
+        match self.conn.lock() {
+            Ok(c) => c,
+            Err(poisoned) => {
+                self.conn.clear_poison();
+                let c = poisoned.into_inner();
+                if !c.is_autocommit() {
+                    let _ = c.execute_batch("ROLLBACK");
+                }
+                tracing::error!("control database lock recovered after a panic");
+                c
+            }
+        }
     }
 }
 
@@ -348,8 +390,9 @@ impl Control {
 
 /// Account.create!(name:) with assign_slug; a self-hosted plan, no billing.
 pub fn insert_account(tx: &Connection, name: &str, slug: &str, retention_days: i64) -> ModelResult<i64> {
-    if name.trim().is_empty() {
-        return invalid("name", "can't be blank");
+    let errors = name_errors(name);
+    if !errors.is_empty() {
+        return Err(ModelError::Invalid(errors));
     }
     let now = now_db();
     match tx.execute(
@@ -583,9 +626,7 @@ pub fn validate_new_user(name: &str, email: &str, password: &str, confirmation: 
     if confirmation.is_some_and(|c| c != password) {
         e.push(("password_confirmation".into(), "doesn't match Password".into()));
     }
-    if name.trim().is_empty() {
-        e.push(("name".into(), "can't be blank".into()));
-    }
+    e.extend(name_errors(name));
     if email.is_empty() {
         e.push(("email".into(), "can't be blank".into()));
     } else if !valid_email(email) {
@@ -668,8 +709,13 @@ pub fn authenticate_by(c: &Connection, email: &str, password: &str) -> rusqlite:
     }
 }
 
-/// User.create! for sign-up and setup. The caller validated.
+/// User.create! for sign-up and setup. The caller validated, except the
+/// name, which is checked here for every path (name_errors).
 pub fn insert_user(tx: &Connection, name: &str, email: &str, password: &str, verified: bool) -> ModelResult<i64> {
+    let errors = name_errors(name);
+    if !errors.is_empty() {
+        return Err(ModelError::Invalid(errors));
+    }
     let now = now_db();
     match tx.execute(
         "INSERT INTO users (name, email, password_digest, verified, terms_accepted_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5)",
@@ -785,13 +831,25 @@ pub fn find_invitation_by_token(c: &Connection, raw: &str) -> rusqlite::Result<O
 #[derive(Debug, PartialEq)]
 pub enum AcceptError {
     RecipientMismatch,
+    /// The user's address is not verified: anyone can set their email to an
+    /// unused address with their own password, so an unverified match does
+    /// not prove they own the invited mailbox.
+    Unverified,
     Unavailable,
 }
 
 /// Invitation#accept!: the conditional UPDATE is the linearisation point.
+/// Only for a user who verified the invited address, and only while the
+/// inviter is still an admin or owner of the account.
 pub fn accept_invitation(tx: &Connection, inv: &Invitation, user: &User, raw: &str) -> ModelResult<Result<(), AcceptError>> {
     if inv.email != normalize_email(&user.email) {
         return Ok(Err(AcceptError::RecipientMismatch));
+    }
+    if !user.verified {
+        return Ok(Err(AcceptError::Unverified));
+    }
+    if !matches!(membership_role(tx, inv.account_id, inv.inviter_id)?.as_deref(), Some("owner" | "admin")) {
+        return Ok(Err(AcceptError::Unavailable));
     }
     let now = now_db();
     let claimed = tx.execute(
@@ -803,6 +861,22 @@ pub fn accept_invitation(tx: &Connection, inv: &Invitation, user: &User, raw: &s
     }
     insert_membership(tx, inv.account_id, user.id, &inv.role)?;
     Ok(Ok(()))
+}
+
+/// What a user loses with their place in an account (removed, or an admin
+/// made a member): the invitations they sent there, so they cannot come
+/// back through one, and (when removed) their tokens restricted to that
+/// account or one of its applications.
+pub fn withdraw_access(tx: &Connection, account_id: i64, user_id: i64, removed: bool) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM invitations WHERE account_id = ? AND inviter_id = ? AND accepted_at IS NULL", params![account_id, user_id])?;
+    if removed {
+        tx.execute(
+            "UPDATE api_tokens SET revoked_at = ?1, updated_at = ?1 WHERE user_id = ?2 AND revoked_at IS NULL
+               AND (account_id = ?3 OR application_id IN (SELECT id FROM applications WHERE account_id = ?3))",
+            params![now_db(), user_id, account_id],
+        )?;
+    }
+    Ok(())
 }
 
 /// ApiToken.issue!: "rwp_" + base58(40), SHA-256 digest stored.
@@ -849,6 +923,35 @@ pub(crate) fn test_password() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// GA hunt H1: a panic while a request holds the control connection
+    /// (one handler's bug) must not fail every later request of every
+    /// account; nor may a transaction it left open leak into the next.
+    #[test]
+    fn a_panic_holding_the_control_lock_does_not_break_the_next_request() {
+        let dir = std::env::temp_dir().join(format!("rw-control-poison-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.with::<()>(|x| {
+                x.execute_batch(
+                    "BEGIN IMMEDIATE; INSERT INTO users (name, email, password_digest, created_at, updated_at) VALUES ('x', 'x@x.test', 'd', 'x', 'x');",
+                )?;
+                panic!("a handler bug");
+            })
+        }));
+        assert!(panicked.is_err());
+        let users: i64 = c.with(|x| x.query_row("SELECT count(*) FROM users", [], |r| r.get(0))).expect("the next request works");
+        assert_eq!(users, 0, "the half-done write was rolled back");
+        assert!(c.conn().is_autocommit());
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c.tx::<()>(|_| panic!("inside a transaction"));
+        }));
+        assert!(panicked.is_err());
+        c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).expect("writes work too");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     fn temp() -> (std::path::PathBuf, Control) {
@@ -954,6 +1057,46 @@ mod tests {
         assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &newbie, &inv.token)).unwrap(), Ok(()));
         assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &newbie, &inv.token)).unwrap(), Err(AcceptError::Unavailable));
         assert_eq!(c.with(|x| membership_role(x, account, newbie.id)).unwrap().as_deref(), Some("member"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn names_are_present_short_and_on_one_line() {
+        assert!(name_errors("Ada").is_empty());
+        assert!(name_errors(&"é".repeat(MAX_NAME_CHARS)).is_empty());
+        assert_eq!(name_errors(" ")[0].1, "can't be blank");
+        assert!(name_errors(&"x".repeat(MAX_NAME_CHARS + 1))[0].1.contains("too long"));
+        assert!(name_errors("a\r\nb")[0].1.contains("control"));
+        assert_eq!(clean_name(" Ada\r\nLovelace\t"), "Ada  Lovelace");
+        assert_eq!(clean_name(&"x".repeat(300)).len(), MAX_NAME_CHARS);
+        let (dir, c) = temp();
+        assert!(matches!(c.tx(|tx| insert_user(tx, "a\nb", "a@example.com", &test_password(), true)), Err(ModelError::Invalid(_))), "every path");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// GA hunt H3 and H2: the address must be verified (anyone can set
+    /// their email to an unused address), and the inviter must still be an
+    /// admin or owner of the account when it is accepted.
+    #[test]
+    fn an_invitation_needs_a_verified_recipient_and_an_inviter_still_in_charge() {
+        let (dir, c) = temp();
+        let owner = c.tx(|tx| insert_user(tx, "Owner", "o@example.com", &test_password(), true)).unwrap();
+        let account = c.tx(|tx| create_account(tx, "Acme", owner)).unwrap();
+        let inv = c.tx(|tx| create_invitation(tx, account, owner, "new@example.com", "admin")).unwrap();
+        let found = c.with(|x| find_invitation_by_token(x, &inv.token)).unwrap().unwrap();
+        let squatter = c.tx(|tx| insert_user(tx, "Eve", "new@example.com", &test_password(), false)).unwrap();
+        let squatter = c.with(|x| find_user(x, squatter)).unwrap().unwrap();
+        assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &squatter, &inv.token)).unwrap(), Err(AcceptError::Unverified));
+        assert_eq!(c.with(|x| membership_role(x, account, squatter.id)).unwrap(), None);
+
+        let admin = c.tx(|tx| insert_user(tx, "Adam", "adam@example.com", &test_password(), true)).unwrap();
+        c.tx(|tx| insert_membership(tx, account, admin, "admin")).unwrap();
+        let inv = c.tx(|tx| create_invitation(tx, account, admin, "alt@example.com", "admin")).unwrap();
+        let alt = c.tx(|tx| insert_user(tx, "Alt", "alt@example.com", &test_password(), true)).unwrap();
+        let alt = c.with(|x| find_user(x, alt)).unwrap().unwrap();
+        c.with(|x| x.execute("UPDATE memberships SET role = 'member' WHERE user_id = ?", [admin])).unwrap();
+        let found = c.with(|x| find_invitation_by_token(x, &inv.token)).unwrap().unwrap();
+        assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &alt, &inv.token)).unwrap(), Err(AcceptError::Unavailable), "the inviter is no longer an admin");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -476,3 +476,16 @@ fn an_invalid_utf8_type_is_rejected_alone_with_a_scrubbed_type() {
     let stored: String = s.tenant().query_row("SELECT rejections FROM ingest_batches", [], |r| r.get(0)).unwrap();
     assert!(stored.contains("log\u{fffd}\u{fffd}-x"), "{stored}");
 }
+
+/// GA hunt H1: /up is the health check a load balancer or Kamal restarts
+/// on, so it answers 200 only while the control database answers.
+#[test]
+fn up_fails_when_the_control_database_does_not_answer() {
+    let s = start(0, 0);
+    assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 200);
+    // A control database whose read fails (here: the table it reads is gone).
+    s.control.with(|c| c.execute_batch("ALTER TABLE railwatch_migrations RENAME TO broken")).unwrap();
+    assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 503, "a control database that fails its read fails the health check");
+    s.control.with(|c| c.execute_batch("ALTER TABLE broken RENAME TO railwatch_migrations")).unwrap();
+    assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 200);
+}
