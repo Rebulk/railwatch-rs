@@ -155,7 +155,12 @@ open handle keeps an unlinked file's space allocated: idle dashboard readers
 are dropped, a reader checked out at the time is dropped when it is
 returned, ingest writers drop cached day files, and the worker re-attaches
 its own union readers; the budget does this before it reads free space.
-Single-file environments
+With several accounts the budget is split max-min fairly
+(`trim_fair`): only accounts over their share lose days (furthest over
+first), and only they are refused when nothing older is left
+(`State::admit(account)`); telemetry no environment owns is an account of
+its own. Source maps count (per environment) but are bounded by
+`storage::sourcemaps`, not trimmed. Single-file environments
 count against the budget but are never trimmed (split them). Every deletion
 and every crossing is logged (docs/SELF-HOST.md, "Disk budget").
 

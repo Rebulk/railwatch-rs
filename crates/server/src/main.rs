@@ -1374,6 +1374,16 @@ fn serve() -> ExitCode {
         let (followups_tx, followups_rx) = followups::channel();
         let tenants = Tenants::new(cfg.tenants_dir(), Duration::from_secs(cfg.tenant_idle_seconds), followups_tx);
         let disk = tenants.disk();
+        // The disk budget shares max_data_bytes fairly between accounts.
+        {
+            let c = control.clone();
+            disk.set_owners(Box::new(move || {
+                c.with(control::slug_accounts).unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "disk budget: cannot read environment owners");
+                    Default::default()
+                })
+            }));
+        }
         let state = Arc::new(AppState {
             control: control.clone(),
             tenants: tenants.clone(),

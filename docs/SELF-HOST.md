@@ -413,6 +413,19 @@ settings bound it; both are off unless set:
 `railwatch doctor` shows both. Size the budget below the volume's free
 space minus `MIN_FREE_BYTES`, so the budget acts first.
 
+**Several accounts on one server.** `MAX_DATA_BYTES` is shared fairly:
+each account may keep an equal share, and an account using less than its
+share leaves the rest to the others (max-min fairness). When telemetry is
+over the budget, only accounts over their share lose days, the one furthest
+over first and its own oldest days first; an account within its share
+never loses data to make room for another's growth. With nothing older
+left to delete, only the accounts still over their share get the 503;
+the others keep ingesting. With one account (the usual self-host) this is
+exactly the behaviour above. Source maps (`sourcemaps/`) count toward the
+budget and toward their environment's account, but are bounded per
+environment instead of deleted by it (200 MiB and the 10 newest deploys).
+`MIN_FREE_BYTES` stays server-wide: below the floor nobody can write.
+
 ## Weekly digest
 
 Every Monday at 08:00 UTC the server emails each account member who has

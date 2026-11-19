@@ -199,7 +199,7 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
         return rate_limited();
     }
     if action != Action::Ping
-        && let Err(why) = state.disk.admit().await
+        && let Err(why) = state.disk.admit(env.account_id).await
     {
         return disk_refused(why);
     }

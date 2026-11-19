@@ -56,12 +56,20 @@ impl Budget {
 pub const TRIM_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What the ingest path reads, written by the budget thread.
-#[derive(Debug, Default)]
+/// slug -> account id, for `State::set_owners`.
+pub type Owners = Box<dyn Fn() -> std::collections::HashMap<String, i64> + Send + Sync>;
+
+#[derive(Default)]
 pub struct State {
     /// Free space is under the floor: ingest answers 503.
     low_space: AtomicBool,
-    /// Still over max_data_bytes after deleting all it may.
-    over_budget: AtomicBool,
+    /// Still over max_data_bytes after deleting all it may: every account
+    /// (`None`, a server whose environments' owners are unknown) or the
+    /// accounts over their share (`Some`).
+    over_budget: Mutex<Option<std::collections::HashSet<i64>>>,
+    /// Whose environment each telemetry directory is (slug -> account id),
+    /// read at each pass; unset, every directory is one account.
+    owners: Mutex<Option<Owners>>,
     /// Ingest requests refused while low (logged on recovery).
     refused: AtomicU64,
     /// Ingest requests refused over max_data_bytes (logged by the pass).
@@ -96,12 +104,14 @@ pub enum Refusal {
 }
 
 impl State {
-    /// Before an ingest write. Over max_data_bytes by the estimate, it
-    /// wakes the budget pass and waits up to TRIM_WAIT for it to trim; a
+    /// Before an ingest write by `account`. Over max_data_bytes by the
+    /// estimate, it wakes the budget pass and waits up to TRIM_WAIT for it
+    /// to trim; it is then refused only when the last pass found its
+    /// account over its share (every account, when owners are unknown). A
     /// refusal is counted.
-    pub async fn admit(&self) -> Result<(), Refusal> {
+    pub async fn admit(&self, account: i64) -> Result<(), Refusal> {
         let deadline = tokio::time::Instant::now() + TRIM_WAIT;
-        while self.over_estimate() && !self.over_budget.load(Ordering::Relaxed) {
+        while self.over_estimate() && !self.refuses(account) {
             // Notified by every pass that ends from here on, polled or not.
             let passed = self.passed.notified();
             self.wake();
@@ -113,11 +123,31 @@ impl State {
             self.refused.fetch_add(1, Ordering::Relaxed);
             return Err(Refusal::LowSpace);
         }
-        if self.over_budget.load(Ordering::Relaxed) || self.over_estimate() {
+        // Owners unknown (one account): over the estimate after the wait is
+        // refused too, as before. With owners, only accounts the pass found
+        // over their share are, so a burst from one account never refuses
+        // another's ingest.
+        let unknown = self.owners.lock().unwrap().is_none();
+        if self.refuses(account) || (unknown && self.over_estimate()) {
             self.refused_over.fetch_add(1, Ordering::Relaxed);
             return Err(Refusal::OverBudget);
         }
         Ok(())
+    }
+
+    fn refuses(&self, account: i64) -> bool {
+        match &*self.over_budget.lock().unwrap() {
+            None => false,
+            Some(over) if self.owners.lock().unwrap().is_none() => !over.is_empty(),
+            Some(over) => over.contains(&account),
+        }
+    }
+
+    /// How the budget pass learns which account each environment directory
+    /// belongs to (serve: from the control DB). Unset, the whole server is
+    /// one account: oldest days go first across every environment.
+    pub fn set_owners(&self, owners: Owners) {
+        *self.owners.lock().unwrap() = Some(owners);
     }
 
     /// The ingest writers, after each commit: `bytes` (see `take_written`)
@@ -189,6 +219,11 @@ pub struct Trimmed {
     pub core_through: Vec<(String, String)>,
     /// Telemetry bytes after the pass.
     pub used: u64,
+    /// Still over max_data_bytes: the accounts over their fair share
+    /// (0 is every directory when owners are unknown, -1 telemetry no
+    /// environment owns). Their ingest is refused until a pass finds them
+    /// within it; other accounts' is not.
+    pub over: Vec<i64>,
 }
 
 /// A database file with its -wal and -shm. With a live WAL, the main file
@@ -220,53 +255,129 @@ fn wal_db_bytes(path: &Path) -> Option<u64> {
 
 /// Bytes under `tenants_dir`, and its per-day environments. A single-file
 /// (Rails layout) environment counts but cannot be trimmed by file
-/// (`railwatch split` it).
+/// (`railwatch split` it). Source maps (the `sourcemaps/` directory beside
+/// `tenants_dir`) count too; they are bounded per environment instead of
+/// trimmed (storage::sourcemaps).
 pub fn usage(tenants_dir: &Path) -> (u64, Vec<PathBuf>) {
-    let mut total = 0;
-    let mut dirs = Vec::new();
-    for e in std::fs::read_dir(tenants_dir).into_iter().flatten().flatten() {
-        let path = e.path();
-        if path.is_dir() && layout::meta_path(&path).is_file() {
-            total += layout::all_files(&path).iter().map(|f| file_bytes(f)).sum::<u64>();
-            dirs.push(path);
-        } else if path.extension().is_some_and(|x| x == "sqlite3") {
-            total += file_bytes(&path);
-        }
-    }
+    let per = usage_by_slug(tenants_dir);
+    let total = per.iter().map(|(_, b, _)| b).sum();
+    let mut dirs: Vec<PathBuf> = per.into_iter().filter_map(|(_, _, d)| d).collect();
     dirs.sort();
     (total, dirs)
 }
 
+/// Bytes per environment slug: (slug, bytes, its per-day directory).
+fn usage_by_slug(tenants_dir: &Path) -> Vec<(String, u64, Option<PathBuf>)> {
+    let mut out: std::collections::BTreeMap<String, (u64, Option<PathBuf>)> = Default::default();
+    for e in std::fs::read_dir(tenants_dir).into_iter().flatten().flatten() {
+        let path = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        if path.is_dir() && layout::meta_path(&path).is_file() {
+            let entry = out.entry(name).or_default();
+            entry.0 += layout::all_files(&path).iter().map(|f| file_bytes(f)).sum::<u64>();
+            entry.1 = Some(path);
+        } else if let Some(slug) = name.strip_suffix(".sqlite3") {
+            out.entry(slug.to_string()).or_default().0 += file_bytes(&path);
+        }
+    }
+    let maps = sourcemaps_dir(tenants_dir);
+    for e in (tenants_dir.file_name() == Some(std::ffi::OsStr::new("telemetry"))).then(|| std::fs::read_dir(&maps)).into_iter().flatten().flatten().flatten() {
+        let slug = e.file_name().to_string_lossy().into_owned();
+        out.entry(slug.clone()).or_default().0 += super::sourcemaps::env_bytes(&maps, &slug);
+    }
+    out.into_iter().map(|(s, (b, d))| (s, b, d)).collect()
+}
+
+/// `<data_dir>/sourcemaps`, beside `<data_dir>/telemetry`.
+fn sourcemaps_dir(tenants_dir: &Path) -> PathBuf {
+    tenants_dir.with_file_name("sourcemaps")
+}
+
+/// The fair share each account may keep when `max_bytes` must be split
+/// among accounts using `used` bytes each (max-min fairness): an account
+/// under the level keeps all it has, the rest share what is left equally.
+fn water_level(used: &[u64], max_bytes: u64) -> u64 {
+    let mut sorted = used.to_vec();
+    sorted.sort_unstable();
+    let mut left = max_bytes;
+    for (i, u) in sorted.iter().enumerate() {
+        let level = left / (sorted.len() - i) as u64;
+        if *u > level {
+            return level;
+        }
+        left -= u;
+    }
+    u64::MAX
+}
+
 /// Deletes the oldest day files until the telemetry under `tenants_dir`
-/// fits `max_bytes`: detail days oldest first across environments, then
-/// core days (each with its detail day). Days on or after `today` stay.
-/// Files go while holding their meta file's write lock, as retention
-/// deletes them, so no batch is writing into one.
+/// fits `max_bytes`. Days on or after `today` stay. Files go while holding
+/// their meta file's write lock, as retention deletes them, so no batch is
+/// writing into one.
+///
+/// `owners` (slug -> account) makes it fair between accounts: each gets
+/// the max-min fair share of `max_bytes`, only accounts over it lose days
+/// (the one furthest over first, its own oldest detail day, then its oldest
+/// core day with its detail day), and an account under it never loses
+/// anything to make room for another's growth. Accounts still over their
+/// share afterwards (only today's files left) are in `Trimmed::over`.
+/// Without owners every directory is one account: oldest detail day across
+/// environments first, then core days.
 pub fn trim(tenants_dir: &Path, max_bytes: u64, today: &str) -> rusqlite::Result<Trimmed> {
-    let (mut used, dirs) = usage(tenants_dir);
+    trim_fair(tenants_dir, max_bytes, today, None)
+}
+
+pub fn trim_fair(tenants_dir: &Path, max_bytes: u64, today: &str, owners: Option<&std::collections::HashMap<String, i64>>) -> rusqlite::Result<Trimmed> {
+    let per = usage_by_slug(tenants_dir);
+    let mut used: u64 = per.iter().map(|(_, b, _)| b).sum();
     let mut out = Trimmed { used, ..Default::default() };
     if used <= max_bytes {
         return Ok(out);
     }
+    // Account of each slug: unknown slugs (no environment) are one account
+    // of their own, never charged to anyone else's share.
+    let account = |slug: &str| owners.map_or(0, |o| o.get(slug).copied().unwrap_or(-1));
+    let mut by_account: std::collections::BTreeMap<i64, u64> = Default::default();
+    for (slug, b, _) in &per {
+        *by_account.entry(account(slug)).or_default() += b;
+    }
+    let level = water_level(&by_account.values().copied().collect::<Vec<_>>(), max_bytes);
+    // Each account's deletable days, in deletion order: detail days oldest
+    // first across its environments, then core days.
+    let mut queue: std::collections::BTreeMap<i64, std::collections::VecDeque<(Tier, String, PathBuf)>> = Default::default();
     for tier in [Tier::Detail, Tier::Core] {
-        let mut days: Vec<(String, &PathBuf)> = Vec::new();
-        for dir in &dirs {
-            days.extend(layout::days(dir, tier).into_iter().filter(|d| d.as_str() < today).map(|d| (d, dir)));
+        let mut days: Vec<(i64, String, PathBuf)> = Vec::new();
+        for (slug, _, dir) in &per {
+            let Some(dir) = dir else { continue };
+            days.extend(layout::days(dir, tier).into_iter().filter(|d| d.as_str() < today).map(|d| (account(slug), d, dir.clone())));
         }
         days.sort();
-        for (day, dir) in days {
-            if used <= max_bytes {
-                break;
-            }
-            let meta: Connection = crate::tenants::open_tenant(&layout::meta_path(dir))?;
+        for (acct, day, dir) in days {
+            queue.entry(acct).or_default().push_back((tier, day, dir));
+        }
+    }
+    while used > max_bytes {
+        // The account furthest over its share that still has a day to give.
+        let Some(acct) = by_account
+            .iter()
+            .filter(|(a, u)| **u > level && queue.get(a).is_some_and(|q| !q.is_empty()))
+            .max_by_key(|(a, u)| (**u - level, std::cmp::Reverse(**a)))
+            .map(|(a, _)| *a)
+        else {
+            break;
+        };
+        let (tier, day, dir) = queue.get_mut(&acct).unwrap().pop_front().unwrap();
+        // A core day goes with its detail day, which may be gone already.
+        let detail = layout::day_path(&dir, Tier::Detail, &day);
+        if tier == Tier::Core || detail.exists() {
+            let meta: Connection = crate::tenants::open_tenant(&layout::meta_path(&dir))?;
             meta.execute_batch("BEGIN IMMEDIATE")?;
             // `used` counts files as file_bytes does, which can be more
             // than their length today (a WAL not yet checkpointed).
-            let detail = layout::day_path(dir, Tier::Detail, &day);
             let mut counted = file_bytes(&detail);
             let mut freed = super::retention::remove(&detail);
             if tier == Tier::Core {
-                let core = layout::day_path(dir, Tier::Core, &day);
+                let core = layout::day_path(&dir, Tier::Core, &day);
                 counted += file_bytes(&core);
                 freed += super::retention::remove(&core);
                 let slug = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -280,10 +391,16 @@ pub fn trim(tenants_dir: &Path, max_bytes: u64, today: &str) -> rusqlite::Result
             }
             meta.execute_batch("COMMIT")?;
             out.bytes += freed;
-            used = used.saturating_sub(counted.max(freed));
+            let gone = counted.max(freed);
+            used = used.saturating_sub(gone);
+            let u = by_account.get_mut(&acct).unwrap();
+            *u = u.saturating_sub(gone);
         }
     }
     out.used = used;
+    if used > max_bytes {
+        out.over = by_account.into_iter().filter(|(_, u)| *u > level).map(|(a, _)| a).collect();
+    }
     Ok(out)
 }
 
@@ -304,12 +421,18 @@ fn check_with(budget: &Budget, data_dir: &Path, tenants_dir: &Path, state: &Stat
         // Writes counted from here on may be in the measurement too: the
         // estimate errs high.
         let counted = state.written.load(Ordering::Relaxed);
-        match trim(tenants_dir, budget.max_data_bytes, today) {
+        let owners = state.owners.lock().unwrap().as_ref().map(|f| f());
+        match trim_fair(tenants_dir, budget.max_data_bytes, today, owners.as_ref()) {
             Ok(t) => {
                 let over = t.used > budget.max_data_bytes;
                 state.measured.store(t.used, Ordering::Relaxed);
                 state.written.fetch_sub(counted, Ordering::Relaxed);
-                let was_over = state.over_budget.swap(over, Ordering::Relaxed);
+                let was_over = {
+                    let mut o = state.over_budget.lock().unwrap();
+                    let was = o.as_ref().is_some_and(|s| !s.is_empty());
+                    *o = Some(if over { t.over.iter().copied().collect() } else { Default::default() });
+                    was
+                };
                 // Ingest waiting on this pass goes on now; closing handles
                 // (on_trim) only matters to the floor.
                 state.passed.notify_waiters();
@@ -328,7 +451,8 @@ fn check_with(budget: &Budget, data_dir: &Path, tenants_dir: &Path, state: &Stat
                     tracing::error!(
                         used = t.used,
                         max_data_bytes = budget.max_data_bytes,
-                        "telemetry is still over max_data_bytes with no older day file left to delete (today's files, or a single-file environment): refusing ingest (503) until it is within max_data_bytes"
+                        accounts = ?t.over,
+                        "telemetry is still over max_data_bytes with no older day file left to delete (today's files, or a single-file environment): refusing ingest (503) from the accounts over their share until it is within max_data_bytes"
                     );
                 } else if !over {
                     let refused = state.refused_over.swap(0, Ordering::Relaxed);
@@ -541,7 +665,7 @@ mod tests {
     }
 
     fn admit(state: &State) -> Result<(), Refusal> {
-        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(state.admit())
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(state.admit(1))
     }
 
     fn today() -> String {
@@ -640,5 +764,59 @@ mod tests {
         assert_eq!(admit(&state), Ok(()));
         assert_eq!(state.refused_over.load(Ordering::Relaxed), 0, "reported and reset on recovery");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// GA review 2026-11-19 T2: one account's growth never deletes another
+    /// account's history or refuses its ingest. Account 2 fills today's
+    /// files far past the budget; account 1, within its fair share, keeps
+    /// every day and may still ingest, while account 2 loses its own old
+    /// days first and is the only one refused.
+    #[test]
+    fn one_accounts_growth_never_trims_or_refuses_another_account() {
+        let root = tenants("fair");
+        let today = "2026-10-14";
+        let big = open_or_create(&day_path(&root.join("b"), Tier::Detail, today)).unwrap();
+        big.execute_batch("CREATE TABLE more (b BLOB); INSERT INTO more VALUES (zeroblob(12000000)); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        let a_bytes = usage_by_slug(&root).into_iter().find(|(s, _, _)| s == "a").unwrap().1;
+        let owners: std::collections::HashMap<String, i64> = [("a".to_string(), 1), ("b".to_string(), 2)].into();
+        // Room for all of a's data and a bit more: b alone is over.
+        let budget = a_bytes * 2;
+        let t = trim_fair(&root, budget, today, Some(&owners)).unwrap();
+        assert_eq!(left(&root, "a", Tier::Detail).len(), 5, "account 1 keeps every detail day");
+        assert_eq!(left(&root, "a", Tier::Core).len(), 5, "and every core day");
+        assert_eq!(left(&root, "b", Tier::Detail), vec![today.to_string()], "account 2 lost its own old days");
+        assert_eq!(left(&root, "b", Tier::Core), vec![today.to_string()]);
+        assert_eq!(t.over, vec![2], "only account 2 is still over its share");
+
+        let state = State::default();
+        let owners2 = owners.clone();
+        state.set_owners(Box::new(move || owners2.clone()));
+        // check() uses the real today; a fresh tree with today's date works the same way.
+        let root2 = std::env::temp_dir().join(format!("rw-budget-fair2-{}", crate::control::base58(8)));
+        for slug in ["a", "b"] {
+            let c = open_or_create(&day_path(&root2.join(slug), Tier::Core, &today_now())).unwrap();
+            c.execute_batch("CREATE TABLE pad (b BLOB); INSERT INTO pad VALUES (zeroblob(200000)); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            open_or_create(&meta_path(&root2.join(slug))).unwrap();
+        }
+        let c = open_or_create(&day_path(&root2.join("b"), Tier::Detail, &today_now())).unwrap();
+        c.execute_batch("CREATE TABLE pad (b BLOB); INSERT INTO pad VALUES (zeroblob(3000000)); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        let (total, _) = usage(&root2);
+        check(&Budget { max_data_bytes: total / 2, min_free_bytes: 0 }, &root2, &root2, &state, &|_| {});
+        let admit_as = |acct: i64| tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(state.admit(acct));
+        assert_eq!(admit_as(1), Ok(()), "the account within its share keeps ingesting");
+        assert_eq!(admit_as(2), Err(Refusal::OverBudget), "the one over it is refused");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    fn today_now() -> String {
+        today()
+    }
+
+    #[test]
+    fn the_fair_share_is_max_min() {
+        assert_eq!(water_level(&[10, 100], 60), 50, "the small account keeps all, the large one gets the rest");
+        assert_eq!(water_level(&[10, 20], 60), u64::MAX, "everyone fits");
+        assert_eq!(water_level(&[100, 100], 60), 30);
     }
 }

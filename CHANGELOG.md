@@ -86,6 +86,11 @@ tag is a release candidate (marked pre-release, not "latest", so
   adds one table and a trigger; nothing on disk moves. At start, telemetry
   and source map directories that no environment owns, and backup objects
   that none owns (after each backup pass), have their slugs retired too.
+- `MAX_DATA_BYTES` on a server with several accounts is shared fairly: an
+  account that grows past its share loses its own oldest days first and is
+  the only one refused (503) when nothing older is left. Before, one
+  account's burst deleted every other account's history and blocked their
+  ingest. One account behaves as before (docs/SELF-HOST.md, "Disk budget").
 - Grouping an exception into an issue, or changing an issue's status, no
   longer panics when the issue (or its environment) was deleted a moment
   earlier. That panic ran while holding the control database lock and could

@@ -33,6 +33,8 @@ pub struct Environment {
     pub retention_days: i64,
     pub ingest_followup_gc_before: i64,
     pub raw_pruned_through: Option<i64>,
+    /// The account it belongs to (the disk budget's share is per account).
+    pub account_id: i64,
 }
 
 impl Environment {
@@ -206,7 +208,7 @@ pub fn valid_email(s: &str) -> bool {
 const COLUMNS: &str = "e.id, e.slug, e.paused_at IS NOT NULL, a.monthly_event_quota + a.additional_events_cap,
   (SELECT COALESCE(SUM(m.events), 0) FROM ingest_usage_months m JOIN environments e2 ON e2.id = m.environment_id
      JOIN applications ap2 ON ap2.id = e2.application_id WHERE ap2.account_id = a.id AND m.month = ?2),
-  a.retention_days, e.ingest_followup_gc_before, e.raw_pruned_through";
+  a.retention_days, e.ingest_followup_gc_before, e.raw_pruned_through, a.id";
 
 const FROM: &str = "FROM environments e JOIN applications ap ON ap.id = e.application_id JOIN accounts a ON a.id = ap.account_id";
 
@@ -259,6 +261,7 @@ impl Control {
             retention_days: r.get(5)?,
             ingest_followup_gc_before: micros(&r.get::<_, String>(6)?),
             raw_pruned_through: r.get::<_, Option<String>>(7)?.map(|s| micros(&s)),
+            account_id: r.get(8)?,
         })
     }
 
@@ -631,6 +634,13 @@ pub fn storage_names(tenants_dir: &Path, sourcemaps_dir: &Path) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// Each environment slug's account, for the disk budget's per-account shares.
+pub fn slug_accounts(c: &Connection) -> rusqlite::Result<std::collections::HashMap<String, i64>> {
+    c.prepare("SELECT e.slug, ap.account_id FROM environments e JOIN applications ap ON ap.id = e.application_id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect()
 }
 
 /// Slugs name tenant files and directories, so they must be path-safe.

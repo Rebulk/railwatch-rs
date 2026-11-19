@@ -230,12 +230,17 @@ fn a_burst_stays_within_the_budget_plus_one_batch_per_sender() {
     let statuses = statuses.into_inner().unwrap();
     let (ok, refused) = (statuses.iter().filter(|s| **s == 200).count(), statuses.iter().filter(|s| **s == 503).count());
     assert_eq!(ok + refused, statuses.len(), "only 200 or 503: {statuses:?}");
-    // 100 batches is ~3x the room the old days free: some went in and
-    // the rest were refused once only today's files were left.
+    // 100 batches is far more than the burst account's share: some went
+    // in and the rest were refused once it was over its share.
     assert!(ok > 0 && refused > 0, "{ok} accepted, {refused} refused");
     let peak = peak.into_inner();
     assert!(peak <= max + SENDERS * batch, "peak {peak} over max {max} + {SENDERS} x {batch}");
-    assert!(layout::days(&_dir, Tier::Detail).len() <= 1, "old detail days were trimmed for the burst");
+    // `env create` puts "burst" in another account than setup's "a". The
+    // old days (a's) are more than a's fair half of the budget, so a loses
+    // its oldest days down to that half, and no further (GA review
+    // 2026-11-19 T2: storage::budget's fair trim).
+    let left = layout::days(&_dir, Tier::Detail).len();
+    assert!((1..6).contains(&left), "a's oldest days were trimmed to its share, not all of them: {left} left");
     let log = stop(child);
     assert!(log.contains("telemetry over max_data_bytes: deleted the oldest day files"), "{log}");
     assert_eq!(log.matches("still over max_data_bytes with no older day file left to delete").count(), 1, "logged once: {log}");
