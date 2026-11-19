@@ -242,8 +242,8 @@ pub struct Trimmed {
     /// Telemetry bytes after the pass.
     pub used: u64,
     /// Still over max_data_bytes: the accounts over their fair share
-    /// (0 is every directory when owners are unknown, -1 telemetry no
-    /// environment owns). Their ingest is refused until a pass finds them
+    /// (0 is every directory when owners are unknown; telemetry no
+    /// environment owns is never listed). Their ingest is refused until a pass finds them
     /// within it; other accounts' is not.
     pub over: Vec<i64>,
 }
@@ -315,6 +315,9 @@ fn sourcemaps_dir(tenants_dir: &Path) -> PathBuf {
     tenants_dir.with_file_name("sourcemaps")
 }
 
+/// The account `trim_fair` charges telemetry no environment owns to.
+const UNOWNED: i64 = -1;
+
 /// The fair share each account may keep when `max_bytes` must be split
 /// among accounts using `used` bytes each (max-min fairness): an account
 /// under the level keeps all it has, the rest share what is left equally.
@@ -356,14 +359,20 @@ pub fn trim_fair(tenants_dir: &Path, max_bytes: u64, today: &str, owners: Option
     if used <= max_bytes {
         return Ok(out);
     }
-    // Account of each slug: unknown slugs (no environment) are one account
-    // of their own, never charged to anyone else's share.
-    let account = |slug: &str| owners.map_or(0, |o| o.get(slug).copied().unwrap_or(-1));
+    // Account of each slug. Telemetry no environment owns (UNOWNED) is not an
+    // account: its old days go first, before anyone's, and what is left of
+    // it (today's, a single file) only shrinks what the accounts share
+    // (PR #107 review L5: it took a whole account's share).
+    let account = |slug: &str| owners.map_or(0, |o| o.get(slug).copied().unwrap_or(UNOWNED));
     let mut by_account: std::collections::BTreeMap<i64, u64> = Default::default();
     for (slug, b, _) in &per {
         *by_account.entry(account(slug)).or_default() += b;
     }
-    let level = water_level(&by_account.values().copied().collect::<Vec<_>>(), max_bytes);
+    // The fair share of what the unowned data leaves.
+    let level = |by: &std::collections::BTreeMap<i64, u64>| {
+        let owned: Vec<u64> = by.iter().filter(|(a, _)| **a != UNOWNED).map(|(_, u)| *u).collect();
+        water_level(&owned, max_bytes.saturating_sub(by.get(&UNOWNED).copied().unwrap_or(0)))
+    };
     // Each account's deletable days, in deletion order: detail days oldest
     // first across its environments, then core days.
     let mut queue: std::collections::BTreeMap<i64, std::collections::VecDeque<(Tier, String, PathBuf)>> = Default::default();
@@ -379,13 +388,17 @@ pub fn trim_fair(tenants_dir: &Path, max_bytes: u64, today: &str, owners: Option
         }
     }
     while used > max_bytes {
-        // The account furthest over its share that still has a day to give.
-        let Some(acct) = by_account
-            .iter()
-            .filter(|(a, u)| **u > level && queue.get(a).is_some_and(|q| !q.is_empty()))
-            .max_by_key(|(a, u)| (**u - level, std::cmp::Reverse(**a)))
-            .map(|(a, _)| *a)
-        else {
+        // Unowned days first; then the account furthest over its share that
+        // still has a day to give.
+        let level = level(&by_account);
+        let unowned = queue.get(&UNOWNED).is_some_and(|q| !q.is_empty()).then_some(UNOWNED);
+        let Some(acct) = unowned.or_else(|| {
+            by_account
+                .iter()
+                .filter(|(a, u)| **a != UNOWNED && **u > level && queue.get(a).is_some_and(|q| !q.is_empty()))
+                .max_by_key(|(a, u)| (**u - level, std::cmp::Reverse(**a)))
+                .map(|(a, _)| *a)
+        }) else {
             break;
         };
         let (tier, day, dir) = queue.get_mut(&acct).unwrap().pop_front().unwrap();
@@ -421,7 +434,8 @@ pub fn trim_fair(tenants_dir: &Path, max_bytes: u64, today: &str, owners: Option
     }
     out.used = used;
     if used > max_bytes {
-        out.over = by_account.into_iter().filter(|(_, u)| *u > level).map(|(a, _)| a).collect();
+        let level = level(&by_account);
+        out.over = by_account.into_iter().filter(|(a, u)| *a != UNOWNED && *u > level).map(|(a, _)| a).collect();
     }
     Ok(out)
 }
@@ -886,6 +900,23 @@ mod tests {
         let (total, _) = usage(&root);
         check(&Budget { max_data_bytes: total / 2, min_free_bytes: 0 }, &root, &root, &state, &|_| {});
         assert_eq!(admit(&state), Err(Refusal::OverBudget), "over with only today left: refused, as with one account");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #107 review L5: telemetry no environment owns loses its old days
+    /// before any account does, and does not take an account's share.
+    #[test]
+    fn unowned_telemetry_goes_first_and_takes_no_accounts_share() {
+        let root = tenants("l5");
+        let owners: std::collections::HashMap<String, i64> = [("a".to_string(), 1)].into();
+        let (total, _) = usage(&root);
+        let b_old: u64 = usage_by_slug(&root).into_iter().find(|(s, _, _)| s == "b").unwrap().1;
+        // Room for everything but b's (unowned) old days, roughly.
+        let t = trim_fair(&root, total - b_old / 2, "2026-10-14", Some(&owners)).unwrap();
+        assert_eq!(left(&root, "a", Tier::Detail).len(), 5, "the account keeps every day");
+        assert_eq!(left(&root, "a", Tier::Core).len(), 5);
+        assert!(left(&root, "b", Tier::Detail).len() < 5, "the unowned data paid");
+        assert!(t.over.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
