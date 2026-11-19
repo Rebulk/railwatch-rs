@@ -61,7 +61,7 @@
   "pnpm": {
     "overrides": {
       "postcss-selector-parser@<7.1.6": "7.1.6",
-      "axios>follow-redirects": "^1.16.1"
+      "axios>follow-redirects": "^1.16.2"
     }
   }
 }

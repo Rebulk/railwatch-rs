@@ -57,6 +57,9 @@ tag is a release candidate (marked pre-release, not "latest", so
   Slack URL now reach `railwatch setup` through its environment
   (`RAILWATCH_SETUP_ALERT_WEBHOOK_SECRET`, `RAILWATCH_SETUP_ALERT_SLACK`),
   not its command line.
+- Frontend build: follow-redirects 1.16.1 -> 1.16.3 (pnpm override
+  `^1.16.2`). It is a build-time dependency of axios only and not in the
+  shipped bundle; `pnpm audit` is clean.
 - `/cable` bounds what one connection can make the server keep: messages up
   to 4 KiB, subscribe identifiers up to 256 bytes, 16 subscriptions.
 
