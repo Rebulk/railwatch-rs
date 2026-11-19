@@ -212,10 +212,15 @@ pub fn validate(kind: &str, name: &str, settings: &Map<String, Value>) -> Vec<(S
         }
     }
     // The recipient goes to SMTP as is: a plain address only (no display
-    // name, quoted local part or line break), as everywhere else here.
+    // name, quoted local part or line break), as everywhere else here, and
+    // one lettre will parse at delivery (it refuses `a..b@x`, which the
+    // plain check alone lets through).
     if kind == "email"
         && let Some(to) = settings.get("to").filter(|v| !blank(Some(v)))
-        && !to.as_str().is_some_and(|t| crate::control::valid_email(t.trim_ascii()))
+        && !to.as_str().is_some_and(|t| {
+            let t = t.trim_ascii();
+            crate::control::valid_email(t) && t.parse::<lettre::message::Mailbox>().is_ok()
+        })
     {
         errors.push(("settings".into(), RECIPIENT_INVALID.into()));
     }
@@ -367,7 +372,15 @@ mod tests {
     /// break, a list) is refused when it is saved.
     #[test]
     fn an_email_integration_takes_one_plain_address() {
-        for bad in ["\"victim \"@example.com", "Ops <ops@example.com>", "ops@example.com\r\nRCPT TO:<x@evil.test>", "a@example.com, b@example.com", "nope"] {
+        for bad in [
+            "\"victim \"@example.com",
+            "Ops <ops@example.com>",
+            "ops@example.com\r\nRCPT TO:<x@evil.test>",
+            "a@example.com, b@example.com",
+            "nope",
+            // Passes the plain check; lettre refuses it at delivery.
+            "a..b@example.com",
+        ] {
             assert_eq!(
                 validate("email", "Ops", &obj(json!({"to": bad}))),
                 vec![("settings".to_string(), "to is not a valid email address".to_string())],
