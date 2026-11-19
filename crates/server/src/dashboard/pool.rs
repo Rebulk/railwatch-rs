@@ -133,6 +133,11 @@ pub struct ReadPools {
     max_open: usize,
     total: Arc<Mutex<usize>>,
     pools: Arc<Mutex<HashMap<String, Arc<TenantPool>>>>,
+    /// Slugs of environments deleted while this process ran (`forget`).
+    /// Slugs are never reused, so a read for one is refused rather than
+    /// opening a new pool on files being removed (PR #107 review L9: it
+    /// held their space until it idled out).
+    forgotten: Arc<Mutex<std::collections::HashSet<String>>>,
     /// QUERY_LIMIT, unless `set_query_limit` changed it.
     query_limit: Duration,
 }
@@ -193,6 +198,7 @@ impl ReadPools {
             max_open: max_open.max(1),
             total: Default::default(),
             pools: Default::default(),
+            forgotten: Default::default(),
             query_limit: QUERY_LIMIT,
         }
     }
@@ -283,7 +289,12 @@ impl ReadPools {
     /// longer the slug's). Call before its files are removed, so no handle
     /// to them outlives the delete. Returns how many closed now.
     pub fn forget(&self, slug: &str) -> usize {
-        let Some(pool) = self.pools.lock().unwrap().remove(slug) else { return 0 };
+        let removed = {
+            let mut pools = self.pools.lock().unwrap();
+            self.forgotten.lock().unwrap().insert(slug.to_string());
+            pools.remove(slug)
+        };
+        let Some(pool) = removed else { return 0 };
         pool.forgotten.store(true, std::sync::atomic::Ordering::SeqCst);
         let gone = std::mem::take(&mut *pool.idle.lock().unwrap());
         let n = gone.len();
@@ -300,10 +311,11 @@ impl ReadPools {
     }
 
     pub fn get(&self, slug: &str) -> rusqlite::Result<Reader> {
-        let pool = self
-            .pools
-            .lock()
-            .unwrap()
+        let mut pools = self.pools.lock().unwrap();
+        if self.forgotten.lock().unwrap().contains(slug) {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        let pool = pools
             .entry(slug.to_string())
             .or_insert_with(|| {
                 Arc::new(TenantPool {
@@ -315,6 +327,7 @@ impl ReadPools {
                 })
             })
             .clone();
+        drop(pools);
         loop {
             let popped = pool.idle.lock().unwrap().pop();
             if let Some(mut c) = popped {
@@ -458,6 +471,19 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5), "interrupted near the limit: {:?}", started.elapsed());
         let n: i64 = pools.get("a").unwrap().query_row("SELECT count(*) FROM executions", [], |r| r.get(0)).unwrap();
         assert_eq!((n, pools.open_count()), (0, 1), "the same reader, usable again");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #107 review L9: a read that arrives between `forget` and the
+    /// files' removal opens no new reader on them; it is refused.
+    #[test]
+    fn a_read_after_forget_opens_nothing_on_the_deleted_files() {
+        let root = tenants("forgotten", &["a"]);
+        let pools = ReadPools::with_max(root.clone(), 2, 8);
+        drop(pools.get("a").unwrap());
+        pools.forget("a");
+        assert!(pools.get("a").is_err(), "refused");
+        assert_eq!((pools.open_count(), sqlite_fds(&root)), (0, 0), "nothing holds the files");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

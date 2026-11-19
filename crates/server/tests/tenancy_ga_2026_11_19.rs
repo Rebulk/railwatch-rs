@@ -37,8 +37,7 @@ fn open_fds(root: &Path) -> usize {
 }
 
 /// Deleting an environment forgets its pool before the files go: no handle
-/// to them is left, and a directory created later under the same name is
-/// read fresh, never through a reader of the deleted one.
+/// to them is left, and nothing is read under that name again.
 #[test]
 fn deleting_a_tenant_closes_its_pooled_readers_so_a_new_directory_is_never_read_through_them() {
     let tenants = root("t1");
@@ -57,8 +56,10 @@ fn deleting_a_tenant_closes_its_pooled_readers_so_a_new_directory_is_never_read_
     assert_eq!(open_fds(&tenants), 0, "no reader keeps the deleted files open");
     assert_eq!(pools.open_count(), 0);
 
+    // Even if something recreated the directory, the forgotten slug is not
+    // read again (slugs are never reused; PR #107 review L9).
     write_log(&dir, "2026-11-19", "B-OWN");
-    assert_eq!(messages(&pools, slug), ["B-OWN"], "never the deleted tenant's rows");
+    assert!(pools.get(slug).is_err(), "never the deleted tenant's rows, nor anything under its name");
     let _ = std::fs::remove_dir_all(&tenants);
 }
 
