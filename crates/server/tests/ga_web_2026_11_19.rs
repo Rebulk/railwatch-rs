@@ -959,3 +959,68 @@ fn old_and_current_monitor_urls_stay_out_of_alert_and_incident_details() {
         assert!(seen.contains("example.com"), "{path}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// PR #106 review, second pass
+
+/// An email integration saved before its recipient was checked ("Ops
+/// <ops@x>") can still be disabled or renamed without retyping it; setting
+/// a new recipient or turning it back on is what must pass the check.
+#[test]
+fn an_integration_with_a_recipient_from_before_the_check_can_still_be_disabled() {
+    let s = start("pr106-legacy-to", "open", false);
+    let (account, _, _, password) = acme(&s);
+    let cipher = railwatch_server::alerts::integration::SettingsCipher::new(SECRET.as_bytes());
+    let id = s
+        .control
+        .tx(|tx| {
+            Ok(railwatch_server::alerts::integration::insert(
+                tx,
+                &cipher,
+                account,
+                "email",
+                "Ops",
+                &serde_json::from_value(json!({"to": "ops@acme.test"})).unwrap(),
+            )?)
+        })
+        .unwrap();
+    s.control.with(|x| x.execute("UPDATE integrations SET settings = json_set(settings, '$.to', 'Ops <ops@acme.test>') WHERE id = ?", [id])).unwrap();
+    let mut b = Browser::default();
+    b.sign_in(&s, "alice@acme.test", &password);
+    let enabled = || one::<bool>(&s, "SELECT enabled FROM integrations WHERE id = ?", [id]);
+    let r = b.send(&s, "PATCH", &format!("/settings/integrations/{id}"), "enabled=false&name=Old+ops");
+    assert_eq!(b.flash_after(&s, &r)["notice"], "Integration updated");
+    assert!(!enabled(), "disabled without retyping the recipient");
+    let r = b.send(&s, "PATCH", &format!("/settings/integrations/{id}"), "enabled=true");
+    assert_ne!(b.flash_after(&s, &r)["notice"], "Integration updated");
+    assert!(!enabled(), "but not turned back on with it");
+    let r = b.send(&s, "PATCH", &format!("/settings/integrations/{id}"), "settings%5Bto%5D=Ops+%3Cops%40acme.test%3E");
+    assert_ne!(b.flash_after(&s, &r)["notice"], "Integration updated", "nor set to such a value");
+    let r = b.send(&s, "PATCH", &format!("/settings/integrations/{id}"), "enabled=true&settings%5Bto%5D=ops%40acme.test");
+    assert_eq!(b.flash_after(&s, &r)["notice"], "Integration updated");
+    assert!(enabled());
+}
+
+/// Through the trusted proxy a user may revoke or replace only tokens of
+/// the proxy's account (or an app in it), not one they made for another
+/// account; signed in natively they still manage all their tokens.
+#[test]
+fn a_proxied_request_cannot_revoke_or_replace_the_users_tokens_for_other_accounts() {
+    let s = start("pr106-revoke", "open", true);
+    let (host, other, _, password) = proxy_fixture(&s);
+    let boss: i64 = one(&s, "SELECT id FROM users WHERE email = 'boss@other.test'", []);
+    let scopes: Vec<String> = ["api", "read"].map(String::from).to_vec();
+    let issue = |acc: i64| s.control.tx(|tx| control::issue_api_token(tx, boss, "t", &scopes, Some(acc), None, None)).unwrap().0;
+    let (theirs, ours) = (issue(other), issue(host));
+    let revoked = |id: i64| one::<bool>(&s, "SELECT revoked_at IS NOT NULL FROM api_tokens WHERE id = ?", [id]);
+    let mut b = Browser::proxied("boss@other.test", "admin");
+    b.send(&s, "DELETE", "/settings/profile/revoke_mcp_token", &format!("token_id={theirs}"));
+    b.post(&s, "/settings/profile/generate_mcp_token", &format!("restriction=account%3A{host}&replace_token_id={theirs}"));
+    assert!(!revoked(theirs), "OtherCo's token is out of the proxy's reach");
+    b.send(&s, "DELETE", "/settings/profile/revoke_mcp_token", &format!("token_id={ours}"));
+    assert!(revoked(ours), "the proxy's own account's token can be revoked");
+    let mut native = Browser::default();
+    native.sign_in(&s, "boss@other.test", &password);
+    native.send(&s, "DELETE", "/settings/profile/revoke_mcp_token", &format!("token_id={theirs}"));
+    assert!(revoked(theirs), "signed in directly, the user manages it");
+}

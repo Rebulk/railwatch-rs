@@ -211,6 +211,10 @@ pub fn resolve(c: &Connection, claims: &Claims) -> control::ModelResult<(Session
                 "UPDATE memberships SET role = ?, updated_at = ? WHERE account_id = ? AND user_id = ?",
                 params![claims.role, control::now_db(), account, user.id],
             )?;
+            // As members_update: a demoted admin's pending invitations go.
+            if r == "admin" && claims.role == "member" {
+                control::withdraw_access(c, account, user.id, false)?;
+            }
         }
         Some(_) => {}
     }
@@ -291,6 +295,26 @@ mod tests {
         let err = control.tx(|tx| bind_account(tx, other)).unwrap_err().to_string();
         assert!(err.contains("Acme") && err.contains("has members"), "{err}");
         assert_eq!(control.with(bound_account).unwrap(), Some(made), "a used account keeps the proxy");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// PR #106 review: the proxy demoting an admin to member withdraws the
+    /// invitations they sent, as Settings > Members does.
+    #[test]
+    fn a_proxy_demotion_withdraws_the_admins_invitations() {
+        let dir = std::env::temp_dir().join(format!("rw-proxy-demote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let control = control::Control::open(&dir.join("control.sqlite3")).unwrap();
+        let owner = control.tx(|tx| control::insert_user(tx, "Owner", "owner@example.com", &control::test_password(), true)).unwrap();
+        let account = control.tx(|tx| control::create_account(tx, "Acme", owner)).unwrap();
+        control.tx(|tx| bind_account(tx, account)).unwrap();
+        let c = |role: &str| Claims { email: "ada@example.com".into(), name: "Ada".into(), role: role.into(), exp: 0 };
+        let (_, ada, _) = control.tx(|tx| resolve(tx, &c("admin"))).unwrap();
+        control.tx(|tx| control::create_invitation(tx, account, ada.id, "alt@evil.test", "admin")).unwrap();
+        control.tx(|tx| resolve(tx, &c("member"))).unwrap();
+        let left: i64 = control.with(|x| x.query_row("SELECT count(*) FROM invitations", [], |r| r.get(0))).unwrap();
+        assert_eq!(left, 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

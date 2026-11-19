@@ -1519,8 +1519,12 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
                     }
                 }
                 if let Some(rid) = replace {
-                    let mine: bool =
-                        tx.query_row("SELECT 1 FROM api_tokens WHERE id = ? AND user_id = ?", params![rid, uid], |_| Ok(true)).optional()?.unwrap_or(false);
+                    let mine: bool = tx
+                        .query_row(&format!("SELECT 1 FROM api_tokens WHERE id = ?1 AND user_id = ?2 AND {TOKEN_IN_BOUND}"), params![rid, uid, pinned], |_| {
+                            Ok(true)
+                        })
+                        .optional()?
+                        .unwrap_or(false);
                     if !mine {
                         return Ok(Out::Bad);
                     }
@@ -1558,15 +1562,19 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
     }
 }
 
+/// An api_tokens row a request may replace or revoke, with ?3 the trusted
+/// proxy's account (NULL for a native sign-in: any of the user's tokens):
+/// through the proxy, only tokens restricted to that account or an
+/// application in it, never one for the user's other accounts.
+const TOKEN_IN_BOUND: &str = "(?3 IS NULL OR account_id = ?3 OR application_id IN (SELECT id FROM applications WHERE account_id = ?3))";
+
 async fn profile_revoke_token(cx: Ctx, p: Params) -> Response {
     guard!(authenticate(&cx));
     let uid = cx.user_id();
     let Some(id) = p.i64("token_id") else { return not_found() };
-    match cx
-        .state
-        .db(move |c| c.with(|x| x.execute("UPDATE api_tokens SET revoked_at = ?1, updated_at = ?1 WHERE id = ?2 AND user_id = ?3", params![now_db(), id, uid])))
-        .await
-    {
+    let pinned = cx.current.is_proxied().then(|| cx.current.account.as_ref().map(|a| a.id).unwrap_or(0));
+    let sql = format!("UPDATE api_tokens SET revoked_at = ?4, updated_at = ?4 WHERE id = ?1 AND user_id = ?2 AND {TOKEN_IN_BOUND}");
+    match cx.state.db(move |c| c.with(|x| x.execute(&sql, params![id, uid, pinned, now_db()]))).await {
         Ok(0) => not_found(),
         Ok(_) => cx.redirect(Redirect::to("/settings/profile").notice("API token revoked.")),
         Err(e) => internal(e),

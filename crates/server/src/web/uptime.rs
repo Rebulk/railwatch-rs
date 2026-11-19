@@ -192,7 +192,8 @@ async fn update(cx: Ctx, Path((app, env, id)): Path<(i64, i64, i64)>, p: Params)
         return cx.redirect(Redirect::to(back).errors(errors));
     }
     let now = time::now_micros();
-    match cx.state.db(move |c| c.with(|x| uptime::update(x, id, &m, now))).await {
+    // One transaction: the new URL and the old one's scrub land together.
+    match cx.state.db(move |c| c.tx(|x| Ok(uptime::update(x, id, &m, now)?))).await {
         Ok(()) => cx.redirect(Redirect::to(back).notice("Monitor updated")),
         Err(e) => internal(e),
     }

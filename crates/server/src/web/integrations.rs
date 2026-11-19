@@ -198,12 +198,20 @@ async fn update(cx: Ctx, Path(id): Path<i64>, p: Params) -> Response {
     let name = if p.has("name") { p.s("name") } else { found.name.clone() };
     let enabled = if p.has("enabled") { p.bool("enabled").unwrap_or(false) } else { found.enabled };
     let mut settings = found.settings.clone();
-    for (k, v) in permitted_settings(&p) {
+    let given = permitted_settings(&p);
+    let sets_recipient = given.get("to").is_some_and(|v| !blank(v));
+    for (k, v) in given {
         if !blank(&v) {
             settings.insert(k, v);
         }
     }
-    let errors = integration::validate(&found.kind, &name, &settings);
+    let mut errors = integration::validate(&found.kind, &name, &settings);
+    // A recipient saved before it was checked does not stop an admin from
+    // disabling, renaming or deleting the integration; only setting it, or
+    // turning it back on, must pass.
+    if !sets_recipient && !(enabled && !found.enabled) {
+        errors.retain(|(_, m)| m != integration::RECIPIENT_INVALID);
+    }
     if !errors.is_empty() {
         return cx.redirect(Redirect::to(INDEX).errors(errors));
     }

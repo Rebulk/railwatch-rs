@@ -12,7 +12,9 @@ tag is a release candidate (marked pre-release, not "latest", so
   message with a bare CR or LF could end an email alert's DATA early on a
   lenient SMTP relay and run its own SMTP commands on the server's session.
   Issue titles in email alerts and the weekly digest are now also put on one
-  line, and an email integration's recipient must be one plain address.
+  line, and an email integration's recipient must be one plain address
+  (checked when it is set or the integration is enabled, so an older one
+  can still be disabled or deleted).
 - Trusted proxy (railwatch-sidecar): a proxied user stays in the proxy's
   account with the role the proxy signed. They can no longer switch into,
   create, delete or mint tokens for the user's other accounts, and an owner
@@ -37,7 +39,9 @@ tag is a release candidate (marked pre-release, not "latest", so
   Removing an admin, or making them a member, withdraws the invitations
   they sent.
 - Removing a member revokes their API tokens restricted to that account or
-  one of its applications.
+  one of its applications. Through the trusted proxy, a user can replace or
+  revoke only tokens of the proxy's account, and the proxy demoting an
+  admin to member withdraws their pending invitations.
 - Changing your email now tells the old address and signs out your other
   sessions, as a password change does.
 - Uptime monitors: members, and API/MCP tokens of members, see only the

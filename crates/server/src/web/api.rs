@@ -1486,7 +1486,10 @@ impl Api<'_> {
                     })
                 },
             )
-        })
+            .optional()
+        })?
+        // Gone since it was found (deleted with its environment): a 404, not a 500.
+        .ok_or_else(not_found)
     }
 
     /// issue_json(i, full: true)
@@ -1629,10 +1632,6 @@ impl Api<'_> {
                 None => Ok(None),
             })?
             .ok_or_else(not_found)?;
-        }
-        // Deleted after the last write: a 404, as the writes answer.
-        if self.control(|c| issue_model::find(c, id))?.is_none() {
-            return Err(not_found());
         }
         ok(self.issue_full(id)?)
     }
@@ -2005,6 +2004,23 @@ mod tests {
         .unwrap();
         let r = req(&f, Method::PATCH, &format!("/api/v1/issues/{}", f.issue), Some("full"), Some(json!({"status": "resolved"})));
         assert_eq!(r.status, StatusCode::NOT_FOUND);
+    }
+
+    /// PR #106 review: an issue deleted between the last check and the
+    /// closing read (no lock is held in between) is a 404 from that read.
+    #[test]
+    fn an_issue_deleted_before_the_closing_read_is_a_404() {
+        let f = fixture("vanish-read");
+        let token = Token::from_authorization(&f.c, Some(&format!("Bearer {}", f.tokens["full"])), NOW).unwrap().unwrap();
+        let params = Params { map: Map::new() };
+        let env = Env { control: &f.c, tenants: &f.tenants, readers: &f.readers, cursor_key: &f.key };
+        let api = Api { env: &env, now: NOW, token, params: &params };
+        assert!(api.issue_full(f.issue).is_ok());
+        f.c.with(|x| x.execute_batch(&format!("DELETE FROM issue_activities WHERE issue_id = {0}; DELETE FROM issues WHERE id = {0}", f.issue))).unwrap();
+        match api.issue_full(f.issue) {
+            Err(Halt::Json(status, _)) | Err(Halt::Page(status)) => assert_eq!(status, StatusCode::NOT_FOUND),
+            Ok(v) => panic!("the deleted issue was read: {v}"),
+        }
     }
 
     #[test]

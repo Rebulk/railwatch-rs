@@ -298,6 +298,8 @@ pub fn insert(c: &Connection, environment_id: i64, m: &MonitorInput) -> rusqlite
 
 /// Updates a monitor's settings. Disabling pauses it (an open incident is
 /// closed now, without an alert); enabling a paused one starts from pending.
+/// A new URL scrubs the old one (forget_url): call it in a transaction so
+/// the two land together.
 pub fn update(c: &Connection, id: i64, m: &MonitorInput, now_micros: i64) -> rusqlite::Result<()> {
     let (was_enabled, old_url): (bool, String) = c.query_row("SELECT enabled, url FROM uptime_monitors WHERE id = ?", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
     if old_url != m.url.trim() {
@@ -342,16 +344,23 @@ fn forget_url(c: &Connection, id: i64, old: &str) -> rusqlite::Result<()> {
     for form in std::iter::once(old.to_string()).chain(normalized) {
         c.execute("UPDATE uptime_incidents SET detail = replace(detail, ?2, ?3) WHERE monitor_id = ?1 AND instr(detail, ?2) > 0", params![id, form, host])?;
         c.execute("UPDATE uptime_monitors SET last_error = replace(last_error, ?2, ?3) WHERE id = ?1 AND instr(last_error, ?2) > 0", params![id, form, host])?;
-        // Alerts keep the payload as JSON text: replace the URL as JSON writes it.
-        let json_form = serde_json::to_string(&form).unwrap_or_default();
-        let json_host = serde_json::to_string(&host).unwrap_or_default();
+        // Alerts keep the payload as JSON text: replace the URL as JSON
+        // writes it inside a string (escapes and all, without its quotes).
+        let (json_form, json_host) = (json_string_body(&form), json_string_body(&host));
         c.execute(
             "UPDATE alerts SET payload = replace(payload, ?2, ?3)
              WHERE event IN ('monitor_down', 'monitor_recovered') AND json_extract(payload, '$.monitor_id') = ?1 AND instr(payload, ?2) > 0",
-            params![id, json_form.trim_matches('"'), json_host.trim_matches('"')],
+            params![id, json_form, json_host],
         )?;
     }
     Ok(())
+}
+
+/// `s` as JSON encodes it within a string: exactly the two delimiting
+/// quotes removed (an escaped quote at either end stays).
+fn json_string_body(s: &str) -> String {
+    let quoted = serde_json::to_string(s).expect("a string encodes");
+    quoted[1..quoted.len() - 1].to_string()
 }
 
 /// Deletes a monitor with its checks, rollups and incidents (ON DELETE CASCADE).

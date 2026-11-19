@@ -186,6 +186,10 @@ fn blank(v: Option<&Value>) -> bool {
     }
 }
 
+/// The email recipient's validation message (integrations::update lets an
+/// admin disable or rename an integration saved before this check existed).
+pub const RECIPIENT_INVALID: &str = "to is not a valid email address";
+
 /// Integration's validations: kind inclusion, name presence,
 /// settings_present, destination_safe. Errors keyed by attribute.
 pub fn validate(kind: &str, name: &str, settings: &Map<String, Value>) -> Vec<(String, String)> {
@@ -213,7 +217,7 @@ pub fn validate(kind: &str, name: &str, settings: &Map<String, Value>) -> Vec<(S
         && let Some(to) = settings.get("to").filter(|v| !blank(Some(v)))
         && !to.as_str().is_some_and(|t| crate::control::valid_email(t.trim_ascii()))
     {
-        errors.push(("settings".into(), "to is not a valid email address".into()));
+        errors.push(("settings".into(), RECIPIENT_INVALID.into()));
     }
     let target = match kind {
         "slack" => Some(("webhook_url", Kind::Slack)),
