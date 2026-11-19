@@ -69,3 +69,13 @@ fn setup_under_umask_022_leaves_nothing_readable_by_other_users_and_doctor_warns
     assert!(doctor.contains("warn  readable by other local users") && doctor.contains("control.sqlite3 (644)"), "{doctor}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// PR #107 review L8: the image's `/data` was created 0755, so `doctor`
+/// warned on every Docker install and other uids in the container could
+/// list it. (Checked by building the image: `drwx------ 10001/10001 data/`.)
+#[test]
+fn the_docker_images_data_dir_is_0700() {
+    let dockerfile = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Dockerfile")).unwrap();
+    assert!(dockerfile.contains("chown 10001:10001 /out/data"), "the volume belongs to the server's uid");
+    assert!(dockerfile.contains("chmod 0700 /out/data"), "and only it can read the volume");
+}

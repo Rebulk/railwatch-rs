@@ -28,7 +28,8 @@ RUN --mount=from=dist,target=/dist \
  && mkdir -p /out/usr/local/bin /out/usr/share/doc/railwatch /out/data \
  && mv "/tmp/$name/railwatch" /out/usr/local/bin/railwatch \
  && mv "/tmp/$name/LICENSE" "/tmp/$name/THIRD-PARTY-LICENSES" "/tmp/$name/SELF-HOST.md" /out/usr/share/doc/railwatch/ \
- && chown 10001:10001 /out/data
+ && chown 10001:10001 /out/data \
+ && chmod 0700 /out/data
 
 FROM scratch
 ARG VERSION

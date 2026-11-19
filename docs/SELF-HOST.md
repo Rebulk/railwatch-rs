@@ -95,7 +95,11 @@ be readable by other users; `railwatch doctor` says so, and
 The same binary as a container image, for x86_64 and arm64, published with
 every release: `ghcr.io/rebulk/railwatch:vX.Y.Z` (and `:latest`). It holds
 the release binary and its licences, nothing else (no shell), runs as uid
-10001, and keeps everything in the `/data` volume.
+10001, and keeps everything in the `/data` volume. `/data` is 0700 and the server
+creates its files 0600, readable by uid 10001 only. Run the container as that
+uid (the image's default): one started with `--user 0` (or `docker exec -u
+0`) on an existing volume creates root-owned 0600 files there that the
+server, as 10001, cannot read.
 
 ```sh
 docker run -d --name railwatch --restart unless-stopped \
