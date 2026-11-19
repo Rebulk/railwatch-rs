@@ -101,6 +101,11 @@ tag is a release candidate (marked pre-release, not "latest", so
 - Dashboard, API and MCP reads stop after 30 seconds per request (SQLite
   interrupts the query and the request fails), so one tenant's runaway query
   cannot hold the read connections that all tenants share.
+- The per-address limits in front of `/ingest` (`RATE_LIMIT_IP`) and `/mcp`
+  (300 a minute) count only requests that fail to authenticate. An
+  authenticated request counts toward its environment (ingest) or token
+  (MCP, 300 a minute). Before, customers sharing an egress address (a PaaS,
+  CI, a NAT) used up each other's limit.
 - Grouping an exception into an issue, or changing an issue's status, no
   longer panics when the issue (or its environment) was deleted a moment
   earlier. That panic ran while holding the control database lock and could

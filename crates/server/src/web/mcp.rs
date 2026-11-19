@@ -188,9 +188,13 @@ pub struct Env<'a> {
 
 /// POST /mcp.
 async fn create(State(state): State<Arc<WebState>>, req: Request) -> Response {
-    // rate_limit to: 300, within: 1.minute, before the token lookup.
+    // rate_limit to: 300, within: 1.minute, before the token lookup. Only
+    // requests that do not authenticate count toward the address's limit;
+    // an authenticated one counts toward its credential's (GA review
+    // 2026-11-19 T4: tenants behind one egress address shared one budget).
     let ip = state.client_ip(&req);
-    if state.mcp_preauth_limit.exceeded(&ip) {
+    let credential = req.headers().get(header::AUTHORIZATION).map(|v| crate::control::digest(&String::from_utf8_lossy(v.as_bytes())));
+    if state.mcp_preauth_limit.full(&ip) || credential.as_ref().is_some_and(|c| credential_limit().full(c)) {
         return json_body(
             StatusCode::TOO_MANY_REQUESTS,
             &json!({"jsonrpc": "2.0", "id": null,
@@ -201,7 +205,10 @@ async fn create(State(state): State<Arc<WebState>>, req: Request) -> Response {
     let auth = parts.headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(str::to_string);
     let proxied = match Token::proxied_claims(&parts) {
         Ok(p) => p,
-        Err(refused) => return json_body(StatusCode::FORBIDDEN, &refused),
+        Err(refused) => {
+            state.mcp_preauth_limit.exceeded(&ip);
+            return json_body(StatusCode::FORBIDDEN, &refused);
+        }
     };
     let base = base_url(&state, &parts.headers);
     let Ok(bytes) = axum::body::to_bytes(body, 4 << 20).await else {
@@ -214,10 +221,25 @@ async fn create(State(state): State<Arc<WebState>>, req: Request) -> Response {
     })
     .await
     .unwrap_or_else(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": format!("mcp task failed: {e}")})));
+    match (status, &credential) {
+        (StatusCode::UNAUTHORIZED, _) | (_, None) => {
+            state.mcp_preauth_limit.exceeded(&ip);
+        }
+        (_, Some(c)) => {
+            credential_limit().exceeded(c);
+        }
+    }
     match v {
         Value::Null => (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response(),
         v => json_body(status, &v),
     }
+}
+
+/// PREAUTH_IP_LIMIT per PREAUTH_IP_WINDOW per authenticated credential
+/// (the digest of its Authorization header).
+fn credential_limit() -> &'static FixedWindow<String> {
+    static LIMIT: std::sync::OnceLock<FixedWindow<String>> = std::sync::OnceLock::new();
+    LIMIT.get_or_init(|| FixedWindow::with_window(PREAUTH_IP_LIMIT, std::time::Duration::from_secs(PREAUTH_IP_WINDOW_SECS as u64)))
 }
 
 pub fn preauth_limit() -> FixedWindow<std::net::IpAddr> {

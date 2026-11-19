@@ -1,6 +1,8 @@
 //! The two ingest rate limits, in memory instead of Solid Cache:
 //! - IngestRequestRateLimit: per client IP, 2,400 requests a minute on any
-//!   /ingest path, checked before authentication;
+//!   /ingest path, checked before authentication. Only requests that do not
+//!   authenticate count toward it (GA review 2026-11-19 T4): tenants behind
+//!   one egress address must not use up each other's;
 //! - BaseController `rate_limit`: per environment, 600 a minute, after
 //!   authentication.
 //!
@@ -37,6 +39,13 @@ impl<K: Hash + Eq + Clone> FixedWindow<K> {
         self.exceeded_at(key, Instant::now())
     }
 
+    /// Would the next request for `key` be refused? Counts nothing: for a
+    /// limit that only failed requests count toward (`exceeded` them).
+    pub fn full(&self, key: &K) -> bool {
+        let now = Instant::now();
+        self.limit != 0 && self.counters.lock().unwrap().get(key).is_some_and(|(start, n)| now.duration_since(*start) < self.window && *n >= self.limit)
+    }
+
     pub fn exceeded_at(&self, key: &K, now: Instant) -> bool {
         if self.limit == 0 {
             return false;
@@ -68,6 +77,12 @@ mod tests {
         assert!(rl.exceeded_at(&"a", t0 + Duration::from_secs(59)));
         assert!(!rl.exceeded_at(&"b", t0), "keys are independent");
         assert!(!rl.exceeded_at(&"a", t0 + Duration::from_secs(60)), "a new window starts");
+        let full = FixedWindow::new(2);
+        assert!(!full.full(&"k"));
+        full.exceeded(&"k");
+        assert!(!full.full(&"k"), "one left");
+        full.exceeded(&"k");
+        assert!(full.full(&"k") && full.full(&"k"), "full, and asking counts nothing");
         let off = FixedWindow::new(0);
         assert!((0..10_000).all(|_| !off.exceeded(&"a")));
     }

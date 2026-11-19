@@ -236,7 +236,7 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `CORE_RETENTION_DAYS_MAX` | 90 | cap on an environment's retention |
 | `MAX_DATA_BYTES` | off | size budget for telemetry (`5G`, `500M`, bytes). Over it, the oldest day files are deleted, detail days before core days; never today's, rollups or the control DB. Still over with only today's files left, ingest answers 503 + `Retry-After`. For a server sharing its disk with an app ([below](#disk-budget)) |
 | `MIN_FREE_BYTES` | off | below this much free space on the data dir's filesystem, ingest answers 503 + `Retry-After` (the gem keeps its buffer and retries) |
-| `RATE_LIMIT_IP`, `RATE_LIMIT_ENV` | 2400, 600 per minute | `0` disables |
+| `RATE_LIMIT_IP`, `RATE_LIMIT_ENV` | 2400, 600 per minute | `0` disables. Only ingest requests that fail to authenticate count toward the per-address limit; authenticated ones count per environment |
 | `MAX_READ_CONNECTIONS` | 16 | dashboard read connections open at once, across every environment (a few MB each; idle ones close after a minute). Raise it for many people on many environments at once ([PERF.md](PERF.md#memory-bounded-by-configuration)) |
 | `SILENCE_SECONDS` | 60 | quiet time before "app stopped reporting" |
 | `DEADMAN_URL` | | pinged every 30 s while healthy (healthchecks.io etc.) |

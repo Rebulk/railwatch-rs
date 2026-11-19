@@ -6,7 +6,8 @@
 //! them (html entities escaped).
 //!
 //! Order per request, as in Rails: body limit (413) -> IP limit (429) ->
-//! route (404) -> authenticate (401) -> environment limit (429) -> action,
+//! route (404) -> authenticate (401) -> environment limit (429) -> action
+//! (only a 404 or 401 counts toward the IP limit),
 //! with the disk floor (503, storage::budget) before any action that writes.
 
 use std::net::{IpAddr, SocketAddr};
@@ -164,13 +165,19 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
         return too_large();
     }
 
-    // IngestRequestRateLimit, keyed by the client address.
+    // IngestRequestRateLimit, keyed by the client address. Only requests
+    // that fail to authenticate (no route, no or a wrong token) count, so
+    // tenants sharing an egress address (a PaaS, CI, a NAT) never use up
+    // each other's; authenticated ones count per environment below.
     let ip = client_ip(&state, &req);
-    if state.ip_limit.exceeded(&ip) {
+    if state.ip_limit.full(&ip) {
         return rate_limited();
     }
 
-    let Some(action) = route(req.method(), &path) else { return StatusCode::NOT_FOUND.into_response() };
+    let Some(action) = route(req.method(), &path) else {
+        state.ip_limit.exceeded(&ip);
+        return StatusCode::NOT_FOUND.into_response();
+    };
 
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
@@ -193,7 +200,10 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
             }
         }
     };
-    let Some(env) = env else { return StatusCode::UNAUTHORIZED.into_response() };
+    let Some(env) = env else {
+        state.ip_limit.exceeded(&ip);
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
 
     if state.env_limit.exceeded(&env.id) {
         return rate_limited();
