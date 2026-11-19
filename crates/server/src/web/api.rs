@@ -1554,22 +1554,26 @@ impl Api<'_> {
             if !matches!(status.as_str(), "resolved" | "ignored" | "open") {
                 return Err(unprocessable("status", "must be one of open, resolved, ignored"));
             }
-            let merged = self.write(|c| {
-                let i = issue_model::find(c, id)?.expect("issue");
-                match status.as_str() {
-                    "resolved" => {
-                        issue_model::resolve_by(c, &i, None, actor)?;
+            // The issue can be deleted (its environment, app or account)
+            // between find_issue and here: a 404, never a panic under the lock.
+            let merged = self
+                .write(|c| {
+                    let Some(i) = issue_model::find(c, id)? else { return Ok(Err(())) };
+                    match status.as_str() {
+                        "resolved" => {
+                            issue_model::resolve_by(c, &i, None, actor)?;
+                        }
+                        "ignored" => {
+                            issue_model::ignore(c, &i, actor)?;
+                        }
+                        _ if i.status == "merged" => return Ok(Ok(Some(()))),
+                        _ => {
+                            issue_model::reopen(c, &i, actor)?;
+                        }
                     }
-                    "ignored" => {
-                        issue_model::ignore(c, &i, actor)?;
-                    }
-                    _ if i.status == "merged" => return Ok(Some(())),
-                    _ => {
-                        issue_model::reopen(c, &i, actor)?;
-                    }
-                }
-                Ok(None)
-            })?;
+                    Ok(Ok(None))
+                })?
+                .map_err(|()| not_found())?;
             if merged.is_some() {
                 // unmerge! raises InvalidMerge on a broken chain: a 422 with
                 // its message on status.
@@ -1582,10 +1586,12 @@ impl Api<'_> {
         }
         if p.present("priority") {
             let priority = p.s("priority");
-            let valid = self.write(|c| {
-                let i = issue_model::find(c, id)?.expect("issue");
-                issue_model::set_priority(c, &i, &priority, actor)
-            })?;
+            let valid = self
+                .write(|c| match issue_model::find(c, id)? {
+                    Some(i) => issue_model::set_priority(c, &i, &priority, actor).map(Some),
+                    None => Ok(None),
+                })?
+                .ok_or_else(not_found)?;
             if !valid {
                 return Err(unprocessable("priority", "is not included in the list"));
             }
@@ -1612,10 +1618,11 @@ impl Api<'_> {
             } else {
                 None
             };
-            self.write(|c| {
-                let i = issue_model::find(c, id)?.expect("issue");
-                issue_model::set_assignee(c, &i, to.as_ref().map(|(u, n)| (*u, n.as_str())), actor)
-            })?;
+            self.write(|c| match issue_model::find(c, id)? {
+                Some(i) => issue_model::set_assignee(c, &i, to.as_ref().map(|(u, n)| (*u, n.as_str())), actor).map(Some),
+                None => Ok(None),
+            })?
+            .ok_or_else(not_found)?;
         }
         ok(self.issue_full(id)?)
     }
@@ -1938,6 +1945,37 @@ mod tests {
         assert_eq!(get(&f, "/api/v1/issues?status=bogus", "full").1["meta"]["total"], 2);
         assert_eq!(get(&f, "/api/v1/issues?q=broken", "full").1["meta"]["total"], 2);
         assert_eq!(get(&f, "/api/v1/issues?assignee_id=abc", "full").1["meta"]["total"], 0, "assignee_id = NULL");
+    }
+
+    /// GA hunt H1: the issue is deleted (its environment, by another
+    /// session) between the scope check and a later write of the same
+    /// PATCH. That is a 404, not a panic holding the control lock, and the
+    /// next request, anyone's, works.
+    #[test]
+    fn an_issue_deleted_mid_update_is_a_404_and_the_server_keeps_working() {
+        let f = fixture("vanish");
+        // The race, made deterministic: the status write's activity deletes
+        // the issue, so the priority write's re-read finds nothing.
+        f.c.with(|x| {
+            x.execute_batch(
+                "CREATE TEMP TRIGGER vanish AFTER INSERT ON issue_activities WHEN NEW.kind = 'status' BEGIN
+                   DELETE FROM issue_activities WHERE issue_id = NEW.issue_id;
+                   DELETE FROM alerts WHERE issue_id = NEW.issue_id;
+                   DELETE FROM issues WHERE id = NEW.issue_id;
+                 END",
+            )
+        })
+        .unwrap();
+        let path = format!("/api/v1/issues/{}", f.issue);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            req(&f, Method::PATCH, &path, Some("full"), Some(json!({"status": "resolved", "priority": "high"})))
+        }));
+        let r = r.expect("no panic");
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        f.c.with(|x| x.execute_batch("DROP TRIGGER vanish")).unwrap();
+        let (status, list) = get(&f, "/api/v1/issues", "full");
+        assert_eq!(status, 200, "the next request works");
+        assert_eq!(list["meta"]["total"], 1, "{list}");
     }
 
     #[test]

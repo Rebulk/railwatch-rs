@@ -20,6 +20,11 @@ tag is a release candidate (marked pre-release, not "latest", so
   (`railwatch setup` binds the account it creates; an existing data dir is
   bound to its lowest account on upgrade). If it is deleted, proxied
   requests are refused instead of joining whichever account is first.
+- A panic in one request while it held the control database (for example
+  `PATCH /api/v1/issues/:id` racing the deletion of its environment) no
+  longer takes the server down for every account until a restart. The lock
+  is recovered, the issue update answers 404, and `/up` now answers 503 when
+  the control database does not, so a health check sees a wedged server.
 
 ## v0.3.4 (2026-11-18)
 

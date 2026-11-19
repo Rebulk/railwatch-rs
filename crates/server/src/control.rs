@@ -210,12 +210,12 @@ impl Control {
     }
 
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> rusqlite::Result<T> {
-        f(&self.conn.lock().unwrap())
+        f(&self.conn())
     }
 
     /// A write that may fail validation, in one IMMEDIATE transaction.
     pub fn tx<T>(&self, f: impl FnOnce(&rusqlite::Transaction) -> ModelResult<T>) -> ModelResult<T> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let out = f(&tx)?;
         tx.commit()?;
@@ -338,8 +338,24 @@ impl Control {
         })
     }
 
+    /// The one control connection, for every account. A panic while it was
+    /// held (a handler bug) must not take the server down for everyone: the
+    /// lock is recovered, not unwrapped. The connection itself is sound (a
+    /// rusqlite Transaction rolls back when the panic drops it); anything
+    /// a bare `BEGIN` left open is rolled back here.
     pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap()
+        match self.conn.lock() {
+            Ok(c) => c,
+            Err(poisoned) => {
+                self.conn.clear_poison();
+                let c = poisoned.into_inner();
+                if !c.is_autocommit() {
+                    let _ = c.execute_batch("ROLLBACK");
+                }
+                tracing::error!("control database lock recovered after a panic");
+                c
+            }
+        }
     }
 }
 
@@ -849,6 +865,35 @@ pub(crate) fn test_password() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// GA hunt H1: a panic while a request holds the control connection
+    /// (one handler's bug) must not fail every later request of every
+    /// account; nor may a transaction it left open leak into the next.
+    #[test]
+    fn a_panic_holding_the_control_lock_does_not_break_the_next_request() {
+        let dir = std::env::temp_dir().join(format!("rw-control-poison-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.with::<()>(|x| {
+                x.execute_batch(
+                    "BEGIN IMMEDIATE; INSERT INTO users (name, email, password_digest, created_at, updated_at) VALUES ('x', 'x@x.test', 'd', 'x', 'x');",
+                )?;
+                panic!("a handler bug");
+            })
+        }));
+        assert!(panicked.is_err());
+        let users: i64 = c.with(|x| x.query_row("SELECT count(*) FROM users", [], |r| r.get(0))).expect("the next request works");
+        assert_eq!(users, 0, "the half-done write was rolled back");
+        assert!(c.conn().is_autocommit());
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c.tx::<()>(|_| panic!("inside a transaction"));
+        }));
+        assert!(panicked.is_err());
+        c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).expect("writes work too");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     fn temp() -> (std::path::PathBuf, Control) {
