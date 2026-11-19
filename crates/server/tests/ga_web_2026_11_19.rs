@@ -556,3 +556,116 @@ fn an_email_change_notifies_the_old_address_and_ends_other_sessions() {
     assert_eq!(stolen.get(&s, "/dashboard").location(), "/sign_in", "the other session is signed out");
     assert_ne!(b.get(&s, "/settings/email").status, 302, "the changing session stays");
 }
+
+// ---------------------------------------------------------------------------
+// Hunt H4: /cable limits
+
+/// A WebSocket client over a raw socket: masked text frames out, server
+/// frames in. Enough of RFC 6455 for /cable.
+struct Ws(TcpStream);
+
+impl Ws {
+    fn open(s: &Server, cookies: &HashMap<String, String>) -> Ws {
+        let mut c = TcpStream::connect(s.addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let cookie: Vec<String> = cookies.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let req = format!(
+            "GET /cable HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: actioncable-v1-json\r\nCookie: {}\r\n\r\n",
+            s.addr,
+            cookie.join("; ")
+        );
+        c.write_all(req.as_bytes()).unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            c.read_exact(&mut b).unwrap();
+            head.push(b[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+        Ws(c)
+    }
+
+    fn send(&mut self, text: &str) -> std::io::Result<()> {
+        let p = text.as_bytes();
+        let mut f = vec![0x81];
+        match p.len() {
+            n if n < 126 => f.push(0x80 | n as u8),
+            n if n < 65536 => {
+                f.push(0x80 | 126);
+                f.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+            n => {
+                f.push(0x80 | 127);
+                f.extend_from_slice(&(n as u64).to_be_bytes());
+            }
+        }
+        let mask = [1u8, 2, 3, 4];
+        f.extend_from_slice(&mask);
+        f.extend(p.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        self.0.write_all(&f)
+    }
+
+    /// The next text message that is not a ping; None once the server closed.
+    fn recv(&mut self) -> Option<Value> {
+        loop {
+            let mut h = [0u8; 2];
+            self.0.read_exact(&mut h).ok()?;
+            let mut len = (h[1] & 0x7f) as usize;
+            if len == 126 {
+                let mut l = [0u8; 2];
+                self.0.read_exact(&mut l).ok()?;
+                len = u16::from_be_bytes(l) as usize;
+            } else if len == 127 {
+                let mut l = [0u8; 8];
+                self.0.read_exact(&mut l).ok()?;
+                len = u64::from_be_bytes(l) as usize;
+            }
+            let mut p = vec![0u8; len];
+            self.0.read_exact(&mut p).ok()?;
+            match h[0] & 0x0f {
+                0x8 => return None,
+                0x1 => {
+                    let v: Value = serde_json::from_slice(&p).ok()?;
+                    if v["type"] != "ping" {
+                        return Some(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// One socket cannot pile up subscriptions: an identifier is at most 256
+/// bytes, a connection holds at most 16, and a message over 4 KiB closes it.
+#[test]
+fn cable_subscriptions_per_connection_are_bounded() {
+    let s = start("h4-cable", "open", false);
+    let (account, _, _, password) = acme(&s);
+    let app = s.control.tx(|tx| control::insert_application(tx, account, "Shop", "shop", "SHOP", None, "main")).unwrap();
+    let (env, _) = s.control.tx(|tx| control::create_environment(tx, app, "production")).unwrap();
+    let mut b = Browser::default();
+    b.sign_in(&s, "alice@acme.test", &password);
+    let mut ws = Ws::open(&s, &b.jar);
+    assert_eq!(ws.recv().unwrap()["type"], "welcome");
+    let subscribe = |pad: &str| {
+        let identifier = json!({"channel": "EnvironmentChannel", "id": env, "pad": pad}).to_string();
+        json!({"command": "subscribe", "identifier": identifier}).to_string()
+    };
+    let mut confirmed = 0;
+    for i in 0..20 {
+        ws.send(&subscribe(&i.to_string())).unwrap();
+        if ws.recv().unwrap()["type"] == "confirm_subscription" {
+            confirmed += 1;
+        }
+    }
+    assert_eq!(confirmed, 16, "at most 16 subscriptions per connection");
+    let mut ws = Ws::open(&s, &b.jar);
+    assert_eq!(ws.recv().unwrap()["type"], "welcome");
+    ws.send(&subscribe(&"x".repeat(300))).unwrap();
+    assert_eq!(ws.recv().unwrap()["type"], "reject_subscription", "a long identifier is not kept");
+    ws.send(&subscribe("ok")).unwrap();
+    assert_eq!(ws.recv().unwrap()["type"], "confirm_subscription", "the connection still works");
+    let _ = ws.send(&subscribe(&"x".repeat(100_000)));
+    assert_eq!(ws.recv(), None, "a 100 KB message closes the connection");
+}

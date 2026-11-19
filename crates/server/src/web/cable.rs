@@ -17,6 +17,11 @@
 //!   {"event":"ingested","at":...,"counts":{...}}}`, re-authorized before
 //!   it is sent (EnvironmentChannel#transmit_authorized).
 //!
+//! Limits (the protocol only needs small commands): a message or frame is
+//! at most MAX_MESSAGE_BYTES (the connection is closed past it), an
+//! identifier at most MAX_IDENTIFIER_BYTES, and a connection holds at most
+//! MAX_SUBSCRIPTIONS; a subscribe past either is rejected, never stored.
+//!
 //! Broadcasts come from the ingest commit path (followups.rs), at most one
 //! per environment every 2 s (Ingest::Batch::THROTTLE_WINDOW). They are a
 //! "data changed, refetch" ping, not the data.
@@ -36,6 +41,13 @@ use tokio::sync::broadcast;
 
 use super::WebState;
 use super::cookies;
+
+/// The largest WebSocket message or frame a client may send.
+pub const MAX_MESSAGE_BYTES: usize = 4096;
+/// The longest subscribe identifier kept (the frontend's is ~40 bytes).
+pub const MAX_IDENTIFIER_BYTES: usize = 256;
+/// Subscriptions per connection (one page subscribes to one environment).
+pub const MAX_SUBSCRIPTIONS: usize = 16;
 
 pub const THROTTLE: Duration = Duration::from_secs(2);
 const PING_EVERY: Duration = Duration::from_secs(3);
@@ -105,7 +117,10 @@ pub async fn upgrade(
         (true, None, Some(sid)) => state.db(move |c| c.with(|x| crate::control::find_session(x, sid))).await.ok().flatten().map(|s| (s.id, s.user_id, None)),
         _ => None,
     };
-    ws.protocols(["actioncable-v1-json"]).on_upgrade(move |socket| run(socket, state, user))
+    ws.protocols(["actioncable-v1-json"])
+        .max_message_size(MAX_MESSAGE_BYTES)
+        .max_frame_size(MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| run(socket, state, user))
 }
 
 fn text(v: Value) -> Message {
@@ -164,7 +179,8 @@ async fn run(socket: WebSocket, state: Arc<WebState>, user: Option<(i64, i64, Op
                             .then(|| id["id"].as_i64().or_else(|| id["id"].as_str().and_then(|s| s.parse().ok())))
                             .flatten();
                         let st = state.clone();
-                        let ok = match env {
+                        let room = identifier.len() <= MAX_IDENTIFIER_BYTES && (subs.len() < MAX_SUBSCRIPTIONS || subs.contains_key(&identifier));
+                        let ok = match env.filter(|_| room) {
                             Some(e) => tokio::task::spawn_blocking(move || authorized(&st, session_id, user_id, only, e)).await.unwrap_or(false),
                             None => false,
                         };

@@ -34,6 +34,8 @@ tag is a release candidate (marked pre-release, not "latest", so
   one of its applications.
 - Changing your email now tells the old address and signs out your other
   sessions, as a password change does.
+- `/cable` bounds what one connection can make the server keep: messages up
+  to 4 KiB, subscribe identifiers up to 256 bytes, 16 subscriptions.
 
 ## v0.3.4 (2026-11-18)
 
