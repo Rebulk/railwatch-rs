@@ -83,7 +83,12 @@ per-IP limit uses `X-Forwarded-For`.
 
 The binary is the whole app: `RAILWATCH_DATA_DIR=./data railwatch setup`,
 then `railwatch serve`. Any process supervisor works; socket activation
-(`LISTEN_FDS`) is used when present.
+(`LISTEN_FDS`) is used when present. Whatever your shell's umask, the
+binary creates the data dir and everything in it for its own user only
+(directories 0700, files 0600): the control DB holds password digests,
+sessions and token digests. A data dir made by an older version may still
+be readable by other users; `railwatch doctor` says so, and
+`chmod -R go-rwx <data dir>` fixes it.
 
 ## Docker
 
@@ -452,7 +457,8 @@ Run it any time: `sudo railwatch doctor`. As root, the binary reads
 file) and switches to the data dir's owner (`railwatch`) before touching
 anything, so it never leaves root-owned files in the data dir; the same
 holds for every other command except `serve` and `upgrade`.
-It checks: the data dir is writable; disk over 10% free; the control DB;
+It checks: the data dir is writable, and (a warning) that no other local
+user can read it; disk over 10% free; the control DB;
 SMTP accepts a connection; **Google sign-in** (configured or not, the
 redirect URI to register, Google's signing keys reachable); **DNS** for the public host resolves; **ports**
 443 (and 80 with built-in TLS) accept connections at that address; the

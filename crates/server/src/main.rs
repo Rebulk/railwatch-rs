@@ -213,6 +213,13 @@ fn main() -> ExitCode {
     if let Some(code) = client::run(&argv.iter().map(String::as_str).collect::<Vec<_>>()) {
         return code;
     }
+    // Everything the server and its commands create (the data dir, the
+    // control DB with password digests and sessions, telemetry, exports) is
+    // for this user only: 0700 directories, 0600 files, whatever umask the
+    // shell had (GA review 2026-11-19, security #9; install.sh's unit and
+    // the Docker image set this already, a bare binary did not).
+    // SAFETY: umask only changes this process's file-creation mask.
+    unsafe { libc::umask(0o077) };
     if let Err(e) = railwatch_server::config::load_env_file() {
         return fail(format!("RAILWATCH_ENV_FILE: {e}"));
     }
@@ -1100,6 +1107,7 @@ fn doctor() -> ExitCode {
             println!("FAIL  data dir {}: {e}", cfg.data_dir.display());
         }
     }
+    ok &= doctor_permissions(&cfg);
     // Disk space.
     if let Ok(path) = std::ffi::CString::new(cfg.data_dir.display().to_string()) {
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -1185,6 +1193,34 @@ fn doctor() -> ExitCode {
     ok &= doctor_tls(&cfg);
     ok &= doctor_backups(&cfg);
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// The data dir and what holds secrets or telemetry should be this user's
+/// only: a group- or world-readable one lets any local user read password
+/// digests, sessions, token digests and every tenant's telemetry. A warning,
+/// not a failure: a deliberately shared dir is the operator's call.
+fn doctor_permissions(cfg: &Config) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let mut loose = Vec::new();
+    let control = cfg.control_path();
+    let wal = std::path::PathBuf::from(format!("{}-wal", control.display()));
+    for p in [cfg.data_dir.clone(), control, wal, cfg.tenants_dir(), cfg.data_dir.join("sourcemaps")] {
+        if let Ok(m) = std::fs::symlink_metadata(&p)
+            && m.permissions().mode() & 0o077 != 0
+        {
+            loose.push(format!("{} ({:o})", p.display(), m.permissions().mode() & 0o777));
+        }
+    }
+    if loose.is_empty() {
+        println!("ok    data dir permissions: this user's only");
+    } else {
+        println!(
+            "warn  readable by other local users: {}; run `chmod -R go-rwx {}` (the server creates new files 0600 itself)",
+            loose.join(", "),
+            cfg.data_dir.display()
+        );
+    }
+    true
 }
 
 /// Google sign-in: configured or not, the redirect URI to register, and

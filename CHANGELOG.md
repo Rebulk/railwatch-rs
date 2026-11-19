@@ -106,6 +106,12 @@ tag is a release candidate (marked pre-release, not "latest", so
   authenticated request counts toward its environment (ingest) or token
   (MCP, 300 a minute). Before, customers sharing an egress address (a PaaS,
   CI, a NAT) used up each other's limit.
+- A bare-binary install no longer leaves the data dir readable by other
+  local users: every command creates directories 0700 and files 0600
+  whatever the shell's umask (the installer and the Docker image already
+  did). `railwatch doctor` warns about a data dir, control DB or telemetry
+  directory that other users can read; `chmod -R go-rwx <data dir>` fixes
+  one made by an older version.
 - Grouping an exception into an issue, or changing an issue's status, no
   longer panics when the issue (or its environment) was deleted a moment
   earlier. That panic ran while holding the control database lock and could
