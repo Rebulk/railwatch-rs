@@ -1414,10 +1414,9 @@ fn serve() -> ExitCode {
         {
             let c = control.clone();
             disk.set_owners(Box::new(move || {
-                c.with(control::slug_accounts).unwrap_or_else(|e| {
-                    tracing::error!(error = %e, "disk budget: cannot read environment owners");
-                    Default::default()
-                })
+                c.with(control::slug_accounts)
+                    .map_err(|e| tracing::error!(error = %e, "disk budget: cannot read environment owners; this pass treats the server as one account"))
+                    .ok()
             }));
         }
         let state = Arc::new(AppState {

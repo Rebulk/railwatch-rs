@@ -57,7 +57,9 @@ pub const TRIM_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What the ingest path reads, written by the budget thread.
 /// slug -> account id, for `State::set_owners`.
-pub type Owners = Box<dyn Fn() -> std::collections::HashMap<String, i64> + Send + Sync>;
+/// None when they cannot be read (a control DB error): that pass then
+/// treats the server as one account, rather than every slug as unowned.
+pub type Owners = Box<dyn Fn() -> Option<std::collections::HashMap<String, i64>> + Send + Sync>;
 
 #[derive(Default)]
 pub struct State {
@@ -72,6 +74,8 @@ pub struct State {
     owners: Mutex<Option<Owners>>,
     /// The last pass ended with telemetry still over max_data_bytes.
     last_pass_over: AtomicBool,
+    /// The last pass knew each environment's account (owners set and read).
+    owners_known: AtomicBool,
     /// Ingest requests refused while low (logged on recovery).
     refused: AtomicU64,
     /// Ingest requests refused over max_data_bytes (logged by the pass).
@@ -137,7 +141,7 @@ impl State {
         // refused too, as before. With owners, only accounts the pass found
         // over their share are, so a burst from one account never refuses
         // another's ingest.
-        let unknown = self.owners.lock().unwrap().is_none();
+        let unknown = !self.owners_known.load(Ordering::Relaxed);
         if self.refuses(account) || (unknown && self.over_estimate()) {
             self.refused_over.fetch_add(1, Ordering::Relaxed);
             return Err(Refusal::OverBudget);
@@ -148,7 +152,7 @@ impl State {
     /// Did the last pass, finding telemetry over the budget, leave `account`
     /// out of the accounts over their share? Only with owners known.
     fn cleared(&self, account: i64) -> bool {
-        self.owners.lock().unwrap().is_some()
+        self.owners_known.load(Ordering::Relaxed)
             && self.last_pass_over.load(Ordering::Relaxed)
             && self.over_budget.lock().unwrap().as_ref().is_some_and(|over| !over.contains(&account))
     }
@@ -156,7 +160,7 @@ impl State {
     fn refuses(&self, account: i64) -> bool {
         match &*self.over_budget.lock().unwrap() {
             None => false,
-            Some(over) if self.owners.lock().unwrap().is_none() => !over.is_empty(),
+            Some(over) if !self.owners_known.load(Ordering::Relaxed) => !over.is_empty(),
             Some(over) => over.contains(&account),
         }
     }
@@ -439,7 +443,8 @@ fn check_with(budget: &Budget, data_dir: &Path, tenants_dir: &Path, state: &Stat
         // Writes counted from here on may be in the measurement too: the
         // estimate errs high.
         let counted = state.written.load(Ordering::Relaxed);
-        let owners = state.owners.lock().unwrap().as_ref().map(|f| f());
+        let owners = state.owners.lock().unwrap().as_ref().and_then(|f| f());
+        state.owners_known.store(owners.is_some(), Ordering::Relaxed);
         match trim_fair(tenants_dir, budget.max_data_bytes, today, owners.as_ref()) {
             Ok(t) => {
                 let over = t.used > budget.max_data_bytes;
@@ -809,7 +814,7 @@ mod tests {
 
         let state = State::default();
         let owners2 = owners.clone();
-        state.set_owners(Box::new(move || owners2.clone()));
+        state.set_owners(Box::new(move || Some(owners2.clone())));
         // check() uses the real today; a fresh tree with today's date works the same way.
         let root2 = std::env::temp_dir().join(format!("rw-budget-fair2-{}", crate::control::base58(8)));
         for slug in ["a", "b"] {
@@ -852,7 +857,7 @@ mod tests {
             c.execute_batch(&format!("CREATE TABLE pad (b BLOB); INSERT INTO pad VALUES (zeroblob({pad})); PRAGMA wal_checkpoint(TRUNCATE);")).unwrap();
         }
         let state = State::default();
-        state.set_owners(Box::new(|| [("a".to_string(), 1), ("b".to_string(), 2)].into()));
+        state.set_owners(Box::new(|| Some([("a".to_string(), 1), ("b".to_string(), 2)].into())));
         // Room for twice a's bytes: a is within its share, b far over it.
         let a_bytes = usage_by_slug(&root).into_iter().find(|(s, _, _)| s == "a").unwrap().1;
         check(&Budget { max_data_bytes: a_bytes * 2, min_free_bytes: 0 }, &root, &root, &state, &|_| {});
@@ -864,6 +869,23 @@ mod tests {
             assert!(started.elapsed() < TRIM_WAIT / 4, "admitted without waiting: {:?}", started.elapsed());
         }
         assert_eq!(rt.block_on(state.admit(2)), Err(Refusal::OverBudget));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #107 review L4: when the owners cannot be read, the pass treats
+    /// the server as one account (trim oldest first, refuse when over), not
+    /// every slug as an unowned account of its own that nothing refuses.
+    #[test]
+    fn owners_that_cannot_be_read_fall_back_to_one_account() {
+        let root = std::env::temp_dir().join(format!("rw-budget-l4-{}", crate::control::base58(8)));
+        open_or_create(&meta_path(&root.join("a"))).unwrap();
+        let c = open_or_create(&day_path(&root.join("a"), Tier::Core, &today())).unwrap();
+        c.execute_batch("CREATE TABLE pad (b BLOB); INSERT INTO pad VALUES (zeroblob(400000)); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        let state = State::default();
+        state.set_owners(Box::new(|| None));
+        let (total, _) = usage(&root);
+        check(&Budget { max_data_bytes: total / 2, min_free_bytes: 0 }, &root, &root, &state, &|_| {});
+        assert_eq!(admit(&state), Err(Refusal::OverBudget), "over with only today left: refused, as with one account");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
