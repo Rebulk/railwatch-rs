@@ -92,7 +92,7 @@ tag is a release candidate (marked pre-release, not "latest", so
   account's burst deleted every other account's history and blocked their
   ingest. One account behaves as before (docs/SELF-HOST.md, "Disk budget").
 - `/ingest/sourcemaps` is bounded: refused while the environment is paused
-  (409) or over quota (402), 120 uploads a minute per environment, the 10
+  (409) or over quota (402), 600 uploads a minute per environment, the 10
   newest deploys and 200 MiB per environment (the deploys uploaded to
   least recently are pruned first; an upload that cannot fit even then gets
   507 and prunes nothing). Uploads to one environment are serialised, so

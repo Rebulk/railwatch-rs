@@ -38,7 +38,7 @@ removes maps before assets become public.
 Each environment keeps source maps for its 10 newest deploys and at most
 200 MiB in all: an upload first deletes the oldest other deploys' maps to
 make room, and one that would still not fit is refused (HTTP 507). Uploads
-are limited to 120 a minute per environment, and are refused while the
+are limited to 600 a minute per environment, and are refused while the
 environment is paused (409) or over its event quota (402). Deleting an
 environment deletes its maps.
 

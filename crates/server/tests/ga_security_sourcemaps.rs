@@ -106,20 +106,32 @@ fn sourcemap_uploads_are_refused_when_paused_capped_per_environment_and_counted_
     let (counted, _) = railwatch_server::storage::budget::usage(&dir.join("telemetry"));
     assert!(counted >= written, "max_data_bytes sees the source maps ({counted} of {written})");
 
-    // A much lower upload rate than /ingest's 600 a minute.
-    let mut limited = false;
-    for i in 30..30 + railwatch_server::storage::sourcemaps::UPLOADS_PER_MINUTE as usize {
-        let s =
-            request(addr, "/ingest/sourcemaps", &[auth.clone(), ("X-Railwatch-Deploy", "small".into()), ("X-Railwatch-Filename", format!("a{i}.js"))], b"{}");
-        if s == 429 {
-            limited = true;
-            break;
-        }
-    }
-    assert!(limited, "uploads are rate limited per environment");
     // Over quota (enforce_quota on): refused like /ingest's records.
+    let quota: (i64, i64) =
+        control.with(|c| c.query_row("SELECT monthly_event_quota, additional_events_cap FROM accounts", [], |r| Ok((r.get(0)?, r.get(1)?)))).unwrap();
     control.with(|c| c.execute("UPDATE accounts SET monthly_event_quota = 0, additional_events_cap = 0", [])).unwrap();
     let s = request(addr, "/ingest/sourcemaps", &[auth.clone(), ("X-Railwatch-Deploy", "q".into()), ("X-Railwatch-Filename", "q.js".into())], b"{}");
     assert_eq!(s, 402, "over quota");
+    control.with(|c| c.execute("UPDATE accounts SET monthly_event_quota = ?, additional_events_cap = ?", [quota.0, quota.1])).unwrap();
+
+    // A large release (hundreds of chunks) goes in within a minute, with
+    // the 30 above in the same window (PR #107 review L7: 120 a minute
+    // dropped a big Vite/Next release's maps silently); past the limit,
+    // 429.
+    let mut accepted = 30;
+    let mut limited = false;
+    for i in 0..700 {
+        let s = request(addr, "/ingest/sourcemaps", &[auth.clone(), ("X-Railwatch-Deploy", "big".into()), ("X-Railwatch-Filename", format!("a{i}.js"))], b"{}");
+        match s {
+            201 => accepted += 1,
+            429 => {
+                limited = true;
+                break;
+            }
+            other => panic!("upload {i}: {other}"),
+        }
+    }
+    assert!(accepted >= 500, "a 500-map release fits in one minute: {accepted} accepted");
+    assert!(limited, "uploads are rate limited per environment");
     let _ = std::fs::remove_dir_all(&dir);
 }

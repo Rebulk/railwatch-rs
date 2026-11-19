@@ -14,8 +14,11 @@ use std::path::{Path, PathBuf};
 pub const MAX_ENV_BYTES: u64 = 200 * 1024 * 1024;
 /// Deploys per environment whose maps are kept.
 pub const MAX_DEPLOYS: usize = 10;
-/// Uploads per environment per minute (a release uploads tens of maps).
-pub const UPLOADS_PER_MINUTE: u64 = 120;
+/// Uploads per environment per minute. A large Vite or Next release uploads
+/// hundreds of maps, and the uploader does not fail the deploy on a 429, so
+/// a lower limit dropped maps silently (PR #107 review L7). The byte caps
+/// bound what is kept.
+pub const UPLOADS_PER_MINUTE: u64 = 600;
 
 fn dir_bytes(p: &Path) -> u64 {
     let mut n = 0;
