@@ -20,6 +20,12 @@ tag is a release candidate (marked pre-release, not "latest", so
   (`railwatch setup` binds the account it creates; an existing data dir is
   bound to its lowest account on upgrade). If it is deleted, proxied
   requests are refused instead of joining whichever account is first.
+  `railwatch setup` moves the binding to the account it creates when the
+  bound account has no members (one `railwatch env create` made before the
+  upgrade), and refuses, naming the account, when it has. A token created
+  through the proxy keeps the signed role as its ceiling
+  (`api_tokens.role_ceiling`, a new nullable column; existing tokens are
+  unchanged), so an owner signed as a member gets a member's token.
 - A panic in one request while it held the control database (for example
   `PATCH /api/v1/issues/:id` racing the deletion of its environment) no
   longer takes the server down for every account until a restart. The lock
@@ -38,7 +44,9 @@ tag is a release candidate (marked pre-release, not "latest", so
   host of a monitor's URL (on the Uptime page, MCP `uptime`, REST
   `.../uptime`, and in uptime alerts on the Alerts pages), as for webhook
   URLs; admins still see it whole. A failed check's error no longer repeats
-  the URL.
+  the URL, nor does an uptime alert's `detail`. Changing a monitor's URL
+  replaces the old one with its host in that monitor's incidents, last
+  error and alerts.
 - Invitation emails (new and resent) are rate-limited to 20 an hour per
   inviting user and per account. User and account names are at most 100
   characters with no line breaks or control characters on every path that

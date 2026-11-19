@@ -24,6 +24,10 @@
 //!    granted until now. Deliberately no foreign key: deleting that account
 //!    leaves the row pointing at nothing, and proxied requests are refused
 //!    instead of falling through to whichever account is first.
+//! 6. `api_token_role_ceiling`: `api_tokens.role_ceiling` (nullable). A
+//!    token made through the trusted proxy keeps the role the proxy signed,
+//!    and acts with at most that role even where the user's own membership
+//!    is higher. NULL (every existing token): the membership's role.
 
 pub mod issues;
 
@@ -46,6 +50,7 @@ pub const MIGRATIONS: &[(&str, Step)] = &[
     ("20261013000003_issues_alerts", issues_alerts),
     ("20261101000001_uptime", uptime),
     ("20261119000001_trusted_proxy", trusted_proxy),
+    ("20261119000002_api_token_role_ceiling", api_token_role_ceiling),
 ];
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<&'static str>> {
@@ -290,6 +295,10 @@ CREATE TABLE status_pages (
 
 fn uptime(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(UPTIME)
+}
+
+fn api_token_role_ceiling(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch("ALTER TABLE api_tokens ADD COLUMN role_ceiling varchar")
 }
 
 /// One row at most (id 1).

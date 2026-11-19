@@ -494,7 +494,7 @@ pub async fn deliver(ctx: &Context, smtp: Option<&crate::config::Smtp>) -> Resul
     match ctx.integration_kind.as_str() {
         "webhook" => post(&s("url").ok_or("webhook has no url")?, &ctx.webhook_body(), s("secret").as_deref(), &ctx.alert.delivery_key, Kind::Webhook).await,
         "slack" => post(&s("webhook_url").ok_or("slack has no webhook_url")?, &ctx.slack_body(), None, "", Kind::Slack).await,
-        "email" => send_email(&s("to").ok_or("email has no recipient")?, ctx, smtp).await,
+        "email" => send_email(&recipient(&ctx.settings)?, ctx, smtp).await,
         "linear" => Err("Linear delivery is not supported by railwatch-rs".into()),
         other => Err(format!("unknown integration kind {other}")),
     }
@@ -504,6 +504,12 @@ pub async fn deliver(ctx: &Context, smtp: Option<&crate::config::Smtp>) -> Resul
 async fn send_email(to: &str, ctx: &Context, smtp: Option<&crate::config::Smtp>) -> Result<(), String> {
     let smtp = smtp.ok_or("email alerts need SMTP: set smtp_address (RAILWATCH_SMTP_ADDRESS) and friends; see `railwatch doctor`")?;
     crate::web::mailer::Mailer::new(smtp)?.send(&alert_mail(to, ctx)).await
+}
+
+/// An email integration's `to`, trimmed as integration::validate trimmed it
+/// (stored values may carry the spaces a form left).
+fn recipient(settings: &Value) -> Result<String, String> {
+    Ok(pstr(settings, "to").ok_or("email has no recipient")?.trim_ascii().to_string())
 }
 
 /// The alert email: the text (telemetry, so on one line) and the link.
@@ -702,6 +708,18 @@ mod tests {
         assert_eq!(mail.text.lines().count(), 3, "the text, a blank line, the link: {:?}", mail.text);
         assert!(mail.text.starts_with("New issue SHOP-12 in production: x . MAIL FROM:<a@evil.test> RCPT TO:<s@evil.test>\n"), "{:?}", mail.text);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PR #106 review: what validation checked is what is sent. Surrounding
+    /// ASCII spaces are dropped; a Unicode space (U+2003) was never trimmed
+    /// by the validator, so it is refused at save, not at every delivery.
+    #[test]
+    fn an_email_alert_goes_to_the_address_that_was_validated() {
+        let settings = rjson::parse(br#"{"to": "  ops@example.com \t"}"#).unwrap();
+        assert_eq!(recipient(&settings).unwrap(), "ops@example.com");
+        let em = |to: &str| super::super::integration::validate("email", "Ops", &serde_json::from_value(serde_json::json!({"to": to})).unwrap());
+        assert!(em(" ops@example.com ").is_empty());
+        assert!(!em("\u{2003}ops@example.com").is_empty(), "non-ASCII whitespace is refused");
     }
 
     #[test]

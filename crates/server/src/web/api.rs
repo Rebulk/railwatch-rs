@@ -1630,6 +1630,10 @@ impl Api<'_> {
             })?
             .ok_or_else(not_found)?;
         }
+        // Deleted after the last write: a 404, as the writes answer.
+        if self.control(|c| issue_model::find(c, id))?.is_none() {
+            return Err(not_found());
+        }
         ok(self.issue_full(id)?)
     }
 
@@ -1982,6 +1986,25 @@ mod tests {
         let (status, list) = get(&f, "/api/v1/issues", "full");
         assert_eq!(status, 200, "the next request works");
         assert_eq!(list["meta"]["total"], 1, "{list}");
+    }
+
+    /// PR #106 review: a status-only PATCH whose issue goes away with that
+    /// one write: the closing read is a 404 too, not a 500.
+    #[test]
+    fn an_issue_deleted_by_the_last_write_is_a_404() {
+        let f = fixture("vanish-last");
+        f.c.with(|x| {
+            x.execute_batch(
+                "CREATE TEMP TRIGGER vanish AFTER INSERT ON issue_activities WHEN NEW.kind = 'status' BEGIN
+                   DELETE FROM issue_activities WHERE issue_id = NEW.issue_id;
+                   DELETE FROM alerts WHERE issue_id = NEW.issue_id;
+                   DELETE FROM issues WHERE id = NEW.issue_id;
+                 END",
+            )
+        })
+        .unwrap();
+        let r = req(&f, Method::PATCH, &format!("/api/v1/issues/{}", f.issue), Some("full"), Some(json!({"status": "resolved"})));
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
     }
 
     #[test]

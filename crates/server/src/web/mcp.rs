@@ -238,7 +238,9 @@ pub struct Token {
     pub name: String,
     pub expires_at: Option<String>,
     last_used_at: Option<i64>,
-    /// A trusted proxy's identity: the role it claimed (`is_admin_of`).
+    /// A trusted proxy's identity, or a token made through the proxy
+    /// (`api_tokens.role_ceiling`): the role it may act with at most
+    /// (`is_admin_of`).
     proxy_role: Option<String>,
 }
 
@@ -248,11 +250,11 @@ impl Token {
     /// Settings that may carry credentials (monitor URLs) are shown in full
     /// only to them.
     pub fn is_admin_of(&self, control: &Control, account: i64) -> bool {
-        let role = match &self.proxy_role {
-            Some(r) => Some(r.clone()),
-            None => control.with(|c| crate::control::membership_role(c, account, self.user_id)).ok().flatten(),
-        };
-        matches!(role.as_deref(), Some("owner" | "admin"))
+        let admin = |r: Option<&str>| matches!(r, Some("owner" | "admin"));
+        let membership = control.with(|c| crate::control::membership_role(c, account, self.user_id)).ok().flatten();
+        // The lower of the two: the proxy's role never lifts a membership,
+        // and a token made through the proxy never exceeds what it signed.
+        admin(membership.as_deref()) && self.proxy_role.as_deref().is_none_or(|r| admin(Some(r)))
     }
 
     /// ApiToken#allows?
@@ -448,7 +450,7 @@ pub fn call_as(env: &Env, base: &str, now: i64, authorization: Option<&str>, pro
 /// ApiToken.authenticate: active, by SHA-256 digest.
 fn authenticate(c: &Connection, raw: &str, now: i64) -> rusqlite::Result<Option<Token>> {
     c.query_row(
-        "SELECT id, user_id, scopes, account_id, application_id, last_used_at, name, expires_at FROM api_tokens
+        "SELECT id, user_id, scopes, account_id, application_id, last_used_at, name, expires_at, role_ceiling FROM api_tokens
          WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?1) AND token_digest = ?2 LIMIT 1",
         params![qt(now), crate::control::digest(raw)],
         |r| {
@@ -462,7 +464,7 @@ fn authenticate(c: &Connection, raw: &str, now: i64) -> rusqlite::Result<Option<
                 last_used_at: r.get::<_, Option<String>>(5)?.and_then(|t| crate::time::parse_db_time(&t)),
                 name: r.get(6)?,
                 expires_at: r.get(7)?,
-                proxy_role: None,
+                proxy_role: r.get(8)?,
             })
         },
     )
@@ -636,6 +638,12 @@ impl Mcp<'_> {
 pub const MAX_ARGUMENT_BYTES: usize = 4096;
 /// add_comment's `body`: a comment, not a filter.
 pub const MAX_COMMENT_BYTES: usize = 65_536;
+/// What a returned continuation (`next.q`, `expand.q`) adds to the caller's
+/// `q`: `after:` and `before:` times, so a continuation of a `q` the
+/// caller could send is always accepted back.
+pub const CONTINUATION_BYTES: usize = 128;
+/// The longest `q` accepted, original or continuation.
+pub const MAX_Q_BYTES: usize = MAX_ARGUMENT_BYTES + CONTINUATION_BYTES;
 
 /// -32602's message when a string argument (at any depth) is too long.
 fn oversized_argument(tool: &str, args: &Map<String, Value>) -> Option<String> {
@@ -648,7 +656,11 @@ fn oversized_argument(tool: &str, args: &Map<String, Value>) -> Option<String> {
         }
     }
     args.iter().find_map(|(k, v)| {
-        let max = if tool == "add_comment" && k == "body" { MAX_COMMENT_BYTES } else { MAX_ARGUMENT_BYTES };
+        let max = match (tool, k.as_str()) {
+            ("add_comment", "body") => MAX_COMMENT_BYTES,
+            (_, "q") => MAX_Q_BYTES,
+            _ => MAX_ARGUMENT_BYTES,
+        };
         (longest(v) > max).then(|| format!("{k} is too long (at most {max} bytes)"))
     })
 }
@@ -1643,8 +1655,10 @@ impl Mcp<'_> {
                 if more > 0 {
                     let mut p = parsed.clone();
                     p.fields.insert("before".into(), crate::time::iso8601_6(last.unwrap_or(0) - 1));
-                    let next = json!({"q": filter_query::unparse(&p), "window": a.presence("window").unwrap_or_else(|| "24h".into()), "group": g});
-                    db::merge_into(&mut v, "next", next);
+                    if let Some(q) = compact::continuation_q(&p) {
+                        let next = json!({"q": q, "window": a.presence("window").unwrap_or_else(|| "24h".into()), "group": g});
+                        db::merge_into(&mut v, "next", next);
+                    }
                 }
                 if scanned.capped {
                     db::merge_into(&mut v, "scan", scanned.to_json());
@@ -2071,7 +2085,9 @@ impl Mcp<'_> {
                     if more > 0 {
                         let mut p = parsed.clone();
                         p.fields.insert("before".into(), crate::time::iso8601_6(last.flatten().unwrap_or(0) - 1));
-                        db::merge_into(&mut meta, "next", json!({"q": filter_query::unparse(&p), "window": window, "group": g}));
+                        if let Some(q) = compact::continuation_q(&p) {
+                            db::merge_into(&mut meta, "next", json!({"q": q, "window": window, "group": g}));
+                        }
                     }
                     (rows, meta)
                 }
@@ -4531,6 +4547,28 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    /// PR #106 review: a continuation (the caller's q plus `after:` and
+    /// `before:`, as `next` and `expand` build it) of the longest q a caller
+    /// may send is accepted back, not refused as too long; one that would be
+    /// refused is never handed out.
+    #[test]
+    fn a_continuation_of_the_longest_q_is_accepted_back() {
+        use crate::dashboard::filter_query;
+        let q = format!("path:/{}", "a".repeat(MAX_ARGUMENT_BYTES - 6));
+        assert_eq!(q.len(), MAX_ARGUMENT_BYTES);
+        let mut p = filter_query::parse(Some(&q));
+        p.fields.insert("after".into(), crate::time::iso8601_6(NOW - 1));
+        p.fields.insert("before".into(), crate::time::iso8601_6(NOW));
+        let next = compact::continuation_q(&p).expect("a continuation of an accepted q");
+        assert!(next.len() > MAX_ARGUMENT_BYTES, "the times push it past the plain cap");
+        let args = Map::from_iter([("q".to_string(), json!(next))]);
+        assert_eq!(oversized_argument("search_requests", &args), None, "and it is accepted back");
+        p.fields.insert("path".into(), "a".repeat(MAX_Q_BYTES));
+        assert_eq!(compact::continuation_q(&p), None, "one that would be refused is not returned");
+        let args = Map::from_iter([("q".to_string(), json!("x".repeat(MAX_Q_BYTES + 1)))]);
+        assert!(oversized_argument("search_requests", &args).is_some());
     }
 
     /// GA security 10: a 100 KB `q` (or any other overlong string) is an

@@ -1470,6 +1470,9 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
     // Through the trusted proxy: a token for the proxy's account (or an
     // application in it) only, never one for all of the user's accounts.
     let pinned = cx.current.is_proxied().then(|| cx.current.account.as_ref().map(|a| a.id).unwrap_or(0));
+    // ...and with no more than the role the proxy signed, whatever the
+    // user's own membership is (an owner signed as a member).
+    let ceiling = cx.current.proxy_role.clone();
     enum Out {
         Bad,
         Ok(String, bool),
@@ -1523,7 +1526,12 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
                     }
                 }
                 let raw = match control::issue_api_token(tx, uid, &name, &scopes, account, app, expires_at) {
-                    Ok((_, raw)) => raw,
+                    Ok((id, raw)) => {
+                        if let Some(role) = &ceiling {
+                            tx.execute("UPDATE api_tokens SET role_ceiling = ? WHERE id = ?", params![role, id])?;
+                        }
+                        raw
+                    }
                     Err(ModelError::Invalid(e)) => return Ok(Out::Invalid(e)),
                     Err(e) => return Err(e),
                 };
@@ -1624,9 +1632,10 @@ async fn email_update(cx: Ctx, p: Params) -> Response {
     let r = cx
         .state
         .db(move |c| {
-            c.with(|x| {
+            // One transaction: the new email never stands without the sign-out.
+            c.tx(|x| {
                 x.execute("UPDATE users SET email = ?, verified = 0, updated_at = ? WHERE id = ?", params![email, now_db(), uid])?;
-                x.execute("DELETE FROM sessions WHERE user_id = ? AND id IS NOT ?", params![uid, keep])
+                Ok(x.execute("DELETE FROM sessions WHERE user_id = ? AND id IS NOT ?", params![uid, keep])?)
             })
         })
         .await;
@@ -1637,7 +1646,7 @@ async fn email_update(cx: Ctx, p: Params) -> Response {
             send_verification(&cx, uid).await;
             cx.redirect(Redirect::to("/settings/email").notice("Your email has been changed"))
         }
-        Err(rusqlite::Error::SqliteFailure(f, _)) if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE => {
+        Err(ModelError::Sql(rusqlite::Error::SqliteFailure(f, _))) if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE => {
             cx.redirect(Redirect::to("/settings/email").error("email", "has already been taken"))
         }
         Err(e) => internal(e),

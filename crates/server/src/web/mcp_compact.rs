@@ -392,19 +392,27 @@ fn fold_request(fold: &mut Fold, r: &Row<'_>, access: bool, skip: &[&str]) {
 /// still covers them later). Every row of the group in that range is one
 /// of the entry's (a run's range holds no other run of the same group).
 /// The rows come a page (`limit`) at a time, each page with its `next`.
-pub fn expand(parsed: &crate::dashboard::filter_query::Parsed, e: &Entry) -> Value {
+pub fn expand(parsed: &crate::dashboard::filter_query::Parsed, e: &Entry) -> Option<Value> {
     let mut p = parsed.clone();
     p.fields.insert("after".into(), time(e.first));
     p.fields.insert("before".into(), time(e.last));
-    serde_json::json!({"q": crate::dashboard::filter_query::unparse(&p), "window": "30d", "group": e.id})
+    continuation_q(&p).map(|q| serde_json::json!({"q": q, "window": "30d", "group": e.id}))
+}
+
+/// A continuation's `q`, or None when it would be longer than a tool
+/// accepts back (super::MAX_Q_BYTES): never hand out one that is refused.
+/// A caller's q up to MAX_ARGUMENT_BYTES always has room for the times.
+pub fn continuation_q(p: &crate::dashboard::filter_query::Parsed) -> Option<String> {
+    Some(crate::dashboard::filter_query::unparse(p)).filter(|q| q.len() <= super::MAX_Q_BYTES)
 }
 
 /// Each entry of more than one row with its `expand` (before `rank`, so a
 /// budget counts it).
 pub fn with_expand(mut entries: Vec<Entry>, parsed: &crate::dashboard::filter_query::Parsed) -> Vec<Entry> {
     for e in &mut entries {
-        if e.count > 1 {
-            let x = expand(parsed, e);
+        if e.count > 1
+            && let Some(x) = expand(parsed, e)
+        {
             e.json.insert("expand".into(), x);
         }
     }

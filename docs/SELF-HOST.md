@@ -303,7 +303,9 @@ The security model:
   (verified, with a random password nobody knows) in the proxy's account,
   the one `railwatch setup` made, with the claimed role. (A data dir from
   before v0.3.5 is bound to its lowest account id on upgrade, the account
-  the proxy granted until then.) The role follows the proxy on every
+  the proxy granted until then; a later `railwatch setup` moves that binding
+  to the account it creates if nobody is a member of the old one, and
+  otherwise refuses and names it.) The role follows the proxy on every
   request, but the proxy can never create an owner, demote the owner, or
   add anyone to another account. A proxied request stays in that account
   and acts with the claimed role only: an email that matches an existing
@@ -312,7 +314,8 @@ The security model:
   accounts and never as an owner. Through the proxy nobody can switch
   account, create or delete an account, transfer ownership, accept an
   invitation to another account, or create a token for anything but the
-  proxy's account. If that account is deleted, proxied requests are refused
+  proxy's account; a token created there never acts with more than the
+  role the proxy signed. If that account is deleted, proxied requests are refused
   (403; MCP and the API 401) instead of joining the next account. Each
   proxied user has one session row, reused; Settings > Sessions shows it
   as "railwatch trusted proxy". Proxy-created users have no usable

@@ -299,7 +299,10 @@ pub fn insert(c: &Connection, environment_id: i64, m: &MonitorInput) -> rusqlite
 /// Updates a monitor's settings. Disabling pauses it (an open incident is
 /// closed now, without an alert); enabling a paused one starts from pending.
 pub fn update(c: &Connection, id: i64, m: &MonitorInput, now_micros: i64) -> rusqlite::Result<()> {
-    let was_enabled: bool = c.query_row("SELECT enabled FROM uptime_monitors WHERE id = ?", [id], |r| r.get(0))?;
+    let (was_enabled, old_url): (bool, String) = c.query_row("SELECT enabled, url FROM uptime_monitors WHERE id = ?", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if old_url != m.url.trim() {
+        forget_url(c, id, &old_url)?;
+    }
     c.execute(
         "UPDATE uptime_monitors SET name = ?2, url = ?3, method = ?4, expected_status = ?5, keyword = ?6, timeout_seconds = ?7,
            interval_seconds = ?8, enabled = ?9, public = ?10, public_name = ?11, public_url = ?12, updated_at = ?13 WHERE id = ?1",
@@ -324,6 +327,29 @@ pub fn update(c: &Connection, id: i64, m: &MonitorInput, now_micros: i64) -> rus
         c.execute("UPDATE uptime_monitors SET status = 'paused', failures = 0, failing_since = NULL WHERE id = ?", [id])?;
     } else if !was_enabled && m.enabled {
         c.execute("UPDATE uptime_monitors SET status = 'pending', failures = 0, failing_since = NULL WHERE id = ?", [id])?;
+    }
+    Ok(())
+}
+
+/// A monitor's previous URL, which may carry a credential, out of what
+/// outlives the change: its incidents' details and last error (recorded
+/// when probe errors repeated the URL) and its alerts' payloads. Readers
+/// mask only the current URL (shown_text), so the old one is replaced by
+/// its host here, for everyone.
+fn forget_url(c: &Connection, id: i64, old: &str) -> rusqlite::Result<()> {
+    let host = shown_url(old, false).unwrap_or_default();
+    let normalized = reqwest::Url::parse(old).ok().map(|u| u.to_string()).filter(|n| n != old);
+    for form in std::iter::once(old.to_string()).chain(normalized) {
+        c.execute("UPDATE uptime_incidents SET detail = replace(detail, ?2, ?3) WHERE monitor_id = ?1 AND instr(detail, ?2) > 0", params![id, form, host])?;
+        c.execute("UPDATE uptime_monitors SET last_error = replace(last_error, ?2, ?3) WHERE id = ?1 AND instr(last_error, ?2) > 0", params![id, form, host])?;
+        // Alerts keep the payload as JSON text: replace the URL as JSON writes it.
+        let json_form = serde_json::to_string(&form).unwrap_or_default();
+        let json_host = serde_json::to_string(&host).unwrap_or_default();
+        c.execute(
+            "UPDATE alerts SET payload = replace(payload, ?2, ?3)
+             WHERE event IN ('monitor_down', 'monitor_recovered') AND json_extract(payload, '$.monitor_id') = ?1 AND instr(payload, ?2) > 0",
+            params![id, json_form.trim_matches('"'), json_host.trim_matches('"')],
+        )?;
     }
     Ok(())
 }

@@ -143,11 +143,39 @@ pub fn bound_account(c: &Connection) -> rusqlite::Result<Option<i64>> {
     c.query_row("SELECT a.id FROM trusted_proxy t JOIN accounts a ON a.id = t.account_id WHERE t.id = 1", [], |r| r.get(0)).optional()
 }
 
-/// Binds the trusted proxy to `account` unless it is bound already (the
-/// account `railwatch setup` creates).
-pub fn bind_account(c: &Connection, account: i64) -> rusqlite::Result<()> {
-    c.execute("INSERT OR IGNORE INTO trusted_proxy (id, account_id, created_at) VALUES (1, ?, ?)", params![account, control::now_db()])?;
-    Ok(())
+/// Binds the trusted proxy to `account`, the one `railwatch setup` creates.
+/// An existing binding is replaced only when nobody can sign in to the
+/// account it names (no members: deleted, or made by `railwatch env create`
+/// before setup ran, which the upgrade bound as the lowest account); one
+/// that people use is refused, naming it, rather than silently kept or
+/// moved under them.
+pub fn bind_account(c: &Connection, account: i64) -> control::ModelResult<()> {
+    let bound: Option<(i64, Option<String>, i64)> = c
+        .query_row(
+            "SELECT t.account_id, a.name, (SELECT count(*) FROM memberships m WHERE m.account_id = t.account_id)
+             FROM trusted_proxy t LEFT JOIN accounts a ON a.id = t.account_id WHERE t.id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    match bound {
+        Some((id, _, _)) if id == account => Ok(()),
+        Some((id, Some(name), members)) if members > 0 => Err(control::ModelError::Invalid(vec![(
+            "base".into(),
+            format!(
+                "the trusted proxy is bound to account {id} ({name:?}), which has members; \
+                 sign in and use that account, or delete it (Settings > Members) before running setup"
+            ),
+        )])),
+        _ => {
+            c.execute(
+                "INSERT INTO trusted_proxy (id, account_id, created_at) VALUES (1, ?1, ?2)
+                 ON CONFLICT (id) DO UPDATE SET account_id = ?1, created_at = ?2",
+                params![account, control::now_db()],
+            )?;
+            Ok(())
+        }
+    }
 }
 
 /// The session, user and account for verified claims, creating what is
@@ -240,6 +268,30 @@ mod tests {
         // A signature one byte short of the real one: compared, not prefix-matched.
         let truncated = &h[..h.len() - 2];
         assert!(verify(SECRET, truncated, 1_000).is_err());
+    }
+
+    /// PR #106 review: an account made by `railwatch env create` before the
+    /// upgrade is bound by the migration (lowest id). Setup, run after, must
+    /// leave the proxy on the account it creates; an account with members
+    /// is never taken from under them.
+    #[test]
+    fn setup_rebinds_the_proxy_from_an_empty_account_and_refuses_a_used_one() {
+        let dir = std::env::temp_dir().join(format!("rw-proxy-bind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let control = control::Control::open(&dir.join("control.sqlite3")).unwrap();
+        let orphan = control.tx(|tx| control::insert_account(tx, "default", "default", 30)).unwrap();
+        control.with(|x| x.execute("INSERT INTO trusted_proxy (id, account_id, created_at) VALUES (1, ?, 'x')", [orphan])).unwrap();
+        let owner = control.tx(|tx| control::insert_user(tx, "Owner", "owner@example.com", &control::test_password(), true)).unwrap();
+        let made = control.tx(|tx| control::create_account(tx, "Acme", owner)).unwrap();
+        control.tx(|tx| bind_account(tx, made)).unwrap();
+        assert_eq!(control.with(bound_account).unwrap(), Some(made), "moved off the account nobody uses");
+
+        let other = control.tx(|tx| control::create_account(tx, "Other", owner)).unwrap();
+        let err = control.tx(|tx| bind_account(tx, other)).unwrap_err().to_string();
+        assert!(err.contains("Acme") && err.contains("has members"), "{err}");
+        assert_eq!(control.with(bound_account).unwrap(), Some(made), "a used account keeps the proxy");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -67,8 +67,11 @@ pub fn rows(x: &Connection, account: i64, environment: Option<i64>, q: &str, adm
             let mut payload: Value = serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or(json!({}));
             if !admin && let Some(url) = payload.get("url").and_then(Value::as_str).map(str::to_string) {
                 let shown = crate::uptime::shown_url(&url, false);
-                if let Some(Value::String(m)) = payload.get_mut("message") {
-                    *m = m.replace(&url, shown.as_deref().unwrap_or(""));
+                // `detail` is the probe error, which once repeated the URL.
+                for key in ["message", "detail"] {
+                    if let Some(Value::String(m)) = payload.get_mut(key) {
+                        *m = crate::uptime::shown_text(m, &url, false);
+                    }
                 }
                 payload["url"] = shown.map_or(Value::Null, Value::String);
             }

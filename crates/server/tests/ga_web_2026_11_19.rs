@@ -618,33 +618,45 @@ impl Ws {
         self.0.write_all(&f)
     }
 
-    /// The next text message that is not a ping; None once the server closed.
+    /// The next text message that is not a ping; None once the server
+    /// closed (a close frame, or the connection ended). A read that times
+    /// out is a failure, never taken for a close.
     fn recv(&mut self) -> Option<Value> {
         loop {
             let mut h = [0u8; 2];
-            self.0.read_exact(&mut h).ok()?;
+            self.read(&mut h)?;
             let mut len = (h[1] & 0x7f) as usize;
             if len == 126 {
                 let mut l = [0u8; 2];
-                self.0.read_exact(&mut l).ok()?;
+                self.read(&mut l)?;
                 len = u16::from_be_bytes(l) as usize;
             } else if len == 127 {
                 let mut l = [0u8; 8];
-                self.0.read_exact(&mut l).ok()?;
+                self.read(&mut l)?;
                 len = u64::from_be_bytes(l) as usize;
             }
             let mut p = vec![0u8; len];
-            self.0.read_exact(&mut p).ok()?;
+            self.read(&mut p)?;
             match h[0] & 0x0f {
                 0x8 => return None,
                 0x1 => {
-                    let v: Value = serde_json::from_slice(&p).ok()?;
+                    let v: Value = serde_json::from_slice(&p).expect("a JSON message");
                     if v["type"] != "ping" {
                         return Some(v);
                     }
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Some(()) with `buf` filled; None when the server ended the connection.
+    fn read(&mut self, buf: &mut [u8]) -> Option<()> {
+        use std::io::ErrorKind::*;
+        match self.0.read_exact(buf) {
+            Ok(()) => Some(()),
+            Err(e) if matches!(e.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe) => None,
+            Err(e) => panic!("reading the socket: {e} (a timeout is not a close)"),
         }
     }
 }
@@ -680,6 +692,7 @@ fn cable_subscriptions_per_connection_are_bounded() {
     ws.send(&subscribe("ok")).unwrap();
     assert_eq!(ws.recv().unwrap()["type"], "confirm_subscription", "the connection still works");
     let _ = ws.send(&subscribe(&"x".repeat(100_000)));
+    // recv panics on a timeout (10 s, Ws::open), so None is a real close.
     assert_eq!(ws.recv(), None, "a 100 KB message closes the connection");
 }
 
@@ -824,4 +837,125 @@ fn user_and_account_names_are_short_and_have_no_control_characters() {
     alice.sign_in(&s, "alice@acme.test", &password);
     alice.send(&s, "PATCH", "/settings/profile", &format!("name={}", enc(&"é".repeat(100))));
     assert_eq!(one::<String>(&s, "SELECT name FROM users WHERE email = 'alice@acme.test'", []), "é".repeat(100), "100 characters is fine");
+}
+
+// ---------------------------------------------------------------------------
+// PR #106 review
+
+/// The email change and the sign-out of other sessions are one
+/// transaction: if signing out fails, the email is not changed either.
+#[test]
+fn an_email_change_that_cannot_sign_out_other_sessions_changes_nothing() {
+    let s = start("email-tx", "open", false);
+    let password = control::base58(16);
+    user(&s, "Ada", "ada@example.com", &password, true);
+    let mut other = Browser::default();
+    other.sign_in(&s, "ada@example.com", &password);
+    let mut b = Browser::default();
+    b.sign_in(&s, "ada@example.com", &password);
+    s.control.with(|x| x.execute_batch("CREATE TRIGGER no_sign_out BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'refused'); END")).unwrap();
+    let r = b.send(&s, "PATCH", "/settings/email", &format!("email=ada2%40example.com&password_challenge={password}"));
+    assert_eq!(r.status, 500);
+    assert_eq!(one::<String>(&s, "SELECT email FROM users", []), "ada@example.com", "rolled back with the failed sign-out");
+}
+
+/// A token made through the trusted proxy acts with no more than the
+/// signed role: the host's owner, signed as a member, gets a token that
+/// sees uptime monitor URLs as a member does (host only).
+#[test]
+fn a_token_made_through_the_proxy_keeps_the_signed_role() {
+    use railwatch_server::uptime::{self, MonitorInput};
+    let s = start("pr106-ceiling", "open", true);
+    let (host, _, _, _) = proxy_fixture(&s);
+    let app: i64 = one(&s, "SELECT id FROM applications WHERE account_id = ?", [host]);
+    let (env, _) = s.control.tx(|tx| control::create_environment(tx, app, "production")).unwrap();
+    s.control
+        .with(|x| {
+            uptime::insert(x, env, &MonitorInput { name: "Health".into(), url: "https://example.com/up?token=MONITORSECRET".into(), ..Default::default() })
+        })
+        .unwrap()
+        .unwrap();
+    let mut owner = Browser::proxied("owner@host.test", "member");
+    let r =
+        owner.post(&s, "/settings/profile/generate_mcp_token", &format!("restriction=account%3A{host}&scopes_present=1&scopes%5B%5D=api&scopes%5B%5D=read"));
+    assert_eq!(r.location(), "/settings/profile");
+    let page = owner.get(&s, "/settings/profile").page();
+    let raw = page["props"]["mcp_token"].as_str().unwrap_or_else(|| panic!("the new token is shown once: {}", page["props"]["flash"])).to_string();
+    let mut b = Browser::default();
+    let body =
+        b.request(&s, "GET", &format!("/api/v1/applications/{app}/environments/{env}/uptime"), None, &[("Authorization", &format!("Bearer {raw}"))]).body;
+    assert!(body.contains("example.com") && !body.contains("MONITORSECRET"), "an owner's token made as a member acts as a member: {body}");
+    let ceiling: Option<String> = one(&s, "SELECT role_ceiling FROM api_tokens", []);
+    assert_eq!(ceiling.as_deref(), Some("member"));
+}
+
+/// A monitor_down alert keeps the probe error in `detail` too, and an
+/// incident keeps the error it opened with: a member sees neither URL, the
+/// current one or one the monitor had before its URL was changed.
+#[test]
+fn old_and_current_monitor_urls_stay_out_of_alert_and_incident_details() {
+    use railwatch_server::uptime::{self, MonitorInput};
+    let s = start("pr106-detail", "open", false);
+    let (account, _, _, password) = acme(&s);
+    let mallory = user(&s, "Mallory", "mallory@acme.test", &password, true);
+    s.control.tx(|tx| control::insert_membership(tx, account, mallory, "member")).unwrap();
+    let app = s.control.tx(|tx| control::insert_application(tx, account, "Shop", "shop", "SHOP", None, "main")).unwrap();
+    let (env, _) = s.control.tx(|tx| control::create_environment(tx, app, "production")).unwrap();
+    let old = "https://example.com/health?token=OLDSECRET";
+    let cur = "https://example.com/health?token=NEWSECRET";
+    let m = MonitorInput { name: "Health".into(), url: old.into(), ..Default::default() };
+    let monitor = s.control.with(|x| uptime::insert(x, env, &m)).unwrap().unwrap();
+    let integration = s
+        .control
+        .tx(|tx| {
+            Ok(railwatch_server::alerts::integration::insert(
+                tx,
+                &railwatch_server::alerts::integration::SettingsCipher::new(SECRET.as_bytes()),
+                account,
+                "email",
+                "Ops",
+                &serde_json::from_value(json!({"to": "ops@acme.test"})).unwrap(),
+            )?)
+        })
+        .unwrap();
+    let error = |u: &str| format!("error sending request for url ({u})");
+    let alert = |u: &str| {
+        let payload = json!({"monitor": "Health", "monitor_id": monitor, "url": u, "environment_id": env, "detail": error(u), "message": format!("Health is down: {}", error(u))});
+        s.control
+            .with(|x| {
+                x.execute(
+                    "INSERT INTO alerts (event, integration_id, payload, status, created_at, updated_at) VALUES ('monitor_down', ?, ?, 'sent', '2026-11-19 00:00:00', 'x')",
+                    rusqlite::params![integration, payload.to_string()],
+                )
+            })
+            .unwrap();
+    };
+    alert(old);
+    s.control
+        .with(|x| {
+            x.execute(
+                "INSERT INTO uptime_incidents (monitor_id, started_at, ended_at, cause, detail) VALUES (?, 1, 2, 'connect', ?)",
+                rusqlite::params![monitor, error(old)],
+            )
+        })
+        .unwrap();
+    // The URL changes, as the edit form does it.
+    s.control.with(|x| uptime::update(x, monitor, &MonitorInput { url: cur.into(), ..m.clone() }, 3)).unwrap();
+    alert(cur);
+    s.control
+        .with(|x| {
+            x.execute(
+                "INSERT INTO uptime_incidents (monitor_id, started_at, cause, detail) VALUES (?, 4, 'connect', ?)",
+                rusqlite::params![monitor, error(cur)],
+            )
+        })
+        .unwrap();
+
+    let mut b = Browser::default();
+    b.sign_in(&s, "mallory@acme.test", &password);
+    for path in ["/alerts".to_string(), format!("/apps/{app}/envs/{env}/uptime")] {
+        let seen = b.get(&s, &path).page()["props"].to_string();
+        assert!(!seen.contains("OLDSECRET") && !seen.contains("NEWSECRET"), "{path}: {seen}");
+        assert!(seen.contains("example.com"), "{path}");
+    }
 }

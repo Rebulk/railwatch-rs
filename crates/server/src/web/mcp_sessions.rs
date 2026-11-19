@@ -342,8 +342,9 @@ fn run_entry(j: &Journey, run: &journey::Run, base: &Parsed, access: bool) -> co
             let mut p = base.clone();
             let tab = run.lane.map_or("none", |l| j.tabs[l].id.as_str());
             p.fields.insert("tab".into(), tab.into());
-            let x = compact::expand(&p, &e);
-            e.json.insert("expand".into(), x);
+            if let Some(x) = compact::expand(&p, &e) {
+                e.json.insert("expand".into(), x);
+            }
         }
         if !others.is_empty() {
             let v = other_entry(&others, access);

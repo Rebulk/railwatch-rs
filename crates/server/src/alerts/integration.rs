@@ -211,7 +211,7 @@ pub fn validate(kind: &str, name: &str, settings: &Map<String, Value>) -> Vec<(S
     // name, quoted local part or line break), as everywhere else here.
     if kind == "email"
         && let Some(to) = settings.get("to").filter(|v| !blank(Some(v)))
-        && !to.as_str().is_some_and(|t| crate::control::valid_email(t.trim()))
+        && !to.as_str().is_some_and(|t| crate::control::valid_email(t.trim_ascii()))
     {
         errors.push(("settings".into(), "to is not a valid email address".into()));
     }
