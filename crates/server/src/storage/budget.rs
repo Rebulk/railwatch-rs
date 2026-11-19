@@ -70,6 +70,8 @@ pub struct State {
     /// Whose environment each telemetry directory is (slug -> account id),
     /// read at each pass; unset, every directory is one account.
     owners: Mutex<Option<Owners>>,
+    /// The last pass ended with telemetry still over max_data_bytes.
+    last_pass_over: AtomicBool,
     /// Ingest requests refused while low (logged on recovery).
     refused: AtomicU64,
     /// Ingest requests refused over max_data_bytes (logged by the pass).
@@ -112,6 +114,14 @@ impl State {
     pub async fn admit(&self, account: i64) -> Result<(), Refusal> {
         let deadline = tokio::time::Instant::now() + TRIM_WAIT;
         while self.over_estimate() && !self.refuses(account) {
+            // The last pass was itself over the budget and did not name this
+            // account: another account is over its share (only today's files
+            // left), and another pass would say the same. Waiting for it made
+            // every innocent request take TRIM_WAIT and kept the budget thread
+            // running back to back (PR #107 review M2).
+            if self.cleared(account) {
+                break;
+            }
             // Notified by every pass that ends from here on, polled or not.
             let passed = self.passed.notified();
             self.wake();
@@ -133,6 +143,14 @@ impl State {
             return Err(Refusal::OverBudget);
         }
         Ok(())
+    }
+
+    /// Did the last pass, finding telemetry over the budget, leave `account`
+    /// out of the accounts over their share? Only with owners known.
+    fn cleared(&self, account: i64) -> bool {
+        self.owners.lock().unwrap().is_some()
+            && self.last_pass_over.load(Ordering::Relaxed)
+            && self.over_budget.lock().unwrap().as_ref().is_some_and(|over| !over.contains(&account))
     }
 
     fn refuses(&self, account: i64) -> bool {
@@ -433,6 +451,7 @@ fn check_with(budget: &Budget, data_dir: &Path, tenants_dir: &Path, state: &Stat
                     *o = Some(if over { t.over.iter().copied().collect() } else { Default::default() });
                     was
                 };
+                state.last_pass_over.store(over, Ordering::Relaxed);
                 // Ingest waiting on this pass goes on now; closing handles
                 // (on_trim) only matters to the floor.
                 state.passed.notify_waiters();
@@ -818,5 +837,33 @@ mod tests {
         assert_eq!(water_level(&[10, 100], 60), 50, "the small account keeps all, the large one gets the rest");
         assert_eq!(water_level(&[10, 20], 60), u64::MAX, "everyone fits");
         assert_eq!(water_level(&[100, 100], 60), 30);
+    }
+
+    /// PR #107 review M2: account 2 is over its share with only today's
+    /// files left. Account 1's ingest is admitted at once, not after waiting
+    /// TRIM_WAIT for a pass that cannot change the verdict; account 2 is
+    /// still refused.
+    #[test]
+    fn an_account_within_its_share_is_admitted_without_waiting_while_another_is_over() {
+        let root = std::env::temp_dir().join(format!("rw-budget-m2-{}", crate::control::base58(8)));
+        for (slug, pad) in [("a", 200_000), ("b", 3_000_000)] {
+            open_or_create(&meta_path(&root.join(slug))).unwrap();
+            let c = open_or_create(&day_path(&root.join(slug), Tier::Core, &today())).unwrap();
+            c.execute_batch(&format!("CREATE TABLE pad (b BLOB); INSERT INTO pad VALUES (zeroblob({pad})); PRAGMA wal_checkpoint(TRUNCATE);")).unwrap();
+        }
+        let state = State::default();
+        state.set_owners(Box::new(|| [("a".to_string(), 1), ("b".to_string(), 2)].into()));
+        // Room for twice a's bytes: a is within its share, b far over it.
+        let a_bytes = usage_by_slug(&root).into_iter().find(|(s, _, _)| s == "a").unwrap().1;
+        check(&Budget { max_data_bytes: a_bytes * 2, min_free_bytes: 0 }, &root, &root, &state, &|_| {});
+        assert_eq!(state.over_budget.lock().unwrap().clone(), Some([2].into()));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            assert_eq!(rt.block_on(state.admit(1)), Ok(()));
+            assert!(started.elapsed() < TRIM_WAIT / 4, "admitted without waiting: {:?}", started.elapsed());
+        }
+        assert_eq!(rt.block_on(state.admit(2)), Err(Refusal::OverBudget));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
