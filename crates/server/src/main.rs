@@ -375,6 +375,16 @@ fn backup_settings(cfg: &Config) -> Option<railwatch_server::storage::backup::Se
     cfg.backup.clone()
 }
 
+/// Slugs with objects in the backup bucket but no environment are never
+/// given to a new environment (control::retire_unowned).
+fn retire_bucket_slugs(control: &Control, p: &railwatch_server::storage::backup::Pass) {
+    match control.with(|c| control::retire_unowned(c, p.bucket_slugs.iter().cloned())) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(slugs = n, "retired the slugs of backup objects no environment owns"),
+        Err(e) => tracing::error!(error = %e, "could not retire the backup bucket's unowned slugs"),
+    }
+}
+
 fn backup_now() -> ExitCode {
     let cfg = config();
     let Some(b) = backup_settings(&cfg) else { return ExitCode::from(2) };
@@ -382,6 +392,7 @@ fn backup_now() -> ExitCode {
     match railwatch_server::storage::backup::run_pass(&b.s3, &cfg.data_dir, &cfg.tenants_dir(), railwatch_server::time::now_micros(), &mut Default::default()) {
         Ok(p) => {
             railwatch_server::storage::backup::record_ok(&cfg.data_dir);
+            retire_bucket_slugs(&open_control(&cfg), &p);
             println!(
                 "{} snapshots, {} day files uploaded, {} already there; {} -> {} bytes, {:.1} s",
                 p.snapshots,
@@ -1342,6 +1353,16 @@ fn serve() -> ExitCode {
                 std::process::exit(1);
             }
         }
+        // Telemetry left on disk by environments deleted before slugs were
+        // retired on delete: those slugs are never given out again either.
+        match control.with(|c| control::retire_unowned(c, control::storage_names(&cfg.tenants_dir(), &cfg.data_dir.join("sourcemaps")))) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(slugs = n, "retired the slugs of telemetry no environment owns"),
+            Err(e) => {
+                eprintln!("railwatch: retiring unowned telemetry slugs: {e}");
+                std::process::exit(1);
+            }
+        }
         // Before any reader or writer opens a tenant (schema::ADDED_COLUMNS).
         let migrated = railwatch_server::tenants::add_missing_columns_everywhere(&cfg.tenants_dir());
         if migrated > 0 {
@@ -1383,7 +1404,9 @@ fn serve() -> ExitCode {
         let jobs = railwatch_server::jobs::start_with(control.clone(), cfg.tenants_dir(), cfg.tiers, Some(Box::new(release.clone())));
         if let Some(b) = cfg.backup.clone() {
             tracing::info!(endpoint = %b.s3.endpoint, bucket = %b.s3.bucket, every = b.interval_secs, "backups on");
-            railwatch_server::storage::backup::spawn(b, cfg.data_dir.clone(), cfg.tenants_dir());
+            let c = control.clone();
+            let retire = move |p: &railwatch_server::storage::backup::Pass| retire_bucket_slugs(&c, p);
+            railwatch_server::storage::backup::spawn(b, cfg.data_dir.clone(), cfg.tenants_dir(), Box::new(retire));
         }
         let (stop_jobs, jobs_stopped) = tokio::sync::watch::channel(false);
         let scheduler = tokio::spawn(railwatch_server::jobs::scheduler(control.clone(), jobs.background.clone(), cfg.tenants_dir(), jobs_stopped));

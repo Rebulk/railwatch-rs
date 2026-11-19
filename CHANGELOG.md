@@ -74,6 +74,18 @@ tag is a release candidate (marked pre-release, not "latest", so
   shipped bundle; `pnpm audit` is clean.
 - `/cable` bounds what one connection can make the server keep: messages up
   to 4 KiB, subscribe identifiers up to 256 bytes, 16 subscriptions.
+- A deleted environment's slug is never given to a new environment. Before,
+  deleting an environment, application or account and then creating one with
+  the same names reused the slug, and with it the telemetry directory name:
+  a dashboard reader opened before the delete could serve the deleted
+  company's rows to the new environment, and its ingest went to the old
+  writer (usage not counted, no issues). Now deleted slugs are recorded, a
+  new environment gets `<slug>-2` instead, and deleting an environment closes
+  its readers and writer before removing its files and source maps.
+  **Upgrade:** a control migration (`20261119000010_retired_environment_slugs`)
+  adds one table and a trigger; nothing on disk moves. At start, telemetry
+  and source map directories that no environment owns, and backup objects
+  that none owns (after each backup pass), have their slugs retired too.
 - Grouping an exception into an issue, or changing an issue's status, no
   longer panics when the issue (or its environment) was deleted a moment
   earlier. That panic ran while holding the control database lock and could

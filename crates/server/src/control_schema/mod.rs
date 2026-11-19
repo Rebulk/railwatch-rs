@@ -28,6 +28,12 @@
 //!    token made through the trusted proxy keeps the role the proxy signed,
 //!    and acts with at most that role even where the user's own membership
 //!    is higher. NULL (every existing token): the membership's role.
+//! 7. `retired_environment_slugs`: Rust-only. A slug names the environment's
+//!    telemetry directory, source maps and backup objects, so a slug once
+//!    used is never given to another environment (GA review 2026-11-19 T1:
+//!    a recreated slug was served the deleted tenant's telemetry). A trigger
+//!    records every deleted environment's slug; `control::retire_unowned`
+//!    adds names found on disk or in the backup bucket at startup.
 
 pub mod issues;
 
@@ -51,6 +57,7 @@ pub const MIGRATIONS: &[(&str, Step)] = &[
     ("20261101000001_uptime", uptime),
     ("20261119000001_trusted_proxy", trusted_proxy),
     ("20261119000002_api_token_role_ceiling", api_token_role_ceiling),
+    ("20261119000010_retired_environment_slugs", retired_environment_slugs),
 ];
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<&'static str>> {
@@ -315,6 +322,20 @@ fn trusted_proxy(tx: &Transaction) -> rusqlite::Result<()> {
         [crate::time::quoted_date_micros(crate::time::now_micros())],
     )?;
     Ok(())
+}
+
+const RETIRED_ENVIRONMENT_SLUGS: &str = "
+CREATE TABLE retired_environment_slugs (
+  slug TEXT PRIMARY KEY NOT NULL,
+  retired_at TEXT NOT NULL
+);
+CREATE TRIGGER retire_environment_slug AFTER DELETE ON environments BEGIN
+  INSERT OR IGNORE INTO retired_environment_slugs (slug, retired_at) VALUES (OLD.slug, strftime('%Y-%m-%d %H:%M:%f', 'now'));
+END;
+";
+
+fn retired_environment_slugs(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(RETIRED_ENVIRONMENT_SLUGS)
 }
 
 #[cfg(test)]

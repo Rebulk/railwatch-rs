@@ -28,6 +28,7 @@ pub mod layout;
 pub mod reader;
 pub mod retention;
 pub mod s3;
+pub mod sourcemaps;
 pub mod store;
 pub mod writer;
 

@@ -75,6 +75,9 @@ struct TenantPool {
     ready: Condvar,
     /// Readers open across every pool of this ReadPools.
     total: Arc<Mutex<usize>>,
+    /// Its environment was deleted (`ReadPools::forget`): readers coming
+    /// back are closed, not kept.
+    forgotten: std::sync::atomic::AtomicBool,
 }
 
 impl TenantPool {
@@ -118,7 +121,7 @@ impl Drop for Reader {
             // checkout. Checked under the idle lock, so it cannot slip past
             // a concurrent `release_deleted`.
             let mut idle = self.pool.idle.lock().unwrap();
-            if c.attaches_deleted() {
+            if c.attaches_deleted() || self.pool.forgotten.load(std::sync::atomic::Ordering::SeqCst) {
                 drop(idle);
                 drop(c);
                 self.pool.closed(1);
@@ -224,13 +227,36 @@ impl ReadPools {
         closed
     }
 
+    /// The environment `slug` is being deleted: its idle readers close now,
+    /// and readers checked out close when they come back (their pool is no
+    /// longer the slug's). Call before its files are removed, so no handle
+    /// to them outlives the delete. Returns how many closed now.
+    pub fn forget(&self, slug: &str) -> usize {
+        let Some(pool) = self.pools.lock().unwrap().remove(slug) else { return 0 };
+        pool.forgotten.store(true, std::sync::atomic::Ordering::SeqCst);
+        let gone = std::mem::take(&mut *pool.idle.lock().unwrap());
+        let n = gone.len();
+        drop(gone);
+        pool.closed(n);
+        pool.ready.notify_all();
+        n
+    }
+
     pub fn get(&self, slug: &str) -> rusqlite::Result<Reader> {
         let pool = self
             .pools
             .lock()
             .unwrap()
             .entry(slug.to_string())
-            .or_insert_with(|| Arc::new(TenantPool { idle: Mutex::new(vec![]), open: Mutex::new(0), ready: Condvar::new(), total: self.total.clone() }))
+            .or_insert_with(|| {
+                Arc::new(TenantPool {
+                    idle: Mutex::new(vec![]),
+                    open: Mutex::new(0),
+                    ready: Condvar::new(),
+                    total: self.total.clone(),
+                    forgotten: Default::default(),
+                })
+            })
             .clone();
         loop {
             let popped = pool.idle.lock().unwrap().pop();

@@ -536,6 +536,9 @@ pub fn insert_environment(tx: &Connection, application_id: i64, name: &str, slug
         return invalid("name", m);
     }
     validate_slug(slug).or_else(|_| invalid("slug", "is invalid"))?;
+    if slug_retired(tx, slug)? {
+        return invalid("slug", "was used by a deleted environment");
+    }
     let taken_name: bool = tx
         .query_row("SELECT 1 FROM environments WHERE application_id = ? AND name = ?", params![application_id, name], |_| Ok(true))
         .optional()?
@@ -564,7 +567,17 @@ pub fn create_environment(tx: &Connection, application_id: i64, name: &str) -> M
         tx.query_row("SELECT a.slug, ap.slug FROM applications ap JOIN accounts a ON a.id = ap.account_id WHERE ap.id = ?", [application_id], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
-    let slug = format!("{account_slug}-{app_slug}-{name}");
+    // Never a slug another environment had: it names the telemetry on disk
+    // and in backups (retired_environment_slugs).
+    let base = format!("{account_slug}-{app_slug}-{name}");
+    let mut slug = base.clone();
+    for n in 2.. {
+        let live: bool = tx.query_row("SELECT 1 FROM environments WHERE slug = ?", [&slug], |_| Ok(true)).optional()?.unwrap_or(false);
+        if !live && !slug_retired(tx, &slug)? {
+            break;
+        }
+        slug = format!("{base}-{n}");
+    }
     let token = new_token();
     let id = insert_environment(tx, application_id, name, &slug, &digest(&token), &token[..12])?;
     Ok((id, token))
@@ -578,6 +591,46 @@ pub fn rotate_token(tx: &Connection, environment_id: i64) -> rusqlite::Result<St
         params![digest(&token), &token[..12], now_db(), environment_id],
     )?;
     Ok(token)
+}
+
+/// Was `slug` an environment's that is gone (deleted, or found unowned on
+/// disk or in the backup bucket)? Such a slug is never given out again.
+pub fn slug_retired(c: &Connection, slug: &str) -> rusqlite::Result<bool> {
+    Ok(c.query_row("SELECT 1 FROM retired_environment_slugs WHERE slug = ?", [slug], |_| Ok(true)).optional()?.unwrap_or(false))
+}
+
+/// Retires every name in `names` that no environment has: telemetry
+/// directories and files, source map directories and backup objects left
+/// by environments deleted before slugs were retired on delete. Idempotent;
+/// returns how many were new.
+pub fn retire_unowned(c: &Connection, names: impl IntoIterator<Item = String>) -> rusqlite::Result<usize> {
+    let mut n = 0;
+    for name in names {
+        if validate_slug(&name).is_err() {
+            continue;
+        }
+        n += c.execute(
+            "INSERT OR IGNORE INTO retired_environment_slugs (slug, retired_at)
+             SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM environments WHERE slug = ?1)",
+            params![name, now_db()],
+        )?;
+    }
+    Ok(n)
+}
+
+/// The environment slugs that names under `tenants_dir` and `sourcemaps_dir`
+/// stand for: `<slug>/`, `<slug>.sqlite3` (+ -wal, -shm, .split).
+pub fn storage_names(tenants_dir: &Path, sourcemaps_dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in [tenants_dir, sourcemaps_dir] {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            out.push(name.split_once(".sqlite3").map_or(name.clone(), |(s, _)| s.to_string()));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Slugs name tenant files and directories, so they must be path-safe.

@@ -45,6 +45,30 @@ pool checkout). `SQLITE_MAX_ATTACHED` is raised to 125
 (`.cargo/config.toml`): 90 days x 2 tiers would not fit, but detail is 7
 days, so 30-day retention is 1 + 30 + 7 = 38 files, 90 days 98.
 
+**Slugs are never reused** (GA review 2026-11-19, T1). The environment's
+slug names its telemetry directory, its source maps
+(`sourcemaps/<slug>/`) and its backup objects (`tenants/<slug>/...`), and
+the processes' caches are keyed by it (dashboard read pools, ingest
+writers). So a slug once used is never given to another environment: a
+trigger records every deleted environment's slug in
+`retired_environment_slugs` (control migration
+`20261119000010_retired_environment_slugs`), and a new environment that
+would get one gets `-2`, `-3`, ... instead (`railwatch env create` with a
+retired slug is refused). At every start, names under `telemetry/` and
+`sourcemaps/` that no environment owns are retired too, and so are the
+slugs a backup pass finds in the bucket without an environment: telemetry
+deleted before this existed can never be attached to a new environment.
+The upgrade needs no file moves: existing directories keep their names.
+
+Deleting an environment closes every handle first (`destroy_tenant`):
+its dashboard pool is forgotten (idle readers close; readers checked out
+close when returned), its ingest writer answers what is queued, closes its
+files and exits, and a batch that authenticated just before the delete is
+refused instead of starting a new writer. Then the directory, the single
+file and the source maps go. The worker's cached connections to a deleted
+directory close at its next flush (within 5 s), and it never opens storage
+for an environment that no longer exists.
+
 ## Exactly-once (decision 3)
 
 There is no atomic commit across WAL files, so the commit point is a single

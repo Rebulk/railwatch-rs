@@ -907,6 +907,11 @@ fn delete_application_rows(tx: &rusqlite::Connection, app: i64) -> rusqlite::Res
 /// Environment#destroy_telemetry_database: the file and its -wal/-shm, or
 /// a per-day tenant's whole directory.
 fn destroy_tenant(state: &WebState, slug: &str) {
+    // Every open handle goes first (GA review 2026-11-19 T1): a pooled
+    // reader or a running writer kept the deleted files open after the delete.
+    state.readers.forget(slug);
+    state.tenants.forget(slug, std::time::Duration::from_secs(5));
+    crate::storage::sourcemaps::destroy(&state.config.data_dir.join("sourcemaps"), slug);
     if let Some(crate::storage::Layout::Days(dir)) = state.tenants.layout(slug) {
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => tracing::info!(path = %dir.display(), "telemetry directory deleted"),
