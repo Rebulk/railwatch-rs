@@ -1348,18 +1348,23 @@ impl Api<'_> {
     /// windows, the last 90 days and recent incidents. Rust-only.
     fn uptime(&self, e: &Scoped) -> R<Rendered> {
         let now = self.now;
+        let account: i64 = self.control(|c| c.query_row("SELECT account_id FROM applications WHERE id = ?", [e.application_id], |r| r.get(0)))?;
+        let admin = self.token.is_admin_of(self.env.control, account);
         let t = |m: Option<i64>| jt(m);
         let (monitors, incidents) = self.control(|c| {
             let mut out = Vec::new();
+            let mut urls = std::collections::HashMap::new();
             for m in crate::uptime::monitors(c, e.id)? {
+                urls.insert(m.id, m.url.clone());
                 out.push(crate::obj! {
-                    "id" => m.id, "name" => m.name.clone(), "url" => m.url.clone(), "method" => m.method.clone(),
+                    "id" => m.id, "name" => m.name.clone(), "url" => js(crate::uptime::shown_url(&m.url, admin).as_deref()), "method" => m.method.clone(),
                     "expected_status" => db::ji(m.expected_status), "keyword" => js(m.keyword.as_deref()),
                     "interval_seconds" => m.interval_seconds, "timeout_seconds" => m.timeout_seconds,
                     "enabled" => m.enabled, "public" => m.public, "status" => m.status.clone(),
                     "status_since" => t(crate::uptime::status_since(c, &m)?),
                     "last_checked_at" => t(m.last_checked_at), "last_status_code" => db::ji(m.last_status_code),
-                    "last_latency_ms" => db::ji(m.last_latency_ms), "last_error" => js(m.last_error.as_deref()),
+                    "last_latency_ms" => db::ji(m.last_latency_ms),
+                    "last_error" => js(m.last_error.as_deref().map(|x| crate::uptime::shown_text(x, &m.url, admin)).as_deref()),
                     "uptime" => crate::uptime::uptime_windows(c, m.id, now)?,
                     "days" => crate::uptime::daily(c, m.id, now, crate::uptime::DAILY_DAYS)?,
                 });
@@ -1370,7 +1375,8 @@ impl Api<'_> {
                     crate::obj! {
                         "id" => i.id, "monitor_id" => i.monitor_id, "monitor" => i.monitor.clone(),
                         "started_at" => t(Some(i.started_at)), "ended_at" => t(i.ended_at), "duration_seconds" => i.duration_secs(now),
-                        "cause" => i.cause.clone(), "detail" => js(i.detail.as_deref()),
+                        "cause" => i.cause.clone(),
+                        "detail" => js(i.detail.as_deref().map(|d| crate::uptime::shown_text(d, urls.get(&i.monitor_id).map_or("", String::as_str), admin)).as_deref()),
                     }
                 })
                 .collect();

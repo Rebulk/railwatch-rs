@@ -669,3 +669,88 @@ fn cable_subscriptions_per_connection_are_bounded() {
     let _ = ws.send(&subscribe(&"x".repeat(100_000)));
     assert_eq!(ws.recv(), None, "a 100 KB message closes the connection");
 }
+
+// ---------------------------------------------------------------------------
+// Security 4: uptime monitor URLs
+
+/// A health-check URL often carries a credential. Members, and tokens of
+/// members, see only its host on the page, through MCP and the API, and in
+/// the uptime alerts' payload; admins see it whole.
+#[test]
+fn members_see_only_the_host_of_an_uptime_monitor_url() {
+    use railwatch_server::uptime::{self, MonitorInput};
+    let s = start("sec4-uptime", "open", false);
+    let (account, _, adam, password) = acme(&s);
+    let mallory = user(&s, "Mallory", "mallory@acme.test", &password, true);
+    s.control.tx(|tx| control::insert_membership(tx, account, mallory, "member")).unwrap();
+    let app = s.control.tx(|tx| control::insert_application(tx, account, "Shop", "shop", "SHOP", None, "main")).unwrap();
+    let (env, _) = s.control.tx(|tx| control::create_environment(tx, app, "production")).unwrap();
+    let url = "https://example.com/health?token=MONITORSECRET";
+    let monitor = s.control.with(|x| uptime::insert(x, env, &MonitorInput { name: "Health".into(), url: url.into(), ..Default::default() })).unwrap().unwrap();
+    // A failed check whose error, incident and alert repeat the URL, as they did.
+    let error = format!("error sending request for url ({url})");
+    s.control.with(|x| x.execute("UPDATE uptime_monitors SET last_error = ? WHERE id = ?", rusqlite::params![error, monitor])).unwrap();
+    s.control
+        .with(|x| {
+            x.execute("INSERT INTO uptime_incidents (monitor_id, started_at, cause, detail) VALUES (?, 1, 'connect', ?)", rusqlite::params![monitor, error])
+        })
+        .unwrap();
+    let integration = s
+        .control
+        .tx(|tx| {
+            Ok(railwatch_server::alerts::integration::insert(
+                tx,
+                &railwatch_server::alerts::integration::SettingsCipher::new(SECRET.as_bytes()),
+                account,
+                "email",
+                "Ops",
+                &serde_json::from_value(json!({"to": "ops@acme.test"})).unwrap(),
+            )?)
+        })
+        .unwrap();
+    s.control
+        .with(|x| {
+            x.execute(
+                "INSERT INTO alerts (event, integration_id, payload, status, created_at, updated_at) VALUES ('monitor_down', ?, ?, 'sent', '2026-11-19 00:00:00', 'x')",
+                rusqlite::params![integration, json!({"monitor": "Health", "url": url, "environment_id": env, "message": format!("Health (production) is down. {url}")}).to_string()],
+            )
+        })
+        .unwrap();
+    let scopes: Vec<String> = ["api", "mcp", "read"].map(String::from).to_vec();
+    let (_, member_token) = s.control.tx(|tx| control::issue_api_token(tx, mallory, "t", &scopes, None, None, None)).unwrap();
+    let (_, admin_token) = s.control.tx(|tx| control::issue_api_token(tx, adam, "t", &scopes, None, None, None)).unwrap();
+
+    let page = |email: &str, path: &str| {
+        let mut b = Browser::default();
+        b.sign_in(&s, email, &password);
+        let r = b.get(&s, path);
+        assert_eq!(r.status, 200, "{path}");
+        r.page()["props"].to_string()
+    };
+    let api = |token: &str| {
+        let mut b = Browser::default();
+        let r = b.request(&s, "GET", &format!("/api/v1/applications/{app}/environments/{env}/uptime"), None, &[("Authorization", &format!("Bearer {token}"))]);
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.body
+    };
+    let mcp = |token: &str| {
+        let mut b = Browser::default();
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "uptime", "arguments": {"application": "shop", "environment": "production"}}}).to_string();
+        let r = b.request(&s, "POST", "/mcp", Some(&body), &[("Content-Type", "application/json"), ("Authorization", &format!("Bearer {token}"))]);
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.body
+    };
+    let uptime_page = format!("/apps/{app}/envs/{env}/uptime");
+    for (what, seen) in [
+        ("page", page("mallory@acme.test", &uptime_page)),
+        ("alerts page", page("mallory@acme.test", "/alerts")),
+        ("env alerts page", page("mallory@acme.test", &format!("/apps/{app}/envs/{env}/alerts"))),
+        ("REST", api(&member_token)),
+        ("MCP", mcp(&member_token)),
+    ] {
+        assert!(!seen.contains("MONITORSECRET"), "a member sees the monitor's secret on the {what}: {seen}");
+        assert!(seen.contains("example.com"), "and still sees which host it checks on the {what}");
+    }
+    assert!(page("adam@acme.test", &uptime_page).contains("MONITORSECRET"), "an admin sees the URL whole");
+    assert!(api(&admin_token).contains("MONITORSECRET") && mcp(&admin_token).contains("MONITORSECRET"), "so does an admin's token");
+}

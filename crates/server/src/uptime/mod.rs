@@ -176,6 +176,30 @@ pub struct Monitor {
     pub last_error: Option<String>,
 }
 
+/// What a viewer may see of a monitor's URL: all of it for an account
+/// admin, else only its host. A health-check URL often carries a
+/// credential (`?token=`, a signed URL), the same rule as webhook URLs
+/// (web/integrations.rs).
+pub fn shown_url(url: &str, admin: bool) -> Option<String> {
+    if admin { Some(url.to_string()) } else { reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)) }
+}
+
+/// A check error or incident detail for the same viewer: the monitor's URL
+/// in it (errors recorded before probe errors dropped it) as shown_url.
+pub fn shown_text(text: &str, url: &str, admin: bool) -> String {
+    if admin || url.is_empty() {
+        return text.to_string();
+    }
+    let parsed = reqwest::Url::parse(url).ok();
+    let shown = shown_url(url, false).unwrap_or_default();
+    // The URL as stored, and as reqwest prints it (normalised).
+    let mut out = text.replace(url, &shown);
+    if let Some(u) = parsed {
+        out = out.replace(u.as_str(), &shown);
+    }
+    out
+}
+
 impl Monitor {
     pub fn request(&self) -> probe::Request {
         probe::Request {

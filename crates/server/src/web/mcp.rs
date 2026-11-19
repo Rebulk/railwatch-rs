@@ -238,9 +238,23 @@ pub struct Token {
     pub name: String,
     pub expires_at: Option<String>,
     last_used_at: Option<i64>,
+    /// A trusted proxy's identity: the role it claimed (`is_admin_of`).
+    proxy_role: Option<String>,
 }
 
 impl Token {
+    /// Whether the token's user may manage `account` (owner or admin), as
+    /// the dashboard decides it: a proxied identity by its claimed role.
+    /// Settings that may carry credentials (monitor URLs) are shown in full
+    /// only to them.
+    pub fn is_admin_of(&self, control: &Control, account: i64) -> bool {
+        let role = match &self.proxy_role {
+            Some(r) => Some(r.clone()),
+            None => control.with(|c| crate::control::membership_role(c, account, self.user_id)).ok().flatten(),
+        };
+        matches!(role.as_deref(), Some("owner" | "admin"))
+    }
+
     /// ApiToken#allows?
     pub fn allows(&self, scope: &str) -> bool {
         self.scopes.iter().any(|s| s == scope)
@@ -323,6 +337,7 @@ impl Token {
                 name: super::proxy_auth::SESSION_AGENT.to_string(),
                 expires_at: None,
                 last_used_at: None,
+                proxy_role: Some(claims.role.clone()),
             })),
             Err(crate::control::ModelError::Sql(e)) => Err(e),
             // The proxy's account is gone, or setup has not run. Nobody to be.
@@ -447,6 +462,7 @@ fn authenticate(c: &Connection, raw: &str, now: i64) -> rusqlite::Result<Option<
                 last_used_at: r.get::<_, Option<String>>(5)?.and_then(|t| crate::time::parse_db_time(&t)),
                 name: r.get(6)?,
                 expires_at: r.get(7)?,
+                proxy_role: None,
             })
         },
     )
@@ -781,6 +797,13 @@ struct EnvRow {
 }
 
 impl Mcp<'_> {
+    /// Whether the token's user manages the account `application` is in
+    /// (Token::is_admin_of).
+    fn environment_admin(&self, application: i64) -> bool {
+        let account = self.env.control.with(|c| c.query_row("SELECT account_id FROM applications WHERE id = ?", [application], |r| r.get(0))).ok();
+        account.is_some_and(|a| self.token.is_admin_of(self.env.control, a))
+    }
+
     fn accounts_sql(&self) -> (String, Vec<rusqlite::types::Value>) {
         self.token.accounts_sql(self.env.control)
     }

@@ -34,6 +34,11 @@ tag is a release candidate (marked pre-release, not "latest", so
   one of its applications.
 - Changing your email now tells the old address and signs out your other
   sessions, as a password change does.
+- Uptime monitors: members, and API/MCP tokens of members, see only the
+  host of a monitor's URL (on the Uptime page, MCP `uptime`, REST
+  `.../uptime`, and in uptime alerts on the Alerts pages), as for webhook
+  URLs; admins still see it whole. A failed check's error no longer repeats
+  the URL.
 - `/cable` bounds what one connection can make the server keep: messages up
   to 4 KiB, subscribe identifiers up to 256 bytes, 16 subscriptions.
 

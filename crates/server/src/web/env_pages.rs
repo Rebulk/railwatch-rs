@@ -236,7 +236,8 @@ async fn props_for(cx: &Ctx, component: &str, scoped: &Scoped, params: &Params, 
     if component == "alerts/index" {
         let (account, env, q) = (cx.account_id(), scoped.id, params.s("q"));
         let q2 = q.clone();
-        return match cx.state.db(move |c| c.with(|x| super::alerts::rows(x, account, Some(env), &q2))).await {
+        let admin = super::alerts::viewer_is_admin(cx).await;
+        return match cx.state.db(move |c| c.with(|x| super::alerts::rows(x, account, Some(env), &q2, admin))).await {
             Ok(rows) => Ok(super::alerts::props(rows, &q)),
             Err(e) => {
                 tracing::error!(error = %e, "alerts failed");

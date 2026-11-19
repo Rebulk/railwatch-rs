@@ -184,6 +184,8 @@ fn memfind(hay: &[u8], needle: &[u8]) -> bool {
 /// A transport error's class: the TLS layer's errors name certificates,
 /// handshakes or rustls; a refused or reset connection is `connect`.
 fn classify(e: reqwest::Error) -> Failed {
+    // The URL may carry a credential; the error is shown to every member.
+    let e = e.without_url();
     if e.is_timeout() {
         return (Failure::Timeout, e.to_string());
     }
@@ -223,6 +225,25 @@ mod tests {
         }
         assert!(validate_url("http://example.com/up", Policy::default()).is_ok(), "plain http to a public host is allowed");
         assert!(validate_url("https://8.8.8.8/", Policy::default()).is_ok());
+    }
+
+    /// A failed check's error is shown to every member; the URL (which may
+    /// carry a credential) is not in it.
+    #[tokio::test]
+    async fn a_failed_checks_error_does_not_repeat_the_url() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l); // nothing listens: connection refused
+        let req = Request {
+            url: format!("http://127.0.0.1:{port}/up?token=MONITORSECRET"),
+            head: false,
+            expected_status: None,
+            keyword: None,
+            timeout: Duration::from_secs(5),
+        };
+        let out = check(&req, Policy { allow_private: true }).await;
+        assert_eq!(out.failure, Some(Failure::Connect), "{out:?}");
+        assert!(!out.detail.as_deref().unwrap_or("").contains("MONITORSECRET"), "{out:?}");
     }
 
     #[tokio::test]
