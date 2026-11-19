@@ -27,6 +27,12 @@ fn dir_bytes(p: &Path) -> u64 {
     n
 }
 
+/// UPLOADS_PER_MINUTE per environment id, process-wide.
+pub fn rate_limit() -> &'static crate::rate_limit::FixedWindow<i64> {
+    static LIMIT: std::sync::OnceLock<crate::rate_limit::FixedWindow<i64>> = std::sync::OnceLock::new();
+    LIMIT.get_or_init(|| crate::rate_limit::FixedWindow::new(UPLOADS_PER_MINUTE))
+}
+
 /// Bytes under `sourcemaps_dir` (every environment).
 pub fn usage(sourcemaps_dir: &Path) -> u64 {
     dir_bytes(sourcemaps_dir)
@@ -118,8 +124,9 @@ mod tests {
         assert_eq!(left, ["d1", "d2", "d3"], "only the newest 3 deploys are kept");
         // Bytes: a big upload prunes the others first, then is refused if it still does not fit.
         assert_eq!(store(&root, "e", "d4", "big.js", &vec![b'x'; 9 * 1024], 10 * 1024, 3).unwrap(), Ok(()));
-        assert_eq!(deploys(&root.join("e")).len(), 1);
-        assert_eq!(store(&root, "e", "d4", "more.js", &kb, 10 * 1024, 3).unwrap(), Err(Refused::TooMuch));
+        assert_eq!(deploys(&root.join("e")).len(), 2, "d1 and d2 went to make room, d3 still fits");
+        assert_eq!(store(&root, "e", "d4", "more.js", &vec![b'x'; 2048], 10 * 1024, 3).unwrap(), Err(Refused::TooMuch));
+        assert_eq!(deploys(&root.join("e")).len(), 1, "d3 was pruned too, and it still does not fit");
         assert!(env_bytes(&root, "e") <= 10 * 1024);
         // Another environment is untouched by one's pruning.
         assert_eq!(store(&root, "other", "d0", "a.js", &kb, 10 * 1024, 3).unwrap(), Ok(()));

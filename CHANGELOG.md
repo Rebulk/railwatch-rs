@@ -91,6 +91,13 @@ tag is a release candidate (marked pre-release, not "latest", so
   the only one refused (503) when nothing older is left. Before, one
   account's burst deleted every other account's history and blocked their
   ingest. One account behaves as before (docs/SELF-HOST.md, "Disk budget").
+- `/ingest/sourcemaps` is bounded: refused while the environment is paused
+  (409) or over quota (402), 120 uploads a minute per environment, the 10
+  newest deploys and 200 MiB per environment (older deploys' maps are
+  pruned first; an upload that still does not fit gets 507). Source maps
+  count toward `MAX_DATA_BYTES`, and deleting an environment, application or
+  account deletes them. Before, an ingest token could fill the disk with
+  maps, paused or not, and they outlived their environment.
 - Grouping an exception into an issue, or changing an issue's status, no
   longer panics when the issue (or its environment) was deleted a moment
   earlier. That panic ran while holding the control database lock and could

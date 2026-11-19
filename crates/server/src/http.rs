@@ -861,15 +861,29 @@ async fn sourcemaps(state: &Arc<AppState>, env: Environment, headers: &HeaderMap
     if !safe(&deploy) || deploy.contains('/') || !safe(&filename) {
         return json(StatusCode::UNPROCESSABLE_ENTITY, rhash! {"error" => "invalid deploy or filename"});
     }
-    let path = state.sourcemaps_dir.join(&env.slug).join(&deploy).join(format!("{filename}.map"));
+    // As /ingest: nothing is stored for a paused environment or one over
+    // its quota, and uploads have their own, lower, rate (GA review
+    // 2026-11-19, security #2).
+    if env.paused {
+        return json(StatusCode::CONFLICT, rhash! {"error" => "environment is paused"});
+    }
+    if env.quota_exhausted(&current_month()) {
+        return json(StatusCode::PAYMENT_REQUIRED, rhash! {"error" => "quota"});
+    }
+    if crate::storage::sourcemaps::rate_limit().exceeded(&env.id) {
+        return rate_limited();
+    }
+    let (dir, slug, name) = (state.sourcemaps_dir.clone(), env.slug.clone(), filename.clone());
     let bytes = raw.len();
     let written = tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        let tmp = path.with_extension("map.tmp");
-        std::fs::write(&tmp, &raw)?;
-        std::fs::rename(&tmp, &path)
+        use crate::storage::sourcemaps::{MAX_DEPLOYS, MAX_ENV_BYTES, store};
+        store(&dir, &slug, &deploy, &name, &raw, MAX_ENV_BYTES, MAX_DEPLOYS)
     })
     .await;
+    if let Ok(Ok(Err(crate::storage::sourcemaps::Refused::TooMuch))) = written {
+        return json(StatusCode::INSUFFICIENT_STORAGE, rhash! {"error" => "source maps for this deploy exceed the environment's limit"});
+    }
+    let written = written.map(|r| r.map(|_| ()));
     match written {
         Ok(Ok(())) => json(StatusCode::CREATED, rhash! {"ok" => true, "filename" => filename, "bytes" => bytes}),
         _ => internal_error(),
