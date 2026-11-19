@@ -132,6 +132,15 @@ fn rate_limited(cx: &Ctx, limit: &crate::rate_limit::FixedWindow<std::net::IpAdd
     if limit.exceeded(&ip) { Err(cx.redirect(Redirect::to(to).alert(alert))) } else { Ok(()) }
 }
 
+/// The invitation throttle (WebState::invitation_*_limit): one more email
+/// for this user and account, or a redirect back saying to wait.
+fn invitations_limited(cx: &Ctx, account: i64) -> Result<(), Response> {
+    // Both are counted, so neither several admins nor several accounts get around it.
+    let by_user = cx.state.invitation_user_limit.exceeded(&cx.user_id());
+    let by_account = cx.state.invitation_account_limit.exceeded(&account);
+    if by_user || by_account { Err(cx.redirect(Redirect::to("/settings/members").alert("Too many invitations sent. Try again later."))) } else { Ok(()) }
+}
+
 /// The provisioning throttle (30/hour per user), `provisioning_rate_limited`.
 fn provisioning(cx: &Ctx) -> Result<(), Response> {
     if cx.state.provisioning_limit.exceeded(&cx.user_id()) {
@@ -1421,10 +1430,7 @@ async fn profile_update(cx: Ctx, p: Params) -> Response {
     let editor = if p.has("editor") { p.s("editor") } else { user.editor.clone() };
     let root = if p.has("editor_root") { p.presence("editor_root") } else { user.editor_root.clone() };
     let digest = if p.has("weekly_digest") { p.bool("weekly_digest").unwrap_or(false) } else { user.weekly_digest };
-    let mut errors = Vec::new();
-    if name.trim().is_empty() {
-        errors.push(("name".to_string(), "can't be blank".to_string()));
-    }
+    let mut errors = control::name_errors(&name);
     if !EDITORS.contains(&editor.as_str()) {
         errors.push(("editor".to_string(), "is not included in the list".to_string()));
     }
@@ -1703,6 +1709,7 @@ async fn members_index(cx: Ctx) -> Response {
 
 async fn members_create(cx: Ctx, p: Params) -> Response {
     let account = guard!(require_admin(&cx).await);
+    guard!(invitations_limited(&cx, account));
     let email = control::normalize_email(&p.s("email"));
     let role = Some(p.s("role")).filter(|r| r == "admin" || r == "member").unwrap_or_else(|| "member".into());
     let inviter = cx.current.user.clone().expect("authenticated");
@@ -1851,6 +1858,7 @@ async fn invitation_destroy(cx: Ctx, Path(id): Path<i64>) -> Response {
 /// Invitation#resend!: a new token, 7 more days, the email again.
 async fn invitation_resend(cx: Ctx, Path(id): Path<i64>) -> Response {
     let account = guard!(require_admin(&cx).await);
+    guard!(invitations_limited(&cx, account));
     let token = control::base58(32);
     let t = token.clone();
     let r = cx

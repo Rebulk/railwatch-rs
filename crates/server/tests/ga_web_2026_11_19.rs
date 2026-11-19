@@ -261,6 +261,19 @@ impl Browser {
         let r = self.post(s, "/sign_in", &format!("email={}&password={}", enc(email), enc(password)));
         assert_eq!((r.status, r.location()), (302, "/dashboard"), "{email} signs in");
     }
+
+    /// Follows a redirect to the page that shows its flash.
+    fn flash_after(&mut self, s: &Server, r: &Res) -> Value {
+        let mut to = r.location().to_string();
+        loop {
+            let r = self.get(s, &to);
+            match r.status {
+                302 => to = r.location().to_string(),
+                200 => return r.page()["props"]["flash"].clone(),
+                other => panic!("{other} at {to}"),
+            }
+        }
+    }
 }
 
 fn enc(s: &str) -> String {
@@ -753,4 +766,62 @@ fn members_see_only_the_host_of_an_uptime_monitor_url() {
     }
     assert!(page("adam@acme.test", &uptime_page).contains("MONITORSECRET"), "an admin sees the URL whole");
     assert!(api(&admin_token).contains("MONITORSECRET") && mcp(&admin_token).contains("MONITORSECRET"), "so does an admin's token");
+}
+
+// ---------------------------------------------------------------------------
+// Security 8: invitations as a mail relay
+
+/// Invitations and resends together: 20 an hour per inviting user, and 20
+/// an hour per account whoever sends them.
+#[test]
+fn invitation_emails_are_rate_limited_per_user_and_per_account() {
+    let s = start("sec8-limit", "open", false);
+    let (_, _, _, password) = acme(&s);
+    let mut alice = Browser::default();
+    alice.sign_in(&s, "alice@acme.test", &password);
+    let invite = |b: &mut Browser, i: usize| {
+        let r = b.post(&s, "/settings/members", &format!("email=v{i}%40victim.test&role=member"));
+        b.flash_after(&s, &r)["alert"].as_str().unwrap_or("").to_string()
+    };
+    let limited = "Too many invitations sent. Try again later.";
+    for i in 0..19 {
+        assert_ne!(invite(&mut alice, i), limited, "invitation {i}");
+    }
+    let last: i64 = one(&s, "SELECT max(id) FROM invitations", []);
+    let resent = alice.post(&s, &format!("/settings/invitations/{last}/resend"), "");
+    assert_ne!(alice.flash_after(&s, &resent)["alert"], limited, "a resend counts too");
+    assert_eq!(invite(&mut alice, 99), limited, "the 21st email in an hour");
+    assert_eq!(alice.post(&s, &format!("/settings/invitations/{last}/resend"), "").status, 302);
+    let mut adam = Browser::default();
+    adam.sign_in(&s, "adam@acme.test", &password);
+    assert_eq!(invite(&mut adam, 100), limited, "another admin of the same account is limited too");
+    assert_eq!(one::<i64>(&s, "SELECT count(*) FROM invitations", []), 19);
+    assert!(s.mails(20).len() <= 20, "at most 20 mails went out");
+}
+
+/// A user's or account's name goes into invitation subjects and bodies:
+/// it is at most 100 characters with no control characters, on every path
+/// that sets it.
+#[test]
+fn user_and_account_names_are_short_and_have_no_control_characters() {
+    let s = start("sec8-names", "open", false);
+    let (_, _, _, password) = acme(&s);
+    let long = "Your bank: URGENT verify at https://evil.test/login ".repeat(3);
+    for bad in [long.as_str(), "Ops\r\nBcc: x@evil.test", "tab\there"] {
+        let mut b = Browser::default();
+        let p = control::base58(16);
+        let r = b.post(&s, "/sign_up", &format!("name={}&email=new%40x.test&password={p}&password_confirmation={p}&terms=1", enc(bad)));
+        assert_ne!(r.location(), "/dashboard", "sign-up with name {bad:?}");
+        let mut alice = Browser::default();
+        alice.sign_in(&s, "alice@acme.test", &password);
+        alice.send(&s, "PATCH", "/settings/profile", &format!("name={}", enc(bad)));
+        alice.post(&s, "/accounts", &format!("name={}", enc(bad)));
+    }
+    assert_eq!(one::<i64>(&s, "SELECT count(*) FROM users WHERE email = 'new@x.test'", []), 0);
+    assert_eq!(one::<String>(&s, "SELECT name FROM users WHERE email = 'alice@acme.test'", []), "Alice", "the profile kept its name");
+    assert_eq!(one::<i64>(&s, "SELECT count(*) FROM accounts", []), 1, "no account with such a name");
+    let mut alice = Browser::default();
+    alice.sign_in(&s, "alice@acme.test", &password);
+    alice.send(&s, "PATCH", "/settings/profile", &format!("name={}", enc(&"é".repeat(100))));
+    assert_eq!(one::<String>(&s, "SELECT name FROM users WHERE email = 'alice@acme.test'", []), "é".repeat(100), "100 characters is fine");
 }

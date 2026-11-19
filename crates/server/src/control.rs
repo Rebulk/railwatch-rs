@@ -140,6 +140,32 @@ fn invalid<T>(attr: &str, message: &str) -> ModelResult<T> {
     Err(ModelError::Invalid(vec![(attr.into(), message.into())]))
 }
 
+/// The longest user or account name (User.name's limit in the sign-up form).
+/// Names go into email subjects and bodies (invitations), so they are short
+/// and have no control characters.
+pub const MAX_NAME_CHARS: usize = 100;
+
+/// A user's or account's name: present, at most MAX_NAME_CHARS, no control
+/// characters (a line break included).
+pub fn name_errors(name: &str) -> Vec<(String, String)> {
+    let name = name.trim();
+    if name.is_empty() {
+        vec![("name".into(), "can't be blank".into())]
+    } else if name.chars().count() > MAX_NAME_CHARS {
+        vec![("name".into(), format!("is too long (maximum is {MAX_NAME_CHARS} characters)"))]
+    } else if name.chars().any(char::is_control) {
+        vec![("name".into(), "can't contain line breaks or control characters".into())]
+    } else {
+        Vec::new()
+    }
+}
+
+/// A name from elsewhere (an identity provider) made acceptable: control
+/// characters become spaces, then it is cut to MAX_NAME_CHARS.
+pub fn clean_name(name: &str) -> String {
+    name.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().chars().take(MAX_NAME_CHARS).collect::<String>().trim().to_string()
+}
+
 fn unique_violation(e: &rusqlite::Error) -> bool {
     matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
 }
@@ -364,8 +390,9 @@ impl Control {
 
 /// Account.create!(name:) with assign_slug; a self-hosted plan, no billing.
 pub fn insert_account(tx: &Connection, name: &str, slug: &str, retention_days: i64) -> ModelResult<i64> {
-    if name.trim().is_empty() {
-        return invalid("name", "can't be blank");
+    let errors = name_errors(name);
+    if !errors.is_empty() {
+        return Err(ModelError::Invalid(errors));
     }
     let now = now_db();
     match tx.execute(
@@ -599,9 +626,7 @@ pub fn validate_new_user(name: &str, email: &str, password: &str, confirmation: 
     if confirmation.is_some_and(|c| c != password) {
         e.push(("password_confirmation".into(), "doesn't match Password".into()));
     }
-    if name.trim().is_empty() {
-        e.push(("name".into(), "can't be blank".into()));
-    }
+    e.extend(name_errors(name));
     if email.is_empty() {
         e.push(("email".into(), "can't be blank".into()));
     } else if !valid_email(email) {
@@ -684,8 +709,13 @@ pub fn authenticate_by(c: &Connection, email: &str, password: &str) -> rusqlite:
     }
 }
 
-/// User.create! for sign-up and setup. The caller validated.
+/// User.create! for sign-up and setup. The caller validated, except the
+/// name, which is checked here for every path (name_errors).
 pub fn insert_user(tx: &Connection, name: &str, email: &str, password: &str, verified: bool) -> ModelResult<i64> {
+    let errors = name_errors(name);
+    if !errors.is_empty() {
+        return Err(ModelError::Invalid(errors));
+    }
     let now = now_db();
     match tx.execute(
         "INSERT INTO users (name, email, password_digest, verified, terms_accepted_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5)",
@@ -1027,6 +1057,20 @@ mod tests {
         assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &newbie, &inv.token)).unwrap(), Ok(()));
         assert_eq!(c.tx(|tx| accept_invitation(tx, &found, &newbie, &inv.token)).unwrap(), Err(AcceptError::Unavailable));
         assert_eq!(c.with(|x| membership_role(x, account, newbie.id)).unwrap().as_deref(), Some("member"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn names_are_present_short_and_on_one_line() {
+        assert!(name_errors("Ada").is_empty());
+        assert!(name_errors(&"é".repeat(MAX_NAME_CHARS)).is_empty());
+        assert_eq!(name_errors(" ")[0].1, "can't be blank");
+        assert!(name_errors(&"x".repeat(MAX_NAME_CHARS + 1))[0].1.contains("too long"));
+        assert!(name_errors("a\r\nb")[0].1.contains("control"));
+        assert_eq!(clean_name(" Ada\r\nLovelace\t"), "Ada  Lovelace");
+        assert_eq!(clean_name(&"x".repeat(300)).len(), MAX_NAME_CHARS);
+        let (dir, c) = temp();
+        assert!(matches!(c.tx(|tx| insert_user(tx, "a\nb", "a@example.com", &test_password(), true)), Err(ModelError::Invalid(_))), "every path");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

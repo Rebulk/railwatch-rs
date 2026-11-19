@@ -39,6 +39,11 @@ tag is a release candidate (marked pre-release, not "latest", so
   `.../uptime`, and in uptime alerts on the Alerts pages), as for webhook
   URLs; admins still see it whole. A failed check's error no longer repeats
   the URL.
+- Invitation emails (new and resent) are rate-limited to 20 an hour per
+  inviting user and per account. User and account names are at most 100
+  characters with no line breaks or control characters on every path that
+  sets them (sign-up, profile, new account, setup, Google sign-in, trusted
+  proxy), since they go into invitation subjects and bodies.
 - `/cable` bounds what one connection can make the server keep: messages up
   to 4 KiB, subscribe identifiers up to 256 bytes, 16 subscriptions.
 

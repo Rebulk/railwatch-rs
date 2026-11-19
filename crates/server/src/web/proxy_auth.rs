@@ -50,15 +50,13 @@ use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 
-use crate::control::{self, Session, User};
+use crate::control::{self, MAX_NAME_CHARS, Session, User};
 
 pub const HEADER: &str = "x-railwatch-proxy-auth";
 /// The longest a signed header may be valid for.
 pub const MAX_TTL_SECS: i64 = 300;
 /// A header longer than this is refused before it is decoded.
 const MAX_HEADER_BYTES: usize = 4096;
-/// User.name's limit in the sign-up form.
-const MAX_NAME_CHARS: usize = 100;
 /// The user agent of the session row a proxied user is given.
 pub const SESSION_AGENT: &str = "railwatch trusted proxy";
 
@@ -166,7 +164,7 @@ pub fn resolve(c: &Connection, claims: &Claims) -> control::ModelResult<(Session
         None => {
             let mut b = [0u8; 32];
             getrandom::fill(&mut b).expect("random");
-            let name = if claims.name.trim().is_empty() { claims.email.clone() } else { claims.name.clone() };
+            let name = control::clean_name(if claims.name.trim().is_empty() { &claims.email } else { &claims.name });
             let id = control::insert_user(c, &name, &claims.email, &URL_SAFE_NO_PAD.encode(b), true)?;
             tracing::info!(user = id, email = %control::normalize_email(&claims.email), "trusted proxy: created user");
             control::find_user(c, id)?.expect("just created")
