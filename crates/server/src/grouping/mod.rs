@@ -283,6 +283,7 @@ pub fn group_with_limits(
         )
         .map_err(e)? as usize;
     let mut created_this_batch = 0usize;
+    let mut failed: Vec<String> = Vec::new();
     for (group_hash, group) in groups {
         control.execute_batch("BEGIN IMMEDIATE").map_err(e)?;
         let result = (|| -> Result<Option<(Outcome, bool)>, String> {
@@ -323,10 +324,18 @@ pub fn group_with_limits(
                 }
             }
             Err(err) => {
+                // This group alone rolls back; the batch's other groups still
+                // become issues (PR #107 review L10: one group whose issue
+                // was deleted meanwhile left the rest ungrouped).
                 let _ = control.execute_batch("ROLLBACK");
-                return Err(err);
+                failed.push(format!("{group_hash}: {err}"));
             }
         }
+    }
+    if !failed.is_empty() {
+        // An error still, so the drain retries the receipt (its claimed
+        // groups are skipped) and the direct path logs it.
+        return Err(format!("{} of the batch's exception groups failed: {}", failed.len(), failed.join("; ")));
     }
     if out.overflowed > 0 {
         tracing::warn!(

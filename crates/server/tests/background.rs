@@ -432,3 +432,28 @@ fn grouping_into_an_issue_deleted_mid_pass_is_an_error_not_a_panic() {
     assert!(c.is_autocommit());
     assert_eq!(count(&c, "SELECT occurrences FROM issues"), 1);
 }
+
+/// PR #107 review L10: one group failing mid-batch (its issue deleted
+/// meanwhile) rolls back alone; the batch's other groups still become
+/// issues, and the batch still reports the failure.
+#[test]
+fn one_failing_group_does_not_leave_the_rest_of_the_batch_ungrouped() {
+    let (control, env, t, _d) = setup("l10-rest");
+    let c = control.conn();
+    let (g1, g2) = (format!("{:032x}", 1), format!("{:032x}", 2));
+    let first = exception(&t, &g1, "E", None, "2026-10-13 10:00:00");
+    grouping::group(&c, &t, env, grouping::load_exceptions(&t, &[first]).unwrap(), None).unwrap();
+    c.execute_batch(&format!(
+        "CREATE TEMP TRIGGER vanish AFTER UPDATE OF occurrences ON issues WHEN NEW.group_hash = '{g1}' BEGIN
+           DELETE FROM issue_activities WHERE issue_id = NEW.id; DELETE FROM alerts WHERE issue_id = NEW.id; DELETE FROM issues WHERE id = NEW.id;
+         END;"
+    ))
+    .unwrap();
+    // g1 (fails) comes first in the batch, then g2 (new).
+    let ids = [exception(&t, &g1, "E", None, "2026-10-13 10:01:00"), exception(&t, &g2, "F", None, "2026-10-13 10:02:00")];
+    let r = grouping::group(&c, &t, env, grouping::load_exceptions(&t, &ids).unwrap(), None);
+    c.execute_batch("DROP TRIGGER vanish").unwrap();
+    assert!(r.is_err(), "the failure is still reported: {r:?}");
+    assert_eq!(count(&c, &format!("SELECT COUNT(*) FROM issues WHERE group_hash = '{g2}'")), 1, "g2 became an issue");
+    assert!(c.is_autocommit());
+}
