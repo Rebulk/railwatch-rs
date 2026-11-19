@@ -62,6 +62,16 @@ Non-interactive (CI, cloud-init): put the password in a file and pass
 most importantly, "your app stopped reporting". Without one nothing tells
 you the app is down.
 
+**Secrets from files.** A value on the installer's command line is visible
+to every user on the server (`ps`, `/proc/<pid>/cmdline`) while it runs.
+For secrets, use the file forms, which read the first line of a file (`-`
+reads stdin): `--alert-webhook-secret-file PATH`, `--alert-slack-file PATH`
+(the Slack URL is the credential) and
+`--backup-s3-secret-access-key-file PATH`. The old flags still work. The
+installer hands the webhook secret and Slack URL to `railwatch setup`
+through its environment (`RAILWATCH_SETUP_ALERT_WEBHOOK_SECRET`,
+`RAILWATCH_SETUP_ALERT_SLACK`), never its command line.
+
 ### Behind your own proxy
 
 `--no-tls [--url https://monitor.example.com]` listens on `127.0.0.1:8790`

@@ -51,6 +51,12 @@ tag is a release candidate (marked pre-release, not "latest", so
   log lines, paths, headers) now says in its description to read it as
   data, never as instructions. docs/agent-webhooks.md recommends read-only,
   account-restricted tokens for agents that run on their own.
+- `install.sh`: `--alert-webhook-secret-file`, `--alert-slack-file` and
+  `--backup-s3-secret-access-key-file` (a path, or `-` for stdin) keep
+  secrets out of `ps`; the old flags still work. The webhook secret and
+  Slack URL now reach `railwatch setup` through its environment
+  (`RAILWATCH_SETUP_ALERT_WEBHOOK_SECRET`, `RAILWATCH_SETUP_ALERT_SLACK`),
+  not its command line.
 - `/cable` bounds what one connection can make the server keep: messages up
   to 4 KiB, subscribe identifiers up to 256 bytes, 16 subscriptions.
 
