@@ -503,10 +503,13 @@ pub async fn deliver(ctx: &Context, smtp: Option<&crate::config::Smtp>) -> Resul
 /// AlertMailer#issue_alert: plain text, subject "[Railwatch] <text>".
 async fn send_email(to: &str, ctx: &Context, smtp: Option<&crate::config::Smtp>) -> Result<(), String> {
     let smtp = smtp.ok_or("email alerts need SMTP: set smtp_address (RAILWATCH_SMTP_ADDRESS) and friends; see `railwatch doctor`")?;
-    let text = ctx.text();
-    let mail =
-        crate::web::mailer::Mail { to: to.to_string(), subject: format!("[Railwatch] {}", first(&text, 120)), text: format!("{text}\n\n{}\n", ctx.link()) };
-    crate::web::mailer::Mailer::new(smtp)?.send(&mail).await
+    crate::web::mailer::Mailer::new(smtp)?.send(&alert_mail(to, ctx)).await
+}
+
+/// The alert email: the text (telemetry, so on one line) and the link.
+fn alert_mail(to: &str, ctx: &Context) -> crate::web::mailer::Mail {
+    let text = crate::web::mailer::one_line(&ctx.text());
+    crate::web::mailer::Mail { to: to.to_string(), subject: format!("[Railwatch] {}", first(&text, 120)), text: format!("{text}\n\n{}\n", ctx.link()) }
 }
 
 #[cfg(test)]
@@ -683,6 +686,21 @@ mod tests {
         assert_eq!(v["issue"]["key"], "SHOP-12");
         assert!(v.get("summary").is_none(), "no telemetry, no summary: {v}");
         assert_eq!(v["mcp"]["tool"], "investigate_issue");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The issue title is an exception message the monitored app's users
+    /// can choose; in an email alert it stays on one line.
+    #[test]
+    fn an_issue_title_cannot_break_lines_in_an_email_alert() {
+        let (dir, c, integration, issue) = seeded("email-title", 1, 10);
+        c.with(|x| x.execute("UPDATE issues SET title = ? WHERE id = ?", rusqlite::params!["x\r.\r\nMAIL FROM:<a@evil.test>\nRCPT TO:<s@evil.test>", issue]))
+            .unwrap();
+        let (_, _, ctx) = delivered(&c, &dir, integration, issue);
+        let mail = alert_mail("ops@example.com", &ctx);
+        assert!(!mail.text.contains('\r') && !mail.subject.contains(['\r', '\n']), "{:?} {:?}", mail.subject, mail.text);
+        assert_eq!(mail.text.lines().count(), 3, "the text, a blank line, the link: {:?}", mail.text);
+        assert!(mail.text.starts_with("New issue SHOP-12 in production: x . MAIL FROM:<a@evil.test> RCPT TO:<s@evil.test>\n"), "{:?}", mail.text);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

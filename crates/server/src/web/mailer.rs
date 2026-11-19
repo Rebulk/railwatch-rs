@@ -95,6 +95,13 @@ pub fn deliver_later(mailer: Option<Mailer>, mail: Mail) {
     }
 }
 
+/// Telemetry text (an issue title is an exception message the monitored
+/// app's users can choose) on one line before it goes into a mail body:
+/// every CR and LF becomes a space, so no line break in it reaches SMTP.
+pub fn one_line(s: &str) -> String {
+    s.replace("\r\n", " ").replace(['\r', '\n'], " ")
+}
+
 pub fn password_reset(base_url: &str, to: &str, sid: &str) -> Mail {
     Mail {
         to: to.into(),
@@ -139,6 +146,12 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn telemetry_text_is_put_on_one_line() {
+        assert_eq!(one_line("a\r.\r\nMAIL FROM:<x@evil.test>\nb\rc"), "a . MAIL FROM:<x@evil.test> b c");
+        assert_eq!(one_line("plain"), "plain");
     }
 
     /// Without SMTP the mail is logged, not sent: anyone who reads the log

@@ -7,6 +7,13 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+**Security fixes from the 2026-11-19 GA review**
+- lettre 0.11.23 → 0.11.24 (RUSTSEC-2026-0560 to 0565). An exception
+  message with a bare CR or LF could end an email alert's DATA early on a
+  lenient SMTP relay and run its own SMTP commands on the server's session.
+  Issue titles in email alerts and the weekly digest are now also put on one
+  line, and an email integration's recipient must be one plain address.
+
 ## v0.3.4 (2026-11-18)
 
 - The server builds for macOS again. Two Linux-only calls added in v0.3.1

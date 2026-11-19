@@ -207,6 +207,14 @@ pub fn validate(kind: &str, name: &str, settings: &Map<String, Value>) -> Vec<(S
             errors.push(("settings".into(), format!("needs {key}")));
         }
     }
+    // The recipient goes to SMTP as is: a plain address only (no display
+    // name, quoted local part or line break), as everywhere else here.
+    if kind == "email"
+        && let Some(to) = settings.get("to").filter(|v| !blank(Some(v)))
+        && !to.as_str().is_some_and(|t| crate::control::valid_email(t.trim()))
+    {
+        errors.push(("settings".into(), "to is not a valid email address".into()));
+    }
     let target = match kind {
         "slack" => Some(("webhook_url", Kind::Slack)),
         "webhook" => Some(("url", Kind::Webhook)),
@@ -348,6 +356,21 @@ mod tests {
         assert!(e[0].1.contains("HTTPS"), "{e:?}");
         assert!(validate("slack", "S", &obj(json!({"webhook_url": "https://example.com/services/a/b/c"}))).iter().any(|(_, m)| m.contains("hooks.slack.com")));
         assert!(validate("email", "Ops", &obj(json!({"to": "ops@example.com"}))).is_empty());
+    }
+
+    /// The email integration's recipient reaches SMTP's envelope; anything
+    /// but a plain address (a quoted local part, a display name, a line
+    /// break, a list) is refused when it is saved.
+    #[test]
+    fn an_email_integration_takes_one_plain_address() {
+        for bad in ["\"victim \"@example.com", "Ops <ops@example.com>", "ops@example.com\r\nRCPT TO:<x@evil.test>", "a@example.com, b@example.com", "nope"] {
+            assert_eq!(
+                validate("email", "Ops", &obj(json!({"to": bad}))),
+                vec![("settings".to_string(), "to is not a valid email address".to_string())],
+                "{bad:?}"
+            );
+        }
+        assert!(validate("email", "Ops", &obj(json!({"to": 5}))).iter().any(|(_, m)| m.contains("valid email")));
     }
 
     #[test]

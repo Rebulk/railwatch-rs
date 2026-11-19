@@ -44,7 +44,8 @@ pub fn weekly(base_url: &str, user_name: &str, user_email: &str, account_name: &
             env.deploys
         );
         for i in &env.top_issues {
-            text += &format!("  {} {} ({}) {}\n", i.key, i.title, delimit(i.occurrences), issue_url(i.id));
+            // The title is telemetry: one line, so it cannot break the body's lines.
+            text += &format!("  {} {} ({}) {}\n", i.key, crate::web::mailer::one_line(&i.title), delimit(i.occurrences), issue_url(i.id));
         }
     }
     text += &format!("\n\nOpen Railwatch: {dashboard_url}\nTurn off this digest: {profile_url}\n");
@@ -71,7 +72,13 @@ pub fn weekly(base_url: &str, user_name: &str, user_email: &str, account_name: &
         if !env.top_issues.is_empty() {
             body += "    <p>Most frequent open issues:</p>\n    <ul>\n";
             for i in &env.top_issues {
-                body += &format!("        <li><a href=\"{}\">{}</a> {} ({})</li>\n", h(&issue_url(i.id)), h(&i.key), h(&i.title), delimit(i.occurrences));
+                body += &format!(
+                    "        <li><a href=\"{}\">{}</a> {} ({})</li>\n",
+                    h(&issue_url(i.id)),
+                    h(&i.key),
+                    h(&crate::web::mailer::one_line(&i.title)),
+                    delimit(i.occurrences)
+                );
             }
             body += "    </ul>\n";
         }
@@ -184,5 +191,18 @@ mod tests {
         );
         let one = weekly("https://rw.example.com", "A", "a@example.com", "Acme", &envs[..1]);
         assert_eq!(one.subject, "[Railwatch] Acme: your week in 1 environment");
+    }
+
+    /// An issue title is telemetry; a line break in it never reaches the mail body.
+    #[test]
+    fn issue_titles_in_a_digest_stay_on_one_line() {
+        let title = "x\r.\r\nMAIL FROM:<a@evil.test>\nDATA";
+        let envs = vec![env("prod", 1, 0, 1.0, vec![TopIssue { id: 1, key: "S-1".into(), title: title.into(), occurrences: 1 }])];
+        let m = weekly("https://rw.example.com", "A", "a@example.com", "Acme", &envs);
+        for body in [&m.text, &m.html] {
+            assert!(!body.contains('\r'), "{body:?}");
+            assert!(body.lines().all(|l| !l.starts_with("MAIL FROM") && !l.starts_with("DATA") && l != "."), "{body:?}");
+        }
+        assert!(m.text.contains("S-1 x . MAIL FROM:<a@evil.test> DATA (1)"), "{:?}", m.text);
     }
 }
