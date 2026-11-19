@@ -408,7 +408,7 @@ fn record(
         Outcome::Seen => None,
     };
     if let Some(event) = event {
-        let issue = issue::find(control, issue.id).map_err(e)?.expect("exists");
+        let issue = issue::find(control, issue.id).map_err(e)?.ok_or("issue deleted while grouping")?;
         crate::alerts::rules::fire_for_issue_plain(control, &issue, event).map_err(e)?;
     }
     Ok(outcome)

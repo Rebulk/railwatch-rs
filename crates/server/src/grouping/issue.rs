@@ -286,7 +286,10 @@ fn bump(c: &Connection, mut issue: Issue, o: &Occurrence<'_>) -> rusqlite::Resul
         c.prepare_cached("UPDATE issues SET occurrences = occurrences + 1, last_seen_at = ?, sample = ?, source = ?, updated_at = ? WHERE id = ?")?
             .execute(params![time::quoted_date_micros(issue.last_seen_at), sample, o.source, now_db(), issue.id])?;
     }
-    Ok((find(c, issue.id)?.expect("exists"), outcome))
+    // The row was read under this same lock, so it exists unless something
+    // deleted it in between; never panic while holding the control DB.
+    let issue = find(c, issue.id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    Ok((issue, outcome))
 }
 
 /// Issue#resolve!(deploy: nil) from background work (no Current.user).
@@ -325,7 +328,9 @@ pub fn reopen(c: &Connection, issue: &Issue, actor: Option<Actor<'_>>) -> rusqli
 /// status gets a 'status' activity and fires resolved_issue/ignored_issue/
 /// regressed_issue (open). Returns whether the status changed.
 fn record_status_change(c: &Connection, before: &Issue, actor: Option<Actor<'_>>) -> rusqlite::Result<bool> {
-    let after = find(c, before.id)?.expect("exists");
+    // Deleted since the caller read it (an environment or issue deleted
+    // meanwhile): nothing changed, and no panic under the control lock.
+    let Some(after) = find(c, before.id)? else { return Ok(false) };
     if after.status == before.status {
         return Ok(false);
     }

@@ -74,6 +74,11 @@ tag is a release candidate (marked pre-release, not "latest", so
   shipped bundle; `pnpm audit` is clean.
 - `/cable` bounds what one connection can make the server keep: messages up
   to 4 KiB, subscribe identifiers up to 256 bytes, 16 subscriptions.
+- Grouping an exception into an issue, or changing an issue's status, no
+  longer panics when the issue (or its environment) was deleted a moment
+  earlier. That panic ran while holding the control database lock and could
+  take the server down for every account. That batch now fails cleanly and
+  is retried, and the status change does nothing.
 
 ## v0.3.4 (2026-11-18)
 
