@@ -25,9 +25,16 @@
 //!   stops being, an owner: ownership moves only by transfer in Settings.
 //! - A valid header makes the request that user's, whatever cookies it
 //!   carries: created on first sight (verified, with a random password
-//!   nobody knows), a member of the server's first account only, with one
+//!   nobody knows), a member of the proxy's account only, with one
 //!   long-lived session row reused on every request. CSRF is unchanged:
 //!   a state-changing request still needs the session's token.
+//! - The proxy's account is bound in the control database (`trusted_proxy`,
+//!   control_schema): the account `railwatch setup` created. A proxied
+//!   request is pinned to it (session::Current::proxied): it cannot switch
+//!   to, create or mint tokens for another account, even when the email
+//!   is also a member elsewhere, and it acts with the claimed role, never
+//!   as an owner. With no bound account (deleted, or none yet) proxied
+//!   requests are refused; nobody is joined to some other account.
 //! - /mcp and /api/v1 take the same claims in place of a token
 //!   (mcp::Token::from_request): that user's dashboard access, refused
 //!   when the browser marks the request cross-origin (no CSRF token there).
@@ -132,15 +139,28 @@ pub async fn layer(state: axum::extract::State<std::sync::Arc<super::WebState>>,
     }
 }
 
-/// The session and user for verified claims, creating what is missing.
-/// Reads first and writes only on a change, so the common request is a few
-/// SELECTs. Proxied users belong to the server's first account (the one
-/// `railwatch setup` created) and only that one: the proxy fronts one app.
-pub fn resolve(c: &Connection, claims: &Claims) -> control::ModelResult<(Session, User)> {
-    let account: i64 = c
-        .query_row("SELECT id FROM accounts ORDER BY id LIMIT 1", [], |r| r.get(0))
-        .optional()?
-        .ok_or_else(|| control::ModelError::Invalid(vec![("base".into(), "no account yet: run `railwatch setup`".into())]))?;
+/// The account a trusted proxy's users belong to: the bound one, if it
+/// still exists. Never another account in its place.
+pub fn bound_account(c: &Connection) -> rusqlite::Result<Option<i64>> {
+    c.query_row("SELECT a.id FROM trusted_proxy t JOIN accounts a ON a.id = t.account_id WHERE t.id = 1", [], |r| r.get(0)).optional()
+}
+
+/// Binds the trusted proxy to `account` unless it is bound already (the
+/// account `railwatch setup` creates).
+pub fn bind_account(c: &Connection, account: i64) -> rusqlite::Result<()> {
+    c.execute("INSERT OR IGNORE INTO trusted_proxy (id, account_id, created_at) VALUES (1, ?, ?)", params![account, control::now_db()])?;
+    Ok(())
+}
+
+/// The session, user and account for verified claims, creating what is
+/// missing. Reads first and writes only on a change, so the common request
+/// is a few SELECTs. Proxied users belong to the proxy's bound account (the
+/// one `railwatch setup` created) and only that one: the proxy fronts one
+/// app. Invalid when that account is gone or was never bound.
+pub fn resolve(c: &Connection, claims: &Claims) -> control::ModelResult<(Session, User, i64)> {
+    let account = bound_account(c)?.ok_or_else(|| {
+        control::ModelError::Invalid(vec![("base".into(), "the trusted proxy's account does not exist (deleted, or `railwatch setup` has not run)".into())])
+    })?;
     let user = match control::find_user_by_email(c, &claims.email)? {
         Some(u) => u,
         None => {
@@ -175,7 +195,7 @@ pub fn resolve(c: &Connection, claims: &Claims) -> control::ModelResult<(Session
         Some(id) => id,
         None => control::create_session(c, user.id, Some(SESSION_AGENT), None)?,
     };
-    Ok((control::find_session(c, session)?.expect("session row"), user))
+    Ok((control::find_session(c, session)?.expect("session row"), user, account))
 }
 
 #[cfg(test)]
@@ -231,11 +251,13 @@ mod tests {
         let control = control::Control::open(&dir.join("control.sqlite3")).unwrap();
         let owner = control.tx(|tx| control::insert_user(tx, "Owner", "owner@example.com", &control::test_password(), true)).unwrap();
         let account = control.tx(|tx| control::create_account(tx, "Acme", owner)).unwrap();
+        control.tx(|tx| Ok(bind_account(tx, account)?)).unwrap();
         let c = |role: &str| Claims { email: "Ada@Example.com".into(), name: "Ada".into(), role: role.into(), exp: 0 };
 
-        let (s1, u1) = control.tx(|tx| resolve(tx, &c("member"))).unwrap();
+        let (s1, u1, a1) = control.tx(|tx| resolve(tx, &c("member"))).unwrap();
+        assert_eq!(a1, account);
         assert_eq!((u1.email.as_str(), u1.verified, s1.user_id), ("ada@example.com", true, u1.id));
-        let (s2, u2) = control.tx(|tx| resolve(tx, &c("admin"))).unwrap();
+        let (s2, u2, _) = control.tx(|tx| resolve(tx, &c("admin"))).unwrap();
         assert_eq!((s2.id, u2.id), (s1.id, u1.id), "the same user and session row every time");
         let role = |user: i64| -> String {
             control.with(|x| x.query_row("SELECT role FROM memberships WHERE account_id = ? AND user_id = ?", params![account, user], |r| r.get(0))).unwrap()
@@ -247,10 +269,10 @@ mod tests {
 
         // A second account (made in the UI) is not the proxy's to grant.
         let other = control.tx(|tx| control::create_account(tx, "Other", owner)).unwrap();
-        let (_, eve) = control.tx(|tx| resolve(tx, &Claims { email: "eve@example.com".into(), name: "Eve".into(), role: "admin".into(), exp: 0 })).unwrap();
+        let (_, eve, _) = control.tx(|tx| resolve(tx, &Claims { email: "eve@example.com".into(), name: "Eve".into(), role: "admin".into(), exp: 0 })).unwrap();
         let accounts: Vec<i64> =
             control.with(|x| x.prepare("SELECT account_id FROM memberships WHERE user_id = ?")?.query_map([eve.id], |r| r.get(0))?.collect()).unwrap();
-        assert_eq!(accounts, vec![account], "proxied users join the first account only, never {other}");
+        assert_eq!(accounts, vec![account], "proxied users join the bound account only, never {other}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

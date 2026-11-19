@@ -103,7 +103,7 @@ async fn index(cx: Ctx, Path((app, env)): Path<(i64, i64)>, p: Params) -> Respon
         .state
         .db(move |c| c.with(|x| crate::control::membership_role(x, account, user)))
         .await
-        .map(|r| matches!(r.as_deref(), Some("owner" | "admin")))
+        .map(|r| matches!(cx.current.effective_role(r).as_deref(), Some("owner" | "admin")))
         .unwrap_or(false);
     let mut props = props;
     props["can_manage"] = json!(admin);

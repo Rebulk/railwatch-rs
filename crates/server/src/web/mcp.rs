@@ -310,8 +310,7 @@ impl Token {
     /// Not a row: nothing to revoke or record.
     pub fn from_proxied(control: &Control, claims: &super::proxy_auth::Claims) -> rusqlite::Result<Option<Token>> {
         let resolved = control.tx(|tx| {
-            let (_, user) = super::proxy_auth::resolve(tx, claims)?;
-            let account: i64 = tx.query_row("SELECT id FROM accounts ORDER BY id LIMIT 1", [], |r| r.get(0))?;
+            let (_, user, account) = super::proxy_auth::resolve(tx, claims)?;
             Ok((user.id, account))
         });
         match resolved {
@@ -326,7 +325,7 @@ impl Token {
                 last_used_at: None,
             })),
             Err(crate::control::ModelError::Sql(e)) => Err(e),
-            // No account yet: setup has not run. Nobody to be.
+            // The proxy's account is gone, or setup has not run. Nobody to be.
             Err(crate::control::ModelError::Invalid(m)) => {
                 tracing::warn!(?m, "trusted proxy: no identity for MCP/API");
                 Ok(None)

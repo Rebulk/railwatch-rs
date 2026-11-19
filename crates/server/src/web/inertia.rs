@@ -264,6 +264,8 @@ impl Ctx {
         let account = cur.account.as_ref().map(|a| json!({"id": a.id, "name": a.name, "slug": a.slug, "plan": a.plan}));
         let user_id = cur.user.as_ref().map(|u| u.id);
         let account_id = cur.account.as_ref().map(|a| a.id);
+        // A trusted proxy's request sees only the proxy's account.
+        let only = cur.is_proxied().then(|| account_id.unwrap_or(0));
         let (accounts, applications) = self
             .state
             .db(move |c| {
@@ -272,9 +274,9 @@ impl Ctx {
                         None => vec![],
                         Some(uid) => conn
                             .prepare_cached(
-                                "SELECT a.id, a.name FROM accounts a JOIN memberships m ON m.account_id = a.id WHERE m.user_id = ? ORDER BY a.name",
+                                "SELECT a.id, a.name FROM accounts a JOIN memberships m ON m.account_id = a.id WHERE m.user_id = ?1 AND (?2 IS NULL OR a.id = ?2) ORDER BY a.name",
                             )?
-                            .query_map([uid], |r| Ok(json!({"id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?})))?
+                            .query_map(rusqlite::params![uid, only], |r| Ok(json!({"id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?})))?
                             .collect::<rusqlite::Result<_>>()?,
                     };
                     let applications = match account_id {

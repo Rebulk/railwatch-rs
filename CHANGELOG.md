@@ -13,6 +13,13 @@ tag is a release candidate (marked pre-release, not "latest", so
   lenient SMTP relay and run its own SMTP commands on the server's session.
   Issue titles in email alerts and the weekly digest are now also put on one
   line, and an email integration's recipient must be one plain address.
+- Trusted proxy (railwatch-sidecar): a proxied user stays in the proxy's
+  account with the role the proxy signed. They can no longer switch into,
+  create, delete or mint tokens for the user's other accounts, and an owner
+  signed as `member` acts as a member. The proxy's account is now stored
+  (`railwatch setup` binds the account it creates; an existing data dir is
+  bound to its lowest account on upgrade). If it is deleted, proxied
+  requests are refused instead of joining whichever account is first.
 
 ## v0.3.4 (2026-11-18)
 

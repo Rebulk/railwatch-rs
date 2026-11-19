@@ -117,7 +117,14 @@ pub(crate) async fn require_admin(cx: &Ctx) -> Result<i64, Response> {
     let account = require_account(cx)?;
     let user = cx.user_id();
     let role = cx.state.db(move |c| c.with(|x| control::membership_role(x, account, user))).await.map_err(internal)?;
+    let role = cx.current.effective_role(role);
     if matches!(role.as_deref(), Some("owner" | "admin")) { Ok(account) } else { Err(StatusCode::FORBIDDEN.into_response()) }
+}
+
+/// A trusted proxy's request stays in the proxy's account: no new account,
+/// no other account (proxy_auth).
+fn refuse_proxied(cx: &Ctx) -> Result<(), Response> {
+    if cx.current.is_proxied() { Err((StatusCode::FORBIDDEN, "Not available through the trusted proxy").into_response()) } else { Ok(()) }
 }
 
 fn rate_limited(cx: &Ctx, limit: &crate::rate_limit::FixedWindow<std::net::IpAddr>, to: &str, alert: &str) -> Result<(), Response> {
@@ -588,6 +595,9 @@ async fn invitation_show(cx: Ctx, Path(token): Path<String>) -> Response {
         Ok(None) => return cx.redirect(Redirect::to("/sign_in").alert("That invitation has expired or was already used.")),
         Err(e) => return internal(e),
     };
+    if cx.current.is_proxied() {
+        return cx.redirect(Redirect::to("/dashboard").alert("Invitations to other accounts cannot be accepted through the app you signed in with."));
+    }
     match cx.current.user.clone() {
         Some(user) => {
             let account_id = inv.account_id;
@@ -731,11 +741,13 @@ fn request_sparkline(tenants: &std::path::Path, slug: &str) -> (Vec<i64>, f64) {
 
 async fn account_new(cx: Ctx) -> Response {
     guard!(authenticate(&cx));
+    guard!(refuse_proxied(&cx));
     cx.render("accounts/new", json!({}), None).await
 }
 
 async fn account_create(cx: Ctx, p: Params) -> Response {
     guard!(authenticate(&cx));
+    guard!(refuse_proxied(&cx));
     guard!(provisioning(&cx));
     let name = p.s("name");
     let user = cx.user_id();
@@ -753,6 +765,7 @@ async fn account_create(cx: Ctx, p: Params) -> Response {
 
 async fn account_switch(cx: Ctx, Path(id): Path<i64>) -> Response {
     guard!(authenticate(&cx));
+    guard!(refuse_proxied(&cx));
     let user = cx.user_id();
     match cx.state.db(move |c| c.with(|x| control::membership_role(x, id, user))).await {
         Ok(Some(_)) => {
@@ -768,6 +781,8 @@ async fn account_switch(cx: Ctx, Path(id): Path<i64>) -> Response {
 /// environments and their telemetry files (DestroyAccountJob, inline).
 async fn account_destroy(cx: Ctx, Path(id): Path<i64>, p: Params) -> Response {
     guard!(authenticate(&cx));
+    // Only an owner deletes an account, and a proxy never signs for one.
+    guard!(refuse_proxied(&cx));
     let user = cx.user_id();
     let found = cx
         .state
@@ -1335,6 +1350,8 @@ async fn profile_show(cx: Ctx) -> Response {
     guard!(authenticate(&cx));
     let user = cx.current.user.clone().expect("authenticated");
     let uid = user.id;
+    // Through the trusted proxy, tokens can name the proxy's account only.
+    let pinned = cx.current.is_proxied().then(|| cx.current.account.as_ref().map(|a| a.id).unwrap_or(0));
     let data = cx
         .state
         .db(move |c| {
@@ -1358,10 +1375,12 @@ async fn profile_show(cx: Ctx) -> Response {
                                   "revoked_at": t_json_opt(r.get(5)?), "created_at": t_json(&r.get::<_, String>(6)?)}))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut targets = vec![json!({"value": "", "label": "All my accounts and applications"})];
+                let mut targets = if pinned.is_some() { vec![] } else { vec![json!({"value": "", "label": "All my accounts and applications"})] };
                 let accounts: Vec<(i64, String)> = x
-                    .prepare("SELECT a.id, a.name FROM accounts a JOIN memberships m ON m.account_id = a.id WHERE m.user_id = ? ORDER BY a.name")?
-                    .query_map([uid], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .prepare(
+                        "SELECT a.id, a.name FROM accounts a JOIN memberships m ON m.account_id = a.id WHERE m.user_id = ?1 AND (?2 IS NULL OR a.id = ?2) ORDER BY a.name",
+                    )?
+                    .query_map(params![uid, pinned], |r| Ok((r.get(0)?, r.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
                 for (id, name) in &accounts {
                     targets.push(json!({"value": format!("account:{id}"), "label": format!("Account: {name}")}));
@@ -1439,6 +1458,9 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
     let name = p.presence("name").unwrap_or_else(|| "API & MCP token".into());
     let scopes = if p.has("scopes_present") { p.strings("scopes") } else { ["api", "mcp", "read", "write"].map(String::from).to_vec() };
     let replace = p.i64("replace_token_id");
+    // Through the trusted proxy: a token for the proxy's account (or an
+    // application in it) only, never one for all of the user's accounts.
+    let pinned = cx.current.is_proxied().then(|| cx.current.account.as_ref().map(|a| a.id).unwrap_or(0));
     enum Out {
         Bad,
         Ok(String, bool),
@@ -1474,6 +1496,16 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
                     }
                     _ => return Ok(Out::Bad),
                 };
+                if let Some(bound) = pinned {
+                    let in_bound = match (account, app) {
+                        (Some(a), _) => a == bound,
+                        (None, Some(a)) => tx.query_row("SELECT account_id = ? FROM applications WHERE id = ?", params![bound, a], |r| r.get(0))?,
+                        (None, None) => false,
+                    };
+                    if !in_bound {
+                        return Ok(Out::Bad);
+                    }
+                }
                 if let Some(rid) = replace {
                     let mine: bool =
                         tx.query_row("SELECT 1 FROM api_tokens WHERE id = ? AND user_id = ?", params![rid, uid], |_| Ok(true)).optional()?.unwrap_or(false);
@@ -1617,6 +1649,7 @@ async fn sessions_index(cx: Ctx) -> Response {
 async fn members_index(cx: Ctx) -> Response {
     let account = guard!(require_account(&cx));
     let uid = cx.user_id();
+    let proxy_role = cx.current.proxy_role.clone();
     let data = cx
         .state
         .db(move |c| {
@@ -1635,7 +1668,7 @@ async fn members_index(cx: Ctx) -> Response {
                                   "expires_at": t_json(&r.get::<_, String>(3)?)}))
                     })?
                     .collect::<rusqlite::Result<_>>()?;
-                let owner = control::membership_role(x, account, uid)?.as_deref() == Some("owner");
+                let owner = proxy_role.is_none() && control::membership_role(x, account, uid)?.as_deref() == Some("owner");
                 Ok((members, invitations, owner))
             })
         })
@@ -1750,6 +1783,8 @@ async fn members_destroy(cx: Ctx, Path(id): Path<i64>) -> Response {
 /// admin, in one transaction.
 async fn members_transfer(cx: Ctx, Path(id): Path<i64>) -> Response {
     let account = guard!(require_account(&cx));
+    // Ownership moves only by the owner's own sign-in, never by a proxy's claim.
+    guard!(refuse_proxied(&cx));
     let uid = cx.user_id();
     let r = cx
         .state

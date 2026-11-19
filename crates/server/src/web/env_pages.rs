@@ -433,7 +433,7 @@ async fn editable(cx: &Ctx, env: i64, id: i64) -> Result<(), Response> {
         .await;
     match r {
         Ok((None, _)) => Err((StatusCode::NOT_FOUND, "Not Found").into_response()),
-        Ok((Some(o), role)) if o == user || matches!(role.as_deref(), Some("owner" | "admin")) => Ok(()),
+        Ok((Some(o), role)) if o == user || matches!(cx.current.effective_role(role.clone()).as_deref(), Some("owner" | "admin")) => Ok(()),
         Ok(_) => Err(StatusCode::FORBIDDEN.into_response()),
         Err(e) => {
             tracing::error!(error = %e, "saved view lookup failed");

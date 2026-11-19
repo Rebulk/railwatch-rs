@@ -97,9 +97,12 @@ pub async fn upgrade(
     let origin_ok = super::session::same_origin(&headers);
     // Verified (and the header removed) by proxy_auth::layer.
     let proxied = proxied.map(|axum::Extension(p)| p.0);
+    // (session, user, the one account a proxied connection may watch)
     let user = match (origin_ok, proxied, session_id) {
-        (true, Some(claims), _) => state.db(move |c| c.tx(|tx| super::proxy_auth::resolve(tx, &claims))).await.ok().map(|(s, u)| (s.id, u.id)),
-        (true, None, Some(sid)) => state.db(move |c| c.with(|x| crate::control::find_session(x, sid))).await.ok().flatten().map(|s| (s.id, s.user_id)),
+        (true, Some(claims), _) => {
+            state.db(move |c| c.tx(|tx| super::proxy_auth::resolve(tx, &claims))).await.ok().map(|(s, u, account)| (s.id, u.id, Some(account)))
+        }
+        (true, None, Some(sid)) => state.db(move |c| c.with(|x| crate::control::find_session(x, sid))).await.ok().flatten().map(|s| (s.id, s.user_id, None)),
         _ => None,
     };
     ws.protocols(["actioncable-v1-json"]).on_upgrade(move |socket| run(socket, state, user))
@@ -109,25 +112,25 @@ fn text(v: Value) -> Message {
     Message::Text(Utf8Bytes::from(v.to_string()))
 }
 
-/// EnvironmentChannel#authorized?
-fn authorized(state: &WebState, session_id: i64, user_id: i64, env_id: i64) -> bool {
+/// EnvironmentChannel#authorized?, within `only` (a proxied connection's account).
+fn authorized(state: &WebState, session_id: i64, user_id: i64, only: Option<i64>, env_id: i64) -> bool {
     state
         .control
         .with(|x| {
             x.query_row(
                 "SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?1 AND user_id = ?2)
                     AND EXISTS (SELECT 1 FROM environments e JOIN applications ap ON ap.id = e.application_id
-                                JOIN memberships m ON m.account_id = ap.account_id WHERE e.id = ?3 AND m.user_id = ?2)",
-                params![session_id, user_id, env_id],
+                                JOIN memberships m ON m.account_id = ap.account_id WHERE e.id = ?3 AND m.user_id = ?2 AND (?4 IS NULL OR ap.account_id = ?4))",
+                params![session_id, user_id, env_id, only],
                 |r| r.get::<_, bool>(0),
             )
         })
         .unwrap_or(false)
 }
 
-async fn run(socket: WebSocket, state: Arc<WebState>, user: Option<(i64, i64)>) {
+async fn run(socket: WebSocket, state: Arc<WebState>, user: Option<(i64, i64, Option<i64>)>) {
     let (mut tx, mut rx) = socket.split();
-    let Some((session_id, user_id)) = user else {
+    let Some((session_id, user_id, only)) = user else {
         let _ = tx.send(text(json!({"type": "disconnect", "reason": "unauthorized", "reconnect": false}))).await;
         let _ = tx.close().await;
         return;
@@ -162,7 +165,7 @@ async fn run(socket: WebSocket, state: Arc<WebState>, user: Option<(i64, i64)>) 
                             .flatten();
                         let st = state.clone();
                         let ok = match env {
-                            Some(e) => tokio::task::spawn_blocking(move || authorized(&st, session_id, user_id, e)).await.unwrap_or(false),
+                            Some(e) => tokio::task::spawn_blocking(move || authorized(&st, session_id, user_id, only, e)).await.unwrap_or(false),
                             None => false,
                         };
                         let reply = if ok {
@@ -186,7 +189,7 @@ async fn run(socket: WebSocket, state: Arc<WebState>, user: Option<(i64, i64)>) 
                 let targets: Vec<String> = subs.iter().filter(|(_, e)| **e == env).map(|(i, _)| i.clone()).collect();
                 if targets.is_empty() { continue; }
                 let st = state.clone();
-                let still = tokio::task::spawn_blocking(move || authorized(&st, session_id, user_id, env)).await.unwrap_or(false);
+                let still = tokio::task::spawn_blocking(move || authorized(&st, session_id, user_id, only, env)).await.unwrap_or(false);
                 let message: Value = serde_json::from_str(&msg).unwrap_or(Value::Null);
                 for identifier in targets {
                     if still {

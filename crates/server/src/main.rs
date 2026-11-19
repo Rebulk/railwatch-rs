@@ -498,6 +498,8 @@ fn setup(rest: &[&str]) -> ExitCode {
     let result = control.tx(|tx| {
         let user = control::insert_user(tx, &name, &email, &password, true)?;
         let account = control::create_account(tx, &account, user)?;
+        // A trusted proxy (if one is ever configured) fronts this account only.
+        web::proxy_auth::bind_account(tx, account)?;
         let (slug, prefix) = control::application_defaults(&app, None);
         let app = control::insert_application(tx, account, app.trim(), &slug, &prefix, None, "main")?;
         let (env_id, token) = control::create_environment(tx, app, &env)?;

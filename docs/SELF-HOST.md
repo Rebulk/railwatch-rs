@@ -290,13 +290,20 @@ The security model:
   claim, or a role other than `admin`/`member` is refused. The header is
   removed before any handler, so it is never logged, stored or forwarded.
 - **What a valid header grants**: that user, created on first sight
-  (verified, with a random password nobody knows) in the server's first
-  account, the one `railwatch setup` made, with the claimed role. The role
-  follows the proxy on every request, but the proxy can never create an
-  owner, demote the owner, or add anyone to another account. An email that
-  matches an existing user (one who signed up directly, or the owner) *is*
-  that user, with their access: the proxy is trusted to name people, so
-  only run it in front of an app whose login you trust with that. Each
+  (verified, with a random password nobody knows) in the proxy's account,
+  the one `railwatch setup` made, with the claimed role. (A data dir from
+  before v0.3.5 is bound to its lowest account id on upgrade, the account
+  the proxy granted until then.) The role follows the proxy on every
+  request, but the proxy can never create an owner, demote the owner, or
+  add anyone to another account. A proxied request stays in that account
+  and acts with the claimed role only: an email that matches an existing
+  user (one who signed up directly, or the owner) is that user *inside the
+  proxy's account*, at the role the proxy signed, never in the user's other
+  accounts and never as an owner. Through the proxy nobody can switch
+  account, create or delete an account, transfer ownership, accept an
+  invitation to another account, or create a token for anything but the
+  proxy's account. If that account is deleted, proxied requests are refused
+  (403; MCP and the API 401) instead of joining the next account. Each
   proxied user has one session row, reused; Settings > Sessions shows it
   as "railwatch trusted proxy". Proxy-created users have no usable
   password, so the actions that ask for one (changing email or password,
@@ -308,8 +315,8 @@ The security model:
   `/railwatch/mcp` and `/railwatch/api/v1`, for the same user, so an AI
   agent behind the proxy needs no pasted token. It gets what that user has
   in the dashboard: every read tool, plus the issue writes (`update_issue`,
-  `add_comment`, attributed to the user and "agent"), in the first account
-  only. Recording a deploy (`POST .../deploys`) is not among them: that is
+  `add_comment`, attributed to the user and "agent"), in the proxy's
+  account only. Recording a deploy (`POST .../deploys`) is not among them: that is
   the deploy hook's, with a token. These routes take no CSRF token, so a proxied request the browser
   marks as coming from another site (`Origin` not the `Host`, or
   `Sec-Fetch-Site: cross-site`) is refused with 403; agents send no

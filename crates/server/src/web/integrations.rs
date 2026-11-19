@@ -120,11 +120,12 @@ async fn index(cx: Ctx) -> Response {
     let account = guard!(require_account(&cx));
     let user = cx.user_id();
     let cipher = cipher(&cx);
+    let current = cx.current.clone();
     let data = cx
         .state
         .db(move |c| {
             c.with(|x| {
-                let admin = matches!(crate::control::membership_role(x, account, user)?.as_deref(), Some("owner" | "admin"));
+                let admin = matches!(current.effective_role(crate::control::membership_role(x, account, user)?).as_deref(), Some("owner" | "admin"));
                 let integrations: Vec<Value> = integration::for_account(x, Some(&cipher), account)?.iter().map(|i| integration_props(i, admin)).collect();
                 let alert_rules = alert_rules_props(x, account)?;
                 let apps: Vec<(i64, String)> = x

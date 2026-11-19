@@ -18,6 +18,12 @@
 //!    their state, raw checks (7 days), daily rollups (90 days), incidents,
 //!    and one status page per environment. Every table cascades from its
 //!    environment, so deleting an environment deletes its monitors.
+//! 5. `trusted_proxy`: the one account a trusted proxy's users belong to
+//!    (web::proxy_auth). `railwatch setup` binds the account it creates; an
+//!    existing file is bound to its lowest account id, the account the proxy
+//!    granted until now. Deliberately no foreign key: deleting that account
+//!    leaves the row pointing at nothing, and proxied requests are refused
+//!    instead of falling through to whichever account is first.
 
 pub mod issues;
 
@@ -39,6 +45,7 @@ pub const MIGRATIONS: &[(&str, Step)] = &[
     ("20261013000002_rails_primary", rails_primary),
     ("20261013000003_issues_alerts", issues_alerts),
     ("20261101000001_uptime", uptime),
+    ("20261119000001_trusted_proxy", trusted_proxy),
 ];
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<&'static str>> {
@@ -285,6 +292,22 @@ fn uptime(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(UPTIME)
 }
 
+/// One row at most (id 1).
+fn trusted_proxy(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE trusted_proxy (
+           id INTEGER PRIMARY KEY CHECK (id = 1),
+           account_id INTEGER NOT NULL,
+           created_at TEXT NOT NULL
+         )",
+    )?;
+    tx.execute(
+        "INSERT INTO trusted_proxy (id, account_id, created_at) SELECT 1, min(id), ? FROM accounts HAVING min(id) IS NOT NULL",
+        [crate::time::quoted_date_micros(crate::time::now_micros())],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +342,36 @@ mod tests {
         assert_eq!(n, 1);
         let usage: i64 = c.query_row("SELECT events FROM ingest_usage_months WHERE environment_id = 1", [], |r| r.get(0)).unwrap();
         assert_eq!(usage, 12);
+    }
+
+    /// A file from before the binding keeps what a trusted proxy granted:
+    /// its lowest account. A file with no account yet stays unbound (setup
+    /// binds the account it creates).
+    #[test]
+    fn the_trusted_proxy_is_bound_to_the_account_it_granted_before_the_upgrade() {
+        let before: Vec<_> = MIGRATIONS.iter().take_while(|(v, _)| *v != "20261119000001_trusted_proxy").collect();
+        let upgrade = |accounts: &[i64]| {
+            let mut c = Connection::open_in_memory().unwrap();
+            for (_, step) in &before {
+                let tx = c.transaction().unwrap();
+                step(&tx).unwrap();
+                tx.commit().unwrap();
+            }
+            for id in accounts {
+                c.execute(
+                    "INSERT INTO accounts (id, name, slug, plan, monthly_event_quota, retention_days, created_at, updated_at) VALUES (?1, 'a', ?1, 'p', 1, 30, 'x', 'x')",
+                    [id],
+                )
+                .unwrap();
+            }
+            c.execute_batch("CREATE TABLE railwatch_migrations (version TEXT PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL)").unwrap();
+            for (version, _) in &before {
+                c.execute("INSERT INTO railwatch_migrations (version, applied_at) VALUES (?, 'x')", [version]).unwrap();
+            }
+            assert_eq!(migrate(&mut c).unwrap(), vec!["20261119000001_trusted_proxy"]);
+            c.query_row("SELECT account_id FROM trusted_proxy", [], |r| r.get::<_, i64>(0)).optional().unwrap()
+        };
+        assert_eq!(upgrade(&[7, 3, 9]), Some(3));
+        assert_eq!(upgrade(&[]), None);
     }
 }
