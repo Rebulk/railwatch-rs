@@ -53,8 +53,9 @@ writers). So a slug once used is never given to another environment: a
 trigger records every deleted environment's slug in
 `retired_environment_slugs` (control migration
 `20261119000010_retired_environment_slugs`), and a new environment that
-would get one gets `-2`, `-3`, ... instead (`railwatch env create` with a
-retired slug is refused). At every start, names under `telemetry/` and
+would get one gets `-2`, `-3`, ... instead, cut to fit the 128-character
+limit (`railwatch env create` does the same and says on stderr which slug it
+used). At every start, names under `telemetry/` and
 `sourcemaps/` that no environment owns are retired too, and so are the
 slugs a backup pass finds in the bucket without an environment: telemetry
 deleted before this existed can never be attached to a new environment.

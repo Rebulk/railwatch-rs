@@ -91,8 +91,21 @@ fn a_deleted_environments_slug_is_never_given_to_a_new_environment() {
     let app = account_app(&c, "Omega", "Shop");
     let (third, _) = c.tx(|tx| control::create_environment(tx, app, "production")).unwrap();
     assert_eq!(slug(third), "omega-shop-production-3");
-    // `railwatch env create <slug>` with a retired slug is refused.
-    assert!(c.create("omega-shop-production", &"0".repeat(64), 30).is_err());
+    // `railwatch env create <slug>` with a retired slug gets the next free
+    // one, as the UI does (PR #107 review L6).
+    let made = c.create("omega-shop-production", &"0".repeat(64), 30).unwrap();
+    assert_eq!(made.slug, "omega-shop-production-4");
+    // A long base still fits the 128-character cap with its suffix.
+    let long = "a".repeat(128);
+    c.with(|x| x.execute("INSERT INTO retired_environment_slugs (slug, retired_at) VALUES (?, 'x')", [&long])).unwrap();
+    let made = c.create(&long, &"1".repeat(64), 30).unwrap();
+    assert_eq!(made.slug, format!("{}-2", "a".repeat(126)));
+    let app2 = account_app(&c, &"x".repeat(60), &"y".repeat(60));
+    for _ in 0..2 {
+        let (id, _) = c.tx(|tx| control::create_environment(tx, app2, "production")).unwrap();
+        assert!(slug(id).len() <= 128, "{}", slug(id));
+        c.with(|x| x.execute("DELETE FROM environments WHERE id = ?", [id])).unwrap();
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -150,5 +163,31 @@ fn deleting_a_tenant_stops_its_writer_and_refuses_later_batches() {
     assert!(lookup(&tenants).is_err(), "refused, not a new writer");
     assert!(!d.join("telemetry").join(slug).exists(), "nothing recreated the directory");
     tenants.shutdown();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// PR #107 review L6: `railwatch env create <slug>` after that environment
+/// was deleted succeeds with the next free slug, says which on stderr, and
+/// still prints only the token on stdout (scripts capture it).
+#[test]
+fn env_create_with_a_deleted_slug_uses_the_next_one_and_says_so() {
+    let d = root("cli");
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_railwatch"))
+            .args(args)
+            .env("RAILWATCH_DATA_DIR", &d)
+            .env("RAILWATCH_SECRET_KEY_BASE", "00".repeat(64))
+            .env_remove("RAILWATCH_CONFIG")
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["env", "create", "ci-web-production"]).status.success());
+    Control::open(&d.join("control.sqlite3")).unwrap().with(|x| x.execute("DELETE FROM environments WHERE slug = 'ci-web-production'", [])).unwrap();
+    let out = run(&["env", "create", "ci-web-production"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.trim().starts_with("rw_") && stdout.lines().count() == 1, "only the token on stdout: {stdout}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("created ci-web-production-2 instead"));
+    assert!(d.join("telemetry/ci-web-production-2/meta.sqlite3").is_file());
     let _ = std::fs::remove_dir_all(&d);
 }

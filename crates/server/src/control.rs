@@ -291,6 +291,10 @@ impl Control {
     /// `railwatch env create/import`: an environment named `slug` in the
     /// self-hosted account/application for that retention (created on
     /// first use), with the given token digest.
+    ///
+    /// A slug a deleted environment had is never reused: the environment gets
+    /// the next free `<slug>-N`, as in the web UI (PR #107 review L6). The
+    /// returned environment's `slug` is the one used; its name is `slug`.
     pub fn create(&self, slug: &str, token_digest: &str, retention_days: i64) -> rusqlite::Result<Environment> {
         validate_slug(slug).map_err(rusqlite::Error::InvalidParameterName)?;
         let id = self
@@ -304,7 +308,9 @@ impl Control {
                     Some(id) => id,
                     None => insert_application(tx, account, "default", "default", "APP", None, "main")?,
                 };
-                insert_environment(tx, app, slug, slug, token_digest, "rw_")
+                let retired = slug_retired(tx, slug)?;
+                let used = if retired { free_slug(tx, slug)? } else { slug.to_string() };
+                insert_environment(tx, app, slug, &used, token_digest, "rw_")
             })
             .map_err(|e| match e {
                 ModelError::Sql(e) => e,
@@ -570,17 +576,7 @@ pub fn create_environment(tx: &Connection, application_id: i64, name: &str) -> M
         tx.query_row("SELECT a.slug, ap.slug FROM applications ap JOIN accounts a ON a.id = ap.account_id WHERE ap.id = ?", [application_id], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
-    // Never a slug another environment had: it names the telemetry on disk
-    // and in backups (retired_environment_slugs).
-    let base = format!("{account_slug}-{app_slug}-{name}");
-    let mut slug = base.clone();
-    for n in 2.. {
-        let live: bool = tx.query_row("SELECT 1 FROM environments WHERE slug = ?", [&slug], |_| Ok(true)).optional()?.unwrap_or(false);
-        if !live && !slug_retired(tx, &slug)? {
-            break;
-        }
-        slug = format!("{base}-{n}");
-    }
+    let slug = free_slug(tx, &format!("{account_slug}-{app_slug}-{name}"))?;
     let token = new_token();
     let id = insert_environment(tx, application_id, name, &slug, &digest(&token), &token[..12])?;
     Ok((id, token))
@@ -594,6 +590,30 @@ pub fn rotate_token(tx: &Connection, environment_id: i64) -> rusqlite::Result<St
         params![digest(&token), &token[..12], now_db(), environment_id],
     )?;
     Ok(token)
+}
+
+/// The longest environment slug (validate_slug).
+const MAX_SLUG: usize = 128;
+
+/// `base`, or `base-2`, `base-3`, ...: the first that no environment has and
+/// none ever had (it names the telemetry on disk and in backups,
+/// retired_environment_slugs). Cut so the suffix still fits MAX_SLUG (PR
+/// #107 review L6: a long base failed as "slug is invalid").
+pub fn free_slug(c: &Connection, base: &str) -> rusqlite::Result<String> {
+    let cut = |n: usize| base[..base.len().min(n)].trim_end_matches('-').to_string();
+    for n in 1.. {
+        let slug = if n == 1 {
+            cut(MAX_SLUG)
+        } else {
+            let suffix = format!("-{n}");
+            format!("{}{suffix}", cut(MAX_SLUG - suffix.len()))
+        };
+        let live: bool = c.query_row("SELECT 1 FROM environments WHERE slug = ?", [&slug], |_| Ok(true)).optional()?.unwrap_or(false);
+        if !live && !slug_retired(c, &slug)? {
+            return Ok(slug);
+        }
+    }
+    unreachable!()
 }
 
 /// Was `slug` an environment's that is gone (deleted, or found unowned on

@@ -80,7 +80,8 @@ tag is a release candidate (marked pre-release, not "latest", so
   a dashboard reader opened before the delete could serve the deleted
   company's rows to the new environment, and its ingest went to the old
   writer (usage not counted, no issues). Now deleted slugs are recorded, a
-  new environment gets `<slug>-2` instead, and deleting an environment closes
+  new environment gets `<slug>-2` instead (`railwatch env create` too, saying
+  which slug it used on stderr), and deleting an environment closes
   its readers and writer before removing its files and source maps.
   **Upgrade:** a control migration (`20261119000010_retired_environment_slugs`)
   adds one table and a trigger; nothing on disk moves. At start, telemetry

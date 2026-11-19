@@ -259,7 +259,7 @@ fn main() -> ExitCode {
             let Some(retention) = retention(rest) else { return usage() };
             let token = control::new_token();
             match create_env(slug, &control::digest(&token), retention) {
-                Ok(()) => {
+                Ok(_) => {
                     println!("{token}");
                     ExitCode::SUCCESS
                 }
@@ -272,8 +272,8 @@ fn main() -> ExitCode {
                 return fail("token digest must be 64 hex characters (SHA-256 of the token)");
             }
             match create_env(slug, &digest.to_ascii_lowercase(), retention) {
-                Ok(()) => {
-                    println!("imported {slug}");
+                Ok(used) => {
+                    println!("imported {used}");
                     ExitCode::SUCCESS
                 }
                 Err(e) => fail(e),
@@ -304,12 +304,20 @@ fn retention(rest: &[&str]) -> Option<i64> {
     }
 }
 
-fn create_env(slug: &str, digest: &str, retention: i64) -> Result<(), String> {
+/// Creates the environment and returns the slug it got: `slug`, or the next
+/// free `<slug>-N` when a deleted environment had it (slugs are never
+/// reused), which is said on stderr so a script reading the token from
+/// stdout keeps working.
+fn create_env(slug: &str, digest: &str, retention: i64) -> Result<String, String> {
     let cfg = config();
     let control = open_control(&cfg);
-    control.create(slug, digest, retention).map_err(|e| e.to_string())?;
+    let env = control.create(slug, digest, retention).map_err(|e| e.to_string())?;
+    if env.slug != slug {
+        eprintln!("railwatch: {slug} belonged to a deleted environment and is never reused; created {} instead", env.slug);
+    }
     // Environment's after_create_commit: the tenant file exists from the start.
-    tenants(&cfg).ensure(slug).map_err(|e| e.to_string())
+    tenants(&cfg).ensure(&env.slug).map_err(|e| e.to_string())?;
+    Ok(env.slug)
 }
 
 // ---------------------------------------------------------------------------
