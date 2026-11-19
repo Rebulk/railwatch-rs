@@ -298,7 +298,7 @@ fn proxy_fixture(s: &Server) -> (i64, i64, i64, String) {
     let password = control::base58(16);
     let owner = user(s, "Owner", "owner@host.test", &password, true);
     let host = s.control.tx(|tx| control::create_account(tx, "HostApp", owner)).unwrap();
-    s.control.tx(|tx| Ok(proxy_auth::bind_account(tx, host)?)).unwrap();
+    s.control.tx(|tx| proxy_auth::bind_account(tx, host)).unwrap();
     s.control.tx(|tx| control::insert_application(tx, host, "Host", "host", "HOST", None, "main")).unwrap();
     let boss = user(s, "Boss", "boss@other.test", &password, true);
     let other = s.control.tx(|tx| control::create_account(tx, "OtherCo", boss)).unwrap();
@@ -423,7 +423,7 @@ fn proxied_mcp_sees_only_the_bound_account_not_the_first_one() {
     let host = s.control.tx(|tx| control::create_account(tx, "HostApp", owner)).unwrap();
     s.control.tx(|tx| control::insert_application(tx, host, "Host", "host", "HOST", None, "main")).unwrap();
     s.control.with(|x| x.execute("DELETE FROM trusted_proxy", [])).ok();
-    s.control.tx(|tx| Ok(proxy_auth::bind_account(tx, host)?)).unwrap();
+    s.control.tx(|tx| proxy_auth::bind_account(tx, host)).unwrap();
     assert!(other < host);
 
     let mut b = Browser::proxied("boss@other.test", "admin");

@@ -377,7 +377,9 @@ mod tests {
             for (version, _) in &before {
                 c.execute("INSERT INTO railwatch_migrations (version, applied_at) VALUES (?, 'x')", [version]).unwrap();
             }
-            assert_eq!(migrate(&mut c).unwrap(), vec!["20261119000001_trusted_proxy"]);
+            assert_eq!(migrate(&mut c).unwrap(), vec!["20261119000001_trusted_proxy", "20261119000002_api_token_role_ceiling"]);
+            let ceiling: Option<String> = c.query_row("SELECT role_ceiling FROM api_tokens LIMIT 1", [], |r| r.get(0)).optional().unwrap().flatten();
+            assert_eq!(ceiling, None, "existing tokens keep no ceiling");
             c.query_row("SELECT account_id FROM trusted_proxy", [], |r| r.get::<_, i64>(0)).optional().unwrap()
         };
         assert_eq!(upgrade(&[7, 3, 9]), Some(3));

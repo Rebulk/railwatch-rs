@@ -301,7 +301,7 @@ mod tests {
         let control = control::Control::open(&dir.join("control.sqlite3")).unwrap();
         let owner = control.tx(|tx| control::insert_user(tx, "Owner", "owner@example.com", &control::test_password(), true)).unwrap();
         let account = control.tx(|tx| control::create_account(tx, "Acme", owner)).unwrap();
-        control.tx(|tx| Ok(bind_account(tx, account)?)).unwrap();
+        control.tx(|tx| bind_account(tx, account)).unwrap();
         let c = |role: &str| Claims { email: "Ada@Example.com".into(), name: "Ada".into(), role: role.into(), exp: 0 };
 
         let (s1, u1, a1) = control.tx(|tx| resolve(tx, &c("member"))).unwrap();
