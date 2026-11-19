@@ -1373,9 +1373,11 @@ async fn profile_show(cx: Ctx) -> Response {
                         "SELECT t.id, t.name, t.scopes, t.expires_at, t.last_used_at, t.revoked_at, t.created_at,
                                 ap.name, apa.name, a.name
                          FROM api_tokens t LEFT JOIN applications ap ON ap.id = t.application_id LEFT JOIN accounts apa ON apa.id = ap.account_id
-                         LEFT JOIN accounts a ON a.id = t.account_id WHERE t.user_id = ? ORDER BY t.created_at DESC",
+                         LEFT JOIN accounts a ON a.id = t.account_id
+                         WHERE t.user_id = ?1 AND (?2 IS NULL OR t.account_id = ?2 OR ap.account_id = ?2)
+                         ORDER BY t.created_at DESC",
                     )?
-                    .query_map([uid], |r| {
+                    .query_map(params![uid, pinned], |r| {
                         let restriction = match (r.get::<_, Option<String>>(7)?, r.get::<_, Option<String>>(8)?, r.get::<_, Option<String>>(9)?) {
                             (Some(app), Some(acct), _) => format!("Application: {acct} / {app}"),
                             (_, _, Some(acct)) => format!("Account: {acct}"),
@@ -1404,7 +1406,13 @@ async fn profile_show(cx: Ctx) -> Response {
                         targets.push(json!({"value": format!("application:{aid}"), "label": format!("Application: {name} / {aname}")}));
                     }
                 }
-                let blocking: Vec<Value> = sole_owned_accounts(x, uid)?.into_iter().map(|(id, name)| json!({"id": id, "name": name})).collect();
+                // Through the proxy, nothing of the user's other accounts is
+                // shown: its tokens above, and its names here.
+                let blocking: Vec<Value> = sole_owned_accounts(x, uid)?
+                    .into_iter()
+                    .filter(|(id, _)| pinned.is_none_or(|p| p == *id))
+                    .map(|(id, name)| json!({"id": id, "name": name}))
+                    .collect();
                 Ok((tokens, targets, blocking))
             })
         })

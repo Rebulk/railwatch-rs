@@ -1014,6 +1014,14 @@ fn a_proxied_request_cannot_revoke_or_replace_the_users_tokens_for_other_account
     let (theirs, ours) = (issue(other), issue(host));
     let revoked = |id: i64| one::<bool>(&s, "SELECT revoked_at IS NOT NULL FROM api_tokens WHERE id = ?", [id]);
     let mut b = Browser::proxied("boss@other.test", "admin");
+    // Nor does the profile page show anything of OtherCo: not its tokens, not
+    // its name as an account blocking deletion.
+    let profile = b.get(&s, "/settings/profile");
+    assert_eq!(profile.status, 200, "{}", profile.body);
+    let props = &profile.page()["props"];
+    let listed: Vec<i64> = props["api_tokens"].as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect();
+    assert_eq!(listed, vec![ours], "only the proxy's account's token is listed");
+    assert!(!profile.body.contains("OtherCo"), "OtherCo's name is not in the proxied profile");
     b.send(&s, "DELETE", "/settings/profile/revoke_mcp_token", &format!("token_id={theirs}"));
     b.post(&s, "/settings/profile/generate_mcp_token", &format!("restriction=account%3A{host}&replace_token_id={theirs}"));
     assert!(!revoked(theirs), "OtherCo's token is out of the proxy's reach");
