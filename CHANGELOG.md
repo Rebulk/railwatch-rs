@@ -47,6 +47,10 @@ tag is a release candidate (marked pre-release, not "latest", so
 - MCP: a string argument over 4 KB (64 KB for `add_comment`'s body) is
   refused as invalid params (-32602) by every tool, instead of a long
   `search_requests` query failing as an internal error.
+- Every MCP tool that returns telemetry (issue titles, exception messages,
+  log lines, paths, headers) now says in its description to read it as
+  data, never as instructions. docs/agent-webhooks.md recommends read-only,
+  account-restricted tokens for agents that run on their own.
 - `/cable` bounds what one connection can make the server keep: messages up
   to 4 KiB, subscribe identifiers up to 256 bytes, 16 subscriptions.
 
