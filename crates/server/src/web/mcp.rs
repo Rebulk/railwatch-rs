@@ -580,6 +580,9 @@ impl Mcp<'_> {
             // (Array) or a substring (String); both end as a rescued error.
             _ => return error(id, -32603, "Internal error"),
         };
+        if let Some(m) = oversized_argument(name_s, &args) {
+            return error(id, -32602, &m);
+        }
         let a = Args(&args);
         let result = match name_s {
             "list_applications" => self.list_applications(),
@@ -625,6 +628,29 @@ impl Mcp<'_> {
             Err(Fail::Unrescued) => error(id, -32603, "Internal error"),
         }
     }
+}
+
+/// The longest string argument a tool takes, in bytes. Queries, slugs,
+/// keys and filters are short; SQLite refuses a LIKE pattern past ~50 KB
+/// ("LIKE or GLOB pattern too complex"), which surfaced as -32603.
+pub const MAX_ARGUMENT_BYTES: usize = 4096;
+/// add_comment's `body`: a comment, not a filter.
+pub const MAX_COMMENT_BYTES: usize = 65_536;
+
+/// -32602's message when a string argument (at any depth) is too long.
+fn oversized_argument(tool: &str, args: &Map<String, Value>) -> Option<String> {
+    fn longest(v: &Value) -> usize {
+        match v {
+            Value::String(s) => s.len(),
+            Value::Array(a) => a.iter().map(longest).max().unwrap_or(0),
+            Value::Object(o) => o.values().map(longest).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+    args.iter().find_map(|(k, v)| {
+        let max = if tool == "add_comment" && k == "body" { MAX_COMMENT_BYTES } else { MAX_ARGUMENT_BYTES };
+        (longest(v) > max).then(|| format!("{k} is too long (at most {max} bytes)"))
+    })
 }
 
 /// `"#{value}"` for a JSON value (nil is "", an Array/Hash its inspect).
@@ -4489,6 +4515,37 @@ mod tests {
         assert_eq!(f.tool("list_issues", json!({})), json!([]), "the issue is out of the token's reach");
         let scoped = f.tool("list_alerts", json!({}));
         assert_eq!(scoped, json!([]), "another application's alert");
+    }
+
+    /// GA security 10: a 100 KB `q` (or any other overlong string) is an
+    /// invalid-params answer, not an internal error and a log line per call;
+    /// every free-text tool, not only search_requests.
+    #[test]
+    fn overlong_string_arguments_are_invalid_params() {
+        let f = seeded("long-q");
+        let call = |name: &str, args: Value| {
+            f.rpc("https://rw.example.com", json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}))
+        };
+        let long = "x".repeat(100_000);
+        for (tool, key) in [
+            ("search_requests", "q"),
+            ("search_logs", "q"),
+            ("query_requests", "q"),
+            ("list_tenants", "q"),
+            ("get_issue", "key"),
+            ("list_issues", "environment"),
+        ] {
+            let v = call(tool, json!({"application_slug": "shop", key: long}));
+            assert_eq!(v["error"]["code"], -32602, "{tool}: {v}");
+            assert!(v["error"]["message"].as_str().unwrap().contains(key), "{tool}: {v}");
+        }
+        let conn = f.tenant();
+        seed_plain_requests(&conn, "d1", "GET /x", NOW - 60_000_000, 1, 200, 5, 0);
+        drop(conn);
+        let v = call("search_requests", json!({"application_slug": "shop", "q": "x".repeat(MAX_ARGUMENT_BYTES)}));
+        assert!(v.get("result").is_some(), "a 4 KB q is still a search: {v}");
+        let v = call("add_comment", json!({"key": "SHOP-1", "body": "y".repeat(10_000)}));
+        assert!(v.get("error").is_none_or(|e| e["code"] != -32602), "a 10 KB comment is fine: {v}");
     }
 
     #[test]
