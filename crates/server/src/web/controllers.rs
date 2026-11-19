@@ -837,9 +837,7 @@ async fn account_destroy(cx: Ctx, Path(id): Path<i64>, p: Params) -> Response {
         Ok(s) => s,
         Err(e) => return internal(e),
     };
-    for slug in slugs {
-        destroy_tenant(&cx.state, &slug);
-    }
+    destroy_tenants(&cx.state, slugs).await;
     let next = cx.state.db(move |c| c.with(|x| super::session::find_account(x, user, None))).await.ok().flatten();
     cx.outgoing.set_account(next.as_ref().map(|a| a.id));
     cx.redirect(Redirect::to(if next.is_some() { "/dashboard" } else { "/accounts/new" }).notice(format!("{name} and its telemetry are being deleted")))
@@ -906,6 +904,16 @@ fn delete_application_rows(tx: &rusqlite::Connection, app: i64) -> rusqlite::Res
 
 /// Environment#destroy_telemetry_database: the file and its -wal/-shm, or
 /// a per-day tenant's whole directory.
+/// `destroy_tenant` for each slug, on the blocking pool: stopping a busy
+/// writer waits up to 5 s each, which must not hold an async worker (PR #107
+/// review L3).
+pub async fn destroy_tenants(state: &Arc<WebState>, slugs: Vec<String>) {
+    let state = state.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || slugs.iter().for_each(|s| destroy_tenant(&state, s))).await {
+        tracing::error!(error = %e, "deleting telemetry failed");
+    }
+}
+
 fn destroy_tenant(state: &WebState, slug: &str) {
     // Every open handle goes first (GA review 2026-11-19 T1): a pooled
     // reader or a running writer kept the deleted files open after the delete.
@@ -1119,9 +1127,7 @@ async fn application_destroy(cx: Ctx, Path(id): Path<i64>) -> Response {
         .await;
     match slugs {
         Ok(slugs) => {
-            for s in slugs {
-                destroy_tenant(&cx.state, &s);
-            }
+            destroy_tenants(&cx.state, slugs).await;
             cx.redirect(Redirect::to("/dashboard").notice("Application deleted"))
         }
         Err(e) => internal(e),
@@ -1312,7 +1318,7 @@ async fn environment_destroy(cx: Ctx, Path((app, id)): Path<(i64, i64)>) -> Resp
         .await;
     match r {
         Ok(()) => {
-            destroy_tenant(&cx.state, &slug);
+            destroy_tenants(&cx.state, vec![slug]).await;
             cx.redirect(Redirect::to(format!("/apps/{app}")).notice("Environment and its telemetry deleted"))
         }
         Err(e) => internal(e),
