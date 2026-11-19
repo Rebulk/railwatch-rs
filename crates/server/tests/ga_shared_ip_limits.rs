@@ -120,6 +120,35 @@ async fn one_tokens_mcp_calls_never_use_up_another_tokens_shared_address_limit()
         assert_eq!(call(alice.clone()).await.unwrap(), 200);
     }
     assert_eq!(call(alice.clone()).await.unwrap(), 429, "Alice's own credential is limited");
+    // PR #107 review M3: the same token written differently (whitespace
+    // inside the header value before CRLF, which hyper may or may not strip)
+    // is the same credential, not a fresh bucket.
+    for variant in [format!("{alice} "), format!("{alice}\t"), format!("{alice} \t ")] {
+        assert_eq!(call(variant.clone()).await.unwrap(), 429, "{variant:?} shares Alice's bucket");
+    }
     assert_eq!(call(bob.clone()).await.unwrap(), 200, "Bob, same address, is not");
+    // Oversized bodies (413) count toward the address: past the limit,
+    // even a valid token from that address is refused.
+    let oversized = move || {
+        tokio::task::spawn_blocking(move || {
+            // Chunked, so the server reads up to its 4 MiB cap and stops.
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            s.write_all(b"POST /mcp HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+            let chunk = vec![b' '; 1 << 20];
+            for _ in 0..5 {
+                if s.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).and_then(|_| s.write_all(&chunk)).and_then(|_| s.write_all(b"\r\n")).is_err() {
+                    break;
+                }
+            }
+            let _ = s.write_all(b"0\r\n\r\n");
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).split(' ').nth(1).and_then(|c| c.parse::<u16>().ok()).unwrap_or(0)
+        })
+    };
+    for _ in 0..limit {
+        assert_eq!(oversized().await.unwrap(), 413);
+    }
+    assert_eq!(call(bob.clone()).await.unwrap(), 429, "the address is full of 413s");
     let _ = std::fs::remove_dir_all(&d);
 }

@@ -193,7 +193,9 @@ async fn create(State(state): State<Arc<WebState>>, req: Request) -> Response {
     // an authenticated one counts toward its credential's (GA review
     // 2026-11-19 T4: tenants behind one egress address shared one budget).
     let ip = state.client_ip(&req);
-    let credential = req.headers().get(header::AUTHORIZATION).map(|v| crate::control::digest(&String::from_utf8_lossy(v.as_bytes())));
+    // Keyed on the token as authentication reads it, so `Bearer T`,
+    // `Bearer T ` and `Bearer T\t` share one bucket (PR #107 review M3).
+    let credential = credential_key(req.headers().get(header::AUTHORIZATION));
     if state.mcp_preauth_limit.full(&ip) || credential.as_ref().is_some_and(|c| credential_limit().full(c)) {
         return json_body(
             StatusCode::TOO_MANY_REQUESTS,
@@ -212,6 +214,8 @@ async fn create(State(state): State<Arc<WebState>>, req: Request) -> Response {
     };
     let base = base_url(&state, &parts.headers);
     let Ok(bytes) = axum::body::to_bytes(body, 4 << 20).await else {
+        // Not authenticated yet: it counts toward the address.
+        state.mcp_preauth_limit.exceeded(&ip);
         return json_body(StatusCode::PAYLOAD_TOO_LARGE, &json!({"error": "body too large"}));
     };
     let s = state.clone();
@@ -236,10 +240,23 @@ async fn create(State(state): State<Arc<WebState>>, req: Request) -> Response {
 }
 
 /// PREAUTH_IP_LIMIT per PREAUTH_IP_WINDOW per authenticated credential
-/// (the digest of its Authorization header).
+/// (the digest of its bearer token, normalised as authentication reads it).
 fn credential_limit() -> &'static FixedWindow<String> {
     static LIMIT: std::sync::OnceLock<FixedWindow<String>> = std::sync::OnceLock::new();
     LIMIT.get_or_init(|| FixedWindow::with_window(PREAUTH_IP_LIMIT, std::time::Duration::from_secs(PREAUTH_IP_WINDOW_SECS as u64)))
+}
+
+/// What the per-credential limit is keyed on: the digest of the bearer token
+/// as authentication reads it, None for no usable token (PR #107 review M3).
+fn credential_key(authorization: Option<&axum::http::HeaderValue>) -> Option<String> {
+    authorization.and_then(|v| v.to_str().ok()).and_then(|a| bearer_token(Some(a))).map(crate::control::digest)
+}
+
+/// The token an `Authorization: Bearer ...` header carries, as
+/// `Token::from_authorization` reads it (trailing whitespace trimmed).
+fn bearer_token(authorization: Option<&str>) -> Option<&str> {
+    let raw = authorization.and_then(|a| a.strip_prefix("Bearer ")).map(|t| t.trim_end_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']));
+    raw.filter(|t| !t.is_empty() && !t.chars().any(char::is_whitespace))
 }
 
 pub fn preauth_limit() -> FixedWindow<std::net::IpAddr> {
@@ -288,9 +305,7 @@ impl Token {
     /// header (/\ABearer ([^\s]+)\z/), active, by SHA-256 digest. Err is a
     /// database failure.
     pub fn from_authorization(control: &Control, authorization: Option<&str>, now: i64) -> rusqlite::Result<Option<Token>> {
-        let raw = authorization.and_then(|a| a.strip_prefix("Bearer ")).map(|t| t.trim_end_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']));
-        let raw = raw.filter(|t| !t.is_empty() && !t.chars().any(char::is_whitespace));
-        match raw {
+        match bearer_token(authorization) {
             Some(t) if t.len() <= 256 => control.with(|c| authenticate(c, t, now)),
             _ => Ok(None),
         }
@@ -3135,6 +3150,21 @@ fn prompt_text(name: &str, args: &Value) -> Result<String, ()> {
 
 #[cfg(test)]
 mod tests {
+    /// PR #107 review M3: the per-token MCP limit was keyed on the raw
+    /// header, so the same token with trailing whitespace (which
+    /// authentication trims) got a fresh bucket each way it was written.
+    #[test]
+    fn the_mcp_credential_limit_keys_a_token_however_its_header_is_written() {
+        let h = |s: &str| axum::http::HeaderValue::from_str(s).unwrap();
+        let key = credential_key(Some(&h("Bearer rw_abc"))).unwrap();
+        for v in ["Bearer rw_abc ", "Bearer rw_abc\t", "Bearer rw_abc  \t"] {
+            assert_eq!(credential_key(Some(&h(v))).as_deref(), Some(key.as_str()), "{v:?}");
+        }
+        assert_ne!(credential_key(Some(&h("Bearer rw_abd"))).as_deref(), Some(key.as_str()));
+        assert_eq!(credential_key(Some(&h("Basic x"))), None, "not a bearer token: the address's limit");
+        assert_eq!(credential_key(None), None);
+    }
+
     use super::*;
 
     /// Expected orders printed by Ruby 4.0.0 in rw-baseline:
