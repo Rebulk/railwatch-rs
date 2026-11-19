@@ -93,6 +93,9 @@ struct Inner {
     /// batch that authenticated just before the delete must not start a
     /// writer, which would create the directory again.
     forgotten: Mutex<std::collections::HashSet<String>>,
+    /// Tests: runs once at the top of `send`'s next loop turn (M4's race).
+    #[cfg(test)]
+    before_lookup: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     followups: Mutex<Option<FollowupSender>>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// The disk budget's estimate, which every commit adds to.
@@ -109,6 +112,8 @@ impl Tenants {
                 writers: Mutex::new(HashMap::new()),
                 generation: Default::default(),
                 forgotten: Default::default(),
+                #[cfg(test)]
+                before_lookup: Default::default(),
                 followups: Mutex::new(Some(followups)),
                 threads: Mutex::new(Vec::new()),
                 disk: Default::default(),
@@ -147,12 +152,21 @@ impl Tenants {
 
     /// Hands a job to the tenant's writer, starting one if none is running.
     pub fn send(&self, env_id: i64, slug: &str, mut job: Job) {
-        if self.inner.forgotten.lock().unwrap().contains(slug) {
-            return fail(job, "environment deleted".into());
-        }
         loop {
+            #[cfg(test)]
+            if let Some(hook) = self.inner.before_lookup.lock().unwrap().take() {
+                hook();
+            }
             let (generation, tx) = {
                 let mut writers = self.inner.writers.lock().unwrap();
+                // Under the lock `forget` takes, so a delete between two
+                // turns of this loop (or before the first) is always seen,
+                // and no writer is started for a deleted environment (PR #107
+                // review M4: it recreated its files).
+                if self.inner.forgotten.lock().unwrap().contains(slug) {
+                    drop(writers);
+                    return fail(job, "environment deleted".into());
+                }
                 writers.entry(slug.to_string()).or_insert_with(|| self.spawn(env_id, slug)).clone()
             };
             match tx.send(job) {
@@ -221,8 +235,12 @@ impl Tenants {
     /// are closed before they are removed. A batch sent later starts a new
     /// writer, which finds no environment row to authenticate against.
     pub fn forget(&self, slug: &str, wait: Duration) {
-        self.inner.forgotten.lock().unwrap().insert(slug.to_string());
-        let Some((_, tx)) = self.inner.writers.lock().unwrap().remove(slug) else { return };
+        let removed = {
+            let mut writers = self.inner.writers.lock().unwrap();
+            self.inner.forgotten.lock().unwrap().insert(slug.to_string());
+            writers.remove(slug)
+        };
+        let Some((_, tx)) = removed else { return };
         let (reply, rx) = std::sync::mpsc::channel();
         if tx.send(Job::Stop { reply }).is_ok() {
             drop(tx);
@@ -801,6 +819,29 @@ fn lookup_receipt(conn: &Connection, producer_id: &str, delivery_id: &str) -> ru
 mod tests {
     use super::*;
     use crate::rjson::Value;
+
+    /// PR #107 review M4: a batch that is past its first check when the
+    /// environment is deleted (here: forget runs just before send looks up
+    /// the writer) is refused, and no writer recreates the deleted files.
+    #[test]
+    fn a_batch_racing_the_delete_never_starts_a_writer_for_it() {
+        let dir = std::env::temp_dir().join(format!("rw-m4-{}", crate::control::base58(8)));
+        let (tx, _rx) = crate::followups::channel();
+        let tenants = Tenants::new(dir.clone(), Duration::from_secs(300), tx);
+        let t2 = tenants.clone();
+        let d2 = dir.clone();
+        *tenants.inner.before_lookup.lock().unwrap() = Some(Box::new(move || {
+            t2.forget("gone-web-production", Duration::from_secs(1));
+            let _ = std::fs::remove_dir_all(d2.join("gone-web-production"));
+        }));
+        let (reply, rx) = oneshot::channel();
+        tenants.send(1, "gone-web-production", Job::LookupReceipt { producer_id: "p".into(), delivery_id: "d".into(), reply });
+        assert!(rx.blocking_recv().unwrap().is_err(), "refused");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!dir.join("gone-web-production").exists(), "no writer recreated the directory");
+        tenants.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A batch of one query (its sql filed in query_shapes) and one log;
     /// `poisoned` gives it the bignum Dropped header, which passes mapping
