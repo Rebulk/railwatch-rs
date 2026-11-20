@@ -342,6 +342,32 @@ fn retired_environment_slugs(tx: &Transaction) -> rusqlite::Result<()> {
 mod tests {
     use super::*;
 
+    /// The slug retirement lives in a trigger on `environments`; a later
+    /// migration that rebuilds that table (SQLite's ALTER workaround) would
+    /// drop it silently, and deleted slugs would be reused again (PR #107
+    /// review note). After every migration it must exist and fire.
+    #[test]
+    fn the_slug_retirement_trigger_exists_after_every_migration() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch("PRAGMA foreign_keys = on").unwrap();
+        migrate(&mut c).unwrap();
+        let sql: String = c
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'retire_environment_slug' AND tbl_name = 'environments'", [], |r| {
+                r.get(0)
+            })
+            .expect("the retire_environment_slug trigger on environments");
+        assert!(sql.contains("AFTER DELETE"), "{sql}");
+        c.execute_batch(
+            "INSERT INTO accounts (id, name, slug, plan, monthly_event_quota, retention_days, created_at, updated_at) VALUES (1, 'a', 'a', 'p', 1, 30, 'x', 'x');
+             INSERT INTO applications (id, account_id, name, slug, issue_prefix, created_at, updated_at) VALUES (1, 1, 'w', 'w', 'W', 'x', 'x');
+             INSERT INTO environments (id, application_id, name, slug, token_digest, token_prefix, created_at, updated_at) VALUES (1, 1, 'p', 'a-w-p', 'd', 'rw_', 'x', 'x');
+             DELETE FROM environments WHERE id = 1;",
+        )
+        .unwrap();
+        let retired: i64 = c.query_row("SELECT COUNT(*) FROM retired_environment_slugs WHERE slug = 'a-w-p'", [], |r| r.get(0)).unwrap();
+        assert_eq!(retired, 1, "and a delete records the slug");
+    }
+
     #[test]
     fn a_phase1_file_moves_forward_keeping_ids_tokens_usage_and_deploys() {
         let mut c = Connection::open_in_memory().unwrap();
