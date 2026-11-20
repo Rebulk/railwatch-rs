@@ -62,6 +62,8 @@ pub struct Control {
     /// at startup (`configure_alerting`). Unset (tests, CLI), integrations
     /// whose secrets are encrypted fail delivery visibly.
     alerting: std::sync::OnceLock<crate::alerts::integration::Alerting>,
+    /// When `answers` last read the database, and whether it could.
+    health: Mutex<Option<(std::time::Instant, bool)>>,
 }
 
 pub fn digest(token: &str) -> String {
@@ -226,7 +228,7 @@ impl Control {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.execute_batch("PRAGMA journal_mode = wal; PRAGMA synchronous = normal; PRAGMA foreign_keys = on;")?;
         control_schema::migrate(&mut conn)?;
-        Ok(Control { conn: Mutex::new(conn), enforce_quota, alerting: std::sync::OnceLock::new() })
+        Ok(Control { conn: Mutex::new(conn), enforce_quota, alerting: std::sync::OnceLock::new(), health: Mutex::new(None) })
     }
 
     pub fn configure_alerting(&self, a: crate::alerts::integration::Alerting) {
@@ -235,6 +237,23 @@ impl Control {
 
     pub fn alerting(&self) -> Option<&crate::alerts::integration::Alerting> {
         self.alerting.get()
+    }
+
+    /// Whether the database answers one small read, for `/up`. Read at most
+    /// once a second: `/up` is public and comes before every rate limit, so
+    /// a flood of it must not become a flood on the one connection every
+    /// account shares (hunt 2, P1). A wedged database still fails within a
+    /// second.
+    pub fn answers(&self) -> bool {
+        const FRESH: std::time::Duration = std::time::Duration::from_secs(1);
+        if let Some((at, ok)) = *self.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            && at.elapsed() < FRESH
+        {
+            return ok;
+        }
+        let ok = self.with(|c| c.query_row("SELECT count(*) FROM railwatch_migrations", [], |r| r.get::<_, i64>(0))).is_ok();
+        *self.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((std::time::Instant::now(), ok));
+        ok
     }
 
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> rusqlite::Result<T> {

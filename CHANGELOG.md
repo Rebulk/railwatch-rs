@@ -7,6 +7,14 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- `/up` reads the control database at most once a second. It is public and
+  comes before every rate limit, so a flood of health checks no longer
+  becomes a flood of reads on the connection every account shares (second
+  GA hunt, P1).
+- A source-map upload that authenticated just before its environment was
+  deleted is refused with 410 instead of recreating the deleted
+  environment's directory (second GA hunt, P2).
+
 ## v0.3.5 (2026-11-19)
 
 Upgrading: the first start runs three control-database migrations in place

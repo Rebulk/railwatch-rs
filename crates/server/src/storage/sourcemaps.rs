@@ -77,11 +77,24 @@ fn env_lock(slug: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
     locks.entry(slug.to_string()).or_default().clone()
 }
 
+/// Slugs whose maps were destroyed in this process. A slug is never reused
+/// (control::retired_environment_slugs), so an upload that authenticated
+/// just before its environment was deleted must not recreate the directory
+/// once `destroy` has run (hunt 2, P2): it is refused instead. Keyed by the
+/// environment's directory, not the bare slug, so two data dirs in one
+/// process (tests) stay apart.
+fn destroyed() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static DESTROYED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    DESTROYED.get_or_init(Default::default)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refused {
     /// The environment's maps would pass MAX_ENV_BYTES even with every
     /// other deploy's pruned.
     TooMuch,
+    /// The environment was deleted while the upload was in flight.
+    Deleted,
 }
 
 /// Writes one map for `deploy`, first pruning the environment's oldest other
@@ -100,6 +113,9 @@ pub fn store(
     let lock = env_lock(slug);
     let _held = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let env_dir = sourcemaps_dir.join(slug);
+    if destroyed().lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&env_dir) {
+        return Ok(Err(Refused::Deleted));
+    }
     let this = env_dir.join(deploy);
     let path = this.join(format!("{filename}.map"));
     let replaced = std::fs::metadata(&path).map_or(0, |m| m.len());
@@ -132,7 +148,12 @@ pub fn store(
 
 /// Deletes the environment's maps (its environment was deleted).
 pub fn destroy(sourcemaps_dir: &Path, slug: &str) {
+    // Under the upload lock, so an upload in flight either finished before
+    // this or sees the slug destroyed and writes nothing.
+    let lock = env_lock(slug);
+    let _held = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = sourcemaps_dir.join(slug);
+    destroyed().lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(dir.clone());
     match std::fs::remove_dir_all(&dir) {
         Ok(()) => tracing::info!(path = %dir.display(), "source maps deleted"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -228,6 +249,21 @@ mod tests {
             assert!(errors.is_empty(), "run {run}: {errors:?}");
             assert_eq!(deploys(&root.join(&slug)).len(), 10);
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Hunt 2, P2: an upload that authenticated just before its environment
+    /// was deleted runs after `destroy`; it must not recreate the deleted
+    /// slug's directory (slugs are never reused, so it would be an orphan).
+    #[test]
+    fn an_upload_after_its_environment_was_destroyed_writes_nothing() {
+        let root = std::env::temp_dir().join(format!("rw-sm-{}", crate::control::base58(8)));
+        let slug = format!("gone-{}", crate::control::base58(6));
+        assert_eq!(store(&root, &slug, "d1", "a.js", b"{}", 1 << 20, 10).unwrap(), Ok(()));
+        destroy(&root, &slug);
+        assert!(!root.join(&slug).exists());
+        assert_eq!(store(&root, &slug, "d2", "a.js", b"{}", 1 << 20, 10).unwrap(), Err(Refused::Deleted));
+        assert!(!root.join(&slug).exists(), "the deleted environment's directory is not recreated");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

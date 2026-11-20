@@ -490,7 +490,26 @@ fn up_fails_when_the_control_database_does_not_answer() {
     assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 200);
     // A control database whose read fails (here: the table it reads is gone).
     s.control.with(|c| c.execute_batch("ALTER TABLE railwatch_migrations RENAME TO broken")).unwrap();
+    // The answer is reused for up to a second (hunt 2, P1), so the broken
+    // database shows within a second, not necessarily on the next request.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 503, "a control database that fails its read fails the health check");
     s.control.with(|c| c.execute_batch("ALTER TABLE broken RENAME TO railwatch_migrations")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 200);
+}
+
+/// Hunt 2, P1: `/up` is public and comes before every rate limit; a flood of
+/// it reads the shared control database at most once a second.
+#[test]
+fn a_flood_of_up_reads_the_control_database_at_most_once_a_second() {
+    let s = start(0, 0);
+    assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 200);
+    // While the database is broken, every /up inside the same second still
+    // gets the answer read before it broke: nothing new was read.
+    s.control.with(|c| c.execute_batch("ALTER TABLE railwatch_migrations RENAME TO broken")).unwrap();
+    for _ in 0..50 {
+        assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 200, "served from the last read, not a new one");
+    }
+    s.control.with(|c| c.execute_batch("ALTER TABLE broken RENAME TO railwatch_migrations")).unwrap();
 }
