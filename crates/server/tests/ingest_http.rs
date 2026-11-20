@@ -490,7 +490,34 @@ fn up_fails_when_the_control_database_does_not_answer() {
     assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 200);
     // A control database whose read fails (here: the table it reads is gone).
     s.control.with(|c| c.execute_batch("ALTER TABLE railwatch_migrations RENAME TO broken")).unwrap();
+    // The answer is reused for up to a second (hunt 2, P1), so the broken
+    // database shows within a second, not necessarily on the next request.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 503, "a control database that fails its read fails the health check");
     s.control.with(|c| c.execute_batch("ALTER TABLE broken RENAME TO railwatch_migrations")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 200);
+}
+
+/// Hunt 2, P1: `/up` is public and comes before every rate limit; a flood of
+/// it, even a concurrent one, reads the shared control database at most once
+/// a second.
+#[test]
+fn a_flood_of_up_reads_the_control_database_at_most_once_a_second() {
+    let s = start(0, 0);
+    let before = s.control.health_reads();
+    let started = std::time::Instant::now();
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let addr = s.addr;
+            std::thread::spawn(move || (0..25).map(|_| request(addr, "GET", "/up", &[], b"").0).collect::<Vec<_>>())
+        })
+        .collect();
+    for t in threads {
+        assert!(t.join().unwrap().iter().all(|status| *status == 200));
+    }
+    let reads = s.control.health_reads() - before;
+    // One read per started second, however the 200 requests were spread.
+    let allowed = started.elapsed().as_secs() + 1;
+    assert!(reads >= 1 && reads <= allowed, "{reads} reads for 200 requests in {:?}", started.elapsed());
 }

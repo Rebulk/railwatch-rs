@@ -142,9 +142,7 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
         // Healthy only if the control database answers (one small read),
         // so a wedged process fails its health check and gets restarted.
         let control = state.control.clone();
-        let db_ok =
-            tokio::task::spawn_blocking(move || control.with(|c| c.query_row("SELECT count(*) FROM railwatch_migrations", [], |r| r.get::<_, i64>(0)))).await;
-        if !matches!(db_ok, Ok(Ok(_))) {
+        if !matches!(tokio::task::spawn_blocking(move || control.answers()).await, Ok(true)) {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
         return (
@@ -890,8 +888,14 @@ async fn sourcemaps(state: &Arc<AppState>, env: Environment, headers: &HeaderMap
         store(&dir, &slug, &deploy, &name, &raw, MAX_ENV_BYTES, MAX_DEPLOYS)
     })
     .await;
-    if let Ok(Ok(Err(crate::storage::sourcemaps::Refused::TooMuch))) = written {
-        return json(StatusCode::INSUFFICIENT_STORAGE, rhash! {"error" => "source maps for this deploy exceed the environment's limit"});
+    match written {
+        Ok(Ok(Err(crate::storage::sourcemaps::Refused::TooMuch))) => {
+            return json(StatusCode::INSUFFICIENT_STORAGE, rhash! {"error" => "source maps for this deploy exceed the environment's limit"});
+        }
+        Ok(Ok(Err(crate::storage::sourcemaps::Refused::Deleted))) => {
+            return json(StatusCode::GONE, rhash! {"error" => "this environment was deleted"});
+        }
+        _ => {}
     }
     let written = written.map(|r| r.map(|_| ()));
     match written {
