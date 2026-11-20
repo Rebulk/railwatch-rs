@@ -7,6 +7,15 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+## v0.3.5 (2026-11-19)
+
+Upgrading: the first start runs three control-database migrations in place
+(`trusted_proxy`, `api_tokens.role_ceiling`, `retired_environment_slugs`).
+They only add a table, a nullable column and a trigger, and nothing on disk
+moves. An existing trusted proxy is bound to the server's lowest account,
+the one it granted before. A recreated environment now gets a `-2` slug,
+because a deleted environment's slug is never reused.
+
 **Security fixes from the 2026-11-19 GA review**
 - lettre 0.11.23 → 0.11.24 (RUSTSEC-2026-0560 to 0565). An exception
   message with a bare CR or LF could end an email alert's DATA early on a
