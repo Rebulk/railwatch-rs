@@ -33,6 +33,8 @@ pub struct Environment {
     pub retention_days: i64,
     pub ingest_followup_gc_before: i64,
     pub raw_pruned_through: Option<i64>,
+    /// The account it belongs to (the disk budget's share is per account).
+    pub account_id: i64,
 }
 
 impl Environment {
@@ -206,7 +208,7 @@ pub fn valid_email(s: &str) -> bool {
 const COLUMNS: &str = "e.id, e.slug, e.paused_at IS NOT NULL, a.monthly_event_quota + a.additional_events_cap,
   (SELECT COALESCE(SUM(m.events), 0) FROM ingest_usage_months m JOIN environments e2 ON e2.id = m.environment_id
      JOIN applications ap2 ON ap2.id = e2.application_id WHERE ap2.account_id = a.id AND m.month = ?2),
-  a.retention_days, e.ingest_followup_gc_before, e.raw_pruned_through";
+  a.retention_days, e.ingest_followup_gc_before, e.raw_pruned_through, a.id";
 
 const FROM: &str = "FROM environments e JOIN applications ap ON ap.id = e.application_id JOIN accounts a ON a.id = ap.account_id";
 
@@ -259,6 +261,7 @@ impl Control {
             retention_days: r.get(5)?,
             ingest_followup_gc_before: micros(&r.get::<_, String>(6)?),
             raw_pruned_through: r.get::<_, Option<String>>(7)?.map(|s| micros(&s)),
+            account_id: r.get(8)?,
         })
     }
 
@@ -288,6 +291,10 @@ impl Control {
     /// `railwatch env create/import`: an environment named `slug` in the
     /// self-hosted account/application for that retention (created on
     /// first use), with the given token digest.
+    ///
+    /// A slug a deleted environment had is never reused: the environment gets
+    /// the next free `<slug>-N`, as in the web UI (PR #107 review L6). The
+    /// returned environment's `slug` is the one used; its name is `slug`.
     pub fn create(&self, slug: &str, token_digest: &str, retention_days: i64) -> rusqlite::Result<Environment> {
         validate_slug(slug).map_err(rusqlite::Error::InvalidParameterName)?;
         let id = self
@@ -301,7 +308,9 @@ impl Control {
                     Some(id) => id,
                     None => insert_application(tx, account, "default", "default", "APP", None, "main")?,
                 };
-                insert_environment(tx, app, slug, slug, token_digest, "rw_")
+                let retired = slug_retired(tx, slug)?;
+                let used = if retired { free_slug(tx, slug)? } else { slug.to_string() };
+                insert_environment(tx, app, slug, &used, token_digest, "rw_")
             })
             .map_err(|e| match e {
                 ModelError::Sql(e) => e,
@@ -536,6 +545,9 @@ pub fn insert_environment(tx: &Connection, application_id: i64, name: &str, slug
         return invalid("name", m);
     }
     validate_slug(slug).or_else(|_| invalid("slug", "is invalid"))?;
+    if slug_retired(tx, slug)? {
+        return invalid("slug", "was used by a deleted environment");
+    }
     let taken_name: bool = tx
         .query_row("SELECT 1 FROM environments WHERE application_id = ? AND name = ?", params![application_id, name], |_| Ok(true))
         .optional()?
@@ -564,7 +576,7 @@ pub fn create_environment(tx: &Connection, application_id: i64, name: &str) -> M
         tx.query_row("SELECT a.slug, ap.slug FROM applications ap JOIN accounts a ON a.id = ap.account_id WHERE ap.id = ?", [application_id], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
-    let slug = format!("{account_slug}-{app_slug}-{name}");
+    let slug = free_slug(tx, &format!("{account_slug}-{app_slug}-{name}"))?;
     let token = new_token();
     let id = insert_environment(tx, application_id, name, &slug, &digest(&token), &token[..12])?;
     Ok((id, token))
@@ -578,6 +590,77 @@ pub fn rotate_token(tx: &Connection, environment_id: i64) -> rusqlite::Result<St
         params![digest(&token), &token[..12], now_db(), environment_id],
     )?;
     Ok(token)
+}
+
+/// The longest environment slug (validate_slug).
+const MAX_SLUG: usize = 128;
+
+/// `base`, or `base-2`, `base-3`, ...: the first that no environment has and
+/// none ever had (it names the telemetry on disk and in backups,
+/// retired_environment_slugs). Cut so the suffix still fits MAX_SLUG (PR
+/// #107 review L6: a long base failed as "slug is invalid").
+pub fn free_slug(c: &Connection, base: &str) -> rusqlite::Result<String> {
+    let cut = |n: usize| base[..base.len().min(n)].trim_end_matches('-').to_string();
+    for n in 1.. {
+        let slug = if n == 1 {
+            cut(MAX_SLUG)
+        } else {
+            let suffix = format!("-{n}");
+            format!("{}{suffix}", cut(MAX_SLUG - suffix.len()))
+        };
+        let live: bool = c.query_row("SELECT 1 FROM environments WHERE slug = ?", [&slug], |_| Ok(true)).optional()?.unwrap_or(false);
+        if !live && !slug_retired(c, &slug)? {
+            return Ok(slug);
+        }
+    }
+    unreachable!()
+}
+
+/// Was `slug` an environment's that is gone (deleted, or found unowned on
+/// disk or in the backup bucket)? Such a slug is never given out again.
+pub fn slug_retired(c: &Connection, slug: &str) -> rusqlite::Result<bool> {
+    Ok(c.query_row("SELECT 1 FROM retired_environment_slugs WHERE slug = ?", [slug], |_| Ok(true)).optional()?.unwrap_or(false))
+}
+
+/// Retires every name in `names` that no environment has: telemetry
+/// directories and files, source map directories and backup objects left
+/// by environments deleted before slugs were retired on delete. Idempotent;
+/// returns how many were new.
+pub fn retire_unowned(c: &Connection, names: impl IntoIterator<Item = String>) -> rusqlite::Result<usize> {
+    let mut n = 0;
+    for name in names {
+        if validate_slug(&name).is_err() {
+            continue;
+        }
+        n += c.execute(
+            "INSERT OR IGNORE INTO retired_environment_slugs (slug, retired_at)
+             SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM environments WHERE slug = ?1)",
+            params![name, now_db()],
+        )?;
+    }
+    Ok(n)
+}
+
+/// The environment slugs that names under `tenants_dir` and `sourcemaps_dir`
+/// stand for: `<slug>/`, `<slug>.sqlite3` (+ -wal, -shm, .split).
+pub fn storage_names(tenants_dir: &Path, sourcemaps_dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in [tenants_dir, sourcemaps_dir] {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            out.push(name.split_once(".sqlite3").map_or(name.clone(), |(s, _)| s.to_string()));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Each environment slug's account, for the disk budget's per-account shares.
+pub fn slug_accounts(c: &Connection) -> rusqlite::Result<std::collections::HashMap<String, i64>> {
+    c.prepare("SELECT e.slug, ap.account_id FROM environments e JOIN applications ap ON ap.id = e.application_id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect()
 }
 
 /// Slugs name tenant files and directories, so they must be path-safe.

@@ -404,9 +404,14 @@ fn rate_limits_answer_429_with_retry_after() {
     assert!(headers.contains(&("retry-after".into(), "60".into())));
     assert_eq!(json_body, json!({"error": "rate limit exceeded", "retry_after": 60}));
 
+    // The per-address limit counts only requests that fail to authenticate
+    // (GA review 2026-11-19 T4), and refuses everything from that address
+    // once full.
     let s = start(2, 0);
-    let statuses: Vec<u16> = (0..3).map(|_| s.post(&body, &[("X-Forwarded-For", "192.0.2.1".into())]).0).collect();
-    assert_eq!(statuses, vec![200, 200, 429]);
+    let bad = |xff: &str| request(s.addr, "POST", "/ingest", &[("Authorization", "Bearer rw_wrong".into()), ("X-Forwarded-For", xff.into())], &body).0;
+    assert_eq!(s.post(&body, &[("X-Forwarded-For", "192.0.2.1".into())]).0, 200, "authenticated: not counted");
+    assert_eq!([bad("192.0.2.1"), bad("192.0.2.1"), bad("192.0.2.1")], [401, 401, 429]);
+    assert_eq!(s.post(&body, &[("X-Forwarded-For", "192.0.2.1".into())]).0, 429, "a full address is refused");
     assert_eq!(s.post(&body, &[("X-Forwarded-For", "192.0.2.2".into())]).0, 200, "XFF is its own bucket when trusted");
 }
 

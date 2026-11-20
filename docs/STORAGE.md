@@ -45,6 +45,31 @@ pool checkout). `SQLITE_MAX_ATTACHED` is raised to 125
 (`.cargo/config.toml`): 90 days x 2 tiers would not fit, but detail is 7
 days, so 30-day retention is 1 + 30 + 7 = 38 files, 90 days 98.
 
+**Slugs are never reused** (GA review 2026-11-19, T1). The environment's
+slug names its telemetry directory, its source maps
+(`sourcemaps/<slug>/`) and its backup objects (`tenants/<slug>/...`), and
+the processes' caches are keyed by it (dashboard read pools, ingest
+writers). So a slug once used is never given to another environment: a
+trigger records every deleted environment's slug in
+`retired_environment_slugs` (control migration
+`20261119000010_retired_environment_slugs`), and a new environment that
+would get one gets `-2`, `-3`, ... instead, cut to fit the 128-character
+limit (`railwatch env create` does the same and says on stderr which slug it
+used). At every start, names under `telemetry/` and
+`sourcemaps/` that no environment owns are retired too, and so are the
+slugs a backup pass finds in the bucket without an environment: telemetry
+deleted before this existed can never be attached to a new environment.
+The upgrade needs no file moves: existing directories keep their names.
+
+Deleting an environment closes every handle first (`destroy_tenant`):
+its dashboard pool is forgotten (idle readers close; readers checked out
+close when returned), its ingest writer answers what is queued, closes its
+files and exits, and a batch that authenticated just before the delete is
+refused instead of starting a new writer. Then the directory, the single
+file and the source maps go. The worker's cached connections to a deleted
+directory close at its next flush (within 5 s), and it never opens storage
+for an environment that no longer exists.
+
 ## Exactly-once (decision 3)
 
 There is no atomic commit across WAL files, so the commit point is a single
@@ -131,7 +156,12 @@ open handle keeps an unlinked file's space allocated: idle dashboard readers
 are dropped, a reader checked out at the time is dropped when it is
 returned, ingest writers drop cached day files, and the worker re-attaches
 its own union readers; the budget does this before it reads free space.
-Single-file environments
+With several accounts the budget is split max-min fairly
+(`trim_fair`): only accounts over their share lose days (furthest over
+first), and only they are refused when nothing older is left
+(`State::admit(account)`); telemetry no environment owns is an account of
+its own. Source maps count (per environment) but are bounded by
+`storage::sourcemaps`, not trimmed. Single-file environments
 count against the budget but are never trimmed (split them). Every deletion
 and every crossing is logged (docs/SELF-HOST.md, "Disk budget").
 

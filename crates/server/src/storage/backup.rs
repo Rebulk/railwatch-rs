@@ -47,6 +47,12 @@ pub struct Pass {
     pub skipped: usize,
     pub bytes_raw: u64,
     pub bytes_compressed: u64,
+    /// Environment slugs that have objects in the bucket (`tenants/<slug>...`),
+    /// when this pass listed it. The caller retires those no environment has
+    /// (control::retire_unowned), so a new environment never gets a slug
+    /// whose old objects a later pass would take for its own ("already
+    /// uploaded") or a restore would mix into its directory.
+    pub bucket_slugs: Vec<String>,
 }
 
 const ZSTD_LEVEL: i32 = 3;
@@ -232,7 +238,11 @@ pub fn run_pass(s3: &S3, data_dir: &Path, tenants_dir: &Path, now_micros: i64, l
         if path.is_dir() && layout::meta_path(&path).is_file() {
             let known = match &existing {
                 Some(k) => k,
-                None => existing.insert(s3.list("tenants/")?.into_iter().collect()),
+                None => {
+                    let keys: std::collections::HashSet<String> = s3.list("tenants/")?.into_iter().collect();
+                    pass.bucket_slugs = bucket_slugs(&keys);
+                    existing.insert(keys)
+                }
             };
             let mut new_days = Vec::new();
             for tier in [Tier::Core, Tier::Detail] {
@@ -270,6 +280,19 @@ pub fn run_pass(s3: &S3, data_dir: &Path, tenants_dir: &Path, now_micros: i64, l
     }
     let _ = std::fs::remove_dir_all(&scratch);
     Ok(pass)
+}
+
+/// The slugs `tenants/<slug>/...` and `tenants/<slug>.sqlite3.zst` keys name.
+pub fn bucket_slugs<'a>(keys: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut out: Vec<String> = keys
+        .into_iter()
+        .filter_map(|k| k.strip_prefix("tenants/"))
+        .filter_map(|rest| rest.split_once('/').map(|(s, _)| s).or_else(|| rest.strip_suffix(".sqlite3.zst")))
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn has_exemplars(file: &Path) -> bool {
@@ -352,7 +375,9 @@ pub fn record_ok(data_dir: &Path) {
 }
 
 /// The backup thread: one pass every `interval_secs`, errors logged.
-pub fn spawn(settings: Settings, data_dir: PathBuf, tenants_dir: PathBuf) -> std::thread::JoinHandle<()> {
+/// `after_pass` runs after each successful pass (serve retires
+/// `Pass::bucket_slugs` no environment owns).
+pub fn spawn(settings: Settings, data_dir: PathBuf, tenants_dir: PathBuf, after_pass: Box<dyn Fn(&Pass) + Send>) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("backup".into())
         .spawn(move || {
@@ -362,6 +387,7 @@ pub fn spawn(settings: Settings, data_dir: PathBuf, tenants_dir: PathBuf) -> std
                 match run_pass(&settings.s3, &data_dir, &tenants_dir, crate::time::now_micros(), &mut last) {
                     Ok(p) => {
                         record_ok(&data_dir);
+                        after_pass(&p);
                         tracing::info!(
                             snapshots = p.snapshots,
                             unchanged = p.unchanged,

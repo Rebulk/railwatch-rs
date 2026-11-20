@@ -74,6 +74,52 @@ tag is a release candidate (marked pre-release, not "latest", so
   shipped bundle; `pnpm audit` is clean.
 - `/cable` bounds what one connection can make the server keep: messages up
   to 4 KiB, subscribe identifiers up to 256 bytes, 16 subscriptions.
+- A deleted environment's slug is never given to a new environment. Before,
+  deleting an environment, application or account and then creating one with
+  the same names reused the slug, and with it the telemetry directory name:
+  a dashboard reader opened before the delete could serve the deleted
+  company's rows to the new environment, and its ingest went to the old
+  writer (usage not counted, no issues). Now deleted slugs are recorded, a
+  new environment gets `<slug>-2` instead (`railwatch env create` too, saying
+  which slug it used on stderr), and deleting an environment closes
+  its readers and writer before removing its files and source maps.
+  **Upgrade:** a control migration (`20261119000010_retired_environment_slugs`)
+  adds one table and a trigger; nothing on disk moves. At start, telemetry
+  and source map directories that no environment owns, and backup objects
+  that none owns (after each backup pass), have their slugs retired too.
+- `MAX_DATA_BYTES` on a server with several accounts is shared fairly: an
+  account that grows past its share loses its own oldest days first and is
+  the only one refused (503) when nothing older is left. Before, one
+  account's burst deleted every other account's history and blocked their
+  ingest. One account behaves as before (docs/SELF-HOST.md, "Disk budget").
+- `/ingest/sourcemaps` is bounded: refused while the environment is paused
+  (409) or over quota (402), 600 uploads a minute per environment, the 10
+  newest deploys and 200 MiB per environment (the deploys uploaded to
+  least recently are pruned first; an upload that cannot fit even then gets
+  507 and prunes nothing). Uploads to one environment are serialised, so
+  parallel uploads never fail on a deploy another one is pruning. Source maps
+  count toward `MAX_DATA_BYTES`, and deleting an environment, application or
+  account deletes them. Before, an ingest token could fill the disk with
+  maps, paused or not, and they outlived their environment.
+- Dashboard, API and MCP reads stop after 30 seconds per request (SQLite
+  interrupts the query and the request fails), so one tenant's runaway query
+  cannot hold the read connections that all tenants share.
+- The per-address limits in front of `/ingest` (`RATE_LIMIT_IP`) and `/mcp`
+  (300 a minute) count only requests that fail to authenticate. An
+  authenticated request counts toward its environment (ingest) or token
+  (MCP, 300 a minute). Before, customers sharing an egress address (a PaaS,
+  CI, a NAT) used up each other's limit.
+- A bare-binary install no longer leaves the data dir readable by other
+  local users: every command creates directories 0700 and files 0600
+  whatever the shell's umask (the installer and the Docker image already
+  did). `railwatch doctor` warns about a data dir, control DB or telemetry
+  directory that other users can read; `chmod -R go-rwx <data dir>` fixes
+  one made by an older version.
+- Grouping an exception into an issue, or changing an issue's status, no
+  longer panics when the issue (or its environment) was deleted a moment
+  earlier. That panic ran while holding the control database lock and could
+  take the server down for every account. That batch now fails cleanly and
+  is retried, and the status change does nothing.
 
 ## v0.3.4 (2026-11-18)
 

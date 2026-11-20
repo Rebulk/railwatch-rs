@@ -213,6 +213,13 @@ fn main() -> ExitCode {
     if let Some(code) = client::run(&argv.iter().map(String::as_str).collect::<Vec<_>>()) {
         return code;
     }
+    // Everything the server and its commands create (the data dir, the
+    // control DB with password digests and sessions, telemetry, exports) is
+    // for this user only: 0700 directories, 0600 files, whatever umask the
+    // shell had (GA review 2026-11-19, security #9; install.sh's unit and
+    // the Docker image set this already, a bare binary did not).
+    // SAFETY: umask only changes this process's file-creation mask.
+    unsafe { libc::umask(0o077) };
     if let Err(e) = railwatch_server::config::load_env_file() {
         return fail(format!("RAILWATCH_ENV_FILE: {e}"));
     }
@@ -252,7 +259,7 @@ fn main() -> ExitCode {
             let Some(retention) = retention(rest) else { return usage() };
             let token = control::new_token();
             match create_env(slug, &control::digest(&token), retention) {
-                Ok(()) => {
+                Ok(_) => {
                     println!("{token}");
                     ExitCode::SUCCESS
                 }
@@ -265,8 +272,8 @@ fn main() -> ExitCode {
                 return fail("token digest must be 64 hex characters (SHA-256 of the token)");
             }
             match create_env(slug, &digest.to_ascii_lowercase(), retention) {
-                Ok(()) => {
-                    println!("imported {slug}");
+                Ok(used) => {
+                    println!("imported {used}");
                     ExitCode::SUCCESS
                 }
                 Err(e) => fail(e),
@@ -297,12 +304,20 @@ fn retention(rest: &[&str]) -> Option<i64> {
     }
 }
 
-fn create_env(slug: &str, digest: &str, retention: i64) -> Result<(), String> {
+/// Creates the environment and returns the slug it got: `slug`, or the next
+/// free `<slug>-N` when a deleted environment had it (slugs are never
+/// reused), which is said on stderr so a script reading the token from
+/// stdout keeps working.
+fn create_env(slug: &str, digest: &str, retention: i64) -> Result<String, String> {
     let cfg = config();
     let control = open_control(&cfg);
-    control.create(slug, digest, retention).map_err(|e| e.to_string())?;
+    let env = control.create(slug, digest, retention).map_err(|e| e.to_string())?;
+    if env.slug != slug {
+        eprintln!("railwatch: {slug} belonged to a deleted environment and is never reused; created {} instead", env.slug);
+    }
     // Environment's after_create_commit: the tenant file exists from the start.
-    tenants(&cfg).ensure(slug).map_err(|e| e.to_string())
+    tenants(&cfg).ensure(&env.slug).map_err(|e| e.to_string())?;
+    Ok(env.slug)
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +390,16 @@ fn backup_settings(cfg: &Config) -> Option<railwatch_server::storage::backup::Se
     cfg.backup.clone()
 }
 
+/// Slugs with objects in the backup bucket but no environment are never
+/// given to a new environment (control::retire_unowned).
+fn retire_bucket_slugs(control: &Control, p: &railwatch_server::storage::backup::Pass) {
+    match control.with(|c| control::retire_unowned(c, p.bucket_slugs.iter().cloned())) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(slugs = n, "retired the slugs of backup objects no environment owns"),
+        Err(e) => tracing::error!(error = %e, "could not retire the backup bucket's unowned slugs"),
+    }
+}
+
 fn backup_now() -> ExitCode {
     let cfg = config();
     let Some(b) = backup_settings(&cfg) else { return ExitCode::from(2) };
@@ -382,6 +407,7 @@ fn backup_now() -> ExitCode {
     match railwatch_server::storage::backup::run_pass(&b.s3, &cfg.data_dir, &cfg.tenants_dir(), railwatch_server::time::now_micros(), &mut Default::default()) {
         Ok(p) => {
             railwatch_server::storage::backup::record_ok(&cfg.data_dir);
+            retire_bucket_slugs(&open_control(&cfg), &p);
             println!(
                 "{} snapshots, {} day files uploaded, {} already there; {} -> {} bytes, {:.1} s",
                 p.snapshots,
@@ -1089,6 +1115,7 @@ fn doctor() -> ExitCode {
             println!("FAIL  data dir {}: {e}", cfg.data_dir.display());
         }
     }
+    ok &= doctor_permissions(&cfg);
     // Disk space.
     if let Ok(path) = std::ffi::CString::new(cfg.data_dir.display().to_string()) {
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -1174,6 +1201,34 @@ fn doctor() -> ExitCode {
     ok &= doctor_tls(&cfg);
     ok &= doctor_backups(&cfg);
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// The data dir and what holds secrets or telemetry should be this user's
+/// only: a group- or world-readable one lets any local user read password
+/// digests, sessions, token digests and every tenant's telemetry. A warning,
+/// not a failure: a deliberately shared dir is the operator's call.
+fn doctor_permissions(cfg: &Config) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let mut loose = Vec::new();
+    let control = cfg.control_path();
+    let wal = std::path::PathBuf::from(format!("{}-wal", control.display()));
+    for p in [cfg.data_dir.clone(), control, wal, cfg.tenants_dir(), cfg.data_dir.join("sourcemaps")] {
+        if let Ok(m) = std::fs::symlink_metadata(&p)
+            && m.permissions().mode() & 0o077 != 0
+        {
+            loose.push(format!("{} ({:o})", p.display(), m.permissions().mode() & 0o777));
+        }
+    }
+    if loose.is_empty() {
+        println!("ok    data dir permissions: this user's only");
+    } else {
+        println!(
+            "warn  readable by other local users: {}; run `chmod -R go-rwx {}` (the server creates new files 0600 itself)",
+            loose.join(", "),
+            cfg.data_dir.display()
+        );
+    }
+    true
 }
 
 /// Google sign-in: configured or not, the redirect URI to register, and
@@ -1342,6 +1397,16 @@ fn serve() -> ExitCode {
                 std::process::exit(1);
             }
         }
+        // Telemetry left on disk by environments deleted before slugs were
+        // retired on delete: those slugs are never given out again either.
+        match control.with(|c| control::retire_unowned(c, control::storage_names(&cfg.tenants_dir(), &cfg.data_dir.join("sourcemaps")))) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(slugs = n, "retired the slugs of telemetry no environment owns"),
+            Err(e) => {
+                eprintln!("railwatch: retiring unowned telemetry slugs: {e}");
+                std::process::exit(1);
+            }
+        }
         // Before any reader or writer opens a tenant (schema::ADDED_COLUMNS).
         let migrated = railwatch_server::tenants::add_missing_columns_everywhere(&cfg.tenants_dir());
         if migrated > 0 {
@@ -1353,6 +1418,15 @@ fn serve() -> ExitCode {
         let (followups_tx, followups_rx) = followups::channel();
         let tenants = Tenants::new(cfg.tenants_dir(), Duration::from_secs(cfg.tenant_idle_seconds), followups_tx);
         let disk = tenants.disk();
+        // The disk budget shares max_data_bytes fairly between accounts.
+        {
+            let c = control.clone();
+            disk.set_owners(Box::new(move || {
+                c.with(control::slug_accounts)
+                    .map_err(|e| tracing::error!(error = %e, "disk budget: cannot read environment owners; this pass treats the server as one account"))
+                    .ok()
+            }));
+        }
         let state = Arc::new(AppState {
             control: control.clone(),
             tenants: tenants.clone(),
@@ -1383,7 +1457,9 @@ fn serve() -> ExitCode {
         let jobs = railwatch_server::jobs::start_with(control.clone(), cfg.tenants_dir(), cfg.tiers, Some(Box::new(release.clone())));
         if let Some(b) = cfg.backup.clone() {
             tracing::info!(endpoint = %b.s3.endpoint, bucket = %b.s3.bucket, every = b.interval_secs, "backups on");
-            railwatch_server::storage::backup::spawn(b, cfg.data_dir.clone(), cfg.tenants_dir());
+            let c = control.clone();
+            let retire = move |p: &railwatch_server::storage::backup::Pass| retire_bucket_slugs(&c, p);
+            railwatch_server::storage::backup::spawn(b, cfg.data_dir.clone(), cfg.tenants_dir(), Box::new(retire));
         }
         let (stop_jobs, jobs_stopped) = tokio::sync::watch::channel(false);
         let scheduler = tokio::spawn(railwatch_server::jobs::scheduler(control.clone(), jobs.background.clone(), cfg.tenants_dir(), jobs_stopped));

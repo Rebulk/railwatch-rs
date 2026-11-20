@@ -389,3 +389,71 @@ fn the_drain_recomputes_a_pre_start_hour_once_and_counts_every_receipts_rows() {
         .unwrap();
     assert_eq!(n, 2);
 }
+
+/// A status change on an issue that was deleted after the caller read it
+/// (its environment deleted meanwhile) changes nothing and does not panic:
+/// a panic here runs under the control DB lock and poisons it for every
+/// account (hunt 2026-11-19 H1/P1).
+#[test]
+fn a_status_change_on_an_issue_deleted_meanwhile_is_a_no_op_not_a_panic() {
+    let (control, env, t, _d) = setup("vanished-status");
+    let c = control.conn();
+    let id = exception(&t, &format!("{:032x}", 7), "E", None, "2026-10-13 10:00:00");
+    grouping::group(&c, &t, env, grouping::load_exceptions(&t, &[id]).unwrap(), None).unwrap();
+    let stale = issue::find(&c, count(&c, "SELECT id FROM issues")).unwrap().unwrap();
+    c.execute_batch("DELETE FROM issue_activities; DELETE FROM alerts; DELETE FROM issues;").unwrap();
+    assert!(!issue::resolve_by(&c, &stale, None, None).unwrap());
+    assert!(!issue::ignore(&c, &stale, None).unwrap());
+    assert!(!issue::reopen(&c, &stale, None).unwrap());
+    // The connection (and the lock around it) is still usable.
+    assert_eq!(count(&c, "SELECT COUNT(*) FROM issues"), 0);
+}
+
+/// Grouping into an issue that disappears mid-pass (simulated with a
+/// trigger) is an error for that batch, never a panic under the lock.
+#[test]
+fn grouping_into_an_issue_deleted_mid_pass_is_an_error_not_a_panic() {
+    let (control, env, t, _d) = setup("vanished-group");
+    let c = control.conn();
+    let g = format!("{:032x}", 9);
+    let first = exception(&t, &g, "E", None, "2026-10-13 10:00:00");
+    grouping::group(&c, &t, env, grouping::load_exceptions(&t, &[first]).unwrap(), None).unwrap();
+    c.execute_batch(
+        "CREATE TEMP TRIGGER vanish AFTER UPDATE OF occurrences ON issues BEGIN
+           DELETE FROM issue_activities WHERE issue_id = NEW.id; DELETE FROM alerts WHERE issue_id = NEW.id; DELETE FROM issues WHERE id = NEW.id;
+         END;",
+    )
+    .unwrap();
+    let again = exception(&t, &g, "E", None, "2026-10-13 10:01:00");
+    let r = grouping::group(&c, &t, env, grouping::load_exceptions(&t, &[again]).unwrap(), None);
+    assert!(r.is_err(), "{r:?}");
+    c.execute_batch("DROP TRIGGER vanish").unwrap();
+    // The group's transaction rolled back whole and the connection is out of it.
+    assert!(c.is_autocommit());
+    assert_eq!(count(&c, "SELECT occurrences FROM issues"), 1);
+}
+
+/// PR #107 review L10: one group failing mid-batch (its issue deleted
+/// meanwhile) rolls back alone; the batch's other groups still become
+/// issues, and the batch still reports the failure.
+#[test]
+fn one_failing_group_does_not_leave_the_rest_of_the_batch_ungrouped() {
+    let (control, env, t, _d) = setup("l10-rest");
+    let c = control.conn();
+    let (g1, g2) = (format!("{:032x}", 1), format!("{:032x}", 2));
+    let first = exception(&t, &g1, "E", None, "2026-10-13 10:00:00");
+    grouping::group(&c, &t, env, grouping::load_exceptions(&t, &[first]).unwrap(), None).unwrap();
+    c.execute_batch(&format!(
+        "CREATE TEMP TRIGGER vanish AFTER UPDATE OF occurrences ON issues WHEN NEW.group_hash = '{g1}' BEGIN
+           DELETE FROM issue_activities WHERE issue_id = NEW.id; DELETE FROM alerts WHERE issue_id = NEW.id; DELETE FROM issues WHERE id = NEW.id;
+         END;"
+    ))
+    .unwrap();
+    // g1 (fails) comes first in the batch, then g2 (new).
+    let ids = [exception(&t, &g1, "E", None, "2026-10-13 10:01:00"), exception(&t, &g2, "F", None, "2026-10-13 10:02:00")];
+    let r = grouping::group(&c, &t, env, grouping::load_exceptions(&t, &ids).unwrap(), None);
+    c.execute_batch("DROP TRIGGER vanish").unwrap();
+    assert!(r.is_err(), "the failure is still reported: {r:?}");
+    assert_eq!(count(&c, &format!("SELECT COUNT(*) FROM issues WHERE group_hash = '{g2}'")), 1, "g2 became an issue");
+    assert!(c.is_autocommit());
+}

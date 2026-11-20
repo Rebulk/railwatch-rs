@@ -28,6 +28,12 @@
 //!    token made through the trusted proxy keeps the role the proxy signed,
 //!    and acts with at most that role even where the user's own membership
 //!    is higher. NULL (every existing token): the membership's role.
+//! 7. `retired_environment_slugs`: Rust-only. A slug names the environment's
+//!    telemetry directory, source maps and backup objects, so a slug once
+//!    used is never given to another environment (GA review 2026-11-19 T1:
+//!    a recreated slug was served the deleted tenant's telemetry). A trigger
+//!    records every deleted environment's slug; `control::retire_unowned`
+//!    adds names found on disk or in the backup bucket at startup.
 
 pub mod issues;
 
@@ -51,6 +57,7 @@ pub const MIGRATIONS: &[(&str, Step)] = &[
     ("20261101000001_uptime", uptime),
     ("20261119000001_trusted_proxy", trusted_proxy),
     ("20261119000002_api_token_role_ceiling", api_token_role_ceiling),
+    ("20261119000010_retired_environment_slugs", retired_environment_slugs),
 ];
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<&'static str>> {
@@ -317,9 +324,49 @@ fn trusted_proxy(tx: &Transaction) -> rusqlite::Result<()> {
     Ok(())
 }
 
+const RETIRED_ENVIRONMENT_SLUGS: &str = "
+CREATE TABLE retired_environment_slugs (
+  slug TEXT PRIMARY KEY NOT NULL,
+  retired_at TEXT NOT NULL
+);
+CREATE TRIGGER retire_environment_slug AFTER DELETE ON environments BEGIN
+  INSERT OR IGNORE INTO retired_environment_slugs (slug, retired_at) VALUES (OLD.slug, strftime('%Y-%m-%d %H:%M:%f', 'now'));
+END;
+";
+
+fn retired_environment_slugs(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(RETIRED_ENVIRONMENT_SLUGS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The slug retirement lives in a trigger on `environments`; a later
+    /// migration that rebuilds that table (SQLite's ALTER workaround) would
+    /// drop it silently, and deleted slugs would be reused again (PR #107
+    /// review note). After every migration it must exist and fire.
+    #[test]
+    fn the_slug_retirement_trigger_exists_after_every_migration() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch("PRAGMA foreign_keys = on").unwrap();
+        migrate(&mut c).unwrap();
+        let sql: String = c
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'retire_environment_slug' AND tbl_name = 'environments'", [], |r| {
+                r.get(0)
+            })
+            .expect("the retire_environment_slug trigger on environments");
+        assert!(sql.contains("AFTER DELETE"), "{sql}");
+        c.execute_batch(
+            "INSERT INTO accounts (id, name, slug, plan, monthly_event_quota, retention_days, created_at, updated_at) VALUES (1, 'a', 'a', 'p', 1, 30, 'x', 'x');
+             INSERT INTO applications (id, account_id, name, slug, issue_prefix, created_at, updated_at) VALUES (1, 1, 'w', 'w', 'W', 'x', 'x');
+             INSERT INTO environments (id, application_id, name, slug, token_digest, token_prefix, created_at, updated_at) VALUES (1, 1, 'p', 'a-w-p', 'd', 'rw_', 'x', 'x');
+             DELETE FROM environments WHERE id = 1;",
+        )
+        .unwrap();
+        let retired: i64 = c.query_row("SELECT COUNT(*) FROM retired_environment_slugs WHERE slug = 'a-w-p'", [], |r| r.get(0)).unwrap();
+        assert_eq!(retired, 1, "and a delete records the slug");
+    }
 
     #[test]
     fn a_phase1_file_moves_forward_keeping_ids_tokens_usage_and_deploys() {
@@ -377,7 +424,10 @@ mod tests {
             for (version, _) in &before {
                 c.execute("INSERT INTO railwatch_migrations (version, applied_at) VALUES (?, 'x')", [version]).unwrap();
             }
-            assert_eq!(migrate(&mut c).unwrap(), vec!["20261119000001_trusted_proxy", "20261119000002_api_token_role_ceiling"]);
+            assert_eq!(
+                migrate(&mut c).unwrap(),
+                vec!["20261119000001_trusted_proxy", "20261119000002_api_token_role_ceiling", "20261119000010_retired_environment_slugs"]
+            );
             let ceiling: Option<String> = c.query_row("SELECT role_ceiling FROM api_tokens LIMIT 1", [], |r| r.get(0)).optional().unwrap().flatten();
             assert_eq!(ceiling, None, "existing tokens keep no ceiling");
             c.query_row("SELECT account_id FROM trusted_proxy", [], |r| r.get::<_, i64>(0)).optional().unwrap()

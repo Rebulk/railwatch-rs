@@ -86,6 +86,11 @@ impl Worker {
 
     fn tenant(&mut self, env: i64, slug: &str) -> rusqlite::Result<&mut Tenant> {
         if !self.tenants.contains_key(&env) {
+            // Work queued for an environment deleted since: opening it would
+            // create its storage again (a single file under a retired slug).
+            if self.control.find(env)?.is_none() {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
             let (read, write, days) = match crate::storage::Layout::detect(&self.dir, slug) {
                 Some(crate::storage::Layout::Days(dir)) => {
                     let write = crate::tenants::open_tenant(&crate::storage::layout::meta_path(&dir))?;
@@ -311,6 +316,10 @@ impl Worker {
             }
         }
         self.tenants.retain(|_, (_, t)| {
+            // Its environment was deleted (the directory is gone): close now.
+            if t.days.as_ref().is_some_and(|(d, _)| !d.exists()) {
+                return false;
+            }
             t.used_at.elapsed() < TENANT_IDLE
                 || t.acc.row_count() > 0
                 || !t.full_hours.is_empty()

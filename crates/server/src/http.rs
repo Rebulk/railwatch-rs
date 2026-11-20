@@ -6,7 +6,8 @@
 //! them (html entities escaped).
 //!
 //! Order per request, as in Rails: body limit (413) -> IP limit (429) ->
-//! route (404) -> authenticate (401) -> environment limit (429) -> action,
+//! route (404) -> authenticate (401) -> environment limit (429) -> action
+//! (only a 404 or 401 counts toward the IP limit),
 //! with the disk floor (503, storage::budget) before any action that writes.
 
 use std::net::{IpAddr, SocketAddr};
@@ -164,13 +165,19 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
         return too_large();
     }
 
-    // IngestRequestRateLimit, keyed by the client address.
+    // IngestRequestRateLimit, keyed by the client address. Only requests
+    // that fail to authenticate (no route, no or a wrong token) count, so
+    // tenants sharing an egress address (a PaaS, CI, a NAT) never use up
+    // each other's; authenticated ones count per environment below.
     let ip = client_ip(&state, &req);
-    if state.ip_limit.exceeded(&ip) {
+    if state.ip_limit.full(&ip) {
         return rate_limited();
     }
 
-    let Some(action) = route(req.method(), &path) else { return StatusCode::NOT_FOUND.into_response() };
+    let Some(action) = route(req.method(), &path) else {
+        state.ip_limit.exceeded(&ip);
+        return StatusCode::NOT_FOUND.into_response();
+    };
 
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
@@ -193,13 +200,16 @@ async fn dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response 
             }
         }
     };
-    let Some(env) = env else { return StatusCode::UNAUTHORIZED.into_response() };
+    let Some(env) = env else {
+        state.ip_limit.exceeded(&ip);
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
 
     if state.env_limit.exceeded(&env.id) {
         return rate_limited();
     }
     if action != Action::Ping
-        && let Err(why) = state.disk.admit().await
+        && let Err(why) = state.disk.admit(env.account_id).await
     {
         return disk_refused(why);
     }
@@ -861,15 +871,29 @@ async fn sourcemaps(state: &Arc<AppState>, env: Environment, headers: &HeaderMap
     if !safe(&deploy) || deploy.contains('/') || !safe(&filename) {
         return json(StatusCode::UNPROCESSABLE_ENTITY, rhash! {"error" => "invalid deploy or filename"});
     }
-    let path = state.sourcemaps_dir.join(&env.slug).join(&deploy).join(format!("{filename}.map"));
+    // As /ingest: nothing is stored for a paused environment or one over
+    // its quota, and uploads have their own, lower, rate (GA review
+    // 2026-11-19, security #2).
+    if env.paused {
+        return json(StatusCode::CONFLICT, rhash! {"error" => "environment is paused"});
+    }
+    if env.quota_exhausted(&current_month()) {
+        return json(StatusCode::PAYMENT_REQUIRED, rhash! {"error" => "quota"});
+    }
+    if crate::storage::sourcemaps::rate_limit().exceeded(&env.id) {
+        return rate_limited();
+    }
+    let (dir, slug, name) = (state.sourcemaps_dir.clone(), env.slug.clone(), filename.clone());
     let bytes = raw.len();
     let written = tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        let tmp = path.with_extension("map.tmp");
-        std::fs::write(&tmp, &raw)?;
-        std::fs::rename(&tmp, &path)
+        use crate::storage::sourcemaps::{MAX_DEPLOYS, MAX_ENV_BYTES, store};
+        store(&dir, &slug, &deploy, &name, &raw, MAX_ENV_BYTES, MAX_DEPLOYS)
     })
     .await;
+    if let Ok(Ok(Err(crate::storage::sourcemaps::Refused::TooMuch))) = written {
+        return json(StatusCode::INSUFFICIENT_STORAGE, rhash! {"error" => "source maps for this deploy exceed the environment's limit"});
+    }
+    let written = written.map(|r| r.map(|_| ()));
     match written {
         Ok(Ok(())) => json(StatusCode::CREATED, rhash! {"ok" => true, "filename" => filename, "bytes" => bytes}),
         _ => internal_error(),

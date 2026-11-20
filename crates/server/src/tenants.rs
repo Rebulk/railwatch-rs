@@ -70,6 +70,11 @@ pub enum Job {
     Release {
         reply: std::sync::mpsc::Sender<()>,
     },
+    /// The environment is being deleted (Tenants::forget): finish what is
+    /// queued, close every connection, then answer and exit.
+    Stop {
+        reply: std::sync::mpsc::Sender<()>,
+    },
 }
 
 #[derive(Clone)]
@@ -84,6 +89,13 @@ struct Inner {
     /// exits on idle whether the map still points at it.
     writers: Mutex<HashMap<String, (u64, Sender<Job>)>>,
     generation: std::sync::atomic::AtomicU64,
+    /// Slugs of environments deleted while this process ran (`forget`): a
+    /// batch that authenticated just before the delete must not start a
+    /// writer, which would create the directory again.
+    forgotten: Mutex<std::collections::HashSet<String>>,
+    /// Tests: runs once at the top of `send`'s next loop turn (M4's race).
+    #[cfg(test)]
+    before_lookup: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     followups: Mutex<Option<FollowupSender>>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// The disk budget's estimate, which every commit adds to.
@@ -99,6 +111,9 @@ impl Tenants {
                 idle,
                 writers: Mutex::new(HashMap::new()),
                 generation: Default::default(),
+                forgotten: Default::default(),
+                #[cfg(test)]
+                before_lookup: Default::default(),
                 followups: Mutex::new(Some(followups)),
                 threads: Mutex::new(Vec::new()),
                 disk: Default::default(),
@@ -138,8 +153,20 @@ impl Tenants {
     /// Hands a job to the tenant's writer, starting one if none is running.
     pub fn send(&self, env_id: i64, slug: &str, mut job: Job) {
         loop {
+            #[cfg(test)]
+            if let Some(hook) = self.inner.before_lookup.lock().unwrap().take() {
+                hook();
+            }
             let (generation, tx) = {
                 let mut writers = self.inner.writers.lock().unwrap();
+                // Under the lock `forget` takes, so a delete between two
+                // turns of this loop (or before the first) is always seen,
+                // and no writer is started for a deleted environment (PR #107
+                // review M4: it recreated its files).
+                if self.inner.forgotten.lock().unwrap().contains(slug) {
+                    drop(writers);
+                    return fail(job, "environment deleted".into());
+                }
                 writers.entry(slug.to_string()).or_insert_with(|| self.spawn(env_id, slug)).clone()
             };
             match tx.send(job) {
@@ -199,6 +226,27 @@ impl Tenants {
             .collect();
         for rx in replies {
             let _ = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+
+    /// The environment `slug` is being deleted: its writer is unregistered
+    /// and stops once it has answered what is queued (its channel closes),
+    /// and this waits up to `wait` for it, so its connections to the files
+    /// are closed before they are removed. A batch sent later starts a new
+    /// writer, which finds no environment row to authenticate against.
+    pub fn forget(&self, slug: &str, wait: Duration) {
+        let removed = {
+            let mut writers = self.inner.writers.lock().unwrap();
+            self.inner.forgotten.lock().unwrap().insert(slug.to_string());
+            writers.remove(slug)
+        };
+        let Some((_, tx)) = removed else { return };
+        let (reply, rx) = std::sync::mpsc::channel();
+        if tx.send(Job::Stop { reply }).is_ok() {
+            drop(tx);
+            if rx.recv_timeout(wait).is_err() {
+                tracing::warn!(tenant = slug, "the deleted environment's writer did not stop in time; its files are removed anyway");
+            }
         }
     }
 
@@ -608,8 +656,22 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
                 Err(_) => break,
             }
         }
+        let stops: Vec<_> = jobs.iter().filter_map(|j| if let Job::Stop { reply } = j { Some(reply.clone()) } else { None }).collect();
         process(env_id, slug, &mut store, jobs, followups);
         disk.wrote(store.take_written());
+        if !stops.is_empty() {
+            // Closed before answering: the caller removes the files next.
+            drop(store);
+            // Anything queued behind the stop is refused; the environment is gone.
+            while let Ok(job) = rx.try_recv() {
+                fail(job, "environment deleted".into());
+            }
+            for reply in stops {
+                let _ = reply.send(());
+            }
+            tracing::debug!(tenant = slug, "writer stopped: environment deleted");
+            return;
+        }
         if trimmed.elapsed() >= TRIM {
             store.quiet();
             crate::memory::collect_thread();
@@ -621,7 +683,7 @@ fn run_writer(env_id: i64, slug: &str, dir: &Path, rx: Receiver<Job>, idle: Dura
 fn row_count(job: &Job) -> usize {
     match job {
         Job::Write { batch, .. } => batch.row_count().max(1),
-        Job::LookupReceipt { .. } | Job::Release { .. } => 0,
+        Job::LookupReceipt { .. } | Job::Release { .. } | Job::Stop { .. } => 0,
     }
 }
 
@@ -633,7 +695,7 @@ fn fail(job: Job, message: String) {
         Job::LookupReceipt { reply, .. } => {
             let _ = reply.send(Err(message));
         }
-        Job::Release { reply } => {
+        Job::Release { reply } | Job::Stop { reply } => {
             let _ = reply.send(());
         }
     }
@@ -657,6 +719,8 @@ fn process(env_id: i64, slug: &str, store: &mut Store, jobs: Vec<Job>, followups
                 store.drop_deleted();
                 let _ = reply.send(());
             }
+            // Answered by run_writer once the store is closed.
+            Job::Stop { .. } => {}
             w @ Job::Write { .. } => writes.push(w),
         }
     }
@@ -668,7 +732,7 @@ fn process(env_id: i64, slug: &str, store: &mut Store, jobs: Vec<Job>, followups
         .into_iter()
         .map(|job| match job {
             Job::Write { batch, gc_floor_micros, reply } => (batch, gc_floor_micros, reply),
-            Job::LookupReceipt { .. } | Job::Release { .. } => unreachable!(),
+            Job::LookupReceipt { .. } | Job::Release { .. } | Job::Stop { .. } => unreachable!(),
         })
         .collect();
     let begin = store.begin();
@@ -755,6 +819,29 @@ fn lookup_receipt(conn: &Connection, producer_id: &str, delivery_id: &str) -> ru
 mod tests {
     use super::*;
     use crate::rjson::Value;
+
+    /// PR #107 review M4: a batch that is past its first check when the
+    /// environment is deleted (here: forget runs just before send looks up
+    /// the writer) is refused, and no writer recreates the deleted files.
+    #[test]
+    fn a_batch_racing_the_delete_never_starts_a_writer_for_it() {
+        let dir = std::env::temp_dir().join(format!("rw-m4-{}", crate::control::base58(8)));
+        let (tx, _rx) = crate::followups::channel();
+        let tenants = Tenants::new(dir.clone(), Duration::from_secs(300), tx);
+        let t2 = tenants.clone();
+        let d2 = dir.clone();
+        *tenants.inner.before_lookup.lock().unwrap() = Some(Box::new(move || {
+            t2.forget("gone-web-production", Duration::from_secs(1));
+            let _ = std::fs::remove_dir_all(d2.join("gone-web-production"));
+        }));
+        let (reply, rx) = oneshot::channel();
+        tenants.send(1, "gone-web-production", Job::LookupReceipt { producer_id: "p".into(), delivery_id: "d".into(), reply });
+        assert!(rx.blocking_recv().unwrap().is_err(), "refused");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!dir.join("gone-web-production").exists(), "no writer recreated the directory");
+        tenants.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A batch of one query (its sql filed in query_shapes) and one log;
     /// `poisoned` gives it the bignum Dropped header, which passes mapping

@@ -44,7 +44,11 @@ here that differs is a bug.
 3. **Rate limits are in memory.** Same limits, keys and fixed 1-minute
    windows as Rails, but per process and reset on restart (Rails keeps them in
    Solid Cache). Configurable: `RAILWATCH_RATE_LIMIT_IP` (2,400),
-   `RAILWATCH_RATE_LIMIT_ENV` (600); 0 disables.
+   `RAILWATCH_RATE_LIMIT_ENV` (600); 0 disables. Unlike Rails, only requests
+   that fail to authenticate count toward the per-address limits (ingest's
+   and MCP's 300/min): authenticated ones count per environment (ingest)
+   or per token (MCP, 300/min), so customers behind one egress address do
+   not share one budget.
 4. **Client IP.** `X-Forwarded-For` is honoured only with
    `RAILWATCH_TRUST_PROXY=1` and only from a loopback or private peer, and
    then the rightmost non-private address wins (Rails' RemoteIp with its
