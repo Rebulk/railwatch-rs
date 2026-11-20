@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use railwatch_server::config::Config;
-use railwatch_server::control::{self, Control};
+use railwatch_server::control::Control;
 use railwatch_server::followups;
 use railwatch_server::tenants::{Job, Tenants};
 use railwatch_server::web::{self, WebState};
