@@ -64,6 +64,7 @@ pub struct Control {
     alerting: std::sync::OnceLock<crate::alerts::integration::Alerting>,
     /// When `answers` last read the database, and whether it could.
     health: Mutex<Option<(std::time::Instant, bool)>>,
+    health_reads: std::sync::atomic::AtomicU64,
 }
 
 pub fn digest(token: &str) -> String {
@@ -228,7 +229,13 @@ impl Control {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.execute_batch("PRAGMA journal_mode = wal; PRAGMA synchronous = normal; PRAGMA foreign_keys = on;")?;
         control_schema::migrate(&mut conn)?;
-        Ok(Control { conn: Mutex::new(conn), enforce_quota, alerting: std::sync::OnceLock::new(), health: Mutex::new(None) })
+        Ok(Control {
+            conn: Mutex::new(conn),
+            enforce_quota,
+            alerting: std::sync::OnceLock::new(),
+            health: Mutex::new(None),
+            health_reads: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     pub fn configure_alerting(&self, a: crate::alerts::integration::Alerting) {
@@ -244,16 +251,27 @@ impl Control {
     /// a flood of it must not become a flood on the one connection every
     /// account shares (hunt 2, P1). A wedged database still fails within a
     /// second.
+    ///
+    /// The health lock is held across the check, the read and the store, so
+    /// requests that find the answer stale wait for one read instead of
+    /// each making their own.
     pub fn answers(&self) -> bool {
         const FRESH: std::time::Duration = std::time::Duration::from_secs(1);
-        if let Some((at, ok)) = *self.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        let mut health = self.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, ok)) = *health
             && at.elapsed() < FRESH
         {
             return ok;
         }
+        self.health_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ok = self.with(|c| c.query_row("SELECT count(*) FROM railwatch_migrations", [], |r| r.get::<_, i64>(0))).is_ok();
-        *self.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((std::time::Instant::now(), ok));
+        *health = Some((std::time::Instant::now(), ok));
         ok
+    }
+
+    /// How many times `answers` has read the database (for tests).
+    pub fn health_reads(&self) -> u64 {
+        self.health_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> rusqlite::Result<T> {

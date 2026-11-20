@@ -500,16 +500,24 @@ fn up_fails_when_the_control_database_does_not_answer() {
 }
 
 /// Hunt 2, P1: `/up` is public and comes before every rate limit; a flood of
-/// it reads the shared control database at most once a second.
+/// it, even a concurrent one, reads the shared control database at most once
+/// a second.
 #[test]
 fn a_flood_of_up_reads_the_control_database_at_most_once_a_second() {
     let s = start(0, 0);
-    assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 200);
-    // While the database is broken, every /up inside the same second still
-    // gets the answer read before it broke: nothing new was read.
-    s.control.with(|c| c.execute_batch("ALTER TABLE railwatch_migrations RENAME TO broken")).unwrap();
-    for _ in 0..50 {
-        assert_eq!(request(s.addr, "GET", "/up", &[], b"").0, 200, "served from the last read, not a new one");
+    let before = s.control.health_reads();
+    let started = std::time::Instant::now();
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let addr = s.addr;
+            std::thread::spawn(move || (0..25).map(|_| request(addr, "GET", "/up", &[], b"").0).collect::<Vec<_>>())
+        })
+        .collect();
+    for t in threads {
+        assert!(t.join().unwrap().iter().all(|status| *status == 200));
     }
-    s.control.with(|c| c.execute_batch("ALTER TABLE broken RENAME TO railwatch_migrations")).unwrap();
+    let reads = s.control.health_reads() - before;
+    // One read per started second, however the 200 requests were spread.
+    let allowed = started.elapsed().as_secs() + 1;
+    assert!(reads >= 1 && reads <= allowed, "{reads} reads for 200 requests in {:?}", started.elapsed());
 }
