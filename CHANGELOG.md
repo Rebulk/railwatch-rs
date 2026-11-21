@@ -22,8 +22,8 @@ Upgrading: no migrations and nothing on disk changes.
 
 **Dependencies**
 - Frontend: Inertia 2.3.29, Tailwind 4.3.5, Vite 8.3.8, recharts 3.11.0 and
-  other minor updates. CI actions: pnpm/action-setup, install-action,
-  cosign-installer and action-gh-release patch updates.
+  other minor updates. CI actions: pnpm/action-setup, install-action (minor),
+  cosign-installer and action-gh-release (patch) updates.
 
 ## v0.3.5 (2026-11-19)
 
