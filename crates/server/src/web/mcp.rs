@@ -41,6 +41,8 @@ mod answers;
 mod compact;
 #[path = "mcp_compare.rs"]
 mod compare;
+#[path = "mcp_incidents.rs"]
+mod incidents;
 #[path = "mcp_records.rs"]
 mod records;
 #[path = "mcp_security.rs"]
@@ -651,6 +653,8 @@ impl Mcp<'_> {
             "query_requests" => self.query_requests(&a),
             "security_summary" => self.security_summary(&a),
             "ip_activity" => self.ip_activity(&a),
+            "list_security_incidents" => self.list_security_incidents(&a),
+            "get_security_incident" => self.get_security_incident(&a),
             "list_sessions" => self.list_sessions(&a),
             "session_journey" => self.session_journey(&a),
             "update_issue" => self.update_issue(&a),
@@ -3008,6 +3012,8 @@ fn narrow_hint(tool: &str) -> &'static str {
         "query_requests" => "Pass a smaller limit, min_count, fewer metrics, or a narrower q or window.",
         "security_summary" => "Pass a narrower window; drill into one finding with its next calls.",
         "ip_activity" => "Pass a smaller limit, a narrower window, or after:/before: in q.",
+        "list_security_incidents" => "Pass a smaller limit, min_severity, status or a narrower window.",
+        "get_security_incident" => "The signals are capped at 200; ip_activity on the actor has the requests.",
         "session_journey" => "Pass max_tokens: the newest timeline entries are kept and the older counted in timeline_left_out.",
         "web_vitals" => "Pass a smaller limit, or component to read one component.",
         "release_health" => "Pass a narrower window.",
@@ -3290,8 +3296,8 @@ mod tests {
         readers: crate::dashboard::pool::ReadPools,
         key: CursorKey,
         token: String,
-        app: i64,
-        env: i64,
+        pub(super) app: i64,
+        pub(super) env: i64,
         slug: String,
     }
 

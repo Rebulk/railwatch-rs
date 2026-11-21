@@ -45,6 +45,9 @@ pub struct Followup {
     pub rolled_ids: Vec<(&'static str, Vec<i64>)>,
     /// Servers named on this batch's rows ("" when a row had none).
     pub servers: Vec<String>,
+    /// The batch held a `security.*` event: the security watcher looks at
+    /// the environment now instead of at its next tick.
+    pub security_events: bool,
 }
 
 impl Followup {
@@ -61,6 +64,14 @@ impl Followup {
                 }
             }
         }
+        let security_events = crate::security::watcher::running()
+            && batch.tables.iter().filter(|(t, _)| *t == "logs").flat_map(|(_, rows)| rows).any(|row| {
+                let text = |k: &str| match row.iter().find(|(c, _)| *c == k) {
+                    Some((_, Bind::Text(s))) => s.as_str(),
+                    _ => "",
+                };
+                text("level") == "event" && text("message").starts_with("security.")
+            });
         Followup {
             env_id,
             slug: slug.to_string(),
@@ -73,6 +84,7 @@ impl Followup {
             receipted: batch.receipt.is_some(),
             rolled_ids: written.rolled_ids.clone(),
             servers,
+            security_events,
         }
     }
 }
@@ -140,6 +152,9 @@ fn handle(p: &mut Pending, f: Followup, bg: Option<&Background>) {
         let e = p.usage.entry((f.env_id, month_of(f.committed_at_micros))).or_insert((0, 0));
         e.0 += f.accepted;
         e.1 = e.1.max(f.committed_at_micros);
+    }
+    if f.security_events {
+        crate::security::watcher::wake(f.env_id);
     }
     let Some(bg) = bg else { return };
     bg.heartbeats.beat(f.env_id, &f.servers, f.committed_at_micros);

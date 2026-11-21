@@ -1462,7 +1462,13 @@ fn serve() -> ExitCode {
             railwatch_server::storage::backup::spawn(b, cfg.data_dir.clone(), cfg.tenants_dir(), Box::new(retire));
         }
         let (stop_jobs, jobs_stopped) = tokio::sync::watch::channel(false);
-        let scheduler = tokio::spawn(railwatch_server::jobs::scheduler(control.clone(), jobs.background.clone(), cfg.tenants_dir(), jobs_stopped));
+        let scheduler = tokio::spawn(railwatch_server::jobs::scheduler(control.clone(), jobs.background.clone(), cfg.tenants_dir(), jobs_stopped.clone()));
+        // The security watcher (docs/security-watcher.md): its own task, off
+        // unless security_watcher_file names a policy.
+        let security_watcher = cfg.security_watcher.as_ref().map(|(_, policy)| {
+            let w = Arc::new(railwatch_server::security::watcher::SecurityWatcher::new(control.clone(), cfg.tenants_dir(), policy.clone(), cfg.pages_url()));
+            tokio::spawn(w.run_forever(jobs_stopped.clone()))
+        });
         let hub = web::cable::Hub::new();
         let followups_task = tokio::spawn(followups::run_with(control.clone(), followups_rx, Some(hub.clone()), Some(jobs.background.clone())));
         let web_state = match WebState::new(control, cfg.clone(), tenants.clone(), hub) {
@@ -1613,6 +1619,9 @@ fn serve() -> ExitCode {
         followups_task.await.ok();
         let _ = stop_jobs.send(true);
         scheduler.await.ok();
+        if let Some(w) = security_watcher {
+            w.await.ok();
+        }
         // Its trim hook holds a sender to the worker: stopped first, so the
         // worker sees its channel close.
         disk.stop();

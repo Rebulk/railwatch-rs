@@ -7,6 +7,20 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- New, off by default: the security watcher (docs/security-watcher.md).
+  With `security_watcher_file` set, it evaluates each application its
+  policy enables every 15 s over the last 15 min, and also as soon as a
+  `security.*` event arrives. Fixed detectors cover secret-file probes,
+  scanner-shaped 4xx, scripts on browser pages, 401/403 and failed sign-in
+  bursts, a spoofed app client, risky and repeated signups, new accounts
+  probing privileged pages, and OAuth client registrations. There is one
+  incident per client address, and its severity only rises. It sends
+  `security_incident` alerts (open, escalate, close) and a daily
+  `security_digest`. It runs in shadow mode by default, where alerts go
+  only to the configured shadow integration. Incidents are listed by the
+  new MCP tools `list_security_incidents` and `get_security_incident` and
+  under `/api/v1/.../security_incidents`, all with the `security` scope.
+  New control tables; an older binary ignores them.
 - Security: a password change, an email change and a new API token
   re-check, in the write itself, that the request's session still exists
   and (for the two changes) that the password its challenge was checked

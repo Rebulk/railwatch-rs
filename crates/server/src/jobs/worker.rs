@@ -425,6 +425,7 @@ mod tests {
                 receipted: false,
                 rolled_ids: vec![("queries", ids)],
                 servers: vec![],
+                security_events: false,
             };
             w.committed(f).unwrap();
             let acc = &w.tenants[&env.id].1.acc;
@@ -492,6 +493,7 @@ mod tests {
                     receipted: false,
                     rolled_ids: vec![("queries", ids)],
                     servers: vec![],
+                    security_events: false,
                 };
                 let rows_before = w.tenants.get(env).map_or(0, |(_, t)| t.acc.bytes());
                 w.committed(f).unwrap();

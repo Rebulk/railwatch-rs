@@ -22,6 +22,7 @@ gem's embedded store and the hosted platform without conversion.
   [agent-webhooks.md](docs/agent-webhooks.md) (alert webhooks an agent can act on, and a GitHub Action recipe),
   [sessions.md](docs/sessions.md) (browser sessions across tabs, and the session journey),
   [uptime.md](docs/uptime.md) (uptime monitors, incidents and public status pages),
+  [security-watcher.md](docs/security-watcher.md) (security detectors, incidents and alerts; off by default),
   [SCALE.md](docs/SCALE.md) and [RAILS-VS-RUST.md](docs/RAILS-VS-RUST.md) (Rails vs Rust, measured),
   [CHANGELOG.md](CHANGELOG.md), [PUBLISH.md](docs/PUBLISH.md) (release checklist)
 

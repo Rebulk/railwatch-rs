@@ -281,7 +281,7 @@ impl IpNet {
         Some(IpNet { addr, prefix })
     }
 
-    fn contains(&self, ip: &IpAddr) -> bool {
+    pub fn contains(&self, ip: &IpAddr) -> bool {
         let keep = |bits: u32| if self.prefix == 0 { 0 } else { !0u128 << (bits - u32::from(self.prefix)) };
         match (self.addr, canonical(*ip)) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {

@@ -27,6 +27,9 @@ pub const EVENTS: &[&str] = &[
     // Rust-only (docs/uptime.md): uptime monitors.
     "monitor_down",
     "monitor_recovered",
+    // Rust-only (docs/security-watcher.md): the security watcher.
+    "security_incident",
+    "security_digest",
 ];
 pub const BURST_EVENTS: &[&str] = &["new_issue", "regressed_issue"];
 pub const BURST_WINDOW_SECS: i64 = 60;

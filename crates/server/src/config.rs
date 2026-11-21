@@ -110,6 +110,10 @@ pub struct Config {
     pub trusted_proxy_secret: Option<Vec<u8>>,
     /// Where it was read from, for `railwatch doctor`.
     pub trusted_proxy_secret_file: Option<PathBuf>,
+    /// `security_watcher_file`: the security watcher's policy (TOML,
+    /// security/policy.rs). None: the watcher is off (the default). Read
+    /// and validated at start; a file that does not parse stops the server.
+    pub security_watcher: Option<(PathBuf, crate::security::policy::Policy)>,
     /// `standby_relay`: while another server holds the data dir, listen on
     /// `bind` anyway and relay every connection to the holder through
     /// `<data_dir>/serve.sock` (standby.rs); the holder listens there too.
@@ -473,6 +477,15 @@ impl Config {
         let trusted_proxy_secret_file =
             get("trusted_proxy_secret_file", &["RAILWATCH_TRUSTED_PROXY_SECRET_FILE"]).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let trusted_proxy_secret = trusted_proxy_secret_file.as_deref().map(read_proxy_secret).transpose()?;
+        let security_watcher = match get("security_watcher_file", &["RAILWATCH_SECURITY_WATCHER_FILE"]).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+        {
+            None => None,
+            Some(f) => {
+                let path = PathBuf::from(f);
+                let policy = crate::security::policy::Policy::load(&path).map_err(|e| format!("security_watcher_file: {e}"))?;
+                Some((path, policy))
+            }
+        };
         // With automatic certificates the public URL is the domain's.
         let url = match (&tls, url_given) {
             (Some(crate::tls::Tls::Acme { domain, .. }), None) => format!("https://{domain}"),
@@ -505,6 +518,7 @@ impl Config {
             base_path,
             trusted_proxy_secret,
             trusted_proxy_secret_file: trusted_proxy_secret_file.map(PathBuf::from),
+            security_watcher,
             standby_relay,
             sources,
             file: l.file,
@@ -675,6 +689,24 @@ impl Config {
                 src("trusted_proxy_secret_file"),
             ),
             ("standby_relay".into(), self.standby_relay.to_string(), src("standby_relay")),
+            (
+                "security_watcher".into(),
+                match &self.security_watcher {
+                    None => "(off)".into(),
+                    Some((f, p)) => format!(
+                        "{}: every {} s over {} min, {} by default, watching {}",
+                        f.display(),
+                        p.watcher.tick_seconds,
+                        p.watcher.lookback_min,
+                        p.watcher.mode.as_str(),
+                        match p.enabled_apps() {
+                            a if a.is_empty() => "no application".to_string(),
+                            a => a.join(", "),
+                        }
+                    ),
+                },
+                src("security_watcher_file"),
+            ),
             ("alert_delivery".into(), if self.alert_delivery { "on" } else { "off (alerts recorded as skipped, never sent)" }.into(), src("alert_delivery")),
             ("secret_key_base".into(), if self.secret_key_base.is_some() { "(set)".into() } else { "(generated file)".into() }, src("secret_key_base")),
         ];
