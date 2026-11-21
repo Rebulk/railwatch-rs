@@ -1511,8 +1511,10 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
     // ...and with no more than the role the proxy signed, whatever the
     // user's own membership is (an owner signed as a member).
     let ceiling = cx.current.proxy_role.clone();
+    let session = cx.current.session.as_ref().map(|s| s.id);
     enum Out {
         Bad,
+        Gone,
         Ok(String, bool),
         Invalid(Vec<(String, String)>),
     }
@@ -1520,6 +1522,12 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
         .state
         .db(move |c| {
             c.tx(|tx| {
+                // A request in flight across a password reset or a proxy
+                // takeover (both end every session and delete the tokens)
+                // must not mint a fresh one.
+                if !control::acting_as(tx, uid, session, None)? {
+                    return Ok(Out::Gone);
+                }
                 let (kind, id) = restriction.split_once(':').map_or((restriction.as_str(), ""), |(k, i)| (k, i));
                 let id: Option<i64> = id.parse().ok();
                 let (account, app) = match kind {
@@ -1595,6 +1603,7 @@ async fn profile_generate_token(cx: Ctx, p: Params) -> Response {
                 .with("generated_api_token", Value::String(raw)),
         ),
         Ok(Out::Bad) => cx.redirect(Redirect::to("/settings/profile").error("restriction", "is not accessible")),
+        Ok(Out::Gone) => cx.redirect(Redirect::to("/sign_in")),
         Ok(Out::Invalid(e)) => cx.redirect(Redirect::to("/settings/profile").errors(e)),
         Err(e) => internal(e),
     }
@@ -1640,8 +1649,12 @@ async fn password_update(cx: Ctx, p: Params) -> Response {
         return cx.redirect(Redirect::to("/settings/password").errors(errors));
     }
     let keep = cx.current.session.as_ref().map(|s| s.id);
-    match cx.state.db(move |c| c.with(|x| control::set_password(x, user.id, &password, keep))).await {
-        Ok(()) => cx.redirect(Redirect::to("/settings/password").notice("Your password has been changed")),
+    // The challenge was checked against the digest this request loaded; the
+    // write re-checks it (and the session) under the same lock, so a
+    // password reset or a proxy takeover in between is not undone.
+    match cx.state.db(move |c| c.tx(|x| Ok(control::change_password(x, user.id, keep, &user.password_digest, &password)?))).await {
+        Ok(true) => cx.redirect(Redirect::to("/settings/password").notice("Your password has been changed")),
+        Ok(false) => cx.redirect(Redirect::to("/settings/password").error("password_challenge", "is invalid")),
         Err(e) => internal(e),
     }
 }
@@ -1673,20 +1686,15 @@ async fn email_update(cx: Ctx, p: Params) -> Response {
     let uid = user.id;
     let keep = cx.current.session.as_ref().map(|s| s.id);
     let new_email = email.clone();
+    let checked = user.password_digest.clone();
     // Like a password change, an email change ends the user's other
-    // sessions (someone else's stolen one included).
-    let r = cx
-        .state
-        .db(move |c| {
-            // One transaction: the new email never stands without the sign-out.
-            c.tx(|x| {
-                x.execute("UPDATE users SET email = ?, verified = 0, updated_at = ? WHERE id = ?", params![email, now_db(), uid])?;
-                Ok(x.execute("DELETE FROM sessions WHERE user_id = ? AND id IS NOT ?", params![uid, keep])?)
-            })
-        })
-        .await;
+    // sessions (someone else's stolen one included), in one transaction
+    // that re-checks the session and the digest the challenge was checked
+    // against (control::change_email).
+    let r = cx.state.db(move |c| c.tx(|x| Ok(control::change_email(x, uid, keep, &checked, &email)?))).await;
     match r {
-        Ok(_) => {
+        Ok(false) => cx.redirect(Redirect::to("/settings/email").error("password_challenge", "is invalid")),
+        Ok(true) => {
             // The old address hears about it, so a change it did not make is noticed.
             mailer::deliver_later(cx.state.mailer.clone(), mailer::email_changed(&user.email, &new_email));
             send_verification(&cx, uid).await;

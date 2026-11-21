@@ -930,6 +930,53 @@ pub fn set_password(tx: &Connection, user_id: i64, password: &str, keep_session:
     Ok(())
 }
 
+/// The request still acts as who it loaded at its start: its session row
+/// is still there and the user's, and (when given) the password digest the
+/// request checked a password against is still the user's. A request reads
+/// the user once and writes later; in between a password reset, a password
+/// change or a trusted proxy's takeover of an unverified address
+/// (proxy_auth::resolve) can replace the password and end every session.
+/// A write that depends on that password check, or that mints a
+/// credential, calls this in the transaction that performs it.
+pub fn acting_as(c: &Connection, user_id: i64, session: Option<i64>, checked_digest: Option<&str>) -> rusqlite::Result<bool> {
+    let Some(session) = session else { return Ok(false) };
+    let live: Option<String> = c
+        .query_row(
+            "SELECT u.password_digest FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ? AND s.user_id = ?",
+            params![session, user_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match (live, checked_digest) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(live), Some(checked)) => live == checked,
+    })
+}
+
+/// A password change from Settings: the challenge was checked against
+/// `checked_digest`. False (and nothing written) when the request no
+/// longer acts as that user (`acting_as`). Call it in one transaction.
+pub fn change_password(tx: &Connection, user_id: i64, session: Option<i64>, checked_digest: &str, password: &str) -> rusqlite::Result<bool> {
+    if !acting_as(tx, user_id, session, Some(checked_digest))? {
+        return Ok(false);
+    }
+    set_password(tx, user_id, password, session)?;
+    Ok(true)
+}
+
+/// An email change from Settings, as `change_password`: the new address
+/// stands unverified, and every other session of the user is signed out
+/// (someone else's stolen one included). Call it in one transaction.
+pub fn change_email(tx: &Connection, user_id: i64, session: Option<i64>, checked_digest: &str, email: &str) -> rusqlite::Result<bool> {
+    if !acting_as(tx, user_id, session, Some(checked_digest))? {
+        return Ok(false);
+    }
+    tx.execute("UPDATE users SET email = ?, verified = 0, updated_at = ? WHERE id = ?", params![email, now_db(), user_id])?;
+    tx.execute("DELETE FROM sessions WHERE user_id = ? AND id IS NOT ?", params![user_id, session])?;
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // Sessions
 
@@ -1422,6 +1469,104 @@ mod tests {
         });
         assert_eq!(raced.unwrap(), None);
         assert_eq!(sessions(), 0, "no session from the old password survives the change");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The previous holder of an address, and the request they started
+    /// before a trusted proxy took the address over (proxy_auth::resolve):
+    /// what that request loaded at its start, and the takeover.
+    fn in_flight_across_a_takeover(c: &Control) -> (User, i64, String) {
+        let owner = c.tx(|tx| insert_user(tx, "Owner", "owner@example.com", &test_password(), true)).unwrap();
+        let account = c.tx(|tx| create_account(tx, "Acme", owner)).unwrap();
+        c.tx(|tx| crate::web::proxy_auth::bind_account(tx, account)).unwrap();
+        let known = test_password();
+        let squatter = c.tx(|tx| insert_user(tx, "Lead", "lead@example.com", &known, false)).unwrap();
+        let session = c.with(|x| create_session(x, squatter, Some("the registrant's browser"), None)).unwrap();
+        // The request loads its user (Current), and its challenge checks
+        // out against that digest...
+        let loaded = c.with(|x| find_user(x, squatter)).unwrap().unwrap();
+        assert!(verify_password(&known, &loaded.password_digest), "premise: the challenge passes against what the request loaded");
+        // ...and the takeover commits before its write.
+        let claims = crate::web::proxy_auth::Claims { email: "lead@example.com".into(), name: "Lead".into(), role: "admin".into(), exp: 0 };
+        c.tx(|tx| crate::web::proxy_auth::resolve(tx, &claims)).unwrap();
+        let after: String = c.with(|x| x.query_row("SELECT password_digest FROM users WHERE id = ?", [squatter], |r| r.get(0))).unwrap();
+        (loaded, session, after)
+    }
+
+    /// A password change checks its challenge against the digest the
+    /// request loaded, then writes. A takeover, a reset or another change
+    /// in between must not be overwritten with a password the old holder
+    /// knows.
+    #[test]
+    fn a_password_change_in_flight_across_a_takeover_is_refused_and_changes_nothing() {
+        let (dir, c) = temp();
+        let (loaded, session, after) = in_flight_across_a_takeover(&c);
+        let theirs = test_password();
+        assert!(!c.tx(|tx| Ok(change_password(tx, loaded.id, Some(session), &loaded.password_digest, &theirs)?)).unwrap());
+        let digest: String = c.with(|x| x.query_row("SELECT password_digest FROM users WHERE id = ?", [loaded.id], |r| r.get(0))).unwrap();
+        assert_eq!(digest, after, "the takeover's password stands");
+        assert!(c.with(|x| authenticate_by(x, "lead@example.com", &theirs)).unwrap().is_none());
+
+        // A valid change still works, keeps its own session and ends the others.
+        let password = test_password();
+        let ada = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &password, true)).unwrap();
+        let mine = c.with(|x| create_session(x, ada, None, None)).unwrap();
+        let other = c.with(|x| create_session(x, ada, None, None)).unwrap();
+        let ada_user = c.with(|x| find_user(x, ada)).unwrap().unwrap();
+        let new = test_password();
+        assert!(c.tx(|tx| Ok(change_password(tx, ada, Some(mine), &ada_user.password_digest, &new)?)).unwrap());
+        assert!(c.with(|x| authenticate_by(x, "ada@example.com", &new)).unwrap().is_some());
+        assert!(c.with(|x| find_session(x, mine)).unwrap().is_some() && c.with(|x| find_session(x, other)).unwrap().is_none());
+
+        // Two changes from one session with the same stale load: the second
+        // one's digest is no longer the user's.
+        assert!(!c.tx(|tx| Ok(change_password(tx, ada, Some(mine), &ada_user.password_digest, &test_password())?)).unwrap());
+        assert!(c.with(|x| authenticate_by(x, "ada@example.com", &new)).unwrap().is_some(), "the first change stands");
+        // A session ended in between (Settings > Sessions) refuses it too.
+        let now = c.with(|x| find_user(x, ada)).unwrap().unwrap();
+        c.with(|x| x.execute("DELETE FROM sessions WHERE id = ?", [mine])).unwrap();
+        assert!(!c.tx(|tx| Ok(change_password(tx, ada, Some(mine), &now.password_digest, &test_password())?)).unwrap());
+        assert!(c.with(|x| authenticate_by(x, "ada@example.com", &new)).unwrap().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_email_change_in_flight_across_a_takeover_is_refused_and_changes_nothing() {
+        let (dir, c) = temp();
+        let (loaded, session, _) = in_flight_across_a_takeover(&c);
+        assert!(!c.tx(|tx| Ok(change_email(tx, loaded.id, Some(session), &loaded.password_digest, "mine@evil.test")?)).unwrap());
+        let now = c.with(|x| find_user(x, loaded.id)).unwrap().unwrap();
+        assert_eq!((now.email.as_str(), now.verified), ("lead@example.com", true), "the vouched address stays, verified");
+
+        // A valid change still works: unverified, other sessions ended.
+        let ada = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
+        let mine = c.with(|x| create_session(x, ada, None, None)).unwrap();
+        let other = c.with(|x| create_session(x, ada, None, None)).unwrap();
+        let ada_user = c.with(|x| find_user(x, ada)).unwrap().unwrap();
+        assert!(c.tx(|tx| Ok(change_email(tx, ada, Some(mine), &ada_user.password_digest, "ada@new.test")?)).unwrap());
+        let now = c.with(|x| find_user(x, ada)).unwrap().unwrap();
+        assert_eq!((now.email.as_str(), now.verified), ("ada@new.test", false));
+        assert!(c.with(|x| find_session(x, mine)).unwrap().is_some() && c.with(|x| find_session(x, other)).unwrap().is_none());
+
+        // Its session ended in between: refused.
+        c.with(|x| x.execute("DELETE FROM sessions WHERE id = ?", [mine])).unwrap();
+        assert!(!c.tx(|tx| Ok(change_email(tx, ada, Some(mine), &now.password_digest, "ada@other.test")?)).unwrap());
+        assert_eq!(c.with(|x| find_user(x, ada)).unwrap().unwrap().email, "ada@new.test");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Token issuance (profile_generate_token) asks `acting_as` in its
+    /// transaction: a session the takeover ended mints nothing.
+    #[test]
+    fn a_session_ended_by_a_takeover_no_longer_acts_for_its_user() {
+        let (dir, c) = temp();
+        let (loaded, session, _) = in_flight_across_a_takeover(&c);
+        assert!(!c.with(|x| acting_as(x, loaded.id, Some(session), None)).unwrap(), "the registrant's session is gone");
+        let live = c.with(|x| create_session(x, loaded.id, None, None)).unwrap();
+        assert!(c.with(|x| acting_as(x, loaded.id, Some(live), None)).unwrap(), "a live session of the user acts");
+        let owner = c.with(|x| find_user_by_email(x, "owner@example.com")).unwrap().unwrap();
+        assert!(!c.with(|x| acting_as(x, owner.id, Some(live), None)).unwrap(), "someone else's session never acts for a user");
+        assert!(!c.with(|x| acting_as(x, loaded.id, None, None)).unwrap(), "nor does no session");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
