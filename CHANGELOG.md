@@ -7,6 +7,33 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- Security: `railwatch env create` and `env import` no longer put an
+  environment into an account a user owns. They looked their account up by
+  the slug `default` (or `default-<N>d`), and a dashboard user could register
+  that slug by naming an account "Default". The next environment the
+  operator created from the command line then belonged to that user, who
+  read everything sent to it. Dashboard accounts can no longer take those
+  slugs, and the CLI only uses an account under that name that has no
+  members, creating its own (`default-cli`) when a user already holds it.
+  If you have used `env create` on a server where someone else could create
+  accounts, check which account your environments are in (Settings >
+  Applications in each account, or `railwatch env list`).
+- Security: an email verification link only verifies the address it was
+  sent to. The link was checked in one database call and `verified` was
+  written in another, by user id alone. Replaying a link for an address you
+  own while changing the account to an address you do not could, with the
+  right timing, mark that second address verified. That defeats the owner's
+  way of taking a squatted address back (a password reset only removes the
+  squatter's sessions and tokens from an unverified row) and lets the
+  owner's first Google sign-in link onto the squatter's account. The write
+  now names the address the link proved.
+- Security: a browser error's user agent needs the `security` scope
+  everywhere. `get_issue`, `investigate_issue`, `GET /api/v1/issues/:id` and
+  the exceptions of `GET /api/v1/.../executions/:id` returned an exception's
+  stored `context` whole, and for a JavaScript error that includes
+  `context.browser.user_agent`. A token without the scope got it there while
+  every request row withheld the same value. That one key is now left out
+  without the scope; the rest of the context is unchanged.
 - Dependencies: rusqlite 0.43, sha2, md-5 and chacha20poly1305 0.11, hmac
   0.13, bcrypt 0.19, jsonwebtoken 12, croner 4, toml 1,
   base64 0.23, getrandom 0.4 and sigstore 0.16 (#99); lucide-react 1.74 and

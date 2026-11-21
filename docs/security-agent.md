@@ -23,7 +23,10 @@ The box is unchecked by default. With the scope:
 - `query_requests` can group by `ip` and `user_agent` and count
   `distinct_ips` and `distinct_user_agents`;
 - `ip_activity` answers (it is about one address);
-- `security_summary` includes its address-level findings.
+- `security_summary` includes its address-level findings;
+- a browser error's occurrence (`get_issue`, `investigate_issue`, the API's
+  issue and execution pages) keeps `context.browser.user_agent`. Without the
+  scope that one key is left out and the rest of the context stays.
 
 Without the scope the tools still answer. Those fields, metrics and
 findings are left out, and an `access` object in the result says so. The
