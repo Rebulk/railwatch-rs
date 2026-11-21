@@ -119,7 +119,7 @@ ingest_batches 2, no id twice; the retry answers `committed` (or
 
 | tier | files | default | knob |
 |---|---|---|---|
-| detail | `detail/<day>` | 7 days | `RAILWATCH_DETAIL_RETENTION_DAYS` |
+| detail | `detail/<day>` | 7 days | `RAILWATCH_DETAIL_RETENTION_DAYS` (log lines matching `RAILWATCH_KEEP_LOGS_MATCHING` are copied to core first) |
 | core | `core/<day>` | the account's `retention_days` (30), capped | `RAILWATCH_CORE_RETENTION_DAYS_MAX` (90) |
 | rollups, release_health | meta, DELETE | 13 months | (PruneTelemetryJob's) |
 

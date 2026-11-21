@@ -242,6 +242,7 @@ refused). `railwatch doctor` prints every setting and where it came from.
 | `BACKUP_S3_REGION`, `_PREFIX` | `us-east-1`, none | |
 | `BACKUP_INTERVAL_SECONDS` | 300 | |
 | `DETAIL_RETENTION_DAYS` | 7 | queries, logs, spans, cache and view events |
+| `KEEP_LOGS_MATCHING` | | log message prefixes, `\|`-separated, kept as long as requests instead (e.g. `{"event":"auth.\|{"event":"mcp.` for an app's security lines). Exact and case-sensitive; at most 32 |
 | `CORE_RETENTION_DAYS_MAX` | 90 | cap on an environment's retention |
 | `MAX_DATA_BYTES` | off | size budget for telemetry (`5G`, `500M`, bytes). Over it, the oldest day files are deleted, detail days before core days; never today's, rollups or the control DB. Still over with only today's files left, ingest answers 503 + `Retry-After`. For a server sharing its disk with an app ([below](#disk-budget)) |
 | `MIN_FREE_BYTES` | off | below this much free space on the data dir's filesystem, ingest answers 503 + `Retry-After` (the gem keeps its buffer and retries) |

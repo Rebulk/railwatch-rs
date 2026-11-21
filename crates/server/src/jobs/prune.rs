@@ -113,7 +113,7 @@ pub fn prune_days(
     dir: &std::path::Path,
     meta: &Connection,
     env: i64,
-    tiers: crate::storage::retention::Tiers,
+    tiers: &crate::storage::retention::Tiers,
 ) -> Result<crate::storage::retention::Pruned, String> {
     let e = |e: rusqlite::Error| e.to_string();
     let now = time::now_micros();

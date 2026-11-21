@@ -205,13 +205,13 @@ impl Worker {
             }
             TenantWork::Prune { env, slug } => {
                 let control = self.control.clone();
-                let tiers = self.tiers;
+                let tiers = self.tiers.clone();
                 let t = self.tenant(env, &slug).map_err(e)?;
                 t.acc.clear();
                 t.users.clear();
                 match t.days.as_ref().map(|(d, _)| d.clone()) {
                     Some(dir) => {
-                        let p = super::prune::prune_days(&control, &dir, &t.write, env, tiers)?;
+                        let p = super::prune::prune_days(&control, &dir, &t.write, env, &tiers)?;
                         // As after the disk budget: every handle to the
                         // deleted files goes, or their space stays in use.
                         if p.detail_files + p.core_files > 0 {

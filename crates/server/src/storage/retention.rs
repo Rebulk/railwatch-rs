@@ -21,19 +21,24 @@ use super::exemplars;
 use super::layout::{self, Tier};
 
 /// Tier lengths (Config: RAILWATCH_DETAIL_RETENTION_DAYS,
-/// RAILWATCH_CORE_RETENTION_DAYS_MAX, RAILWATCH_EXEMPLARS_PER_HOUR).
-#[derive(Debug, Clone, Copy)]
+/// RAILWATCH_CORE_RETENTION_DAYS_MAX, RAILWATCH_EXEMPLARS_PER_HOUR,
+/// RAILWATCH_KEEP_LOGS_MATCHING).
+#[derive(Debug, Clone)]
 pub struct Tiers {
     pub detail_days: i64,
     /// The core tier follows the account's retention_days up to this cap.
     pub core_days_max: i64,
     /// Slowest executions kept per (kind, group, hour); errored ones always.
     pub exemplars_per_hour: usize,
+    /// Log messages starting with one of these are copied to the core file
+    /// with the exemplars, so they live as long as the requests do (an app's
+    /// audit or security lines, e.g. `{"event":"auth.`). Empty: none.
+    pub keep_logs_matching: Vec<String>,
 }
 
 impl Default for Tiers {
     fn default() -> Self {
-        Tiers { detail_days: 7, core_days_max: 90, exemplars_per_hour: 3 }
+        Tiers { detail_days: 7, core_days_max: 90, exemplars_per_hour: 3, keep_logs_matching: Vec::new() }
     }
 }
 
@@ -68,7 +73,7 @@ fn floor_day(micros: i64) -> i64 {
 /// write lock: every ingest transaction holds it from BEGIN to COMMIT
 /// (writer.rs), so no batch can be writing into a file as it goes, and the
 /// writer reopens a cached file that is gone before its next transaction.
-pub fn prune(dir: &Path, meta: &Connection, tiers: Tiers, retention_days: i64, now_micros: i64) -> rusqlite::Result<Pruned> {
+pub fn prune(dir: &Path, meta: &Connection, tiers: &Tiers, retention_days: i64, now_micros: i64) -> rusqlite::Result<Pruned> {
     let mut out = Pruned::default();
     let core_days = retention_days.clamp(1, tiers.core_days_max);
     let detail_days = tiers.detail_days.clamp(1, core_days);
@@ -81,7 +86,7 @@ pub fn prune(dir: &Path, meta: &Connection, tiers: Tiers, retention_days: i64, n
     // Exemplars first, outside meta's lock (each copy is its own
     // transaction on the core file, idempotent by its marker).
     for day in &detail_expired {
-        let c = exemplars::copy(dir, day, tiers.exemplars_per_hour)?;
+        let c = exemplars::copy(dir, day, tiers.exemplars_per_hour, &tiers.keep_logs_matching)?;
         out.exemplar_executions += c.executions;
         out.exemplar_rows += c.rows;
     }
@@ -166,7 +171,7 @@ mod tests {
         }
         meta.execute("INSERT INTO rollups (record_type, group_hash, bucket, name, count) VALUES ('request', 'g', '2025-08-01 00:00:00', 'x', 1), ('request', 'g', '2026-10-01 00:00:00', 'x', 1)", [])
             .unwrap();
-        let p = prune(&dir, &meta, Tiers::default(), 30, now).unwrap();
+        let p = prune(&dir, &meta, &Tiers::default(), 30, now).unwrap();
         // core: 30 days before 2026-10-14 12:00 floors to 2026-09-14 00:00;
         // days ending at or before it go: only 09-10 (both its files).
         assert_eq!(layout::days(&dir, Tier::Core), vec!["2026-09-14", "2026-09-15", "2026-10-06", "2026-10-07", "2026-10-14"]);
@@ -180,6 +185,47 @@ mod tests {
         let kept: i64 =
             Connection::open(day_path(&dir, Tier::Core, "2026-10-06")).unwrap().query_row("SELECT COUNT(*) FROM queries", [], |r| r.get(0)).unwrap();
         assert_eq!(kept, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The point of keep_logs_matching: a day past detail retention is
+    /// deleted, and its security line is still there, in the core file.
+    #[test]
+    fn a_kept_log_line_outlives_its_detail_day() {
+        let dir = std::env::temp_dir().join(format!("rw-retention-keep-{}", crate::control::base58(8)));
+        let meta = open_or_create(&meta_path(&dir)).unwrap();
+        let now = crate::time::parse_db_time("2026-10-14 12:00:00").unwrap();
+        let day = "2026-10-01";
+        let c = open_or_create(&day_path(&dir, Tier::Core, day)).unwrap();
+        for i in 1..=4i64 {
+            c.execute(
+                "INSERT INTO executions (id, execution_id, kind, name, group_hash, status, occurred_at, duration) VALUES (?, ?, 'request', 'POST /x', 'g', 401, ?, ?)",
+                rusqlite::params![i, format!("e{i}"), format!("{day} 10:00:0{i}"), i as f64],
+            )
+            .unwrap();
+        }
+        let d = open_or_create(&day_path(&dir, Tier::Detail, day)).unwrap();
+        d.execute(
+            r#"INSERT INTO logs (id, level, message, execution_id, occurred_at) VALUES (1, 'warn', '{"event":"auth.login","outcome":"failed"}', 'e1', ?)"#,
+            [format!("{day} 10:00:01")],
+        )
+        .unwrap();
+        d.execute("INSERT INTO logs (id, level, message, execution_id, occurred_at) VALUES (2, 'info', 'noise', 'e1', ?)", [format!("{day} 10:00:01")])
+            .unwrap();
+        drop((c, d));
+        let tiers = Tiers { keep_logs_matching: vec![r#"{"event":"auth."#.into()], ..Tiers::default() };
+        let p = prune(&dir, &meta, &tiers, 30, now).unwrap();
+        assert_eq!(p.detail_files, 1);
+        assert!(layout::days(&dir, Tier::Detail).is_empty());
+        let messages: Vec<String> = Connection::open(day_path(&dir, Tier::Core, day))
+            .unwrap()
+            .prepare("SELECT message FROM logs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(messages, vec![r#"{"event":"auth.login","outcome":"failed"}"#.to_string()], "e1 is not an exemplar (3 slowest of 4)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
