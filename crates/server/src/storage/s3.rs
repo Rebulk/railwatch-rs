@@ -25,7 +25,7 @@ fn hex(b: &[u8]) -> String {
 }
 
 fn hmac(key: &[u8], data: &str) -> Vec<u8> {
-    let mut m = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
+    let mut m = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key).expect("hmac key");
     m.update(data.as_bytes());
     m.finalize().into_bytes().to_vec()
 }

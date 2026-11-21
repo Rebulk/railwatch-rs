@@ -55,7 +55,7 @@ pub struct SettingsCipher([u8; 32]);
 
 impl SettingsCipher {
     pub fn new(secret_key_base: &[u8]) -> SettingsCipher {
-        let mut m = <Hmac<Sha256> as Mac>::new_from_slice(secret_key_base).expect("any key length");
+        let mut m = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(secret_key_base).expect("any key length");
         m.update(b"railwatch integration settings");
         SettingsCipher(m.finalize().into_bytes().into())
     }
@@ -66,7 +66,7 @@ impl SettingsCipher {
         getrandom::fill(&mut nonce).expect("random");
         let json = serde_json::to_vec(plain).expect("a JSON object serializes");
         let mut out = nonce.to_vec();
-        out.extend(cipher.encrypt(XNonce::from_slice(&nonce), json.as_slice()).expect("encrypt"));
+        out.extend(cipher.encrypt(&XNonce::from(nonce), json.as_slice()).expect("encrypt"));
         format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(out))
     }
 
@@ -80,7 +80,7 @@ impl SettingsCipher {
             }
             let cipher = XChaCha20Poly1305::new((&self.0).into());
             let plain = cipher
-                .decrypt(XNonce::from_slice(&raw[..24]), &raw[24..])
+                .decrypt(&XNonce::try_from(&raw[..24]).expect("24-byte nonce, length checked above"), &raw[24..])
                 .map_err(|_| "integration secrets cannot be decrypted with this secret_key_base; re-enter them in Settings > Integrations".to_string())?;
             return match serde_json::from_slice(&plain) {
                 Ok(Value::Object(m)) => Ok(m),

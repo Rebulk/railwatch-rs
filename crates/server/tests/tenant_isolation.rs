@@ -842,7 +842,8 @@ fn snapshot(fx: &Fx) -> Vec<String> {
             h.update(f.to_string_lossy().as_bytes());
             h.update(std::fs::read(f).unwrap_or_default());
         }
-        out.push(format!("{} sourcemaps {} files {:x}", e.slug, files.len(), h.finalize()));
+        let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        out.push(format!("{} sourcemaps {} files {digest}", e.slug, files.len()));
     }
     out
 }
