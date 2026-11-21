@@ -147,6 +147,15 @@ pub fn history(c: &Connection, environment_id: i64, now: i64, lookback_hours: i6
         h.open.insert(a, sev(&v));
     }
     let mut s = c.prepare_cached(
+        "SELECT i.actor, MIN(s.first_at) FROM security_incidents i JOIN security_incident_signals s ON s.incident_id = i.id
+         WHERE i.environment_id = ? AND i.status = 'open' AND s.severity IN ('high', 'critical') AND s.detector NOT IN ('risky_signup', 'repeat_signup')
+         GROUP BY i.actor LIMIT 10000",
+    )?;
+    for r in s.query_map([environment_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        let (a, t) = r?;
+        h.flagged_since.insert(a, t);
+    }
+    let mut s = c.prepare_cached(
         "SELECT user_ref, ip, signed_up_at FROM security_accounts WHERE environment_id = ? AND signed_up_at >= ? ORDER BY signed_up_at DESC LIMIT 10000",
     )?;
     for r in s.query_map(params![environment_id, now - lookback_hours.max(1) * 3600 * 1_000_000], |r| {
@@ -173,10 +182,13 @@ pub fn apply(
 ) -> rusqlite::Result<Applied> {
     c.execute_batch("BEGIN IMMEDIATE")?;
     match apply_in(c, t, app, w, signals, events, now, base_url) {
-        Ok(a) => {
-            c.execute_batch("COMMIT")?;
-            Ok(a)
-        }
+        Ok(a) => match c.execute_batch("COMMIT") {
+            Ok(()) => Ok(a),
+            Err(e) => {
+                let _ = c.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        },
         Err(e) => {
             let _ = c.execute_batch("ROLLBACK");
             Err(e)
@@ -582,10 +594,13 @@ pub fn digest(c: &Connection, t: &Target, app: &AppPolicy, w: &Watcher, now: i64
         Ok(alert)
     })();
     match r {
-        Ok(v) => {
-            c.execute_batch("COMMIT")?;
-            Ok(v)
-        }
+        Ok(v) => match c.execute_batch("COMMIT") {
+            Ok(()) => Ok(v),
+            Err(e) => {
+                let _ = c.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        },
         Err(e) => {
             let _ = c.execute_batch("ROLLBACK");
             Err(e)

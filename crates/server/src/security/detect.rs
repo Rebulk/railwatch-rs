@@ -32,6 +32,11 @@ const MIN_US: i64 = 60_000_000;
 pub struct History {
     /// Open incidents' severity by actor.
     pub open: HashMap<String, Severity>,
+    /// Per actor with an open incident: the earliest time a signal of at
+    /// least high, other than a signup's own, was first met. A signup is
+    /// "already flagged" only by evidence from before it, never by the
+    /// incident it opened itself.
+    pub flagged_since: HashMap<String, i64>,
     /// Accounts seen signing up: user ref -> (address, when).
     pub accounts: HashMap<String, (Option<String>, i64)>,
 }
@@ -231,7 +236,7 @@ pub fn detect(input: &Input, policy: &AppPolicy, hosting: &dyn HostingClassifier
         let mut d: Vec<&'static str> =
             address_signals.iter().filter(|s| s.actor == ip && s.at <= at && s.severity >= Severity::High).map(|s| s.detector).collect();
         d.dedup();
-        if d.is_empty() && history.open.get(ip).is_some_and(|s| *s >= Severity::High) {
+        if d.is_empty() && history.flagged_since.get(ip).is_some_and(|t| *t < at) {
             d.push("an open incident");
         }
         d
@@ -533,8 +538,12 @@ mod tests {
         assert_eq!(names(&s), [("secrets_probe", "high"), ("risky_signup", "critical")]);
         let mut h = History::default();
         h.open.insert(ip.into(), Severity::High);
+        h.flagged_since.insert(ip.into(), T0 - 60 * S);
         let s = detect(&Input { events: vec![signup(0, ip, "41", browser, "example.com")], ..Default::default() }, &app(), &NoHosting, &h);
         assert_eq!(names(&s), [("risky_signup", "critical")], "flagged in an earlier evaluation");
+        h.flagged_since.insert(ip.into(), T0 + 60 * S);
+        let s = detect(&Input { events: vec![signup(0, ip, "41", browser, "example.com")], ..Default::default() }, &app(), &NoHosting, &h);
+        assert_eq!(names(&s), [("risky_signup", "info")], "evidence after the signup does not flag it");
     }
 
     #[test]

@@ -446,3 +446,36 @@ fn a_per_day_tenant_is_read_like_a_single_file() {
     assert_eq!((o.requests, o.events), (3, 1));
     assert_eq!(f.incidents(), [(ATTACKER.into(), "high".into(), "open".into())]);
 }
+
+/// Review r1 P1: a signup with one risk feature opens a HIGH incident; the
+/// next ticks re-read the same signup and must not find it "already
+/// flagged" by the incident it opened itself (that escalated it to
+/// critical and alerted twice for one event).
+#[test]
+fn a_signup_never_flags_itself_on_a_later_tick() {
+    let mut f = Fx::new("self-flag");
+    let p = policy(&f);
+    f.event(T0, "security.signup", json!({"ip": ATTACKER, "user_agent": BROWSER, "user_id": 501, "email_domain": "mailinator.com"}));
+    for k in 1..=8 {
+        f.tick(&p, T0 + k * 15 * S);
+    }
+    assert_eq!(f.incidents(), [(ATTACKER.into(), "high".into(), "open".into())]);
+    assert_eq!(f.alerts(), [("security_incident".into(), "opened".into(), "high".into())], "one event, one alert");
+    // Probes that come AFTER the signup do not retroactively make it critical either.
+    for i in 0..3 {
+        f.req(T0 + 3 * MIN + i * S, ATTACKER, BROWSER, "GET", "/.env", 404, None, None);
+    }
+    f.tick(&p, T0 + 4 * MIN);
+    f.tick(&p, T0 + 4 * MIN + 15 * S);
+    assert_eq!(f.incidents(), [(ATTACKER.into(), "high".into(), "open".into())], "still high: the probe came later");
+    // A second address that probed BEFORE its signup is critical at once.
+    let other = "198.51.100.44";
+    for i in 0..3 {
+        f.req(T0 + 5 * MIN + i * S, other, BROWSER, "GET", "/.git/config", 404, None, None);
+    }
+    f.tick(&p, T0 + 6 * MIN);
+    f.event(T0 + 20 * MIN, "security.signup", json!({"ip": other, "user_agent": BROWSER, "user_id": 502, "email_domain": "example.com"}));
+    f.tick(&p, T0 + 20 * MIN + 15 * S);
+    let sev: String = f.c.with(|x| x.query_row("SELECT severity FROM security_incidents WHERE actor = ?", [other], |r| r.get(0))).unwrap();
+    assert_eq!(sev, "critical", "flagged by an earlier evaluation's probe, now outside the window");
+}
