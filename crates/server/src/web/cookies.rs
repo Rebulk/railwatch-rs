@@ -199,7 +199,8 @@ mod tests {
     /// Every value this server signs must verify, whatever its MAC looks like.
     #[test]
     fn a_signed_value_verifies_when_its_mac_contains_the_separator() {
-        let k = Keys::new(b"0123456789abcdef0123456789abcdef");
+        // A key made here, not written into the source: any key shows it.
+        let k = Keys::new(crate::control::base58(32).as_bytes());
         let mut seen = 0;
         for i in 0..5_000 {
             let value = format!("{i}.token");
