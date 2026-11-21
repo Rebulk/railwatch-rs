@@ -1454,7 +1454,7 @@ fn serve() -> ExitCode {
                 tenants.release_deleted(Duration::from_secs(2));
             }
         };
-        let jobs = railwatch_server::jobs::start_with(control.clone(), cfg.tenants_dir(), cfg.tiers, Some(Box::new(release.clone())));
+        let jobs = railwatch_server::jobs::start_with(control.clone(), cfg.tenants_dir(), cfg.tiers.clone(), Some(Box::new(release.clone())));
         if let Some(b) = cfg.backup.clone() {
             tracing::info!(endpoint = %b.s3.endpoint, bucket = %b.s3.bucket, every = b.interval_secs, "backups on");
             let c = control.clone();

@@ -12,6 +12,12 @@
 //! space), so the reader's union view and `export` see each row once.
 //! The copy is idempotent: INSERT OR IGNORE by id, and a marker row in the
 //! core file's ar_internal_metadata records that the day is done.
+//!
+//! Besides the exemplars' own logs, every log line whose message starts with
+//! one of `keep_logs` (RAILWATCH_KEEP_LOGS_MATCHING) is copied whatever its
+//! execution: an app's audit or security lines then live as long as the
+//! requests they describe, and stay findable by full-text search, while the
+//! rest of the detail tier goes on schedule.
 
 use std::path::Path;
 
@@ -38,7 +44,7 @@ const ERRORED: &str = "(CASE kind \
     ELSE 0 END)";
 
 /// Copies the exemplars of `day` from its detail file into its core file.
-pub fn copy(dir: &Path, day: &str, slowest: usize) -> rusqlite::Result<Copied> {
+pub fn copy(dir: &Path, day: &str, slowest: usize, keep_logs: &[String]) -> rusqlite::Result<Copied> {
     let core_path = layout::day_path(dir, Tier::Core, day);
     let detail_path = layout::day_path(dir, Tier::Detail, day);
     if !core_path.is_file() || !detail_path.is_file() {
@@ -70,21 +76,25 @@ pub fn copy(dir: &Path, day: &str, slowest: usize) -> rusqlite::Result<Copied> {
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<_>>()?;
             let cols = cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+            let (keep, prefixes) = if *t == "logs" { kept_logs(keep_logs) } else { (String::new(), Vec::new()) };
             if *t == "logs" {
                 // logs_fts is external-content: its rowids read through to
                 // logs, so the new rows must be listed before they land.
-                core.execute_batch(
-                    "CREATE TEMP TABLE IF NOT EXISTS exemplar_logs (id INTEGER PRIMARY KEY); DELETE FROM exemplar_logs;
-                     INSERT INTO exemplar_logs (id) SELECT id FROM d.logs
-                     WHERE execution_id IN (SELECT execution_id FROM exemplar_ids) AND id NOT IN (SELECT id FROM main.logs);",
+                core.execute_batch("CREATE TEMP TABLE IF NOT EXISTS exemplar_logs (id INTEGER PRIMARY KEY); DELETE FROM exemplar_logs;")?;
+                core.execute(
+                    &format!(
+                        "INSERT INTO exemplar_logs (id) SELECT id FROM d.logs
+                         WHERE (execution_id IN (SELECT execution_id FROM exemplar_ids){keep}) AND id NOT IN (SELECT id FROM main.logs)"
+                    ),
+                    rusqlite::params_from_iter(prefixes.iter()),
                 )?;
             }
             let n = core.execute(
                 &format!(
                     "INSERT OR IGNORE INTO main.\"{t}\" ({cols}) SELECT {cols} FROM d.\"{t}\" \
-                     WHERE execution_id IN (SELECT execution_id FROM exemplar_ids) ORDER BY id"
+                     WHERE execution_id IN (SELECT execution_id FROM exemplar_ids){keep} ORDER BY id"
                 ),
-                [],
+                rusqlite::params_from_iter(prefixes.iter()),
             )? as i64;
             if *t == "logs" {
                 core.execute("INSERT INTO logs_fts(rowid, message) SELECT id, message FROM main.logs WHERE id IN (SELECT id FROM exemplar_logs)", [])?;
@@ -108,6 +118,14 @@ pub fn copy(dir: &Path, day: &str, slowest: usize) -> rusqlite::Result<Copied> {
             Err(e)
         }
     }
+}
+
+/// The `OR instr(message, ?) = 1` clause that keeps `prefixes` (one
+/// placeholder each: an exact, case-sensitive prefix, nothing to escape), and
+/// its values.
+fn kept_logs(prefixes: &[String]) -> (String, Vec<String>) {
+    let clause = prefixes.iter().map(|_| " OR instr(message, ?) = 1").collect::<String>();
+    (clause, prefixes.to_vec())
 }
 
 pub fn done(core: &Connection) -> rusqlite::Result<bool> {
@@ -151,16 +169,76 @@ mod tests {
         }
         detail.execute("INSERT INTO logs_fts(rowid, message) SELECT id, message FROM logs", []).unwrap();
         drop((core, detail));
-        let c = copy(&dir, day, 3).unwrap();
+        let c = copy(&dir, day, 3, &[]).unwrap();
         // slowest 3 (#10, #9, #8) + the errored #3
         assert_eq!(c, Copied { executions: 4, rows: 4 * 3 });
-        assert_eq!(copy(&dir, day, 3).unwrap(), Copied::default(), "idempotent");
+        assert_eq!(copy(&dir, day, 3, &[]).unwrap(), Copied::default(), "idempotent");
         let core = Connection::open(day_path(&dir, Tier::Core, day)).unwrap();
         let kept: Vec<String> =
             core.prepare("SELECT DISTINCT execution_id FROM queries ORDER BY 1").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
         assert_eq!(kept, vec!["e10", "e3", "e8", "e9"]);
         let fts: i64 = core.query_row("SELECT COUNT(*) FROM logs_fts WHERE logs_fts MATCH 'hello'", [], |r| r.get(0)).unwrap();
         assert_eq!(fts, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A security line on an ordinary request (not an exemplar) must outlive
+    /// the detail day, and stay findable by full-text search; other lines of
+    /// that request, a line in another case, and a prefix found mid-message
+    /// must not.
+    #[test]
+    fn keeps_log_lines_matching_a_prefix_whatever_their_execution() {
+        let dir = std::env::temp_dir().join(format!("rw-exemplars-keep-{}", crate::control::base58(8)));
+        open_or_create(&meta_path(&dir)).unwrap();
+        let day = "2026-10-01";
+        let core = open_or_create(&day_path(&dir, Tier::Core, day)).unwrap();
+        let detail = open_or_create(&day_path(&dir, Tier::Detail, day)).unwrap();
+        // Two requests of one route in one hour: with slowest = 1 only #2 is
+        // an exemplar; #1 is the probe's ordinary request.
+        for i in 1..=2i64 {
+            core.execute(
+                "INSERT INTO executions (id, execution_id, kind, name, group_hash, status, occurred_at, duration) VALUES (?, ?, 'request', 'POST /sign_in', 'g', 302, ?, ?)",
+                rusqlite::params![i, format!("e{i}"), format!("{day} 10:0{i}:00"), i as f64],
+            )
+            .unwrap();
+        }
+        let lines: [(i64, Option<&str>, &str); 5] = [
+            (1, Some("e1"), r#"{"event":"auth.login","ip":"203.0.113.9","outcome":"failed"}"#),
+            (2, Some("e1"), "an ordinary line of the same request"),
+            (3, None, r#"{"event":"mcp.call","ip":"203.0.113.9","tool":"rebulk_search_actions"}"#),
+            (4, Some("e1"), r#"{"EVENT":"auth.login","ip":"203.0.113.9"}"#),
+            (5, Some("e1"), r#"prefix later: {"event":"auth.login","ip":"203.0.113.9"}"#),
+        ];
+        for (id, exe, message) in lines {
+            detail
+                .execute(
+                    "INSERT INTO logs (id, level, message, execution_id, occurred_at) VALUES (?, 'info', ?, ?, ?)",
+                    rusqlite::params![id, message, exe, format!("{day} 10:01:00")],
+                )
+                .unwrap();
+        }
+        detail
+            .execute(
+                "INSERT INTO logs (id, level, message, execution_id, occurred_at) VALUES (6, 'info', 'exemplar line', 'e2', ?)",
+                [format!("{day} 10:02:00")],
+            )
+            .unwrap();
+        detail.execute("INSERT INTO logs_fts(rowid, message) SELECT id, message FROM logs", []).unwrap();
+        drop((core, detail));
+
+        let keep = vec![r#"{"event":"auth."#.to_string(), r#"{"event":"mcp."#.to_string()];
+        copy(&dir, day, 1, &keep).unwrap();
+        let core = Connection::open(day_path(&dir, Tier::Core, day)).unwrap();
+        let ids: Vec<i64> = core.prepare("SELECT id FROM logs ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(ids, vec![1, 3, 6], "the two security lines and the exemplar's line");
+        let fts: Vec<i64> = core
+            .prepare("SELECT rowid FROM logs_fts WHERE logs_fts MATCH '\"203.0.113.9\"' ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(fts, vec![1, 3], "searchable by the address in the core file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

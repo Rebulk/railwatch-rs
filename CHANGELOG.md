@@ -7,6 +7,15 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- Added: `RAILWATCH_KEEP_LOGS_MATCHING`, log message prefixes (separated by
+  `|`) kept for the core tier's retention instead of the detail tier's 7
+  days. Before a detail day is deleted, every log line starting with one of
+  them is copied into that day's core file with the exemplars, whatever its
+  request, and stays searchable. Meant for an app's audit or security lines
+  (`{"event":"auth.|{"event":"mcp.`): after an incident, the requests were
+  still there at day 14 but the lines saying what each one did were gone at
+  day 7. Off by default; nothing changes without it.
+
 - Security: the session cookie now carries a random per-session token
   beside the session id (`sessions.token`, a new nullable column). The id
   is a counter, and a restore from backup puts the counter back while

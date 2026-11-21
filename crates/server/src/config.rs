@@ -269,6 +269,20 @@ fn bytes(v: Option<String>, key: &str) -> Result<u64, String> {
     v.map_or(Ok(0), |s| parse_bytes(&s).ok_or_else(|| format!("{key}: expected a size like 5G, 500M or 1073741824, got {s:?}")))
 }
 
+/// RAILWATCH_KEEP_LOGS_MATCHING: message prefixes separated by `|` (a
+/// prefix is literal; `|` cannot be part of one). Blank pieces are dropped.
+pub fn keep_logs_matching(v: Option<String>) -> Result<Vec<String>, String> {
+    let Some(v) = v else { return Ok(Vec::new()) };
+    let out: Vec<String> = v.split('|').map(str::trim).filter(|p| !p.is_empty()).map(String::from).collect();
+    if out.len() > MAX_KEEP_LOG_PREFIXES {
+        return Err(format!("keep_logs_matching: at most {MAX_KEEP_LOG_PREFIXES} prefixes, got {}", out.len()));
+    }
+    Ok(out)
+}
+
+/// Each prefix is one more term in the copy's WHERE clause.
+const MAX_KEEP_LOG_PREFIXES: usize = 32;
+
 fn describe_bytes(n: u64) -> String {
     match n {
         0 => "(off)".into(),
@@ -367,6 +381,7 @@ impl Config {
             core_days_max: num(get("core_retention_days_max", &["RAILWATCH_CORE_RETENTION_DAYS_MAX"]), "core_retention_days_max", d.core_days_max as u64)?
                 as i64,
             exemplars_per_hour: num(get("exemplars_per_hour", &["RAILWATCH_EXEMPLARS_PER_HOUR"]), "exemplars_per_hour", d.exemplars_per_hour as u64)? as usize,
+            keep_logs_matching: keep_logs_matching(get("keep_logs_matching", &["RAILWATCH_KEEP_LOGS_MATCHING"]))?,
         };
         if tiers.detail_days < 1 || tiers.core_days_max < 1 {
             return Err("detail_retention_days and core_retention_days_max must be at least 1".into());
@@ -643,6 +658,11 @@ impl Config {
             ("detail_retention_days".into(), self.tiers.detail_days.to_string(), src("detail_retention_days")),
             ("core_retention_days_max".into(), self.tiers.core_days_max.to_string(), src("core_retention_days_max")),
             ("exemplars_per_hour".into(), self.tiers.exemplars_per_hour.to_string(), src("exemplars_per_hour")),
+            (
+                "keep_logs_matching".into(),
+                if self.tiers.keep_logs_matching.is_empty() { "(none)".into() } else { self.tiers.keep_logs_matching.join(" | ") },
+                src("keep_logs_matching"),
+            ),
             ("max_data_bytes".into(), describe_bytes(self.budget.max_data_bytes), src("max_data_bytes")),
             ("min_free_bytes".into(), describe_bytes(self.budget.min_free_bytes), src("min_free_bytes")),
             (
@@ -724,6 +744,16 @@ mod tests {
         c.trust_proxy = trust_proxy;
         c.tls = None;
         c
+    }
+
+    #[test]
+    fn keep_logs_matching_is_a_pipe_separated_list_of_literal_prefixes() {
+        assert_eq!(keep_logs_matching(None).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            keep_logs_matching(Some(r#"{"event":"auth.| {"event":"mcp." |"#.into())).unwrap(),
+            vec![r#"{"event":"auth."#.to_string(), r#"{"event":"mcp.""#.to_string()]
+        );
+        assert!(keep_logs_matching(Some(vec!["x"; 33].join("|"))).is_err());
     }
 
     #[test]
