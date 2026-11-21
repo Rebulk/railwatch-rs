@@ -28,6 +28,10 @@
 //!   nobody knows), a member of the proxy's account only, with one
 //!   long-lived session row reused on every request. CSRF is unchanged:
 //!   a state-changing request still needs the session's token.
+//! - An existing user with the claimed email is that user. If the row was
+//!   never verified, whoever created it has not shown the address is
+//!   theirs: `resolve` replaces its password and ends its sessions and
+//!   tokens before the proxy's membership is attached to it.
 //! - The proxy's account is bound in the control database (`trusted_proxy`,
 //!   control_schema): the account `railwatch setup` created. A proxied
 //!   request is pinned to it (session::Current::proxied): it cannot switch
@@ -188,6 +192,22 @@ pub fn resolve(c: &Connection, claims: &Claims) -> control::ModelResult<(Session
         control::ModelError::Invalid(vec![("base".into(), "the trusted proxy's account does not exist (deleted, or `railwatch setup` has not run)".into())])
     })?;
     let user = match control::find_user_by_email(c, &claims.email)? {
+        // An unverified row is not proof of who made it: with open sign-up
+        // anyone can register an address they do not own, with a password
+        // they know. The proxy vouches for the address now, so the row is
+        // its owner's from here, as when a password reset link is used
+        // (password_reset_update): a password nobody knows, verified, and
+        // whoever signed up loses their sessions and tokens. Without this
+        // their cookie session would act in the proxy's account.
+        Some(u) if !u.verified => {
+            let mut b = [0u8; 32];
+            getrandom::fill(&mut b).expect("random");
+            control::set_password(c, u.id, &URL_SAFE_NO_PAD.encode(b), None)?;
+            c.execute("UPDATE users SET verified = 1, updated_at = ? WHERE id = ?", params![control::now_db(), u.id])?;
+            c.execute("DELETE FROM api_tokens WHERE user_id = ?", [u.id])?;
+            tracing::warn!(user = u.id, "trusted proxy: an unverified user held the vouched address; its password, sessions and tokens are gone");
+            control::find_user(c, u.id)?.expect("still there")
+        }
         Some(u) => u,
         None => {
             let mut b = [0u8; 32];
@@ -315,6 +335,43 @@ mod tests {
         control.tx(|tx| resolve(tx, &c("member"))).unwrap();
         let left: i64 = control.with(|x| x.query_row("SELECT count(*) FROM invitations", [], |r| r.get(0))).unwrap();
         assert_eq!(left, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// With open sign-up anyone can register an address they do not own,
+    /// with a password they know. When the proxy later vouches for that
+    /// address, the membership it grants must not be usable by whoever
+    /// registered the row.
+    #[test]
+    fn an_unverified_user_holding_the_vouched_address_keeps_no_way_in() {
+        let dir = std::env::temp_dir().join(format!("rw-proxy-unverified-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let control = control::Control::open(&dir.join("control.sqlite3")).unwrap();
+        let owner = control.tx(|tx| control::insert_user(tx, "Owner", "owner@example.com", &control::test_password(), true)).unwrap();
+        let account = control.tx(|tx| control::create_account(tx, "Acme", owner)).unwrap();
+        control.tx(|tx| bind_account(tx, account)).unwrap();
+        let password = control::test_password();
+        let squatter = control.tx(|tx| control::insert_user(tx, "Lead", "lead@example.com", &password, false)).unwrap();
+        let their_session = control.with(|x| control::create_session(x, squatter, Some("the registrant's browser"), None)).unwrap();
+        assert!(control.with(|x| control::authenticate_by(x, "lead@example.com", &password)).unwrap().is_some(), "premise: they know the password");
+
+        let claims = Claims { email: "lead@example.com".into(), name: "Lead".into(), role: "admin".into(), exp: 0 };
+        let (session, user, _) = control.tx(|tx| resolve(tx, &claims)).unwrap();
+
+        assert_eq!((user.id, user.verified), (squatter, true), "one user per address, now vouched for");
+        let role: String = control
+            .with(|x| x.query_row("SELECT role FROM memberships WHERE account_id = ? AND user_id = ?", params![account, squatter], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(role, "admin", "the proxy's membership is attached");
+        assert!(control.with(|x| control::find_session(x, their_session)).unwrap().is_none(), "the registrant's session is gone");
+        assert!(control.with(|x| control::authenticate_by(x, "lead@example.com", &password)).unwrap().is_none(), "and their password no longer signs in");
+
+        // Once: a verified user's own later sign-ins are left alone.
+        let later = control.with(|x| control::create_session(x, squatter, Some("their own sign-in after a reset"), None)).unwrap();
+        let (again, _, _) = control.tx(|tx| resolve(tx, &claims)).unwrap();
+        assert_eq!(again.id, session.id, "the same proxy session row");
+        assert!(control.with(|x| control::find_session(x, later)).unwrap().is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

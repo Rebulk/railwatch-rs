@@ -369,6 +369,74 @@ async fn mounted_under_a_base_path_behind_a_trusted_proxy() {
     let off_me = http.get(format!("http://{off_addr}/railwatch/api/v1/me")).header(proxy_auth::HEADER, signed("agent@example.com", "member"));
     assert_eq!(off_me.send().await.unwrap().status(), 401, "off: the API ignores the header");
 
+    // An email the proxy signs for may already be a user here, with their
+    // own sign-ins and other accounts. The proxied request is that user in
+    // the proxy's account only: it does not see or end their own sessions,
+    // and it cannot delete them (which would remove them everywhere).
+    let (grace, grace_session, globex) = control
+        .tx(|tx| {
+            let boss = control::insert_user(tx, "Boss", "boss@example.com", &control::base58(16), true)?;
+            let globex = control::create_account(tx, "Globex", boss)?;
+            let grace = control::insert_user(tx, "Grace", "grace@example.com", &control::base58(16), true)?;
+            control::insert_membership(tx, globex, grace, "member")?;
+            // She signs in with Google, so deleting her user asks for a recent
+            // authentication instead of a password.
+            tx.execute("UPDATE users SET provider = 'google_oauth2', uid = 'g-grace' WHERE id = ?", [grace])?;
+            let session = control::create_session(tx, grace, Some("Grace's own browser"), Some("203.0.113.9"))?;
+            Ok((grace, session, globex))
+        })
+        .unwrap();
+    let as_grace = || signed("grace@example.com", "member");
+    let first = get(&page, Some(as_grace())).await.unwrap();
+    assert_eq!(first.status(), 200, "the proxy vouches for her in its account");
+    let (xsrf, rw_session) = (set_cookie(&first, "XSRF-TOKEN").expect("XSRF-TOKEN"), set_cookie(&first, "_railwatch_session").expect("session"));
+    let proxy_session: i64 = control
+        .with(|c| {
+            c.query_row("SELECT id FROM sessions WHERE user_id = ? AND user_agent = ?", rusqlite::params![grace, proxy_auth::SESSION_AGENT], |r| r.get(0))
+        })
+        .unwrap();
+    let delete = |path: String, body: serde_json::Value| {
+        http.delete(format!("{base}{path}"))
+            .header(proxy_auth::HEADER, as_grace())
+            .header("cookie", format!("_railwatch_session={rw_session}; XSRF-TOKEN={xsrf}"))
+            .header("x-xsrf-token", &xsrf)
+            .header("origin", &base)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+    };
+    let rows = |sql: &'static str, id: i64| control.with(move |c| c.query_row(sql, [id], |r| r.get::<_, i64>(0))).unwrap();
+
+    let listed = get("/railwatch/settings/sessions", Some(as_grace())).await.unwrap();
+    assert_eq!(listed.status(), 200);
+    let listed = listed.text().await.unwrap();
+    assert!(listed.contains(proxy_auth::SESSION_AGENT), "the proxy's own session is listed");
+    assert!(
+        !listed.contains("203.0.113.9") && !listed.contains("Grace&#39;s own browser") && !listed.contains("Grace's own browser"),
+        "her own sign-in (user agent, IP address) is not shown through the proxy"
+    );
+
+    let r = delete(format!("/railwatch/sessions/{grace_session}"), json!({})).await.unwrap();
+    assert_eq!(r.status(), 404, "her own session is not the proxy's to end");
+    assert_eq!(rows("SELECT count(*) FROM sessions WHERE id = ?", grace_session), 1);
+
+    // The proxy's session row was created a moment ago, which used to count
+    // as "recently authenticated" for a user who signs in with Google.
+    let r = delete("/railwatch/users".into(), json!({"confirmation": "grace@example.com"})).await.unwrap();
+    assert_eq!(r.status(), 403, "a proxied request cannot delete the user");
+    assert_eq!(rows("SELECT count(*) FROM users WHERE id = ?", grace), 1, "she still exists");
+    assert_eq!(rows("SELECT count(*) FROM memberships WHERE user_id = ?", grace), 2, "in Globex and in the proxy's account");
+    assert_eq!(rows("SELECT count(*) FROM memberships WHERE account_id = ?", globex), 2);
+
+    // Ending the proxy's own session is still allowed, and the row the next
+    // request creates is not a recent authentication either.
+    let r = delete(format!("/railwatch/sessions/{proxy_session}"), json!({})).await.unwrap();
+    assert_eq!(r.status(), 302, "the proxy's own session can be ended");
+    let r = delete("/railwatch/users".into(), json!({"confirmation": "grace@example.com"})).await.unwrap();
+    assert_eq!(r.status(), 403);
+    assert_eq!(rows("SELECT count(*) FROM users WHERE id = ?", grace), 1);
+    assert_eq!(rows("SELECT count(*) FROM sessions WHERE id = ?", grace_session), 1);
+
     unsafe {
         std::env::remove_var("RAILWATCH_BASE_PATH");
         std::env::remove_var("RAILWATCH_TRUSTED_PROXY_SECRET_FILE");
