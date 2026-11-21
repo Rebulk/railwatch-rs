@@ -7,6 +7,11 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+## v0.3.6 (2026-11-20)
+
+Upgrading: no migrations and nothing on disk changes.
+
+**Fixes from the second GA hunt**
 - `/up` reads the control database at most once a second. It is public and
   comes before every rate limit, so a flood of health checks no longer
   becomes a flood of reads on the connection every account shares (second
@@ -14,6 +19,11 @@ tag is a release candidate (marked pre-release, not "latest", so
 - A source-map upload that authenticated just before its environment was
   deleted is refused with 410 instead of recreating the deleted
   environment's directory (second GA hunt, P2).
+
+**Dependencies**
+- Frontend: Inertia 2.3.29, Tailwind 4.3.5, Vite 8.3.8, recharts 3.11.0 and
+  other minor updates. CI actions: pnpm/action-setup, install-action,
+  cosign-installer and action-gh-release patch updates.
 
 ## v0.3.5 (2026-11-19)
 
