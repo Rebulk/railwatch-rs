@@ -204,8 +204,9 @@ fn csrf_ok(headers: &HeaderMap, expected: &str) -> bool {
 async fn middleware(State(state): State<Arc<WebState>>, mut req: Request, next: Next) -> Response {
     let jar = cookies::parse(req.headers());
     let session = SessionHandle(Arc::new(Mutex::new(SessionData::load(&state.keys, &jar))));
-    let session_id: Option<i64> =
-        cookies::get(&jar, cookies::SESSION_TOKEN).and_then(|c| state.keys.verify(cookies::SESSION_TOKEN, c)).and_then(|v| v.parse().ok());
+    // "<session id>.<token>" (control::session_cookie).
+    let session_cookie: Option<String> = cookies::get(&jar, cookies::SESSION_TOKEN).and_then(|c| state.keys.verify(cookies::SESSION_TOKEN, c));
+    let had_session_cookie = session_cookie.is_some();
     let account_pref: Option<i64> =
         cookies::get(&jar, cookies::ACCOUNT_ID).and_then(|c| state.keys.verify(cookies::ACCOUNT_ID, c)).and_then(|v| v.parse().ok());
     let ip = state.client_ip(&req).to_string();
@@ -232,7 +233,7 @@ async fn middleware(State(state): State<Arc<WebState>>, mut req: Request, next: 
                 };
             }
             c.with(|conn| {
-                let Some(s) = session_id.map(|id| control::find_session(conn, id)).transpose()?.flatten() else {
+                let Some(s) = session_cookie.map(|v| control::find_session_by_cookie(conn, &v)).transpose()?.flatten() else {
                     return Ok(Ok((None, None, None)));
                 };
                 let user = control::find_user(conn, s.user_id)?;
@@ -257,7 +258,6 @@ async fn middleware(State(state): State<Arc<WebState>>, mut req: Request, next: 
     };
     // A session row without its user (deleted) is no session.
     let sess = sess.filter(|_| user.is_some());
-    let had_session_cookie = session_id.is_some();
     let current = Arc::new(Current { session: sess, user, account, user_agent, ip, proxy_role });
 
     let token = csrf_token(&session);
@@ -282,13 +282,21 @@ async fn middleware(State(state): State<Arc<WebState>>, mut req: Request, next: 
     let o = std::mem::take(&mut *outgoing.0.lock().unwrap());
     let mut set: Vec<SetCookie> = Vec::new();
     match o.session_token {
-        Some(Some(id)) => set.push(SetCookie {
-            name: cookies::SESSION_TOKEN,
-            value: Some(state.keys.sign(cookies::SESSION_TOKEN, &id.to_string())),
-            permanent: true,
-            http_only: true,
-            secure,
-        }),
+        Some(Some(id)) => match state.db(move |c| c.with(|x| control::session_cookie(x, id))).await {
+            Ok(Some(value)) => set.push(SetCookie {
+                name: cookies::SESSION_TOKEN,
+                value: Some(state.keys.sign(cookies::SESSION_TOKEN, &value)),
+                permanent: true,
+                http_only: true,
+                secure,
+            }),
+            // The session ended between the handler and here: no cookie.
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "reading the new session failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response();
+            }
+        },
         Some(None) => set.push(SetCookie { name: cookies::SESSION_TOKEN, value: None, permanent: false, http_only: true, secure }),
         None if had_session_cookie && current.session.is_none() => {
             // A cookie for a session that no longer exists: forget it.

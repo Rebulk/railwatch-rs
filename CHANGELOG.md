@@ -7,6 +7,14 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- Security: the session cookie now carries a random per-session token
+  beside the session id (`sessions.token`, a new nullable column). The id
+  is a counter, and a restore from backup puts the counter back while
+  `secret_key_base` is kept, so a cookie from before a restore could open
+  the session of whoever was given its id afterwards. Sessions that exist
+  at upgrade keep working with the cookie they have; every new sign-in gets
+  a token, and a cookie without one never opens a session that has one.
+  Nothing to do on upgrade or on restore.
 - Fixed: about one sign-in and one emailed link in a hundred did not work.
   A signed value is `<value>--<MAC>`, and it was split on the last `--`,
   but `-` is a character of the MAC's own encoding. A MAC that contained

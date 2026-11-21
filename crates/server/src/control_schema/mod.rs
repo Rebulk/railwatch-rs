@@ -34,6 +34,12 @@
 //!    a recreated slug was served the deleted tenant's telemetry). A trigger
 //!    records every deleted environment's slug; `control::retire_unowned`
 //!    adds names found on disk or in the backup bucket at startup.
+//! 8. `session_token`: Rust-only `sessions.token` (nullable), a random
+//!    value the session cookie carries beside the row id
+//!    (control::session_cookie). Ids are a counter, and a restore puts the
+//!    counter back, so an id alone could name another person's session
+//!    after one. NULL (a session from before this, or an imported row):
+//!    only a cookie that carries no token opens it.
 
 pub mod issues;
 
@@ -58,6 +64,7 @@ pub const MIGRATIONS: &[(&str, Step)] = &[
     ("20261119000001_trusted_proxy", trusted_proxy),
     ("20261119000002_api_token_role_ceiling", api_token_role_ceiling),
     ("20261119000010_retired_environment_slugs", retired_environment_slugs),
+    ("20261121000001_session_token", session_token),
 ];
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<&'static str>> {
@@ -338,6 +345,10 @@ fn retired_environment_slugs(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(RETIRED_ENVIRONMENT_SLUGS)
 }
 
+fn session_token(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch("ALTER TABLE sessions ADD COLUMN token varchar")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,7 +437,12 @@ mod tests {
             }
             assert_eq!(
                 migrate(&mut c).unwrap(),
-                vec!["20261119000001_trusted_proxy", "20261119000002_api_token_role_ceiling", "20261119000010_retired_environment_slugs"]
+                vec![
+                    "20261119000001_trusted_proxy",
+                    "20261119000002_api_token_role_ceiling",
+                    "20261119000010_retired_environment_slugs",
+                    "20261121000001_session_token"
+                ]
             );
             let ceiling: Option<String> = c.query_row("SELECT role_ceiling FROM api_tokens LIMIT 1", [], |r| r.get(0)).optional().unwrap().flatten();
             assert_eq!(ceiling, None, "existing tokens keep no ceiling");

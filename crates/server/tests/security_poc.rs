@@ -19,9 +19,10 @@ use railwatch_server::web::{self, WebState, cookies};
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-fn session_cookie(session_id: i64) -> String {
+fn session_cookie(control: &Control, session_id: i64) -> String {
     let keys = cookies::Keys::new(SECRET.as_bytes());
-    format!("{}={}", cookies::SESSION_TOKEN, keys.sign(cookies::SESSION_TOKEN, &session_id.to_string()))
+    let value = control.with(|x| control::session_cookie(x, session_id)).unwrap().expect("the session exists");
+    format!("{}={}", cookies::SESSION_TOKEN, keys.sign(cookies::SESSION_TOKEN, &value))
 }
 
 /// Pulls one Set-Cookie `name=value` back out of a response's headers.
@@ -109,7 +110,7 @@ async fn security_pocs() {
     let origin = base.clone();
 
     let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
-    let sess = session_cookie(session_a);
+    let sess = session_cookie(&control, session_a);
 
     // ----- obtain a valid CSRF token for A's session -------------------------
     let r = http.get(format!("{base}/settings/profile")).header("Cookie", &sess).send().await.unwrap();

@@ -868,10 +868,41 @@ pub struct Session {
 pub fn create_session(c: &Connection, user_id: i64, user_agent: Option<&str>, ip: Option<&str>) -> rusqlite::Result<i64> {
     let now = now_db();
     c.execute(
-        "INSERT INTO sessions (user_id, user_agent, ip_address, authenticated_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4, ?4)",
-        params![user_id, user_agent, ip, now],
+        "INSERT INTO sessions (user_id, user_agent, ip_address, authenticated_at, created_at, updated_at, token) VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5)",
+        params![user_id, user_agent, ip, now, base58(32)],
     )?;
     Ok(c.last_insert_rowid())
+}
+
+/// What the `session_token` cookie carries for a session (signed by the
+/// caller): "<id>.<token>". The id alone is not enough to name a session.
+/// Ids are a counter, a restore from backup puts the counter back, and
+/// `secret_key_base` is kept across a restore, so a cookie from before it
+/// would open whoever was given its id afterwards. The token is random per
+/// session, so a reused id never matches an outstanding cookie. None: no
+/// such session.
+pub fn session_cookie(c: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
+    let token: Option<Option<String>> = c.query_row("SELECT token FROM sessions WHERE id = ?", [id], |r| r.get(0)).optional()?;
+    Ok(token.map(|t| t.map_or_else(|| id.to_string(), |t| format!("{id}.{t}"))))
+}
+
+/// The session a (verified) `session_token` cookie value names. A session
+/// from before tokens (or an imported row) has none, and is opened by a bare
+/// id only; a session with a token is never opened without it.
+pub fn find_session_by_cookie(c: &Connection, value: &str) -> rusqlite::Result<Option<Session>> {
+    use subtle::ConstantTimeEq;
+    let (id, given) = match value.split_once('.') {
+        Some((id, token)) => (id, Some(token)),
+        None => (value, None),
+    };
+    let Ok(id) = id.parse::<i64>() else { return Ok(None) };
+    let stored: Option<Option<String>> = c.prepare_cached("SELECT token FROM sessions WHERE id = ?")?.query_row([id], |r| r.get(0)).optional()?;
+    let matches = match (stored, given) {
+        (Some(Some(stored)), Some(given)) => bool::from(stored.as_bytes().ct_eq(given.as_bytes())),
+        (Some(None), None) => true,
+        _ => false,
+    };
+    if matches { find_session(c, id) } else { Ok(None) }
 }
 
 pub fn find_session(c: &Connection, id: i64) -> rusqlite::Result<Option<Session>> {
@@ -1158,6 +1189,49 @@ mod tests {
         let rails = "$2a$12$1EzDBnePTwOGg6V1MTqICOaxRDkMD1vVk5RM0fB6JBBMam5iMRCly";
         assert!(verify_password("correct horse battery staple", rails));
         assert!(!verify_password("correct horse battery stapl", rails));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A session is named by its id AND its random token. An id alone (what
+    /// the cookie used to carry) names a session only if that session was
+    /// created before tokens existed, so nobody is signed out by the upgrade
+    /// and a reused id never opens a newer session.
+    #[test]
+    fn a_session_cookie_names_its_session_by_token_not_by_id_alone() {
+        let dir = std::env::temp_dir().join(format!("rw-control-session-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let user = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
+        let other = c.tx(|tx| insert_user(tx, "Bo", "bo@example.com", &test_password(), true)).unwrap();
+        let open = |value: &str| c.with(|x| find_session_by_cookie(x, value)).unwrap().map(|s| (s.id, s.user_id));
+
+        let id = c.with(|x| create_session(x, user, None, None)).unwrap();
+        let cookie = c.with(|x| session_cookie(x, id)).unwrap().unwrap();
+        let (cookie_id, token) = cookie.split_once('.').expect("id.token");
+        assert_eq!((cookie_id, token.len()), (id.to_string().as_str(), 32));
+        assert_eq!(open(&cookie), Some((id, user)));
+        assert_eq!(open(&id.to_string()), None, "the id alone does not open a session that has a token");
+        assert_eq!(open(&format!("{id}.{}", base58(32))), None, "nor does another token");
+        assert_eq!(open(&format!("{id}.")), None);
+        assert_eq!(open("not-a-number.x"), None);
+
+        // The id is handed out again (a restore puts the counter back): the
+        // old cookie names nobody, the new session has its own token.
+        c.with(|x| x.execute_batch("DELETE FROM sessions; DELETE FROM sqlite_sequence WHERE name = 'sessions';")).unwrap();
+        let again = c.with(|x| create_session(x, other, None, None)).unwrap();
+        assert_eq!(again, id, "premise: the id is reused");
+        assert_eq!(open(&cookie), None, "a cookie from before does not open whoever has the id now");
+        let theirs = c.with(|x| session_cookie(x, again)).unwrap().unwrap();
+        assert_eq!(open(&theirs), Some((again, other)));
+
+        // A session from before the upgrade has no token: its old cookie
+        // (the bare id) still opens it, and a token never does.
+        c.with(|x| x.execute("UPDATE sessions SET token = NULL WHERE id = ?", [again])).unwrap();
+        assert_eq!(c.with(|x| session_cookie(x, again)).unwrap().as_deref(), Some(again.to_string().as_str()));
+        assert_eq!(open(&again.to_string()), Some((again, other)));
+        assert_eq!(open(&theirs), None);
+        assert_eq!(c.with(|x| session_cookie(x, again + 1)).unwrap(), None, "no such session, no cookie");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
