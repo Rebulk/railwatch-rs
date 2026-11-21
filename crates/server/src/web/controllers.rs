@@ -236,15 +236,8 @@ async fn sign_in_create(cx: Ctx, p: Params) -> Response {
     let email_key = email.trim().to_lowercase();
     let ua = cx.current.user_agent.clone();
     let ip = cx.current.ip.clone();
-    let result = cx
-        .state
-        .db(move |c| {
-            c.with(|x| match control::authenticate_by(x, &email, &password)? {
-                Some(u) => Ok(Some(control::create_session(x, u.id, ua.as_deref(), Some(&ip))?)),
-                None => Ok(None),
-            })
-        })
-        .await;
+    // The bcrypt check runs with the control connection released (Control::sign_in).
+    let result = cx.state.db(move |c| c.sign_in(&email, &password, ua.as_deref(), Some(&ip))).await;
     match result {
         Ok(Some(session)) => {
             cx.outgoing.sign_in(session);
