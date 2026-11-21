@@ -320,7 +320,12 @@ The security model:
   and acts with the claimed role only: an email that matches an existing
   user (one who signed up directly, or the owner) is that user *inside the
   proxy's account*, at the role the proxy signed, never in the user's other
-  accounts and never as an owner. Through the proxy nobody can switch
+  accounts and never as an owner. If that existing user never verified
+  their address (with open sign-up anyone can register an address they do
+  not own), the first proxied request for it replaces the password and
+  ends that user's sessions and tokens, as a password reset does: the
+  address's owner can still set a password with "Forgot password".
+  Through the proxy nobody can switch
   account, create or delete an account, transfer ownership, accept an
   invitation to another account, or create a token for anything but the
   proxy's account; a token created there never acts with more than the

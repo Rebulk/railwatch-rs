@@ -15,6 +15,12 @@ tag is a release candidate (marked pre-release, not "latest", so
   through the proxy. Before this, a user who signs in with Google could be
   deleted through the proxy, from every account, because the proxy's
   freshly created session row counted as a recent authentication.
+- Security (trusted proxy with open sign-up): when the proxy vouches for
+  an address that an unverified user already holds, that user's password,
+  sessions and tokens are replaced before the proxy's membership is
+  attached, as a password reset does. Before this, someone who had
+  registered a colleague's address kept their own sign-in and gained the
+  colleague's role in the proxy's account.
 - Dependencies: rusqlite 0.43, sha2, md-5 and chacha20poly1305 0.11, hmac
   0.13, bcrypt 0.19, jsonwebtoken 12, croner 4, toml 1,
   base64 0.23, getrandom 0.4 and sigstore 0.16 (#99); lucide-react 1.74 and
