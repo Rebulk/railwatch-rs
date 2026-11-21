@@ -202,7 +202,10 @@ cloud-only page driven in a real browser.
    MessageVerifier/encrypted cookies are not readable here, so an imported
    install signs everyone in again (sessions rows are imported; the cookies
    pointing at them are not). Sessions stay permanent with no idle expiry, as
-   in Rails.
+   in Rails. The `session_token` cookie carries the session id and a random
+   per-session token (`sessions.token`, a Rust-only column): the id alone
+   is a counter that a restore from backup rewinds, so it is not enough to
+   name a session.
 2. **CSRF.** One per-session token, accepted in `X-XSRF-TOKEN` (Inertia/axios,
    from the `XSRF-TOKEN` cookie) or `X-CSRF-Token` (the gem's beacon, from the
    meta tag), compared in constant time; plus an Origin / `Sec-Fetch-Site`

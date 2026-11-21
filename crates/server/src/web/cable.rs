@@ -104,17 +104,18 @@ pub async fn upgrade(
     ws: WebSocketUpgrade,
 ) -> Response {
     let jar = cookies::parse(&headers);
-    let session_id: Option<i64> =
-        cookies::get(&jar, cookies::SESSION_TOKEN).and_then(|c| state.keys.verify(cookies::SESSION_TOKEN, c)).and_then(|v| v.parse().ok());
+    let session_cookie: Option<String> = cookies::get(&jar, cookies::SESSION_TOKEN).and_then(|c| state.keys.verify(cookies::SESSION_TOKEN, c));
     let origin_ok = super::session::same_origin(&headers);
     // Verified (and the header removed) by proxy_auth::layer.
     let proxied = proxied.map(|axum::Extension(p)| p.0);
     // (session, user, the one account a proxied connection may watch)
-    let user = match (origin_ok, proxied, session_id) {
+    let user = match (origin_ok, proxied, session_cookie) {
         (true, Some(claims), _) => {
             state.db(move |c| c.tx(|tx| super::proxy_auth::resolve(tx, &claims))).await.ok().map(|(s, u, account)| (s.id, u.id, Some(account)))
         }
-        (true, None, Some(sid)) => state.db(move |c| c.with(|x| crate::control::find_session(x, sid))).await.ok().flatten().map(|s| (s.id, s.user_id, None)),
+        (true, None, Some(cookie)) => {
+            state.db(move |c| c.with(|x| crate::control::find_session_by_cookie(x, &cookie))).await.ok().flatten().map(|s| (s.id, s.user_id, None))
+        }
         _ => None,
     };
     ws.protocols(["actioncable-v1-json"])

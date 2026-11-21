@@ -530,7 +530,9 @@ systemctl stop railwatch railwatch.socket`, empty `/var/lib/railwatch`, run
 `railwatch restore` as the `railwatch` user with the same `BACKUP_S3_*`
 settings, then start again. `secret_key_base` is not in the bucket: copy
 `/var/lib/railwatch/secret_key_base` separately (or set `SECRET_KEY_BASE`),
-or integration secrets must be re-entered.
+or integration secrets must be re-entered. People who signed in after the
+backup was taken are signed out by the restore: their session is not in
+it, and their cookie does not open a session created afterwards.
 
 ## Upgrades
 

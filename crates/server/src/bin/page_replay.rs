@@ -51,7 +51,8 @@ async fn main() {
     let (followups, _rx) = railwatch_server::followups::channel();
     let tenants = Tenants::new(cfg.tenants_dir(), std::time::Duration::from_secs(600), followups);
     let state = Arc::new(WebState::new(control, cfg.clone(), tenants, web::cable::Hub::new()).expect("web state"));
-    let cookie = format!("{}={}", cookies::SESSION_TOKEN, state.keys.sign(cookies::SESSION_TOKEN, &session.to_string()));
+    let value = state.control.with(|c| railwatch_server::control::session_cookie(c, session)).expect("session").expect("just created");
+    let cookie = format!("{}={}", cookies::SESSION_TOKEN, state.keys.sign(cookies::SESSION_TOKEN, &value));
     let state_keys = cookies::Keys::new(&cfg.secret().expect("secret"));
     let app = web::router(state);
 

@@ -197,6 +197,44 @@ fn user(s: &Server, name: &str, email: &str, password: &str, verified: bool) -> 
 }
 
 // ---------------------------------------------------------------------------
+// A session cookie after a restore
+
+/// Session ids are a counter, and a restore puts the counter back: the next
+/// sign-in is handed an id that a cookie from before the restore still
+/// names. `secret_key_base` is kept across a restore (docs/SELF-HOST.md), so
+/// that cookie still verifies. It must not open the other person's session.
+#[test]
+fn a_cookie_from_before_a_restore_does_not_open_whoever_was_given_its_session_id() {
+    let s = start("restore", "invite");
+    let (xavier_password, yolanda_password) = (control::base58(16), control::base58(16));
+    let xavier = user(&s, "Xavier", "xavier@example.com", &xavier_password, true);
+    let yolanda = user(&s, "Yolanda", "yolanda@example.com", &yolanda_password, true);
+    s.control.tx(|tx| control::create_account(tx, "Acme", xavier)).unwrap();
+    s.control.tx(|tx| control::create_account(tx, "Globex", yolanda)).unwrap();
+
+    let mut his = Browser::default();
+    his.sign_in(&s, "xavier@example.com", &xavier_password);
+    let profile = his.get(&s, "/settings/profile");
+    assert!(profile.status == 200 && profile.body.contains("xavier@example.com"), "premise: his cookie is his session");
+    let his_session: i64 = s.control.with(|c| c.query_row("SELECT id FROM sessions WHERE user_id = ?", [xavier], |r| r.get(0))).unwrap();
+
+    // What `railwatch restore` leaves behind for a backup taken before he
+    // signed in: no such session, and the counter where it was.
+    s.control.with(|c| c.execute_batch("DELETE FROM sessions; DELETE FROM sqlite_sequence WHERE name = 'sessions';")).unwrap();
+
+    let mut hers = Browser::default();
+    hers.sign_in(&s, "yolanda@example.com", &yolanda_password);
+    let her_session: i64 = s.control.with(|c| c.query_row("SELECT id FROM sessions WHERE user_id = ?", [yolanda], |r| r.get(0))).unwrap();
+    assert_eq!(her_session, his_session, "premise: the id was handed out again");
+
+    let after = his.get(&s, "/settings/profile");
+    assert!(!after.body.contains("yolanda@example.com"), "his old cookie opened her session");
+    assert_eq!((after.status, after.location()), (302, "/sign_in"), "an old cookie is signed out, not someone else");
+    let still_hers = hers.get(&s, "/settings/profile");
+    assert!(still_hers.status == 200 && still_hers.body.contains("yolanda@example.com"), "her own cookie still works");
+}
+
+// ---------------------------------------------------------------------------
 // Finding 9
 
 /// Adding someone to an account is an invitation they accept, whether or
