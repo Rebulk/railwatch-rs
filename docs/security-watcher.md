@@ -29,7 +29,15 @@ without being asked.
    ```
 
    ```sh
-   RAILWATCH_SECURITY_WATCHER_FILE=/etc/railwatch/security-watcher.toml   # or security_watcher_file in railwatch.toml
+   export RAILWATCH_SECURITY_WATCHER_FILE=/etc/railwatch/security-watcher.toml
+   ```
+
+   For a service (systemd, the installer's `/etc/railwatch/railwatch.env`, a
+   container), put the variable in the service's environment, or set
+   `security_watcher_file = "..."` in `railwatch.toml`:
+
+   ```sh
+   echo 'RAILWATCH_SECURITY_WATCHER_FILE=/etc/railwatch/security-watcher.toml' >> /etc/railwatch/railwatch.env
    ```
 
 2. Restart. `railwatch doctor` prints the watcher's line (`security_watcher`).
@@ -45,11 +53,17 @@ is not watched.
 ## What it does, and when
 
 Every `tick_seconds` (default **15 s**) it evaluates every watched
-environment over the trailing `lookback_min` (default **15 min**). An ingest
-batch that carries a `security.*` event wakes the watcher for that
-environment straight away, at most once every 2 s. A signup or an OAuth
+environment over the trailing `lookback_min` (default **15 min**), or the
+longest detector window when that is longer (30 min by default, for
+`non_browser_on_web`). An ingest batch that carries a `security.*` event
+wakes the watcher for that environment straight away. A second wake within
+2 s is deferred to the end of the gap, not dropped. A signup or an OAuth
 registration is therefore judged within seconds of the app reporting it,
 not at the next tick.
+
+Environments are evaluated one after another. If one pass takes longer than
+the lookback, requests between two windows go unread, and the watcher logs
+an error saying so. Raise `lookback_min` or watch fewer environments.
 
 ### Detectors
 
@@ -80,7 +94,10 @@ application, e.g. `scanner_shape = { min_4xx = 30 }`.
   seen. A higher one is an *escalation*. Lower evidence later never lowers it.
 - **Close after quiet.** With no new evidence for `quiet_close_min`
   (default 60, at least `lookback_min`), measured on the evidence's own
-  times, the incident closes. Later activity opens a new incident.
+  times, the incident closes. Later activity opens a new incident, and the
+  close happens before new evidence is folded in. Evidence that arrives
+  after a longer gap (the watcher was paused, or telemetry came in late)
+  therefore never revives an incident that had gone quiet.
 - `info` signals alone open nothing. They join an open incident as context.
 
 ### Alerts
@@ -88,14 +105,15 @@ application, e.g. `scanner_shape = { min_4xx = 30 }`.
 | what | when | event |
 |---|---|---|
 | immediate | an open or escalation that reaches `alert_min_severity` (default **high**), once per severity reached; the close of an incident that alerted | `security_incident` |
-| daily | after `digest_hour_utc` (default 13), one list of the last day's incidents at medium or above that never alerted. Deterministic text | `security_digest` |
+| daily | after `digest_hour_utc` (default 13), one list of every incident at medium or above that never alerted and was not in an earlier digest (at most 200; the rest wait for the next one, and the digest says so). Deterministic text | `security_digest` |
 
 The payload carries the incident: actor, severity, every signal's
 detector, count and summary, and the timeline. Its `transition` is
 `opened`, `escalated` or `closed`, and `mcp` names the call that reads it
-in full. Webhooks are HMAC-signed like every Railwatch webhook
-([agent-webhooks.md](agent-webhooks.md)), so a relay verifies them the same
-way.
+in full. A webhook integration with a `secret` signs it like every Railwatch
+webhook ([agent-webhooks.md](agent-webhooks.md)), so a relay verifies it the
+same way. Without a secret it is sent unsigned. Give the shadow
+integration a secret when its receiver checks the signature.
 
 **Shadow mode is the default.** Incidents are recorded and visible in the
 API and MCP. Their alerts go only to the watcher's `shadow_integration_id`,
@@ -185,7 +203,7 @@ environment:
 - `security_incidents`
 - `security_incident_signals`
 - `security_incident_events` (the timeline)
-- `security_accounts` (signups seen, 7 days)
+- `security_accounts` (signups seen: 7 days, or `repeat_signup.lookback_hours` if longer)
 - `security_digests` (30 days)
 
 Closed incidents are kept 90 days. An older binary ignores these tables.

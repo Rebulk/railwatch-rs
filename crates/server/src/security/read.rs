@@ -181,6 +181,8 @@ mod tests {
             "a token for a client is not a registration"
         );
         assert_eq!(super::super::EventKind::of("security.oauth_client.created"), super::super::EventKind::OAuthClientRegistered);
+        assert_eq!(super::super::EventKind::of("security.oauth_client.registration"), super::super::EventKind::OAuthClientRegistered, "not a signup");
+        assert_eq!(super::super::EventKind::of("security.registration"), super::super::EventKind::Signup);
         let e = event(5, "security.login.failed", Some("not json"), None);
         assert_eq!((e.kind, e.ip), (super::super::EventKind::LoginFailed, None), "a payload that does not parse is an event with no fields");
     }

@@ -91,10 +91,14 @@ impl EventKind {
     pub fn of(name: &str) -> EventKind {
         let n = name.to_ascii_lowercase();
         let n = n.strip_prefix("security.").unwrap_or(&n);
-        if n.contains("signup") || n.contains("sign_up") || n.contains("registration") {
+        if n.contains("oauth") {
+            if n.contains("regist") || n.ends_with("client.created") || n.ends_with("client_created") {
+                EventKind::OAuthClientRegistered
+            } else {
+                EventKind::Other
+            }
+        } else if n.contains("signup") || n.contains("sign_up") || n.contains("registration") {
             EventKind::Signup
-        } else if n.contains("oauth") && (n.contains("regist") || n.ends_with("client.created") || n.ends_with("client_created")) {
-            EventKind::OAuthClientRegistered
         } else if n.contains("login") && n.contains("fail") || n.contains("sign_in") && n.contains("fail") {
             EventKind::LoginFailed
         } else if n.contains("lock") {

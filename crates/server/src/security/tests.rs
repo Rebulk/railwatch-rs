@@ -416,7 +416,9 @@ fn the_webhook_carries_the_incident_and_is_signed() {
     assert_eq!((p["transition"].as_str(), p["severity"].as_str(), p["mode"].as_str()), (Some("opened"), Some("high"), Some("shadow")));
     assert_eq!(p["incident"]["actor"], ATTACKER);
     assert_eq!(p["incident"]["signals"][0]["detector"], "secrets_probe");
-    assert!(!body.to_string().contains('\u{1b}'), "client text is cleaned before it is stored");
+    let summary = p["incident"]["signals"][0]["summary"].as_str().unwrap();
+    assert!(summary.contains("/.env") && !summary.contains('\u{1b}'), "client text is cleaned before it is stored: {summary:?}");
+    assert!(!p["message"].as_str().unwrap().contains('\u{1b}'));
     assert!(ctx.text().starts_with("Security incident: HIGH security incident opened in shop / production: 203.0.113.66"), "{}", ctx.text());
     assert_eq!(ctx.severity().as_deref(), Some("high"));
 }
@@ -478,4 +480,59 @@ fn a_signup_never_flags_itself_on_a_later_tick() {
     f.tick(&p, T0 + 20 * MIN + 15 * S);
     let sev: String = f.c.with(|x| x.query_row("SELECT severity FROM security_incidents WHERE actor = ?", [other], |r| r.get(0))).unwrap();
     assert_eq!(sev, "critical", "flagged by an earlier evaluation's probe, now outside the window");
+}
+
+/// CodeRabbit: evidence arriving after a quiet period longer than
+/// quiet_close_min (the watcher was paused, telemetry was late) opens a new
+/// incident and closes the old one, instead of reviving it silently.
+#[test]
+fn evidence_after_a_quiet_gap_opens_a_new_incident() {
+    let mut f = Fx::new("gap");
+    let p = policy(&f);
+    for i in 0..3 {
+        f.req(T0 + i * S, ATTACKER, BROWSER, "GET", "/.env", 404, None, None);
+    }
+    f.tick(&p, T0 + MIN);
+    // No tick for 70 minutes; then fresh probes arrive.
+    for i in 0..3 {
+        f.req(T0 + 70 * MIN + i * S, ATTACKER, BROWSER, "GET", "/.git/config", 404, None, None);
+    }
+    f.tick(&p, T0 + 71 * MIN);
+    assert_eq!(f.incidents(), [(ATTACKER.into(), "high".into(), "closed".into()), (ATTACKER.into(), "high".into(), "open".into())]);
+    let transitions: Vec<String> = f.alerts().into_iter().map(|(_, t, _)| t).collect();
+    assert_eq!(transitions, ["opened", "closed", "opened"]);
+}
+
+/// CodeRabbit: the alert's own transition is in its timeline, linked to it.
+#[test]
+fn an_alert_carries_its_own_transition() {
+    let mut f = Fx::new("timeline");
+    for i in 0..3 {
+        f.req(T0 + i * S, ATTACKER, BROWSER, "GET", "/.env", 404, None, None);
+    }
+    f.tick(&policy(&f), T0 + MIN);
+    let timeline: String = f.c.with(|x| x.query_row("SELECT json_extract(payload, '$.incident.timeline') FROM alerts", [], |r| r.get(0))).unwrap();
+    let timeline: serde_json::Value = serde_json::from_str(&timeline).unwrap();
+    assert_eq!(timeline[0]["kind"], "opened");
+    let linked: Option<i64> = f.c.with(|x| x.query_row("SELECT alert_id FROM security_incident_events", [], |r| r.get(0))).unwrap();
+    assert!(linked.is_some(), "the timeline row names the alert it sent");
+}
+
+/// CodeRabbit: the digest takes every incident not yet digested, however
+/// the run time drifts between days, and says when more wait.
+#[test]
+fn the_digest_never_skips_an_incident() {
+    let mut f = Fx::new("digest-cover");
+    let p = format!("{}\n", policy(&f)).replace("[watcher]\n", "[watcher]\ndigest_hour_utc = 23\n");
+    for i in 0..25 {
+        f.req(T0 + i * 10 * S, ATTACKER, BROWSER, "GET", &format!("/x{}", i % 12), 404, None, None);
+    }
+    f.tick(&p, T0 + 5 * MIN);
+    // The digest runs two days later: the incident is older than 24 h and still listed.
+    let later = T0 - T0.rem_euclid(86_400 * S) + 2 * 86_400 * S + 23 * 3600 * S;
+    f.tick(&p, later);
+    let n: i64 = f.c.with(|x| x.query_row("SELECT count(*) FROM alerts WHERE event = 'security_digest'", [], |r| r.get(0))).unwrap();
+    assert_eq!(n, 1);
+    let digested: Option<i64> = f.c.with(|x| x.query_row("SELECT digested_at FROM security_incidents", [], |r| r.get(0))).unwrap();
+    assert!(digested.is_some());
 }

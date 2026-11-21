@@ -13,7 +13,7 @@
 //!
 //! [watcher]                    # the loop itself (all optional)
 //! tick_seconds = 15            # how often every watched environment is evaluated
-//! lookback_min = 15            # the trailing window each evaluation reads
+//! lookback_min = 15            # the least each evaluation reads back (longer when a detector window is)
 //! mode = "shadow"              # shadow (default) | live; an app may override
 //! shadow_integration_id = 3    # where shadow alerts go (none: recorded only)
 //! alert_min_severity = "high"  # an incident at or above this alerts at once
@@ -69,6 +69,23 @@ pub struct Thresholds {
     pub repeat_signup_lookback_hours: i64,
     /// An incident with no new signal for this long closes.
     pub quiet_close_min: i64,
+}
+
+impl Thresholds {
+    /// The longest detector window, in minutes: an evaluation reads at
+    /// least this far back, or a rule could never be met whole.
+    pub fn longest_window_min(&self) -> i64 {
+        [
+            self.secrets_probe.window_min,
+            self.scanner_shape.window_min,
+            self.non_browser_on_web.window_min,
+            self.auth_refusal_burst.window_min,
+            self.new_account_probe.window_min,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+    }
 }
 
 impl Default for Thresholds {
@@ -404,8 +421,7 @@ fn apply_thresholds(th: &mut Thresholds, t: &toml::Table, at: &str, extra: &[&st
         }
     }
     // A window longer than the lookback could never be satisfied whole.
-    let windows = [th.secrets_probe.window_min, th.scanner_shape.window_min, th.non_browser_on_web.window_min, th.auth_refusal_burst.window_min];
-    if windows.iter().any(|w| *w > super::MAX_WINDOW_MIN) {
+    if th.longest_window_min() > super::MAX_WINDOW_MIN {
         return Err(format!("{at}: a detector window is at most {} minutes", super::MAX_WINDOW_MIN));
     }
     Ok(())

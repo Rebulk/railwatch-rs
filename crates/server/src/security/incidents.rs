@@ -68,6 +68,9 @@ CREATE TABLE security_incident_signals (
   count INTEGER NOT NULL,
   summary TEXT NOT NULL,
   identity INTEGER NOT NULL DEFAULT 0,
+  -- when the signal was first seen at high or above (NULL: never); what
+  -- makes a later signup already flagged; first_at is for display
+  high_at INTEGER,
   PRIMARY KEY (incident_id, detector, subject)
 ) WITHOUT ROWID;
 CREATE TABLE security_incident_events (
@@ -139,7 +142,7 @@ fn sev(s: &str) -> Severity {
 }
 
 /// What the detectors need from earlier runs.
-pub fn history(c: &Connection, environment_id: i64, now: i64, lookback_hours: i64) -> rusqlite::Result<History> {
+pub fn history(c: &Connection, environment_id: i64, now: i64, lookback_hours: i64, quiet_close_min: i64) -> rusqlite::Result<History> {
     let mut h = History::default();
     let mut s = c.prepare_cached("SELECT actor, severity FROM security_incidents WHERE environment_id = ? AND status = 'open' LIMIT 10000")?;
     for r in s.query_map([environment_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
@@ -147,11 +150,13 @@ pub fn history(c: &Connection, environment_id: i64, now: i64, lookback_hours: i6
         h.open.insert(a, sev(&v));
     }
     let mut s = c.prepare_cached(
-        "SELECT i.actor, MIN(s.first_at) FROM security_incidents i JOIN security_incident_signals s ON s.incident_id = i.id
-         WHERE i.environment_id = ? AND i.status = 'open' AND s.severity IN ('high', 'critical') AND s.detector NOT IN ('risky_signup', 'repeat_signup')
+        "SELECT i.actor, MIN(s.high_at) FROM security_incidents i JOIN security_incident_signals s ON s.incident_id = i.id
+         WHERE i.environment_id = ?1 AND i.status = 'open' AND i.last_signal_at >= ?2 AND s.high_at IS NOT NULL AND s.detector NOT IN ('risky_signup', 'repeat_signup')
          GROUP BY i.actor LIMIT 10000",
     )?;
-    for r in s.query_map([environment_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+    // An incident past its quiet period is closing: it flags nothing.
+    let quiet = now - quiet_close_min * MIN_US;
+    for r in s.query_map(params![environment_id, quiet], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
         let (a, t) = r?;
         h.flagged_since.insert(a, t);
     }
@@ -209,10 +214,12 @@ fn apply_in(
 ) -> rusqlite::Result<Applied> {
     let mut out = Applied::default();
     for e in events.iter().filter(|e| e.kind == EventKind::Signup) {
-        if let Some(u) = e.user_ref.as_deref().filter(|u| !u.is_empty()) {
+        // The reference as the app sent it (the key later requests carry);
+        // the telemetry column is varchar(255), so nothing longer exists.
+        if let Some(u) = e.user_ref.as_deref().filter(|u| !u.is_empty() && u.len() <= 255) {
             c.prepare_cached("INSERT OR IGNORE INTO security_accounts (environment_id, user_ref, ip, signed_up_at) VALUES (?, ?, ?, ?)")?.execute(params![
                 t.environment_id,
-                super::text(u),
+                u,
                 e.ip.as_deref().map(super::text),
                 e.at
             ])?;
@@ -229,11 +236,28 @@ fn apply_in(
             "security watcher: more signals than one run folds; the least severe wait"
         );
     }
+    let shadow = shadow_integration(c, t, w)?;
+    // Quiet ones close first: no evidence newer than quiet_close_min. Done
+    // before folding, so evidence arriving after a gap (the watcher paused,
+    // the app's telemetry was late) opens a new incident instead of
+    // reviving one that was quiet for longer than the quiet period.
+    let quiet: Vec<(i64, String, Option<String>)> = c
+        .prepare_cached(
+            "SELECT id, severity, alerted_severity FROM security_incidents WHERE environment_id = ? AND status = 'open' AND last_signal_at < ? LIMIT 1000",
+        )?
+        .query_map(params![t.environment_id, now - app.thresholds.quiet_close_min * MIN_US], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, severity, alerted) in quiet {
+        c.prepare_cached("UPDATE security_incidents SET status = 'closed', closed_at = ?, updated_at = ? WHERE id = ?")?.execute(params![now, now, id])?;
+        let ev = record(c, id, "closed", sev(&severity), None, None, now)?;
+        let alert = if alerted.is_some() { fire(c, t, app, shadow, id, ev, "closed", None, base_url)? } else { None };
+        out.closed.push(id);
+        out.alerts.extend(alert);
+    }
     let mut by_actor: BTreeMap<&str, Vec<&Signal>> = BTreeMap::new();
     for s in kept {
         by_actor.entry(s.actor.as_str()).or_default().push(s);
     }
-    let shadow = shadow_integration(c, t, w)?;
     for (actor, sigs) in by_actor {
         let top = sigs.iter().copied().max_by(|a, b| a.severity.cmp(&b.severity).then(b.at.cmp(&a.at))).expect("non-empty");
         let last = sigs.iter().map(|s| s.last_at).max().unwrap_or(now);
@@ -255,8 +279,8 @@ fn apply_in(
                 .execute(params![t.environment_id, actor, top.severity.as_str(), identity, first, last, now, now])?;
                 let id = c.last_insert_rowid();
                 upsert_signals(c, id, &sigs)?;
-                let alert = if top.severity >= w.alert_min_severity { fire(c, t, app, shadow, id, "opened", None, base_url)? } else { None };
-                record(c, id, "opened", top.severity, None, Some(top.detector), now, alert)?;
+                let ev = record(c, id, "opened", top.severity, None, Some(top.detector), now)?;
+                let alert = if top.severity >= w.alert_min_severity { fire(c, t, app, shadow, id, ev, "opened", None, base_url)? } else { None };
                 out.opened.push(id);
                 if let Some(a) = alert {
                     c.execute("UPDATE security_incidents SET alerted_severity = ? WHERE id = ?", params![top.severity.as_str(), id])?;
@@ -278,12 +302,12 @@ fn apply_in(
                 now,
                 id
             ])?;
+            let ev = record(c, id, "escalated", top.severity, Some(before), Some(top.detector), now)?;
             let alert = if top.severity >= w.alert_min_severity && alerted.is_none_or(|a| top.severity > a) {
-                fire(c, t, app, shadow, id, "escalated", Some(before), base_url)?
+                fire(c, t, app, shadow, id, ev, "escalated", Some(before), base_url)?
             } else {
                 None
             };
-            record(c, id, "escalated", top.severity, Some(before), Some(top.detector), now, alert)?;
             out.escalated.push(id);
             if let Some(a) = alert {
                 c.execute("UPDATE security_incidents SET alerted_severity = ? WHERE id = ?", params![top.severity.as_str(), id])?;
@@ -291,35 +315,22 @@ fn apply_in(
             }
         }
     }
-    // Quiet ones close: no evidence newer than quiet_close_min.
-    let quiet: Vec<(i64, String, Option<String>)> = c
-        .prepare_cached(
-            "SELECT id, severity, alerted_severity FROM security_incidents WHERE environment_id = ? AND status = 'open' AND last_signal_at < ? LIMIT 1000",
-        )?
-        .query_map(params![t.environment_id, now - app.thresholds.quiet_close_min * MIN_US], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    for (id, severity, alerted) in quiet {
-        c.prepare_cached("UPDATE security_incidents SET status = 'closed', closed_at = ?, updated_at = ? WHERE id = ?")?.execute(params![now, now, id])?;
-        let alert = if alerted.is_some() { fire(c, t, app, shadow, id, "closed", None, base_url)? } else { None };
-        record(c, id, "closed", sev(&severity), None, None, now, alert)?;
-        out.closed.push(id);
-        out.alerts.extend(alert);
-    }
     Ok(out)
 }
 
 fn upsert_signals(c: &Connection, incident: i64, sigs: &[&Signal]) -> rusqlite::Result<()> {
     // Severity and count only rise; the summary follows the newest evidence.
     let mut s = c.prepare_cached(
-        "INSERT INTO security_incident_signals (incident_id, detector, subject, severity, first_at, last_at, count, summary, identity)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO security_incident_signals (incident_id, detector, subject, severity, first_at, last_at, count, summary, identity, high_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, CASE WHEN ?10 >= 3 THEN ?5 END)
          ON CONFLICT (incident_id, detector, subject) DO UPDATE SET
            severity = CASE WHEN ?10 > (CASE severity WHEN 'info' THEN 0 WHEN 'low' THEN 1 WHEN 'medium' THEN 2 WHEN 'high' THEN 3 ELSE 4 END) THEN excluded.severity ELSE severity END,
            first_at = MIN(first_at, excluded.first_at),
            summary = CASE WHEN excluded.last_at >= last_at THEN excluded.summary ELSE summary END,
            last_at = MAX(last_at, excluded.last_at),
            count = MAX(count, excluded.count),
-           identity = MAX(identity, excluded.identity)",
+           identity = MAX(identity, excluded.identity),
+           high_at = COALESCE(high_at, CASE WHEN ?10 >= 3 THEN ?5 END)",
     )?;
     for g in sigs {
         s.execute(params![incident, g.detector, g.subject, g.severity.as_str(), g.at, g.last_at, g.count, g.summary, g.identity, g.severity as i64])?;
@@ -328,21 +339,10 @@ fn upsert_signals(c: &Connection, incident: i64, sigs: &[&Signal]) -> rusqlite::
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record(
-    c: &Connection,
-    id: i64,
-    kind: &str,
-    s: Severity,
-    previous: Option<Severity>,
-    detector: Option<&str>,
-    now: i64,
-    alert: Option<i64>,
-) -> rusqlite::Result<()> {
-    c.prepare_cached(
-        "INSERT INTO security_incident_events (incident_id, kind, severity, previous_severity, detector, at, alert_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )?
-    .execute(params![id, kind, s.as_str(), previous.map(Severity::as_str), detector, now, alert])?;
-    Ok(())
+fn record(c: &Connection, id: i64, kind: &str, s: Severity, previous: Option<Severity>, detector: Option<&str>, now: i64) -> rusqlite::Result<i64> {
+    c.prepare_cached("INSERT INTO security_incident_events (incident_id, kind, severity, previous_severity, detector, at) VALUES (?, ?, ?, ?, ?, ?)")?
+        .execute(params![id, kind, s.as_str(), previous.map(Severity::as_str), detector, now])?;
+    Ok(c.last_insert_rowid())
 }
 
 /// The shadow integration, when it is set and belongs to this account.
@@ -365,6 +365,7 @@ fn fire(
     app: &AppPolicy,
     shadow: Option<i64>,
     id: i64,
+    event: i64,
     transition: &str,
     previous: Option<Severity>,
     base_url: &str,
@@ -401,13 +402,17 @@ fn fire(
         "mcp": {"tool": "get_security_incident", "arguments": {"application_id": t.application_id, "environment": t.environment, "incident_id": id}},
     });
     let payload = as_hash(crate::rjson::parse(body.to_string().as_bytes()).unwrap_or(crate::rjson::Value::Nil));
-    Ok(match app.mode {
+    let alert = match app.mode {
         Mode::Shadow => match shadow {
             Some(integration) => Some(outbox::create(c, None, integration, "security_incident", None, &crate::rjson::Value::Hash(payload), "pending", None)?),
             None => None,
         },
         Mode::Live => rules::fire_issueless(c, t.application_id, "security_incident", &payload)?.first().copied(),
-    })
+    };
+    if let Some(a) = alert {
+        c.execute("UPDATE security_incident_events SET alert_id = ? WHERE id = ?", params![a, event])?;
+    }
+    Ok(alert)
 }
 
 /// One incident with its signals (the most severe and newest first, at
@@ -538,7 +543,8 @@ pub fn digest(c: &Connection, t: &Target, app: &AppPolicy, w: &Watcher, now: i64
             "DELETE FROM security_incidents WHERE environment_id = ? AND status = 'closed' AND closed_at < ?",
             params![t.environment_id, now - KEEP_CLOSED_DAYS * DAY_US],
         )?;
-        c.execute("DELETE FROM security_accounts WHERE environment_id = ? AND signed_up_at < ?", params![t.environment_id, now - 7 * DAY_US])?;
+        let keep_accounts = (app.thresholds.repeat_signup_lookback_hours * 3600 * 1_000_000).max(7 * DAY_US);
+        c.execute("DELETE FROM security_accounts WHERE environment_id = ? AND signed_up_at < ?", params![t.environment_id, now - keep_accounts])?;
         c.execute(
             "DELETE FROM security_digests WHERE environment_id = ? AND day < ?",
             params![t.environment_id, &time::utc_seconds_string((now - 30 * DAY_US).div_euclid(1_000_000))[..10]],
@@ -548,11 +554,17 @@ pub fn digest(c: &Connection, t: &Target, app: &AppPolicy, w: &Watcher, now: i64
                 "SELECT i.id, i.actor, i.severity, i.status, i.opened_at,
                    (SELECT count(*) FROM security_incident_signals s WHERE s.incident_id = i.id)
                  FROM security_incidents i WHERE i.environment_id = ? AND i.alerted_severity IS NULL AND i.digested_at IS NULL
-                   AND i.opened_at >= ? AND i.severity IN ('medium', 'high', 'critical')
-                 ORDER BY CASE i.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, i.opened_at LIMIT 200",
+                   AND i.severity IN ('medium', 'high', 'critical')
+                 ORDER BY CASE i.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, i.opened_at LIMIT 201",
             )?
-            .query_map(params![t.environment_id, now - DAY_US], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+            .query_map([t.environment_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
             .collect::<rusqlite::Result<_>>()?;
+        // Every incident not yet in a digest is eligible (digested_at marks
+        // what was sent), so no run-time drift between days skips one; past
+        // 200, the rest wait for the next digest and this one says so.
+        let mut rows = rows;
+        let more = rows.len() > 200;
+        rows.truncate(200);
         let mut alert = None;
         if !rows.is_empty() {
             let mut lines = Vec::new();
@@ -571,10 +583,16 @@ pub fn digest(c: &Connection, t: &Target, app: &AppPolicy, w: &Watcher, now: i64
                 incidents.push(json!({"id": id, "actor": actor, "severity": severity, "status": status, "detectors": detectors, "signals": n}));
                 c.execute("UPDATE security_incidents SET digested_at = ? WHERE id = ?", params![now, id])?;
             }
-            let message =
-                format!("{} security incidents below the alert line in {} / {} (24 h): {}", rows.len(), t.application, t.environment, lines.join("; "));
+            let message = format!(
+                "{} security incidents below the alert line in {} / {}{}: {}",
+                rows.len(),
+                t.application,
+                t.environment,
+                if more { " (more wait for the next digest)" } else { "" },
+                lines.join("; ")
+            );
             let body = json!({
-                "mode": app.mode.as_str(), "message": message, "day": day, "incidents": incidents,
+                "mode": app.mode.as_str(), "message": message, "day": day, "incidents": incidents, "more": more,
                 "application": t.application, "application_id": t.application_id, "environment": t.environment, "environment_id": t.environment_id,
                 "incidents_url": format!("{base_url}/api/v1/applications/{}/environments/{}/security_incidents", t.application_id, t.environment_id),
             });

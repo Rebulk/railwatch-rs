@@ -228,13 +228,56 @@ pub fn detect(input: &Input, policy: &AppPolicy, hosting: &dyn HostingClassifier
         }
     }
 
-    // Identity: signups, then new-account probes, then OAuth clients. A
+    // 6b. oauth_client_registered (before signups: an earlier suspicious
+    // registration flags a later signup, as it would on a later tick)
+    for e in input.events.iter().filter(|e| e.kind == EventKind::OAuthClientRegistered) {
+        let actor = actor_of(e.ip.as_deref(), e.user_ref.as_deref());
+        let name = e.client_name.as_deref().unwrap_or("");
+        let named = lists::suspicious_client_name(name);
+        let mut feats: Vec<String> = Vec::new();
+        if named {
+            feats.push(format!("name \"{}\"", text(name)));
+        }
+        if e.ip.as_deref().is_some_and(|ip| hosting.hosting(ip) == Some(true)) {
+            feats.push("from a hosting address".into());
+        }
+        if let Some(u) = e.redirect_uris.iter().find(|u| lists::throwaway_redirect(u)) {
+            feats.push(format!("throwaway redirect {}", text(u)));
+        }
+        let sev = if named {
+            Severity::High
+        } else if feats.is_empty() {
+            Severity::Info
+        } else {
+            Severity::Medium
+        };
+        let id = e.client_id.as_deref().map(text).unwrap_or_else(|| "?".into());
+        let mut s = signal(
+            "oauth_client_registered",
+            sev,
+            &actor,
+            e.at,
+            e.at,
+            1,
+            format!(
+                "OAuth client {id} \"{}\" -> {}{}",
+                text(name),
+                e.redirect_uris.first().map_or_else(|| "(no redirect)".to_string(), |u| text(u)),
+                if feats.is_empty() { String::new() } else { format!(" ({})", feats.join(", ")) }
+            ),
+        );
+        s.subject = format!("client:{id}");
+        s.identity = true;
+        out.push(s);
+    }
+
+    // Identity: signups, then new-account probes. A
     // signup is judged against the address's signals so far (this
     // evaluation's, and the open incident's).
     let address_signals = out.clone();
     let flagged_by = |ip: &str, at: i64| -> Vec<&'static str> {
         let mut d: Vec<&'static str> =
-            address_signals.iter().filter(|s| s.actor == ip && s.at <= at && s.severity >= Severity::High).map(|s| s.detector).collect();
+            address_signals.iter().filter(|s| s.actor == ip && s.at < at && s.severity >= Severity::High).map(|s| s.detector).collect();
         d.dedup();
         if d.is_empty() && history.flagged_since.get(ip).is_some_and(|t| *t < at) {
             d.push("an open incident");
@@ -252,10 +295,10 @@ pub fn detect(input: &Input, policy: &AppPolicy, hosting: &dyn HostingClassifier
         {
             feats.push("hosting address".into());
         }
-        if let Some(d) = e.email_domain.as_deref()
-            && (e.disposable || lists::disposable_domain(d))
-        {
-            feats.push(format!("disposable domain {}", text(d)));
+        match e.email_domain.as_deref() {
+            Some(d) if e.disposable || lists::disposable_domain(d) => feats.push(format!("disposable domain {}", text(d))),
+            None if e.disposable => feats.push("disposable email (the app's verdict)".into()),
+            _ => {}
         }
         if let Some(ip) = e.ip.as_deref()
             && fam(e.ua.as_deref()) == UaFamily::App
@@ -376,48 +419,6 @@ pub fn detect(input: &Input, policy: &AppPolicy, hosting: &dyn HostingClassifier
         }
     }
 
-    // 9. oauth_client_registered
-    for e in input.events.iter().filter(|e| e.kind == EventKind::OAuthClientRegistered) {
-        let actor = actor_of(e.ip.as_deref(), e.user_ref.as_deref());
-        let name = e.client_name.as_deref().unwrap_or("");
-        let named = lists::suspicious_client_name(name);
-        let mut feats: Vec<String> = Vec::new();
-        if named {
-            feats.push(format!("name \"{}\"", text(name)));
-        }
-        if e.ip.as_deref().is_some_and(|ip| hosting.hosting(ip) == Some(true)) {
-            feats.push("from a hosting address".into());
-        }
-        if let Some(u) = e.redirect_uris.iter().find(|u| lists::throwaway_redirect(u)) {
-            feats.push(format!("throwaway redirect {}", text(u)));
-        }
-        let sev = if named {
-            Severity::High
-        } else if feats.is_empty() {
-            Severity::Info
-        } else {
-            Severity::Medium
-        };
-        let id = e.client_id.as_deref().map(text).unwrap_or_else(|| "?".into());
-        let mut s = signal(
-            "oauth_client_registered",
-            sev,
-            &actor,
-            e.at,
-            e.at,
-            1,
-            format!(
-                "OAuth client {id} \"{}\" -> {}{}",
-                text(name),
-                e.redirect_uris.first().map_or_else(|| "(no redirect)".to_string(), |u| text(u)),
-                if feats.is_empty() { String::new() } else { format!(" ({})", feats.join(", ")) }
-            ),
-        );
-        s.subject = format!("client:{id}");
-        s.identity = true;
-        out.push(s);
-    }
-
     out.sort_by(|a, b| a.at.cmp(&b.at).then(a.detector.cmp(b.detector)).then(a.actor.cmp(&b.actor)).then(a.subject.cmp(&b.subject)));
     out
 }
@@ -488,6 +489,7 @@ mod tests {
         let same: Vec<Req> = (0..25).map(|i| req(i * 10, ip, "Mozilla/5.0 (X11) Gecko Firefox", "/missing", 404)).collect();
         assert!(run(same, vec![]).is_empty(), "one broken link reloaded is not a scanner");
         let slow: Vec<Req> = (0..25).map(|i| req(i * 120, ip, "Mozilla/5.0 (X11) Gecko Firefox", &format!("/x{i}"), 404)).collect();
+        assert_eq!(Policy::default().for_app("shop").thresholds.longest_window_min(), 30, "non_browser_on_web's 30 min: reads cover it");
         assert!(run(slow, vec![]).is_empty(), "25 over 50 minutes never has 20 inside 15");
     }
 
@@ -531,7 +533,22 @@ mod tests {
         assert!(s[0].summary.contains("also sent curl"), "{}", s[0].summary);
         let mut disposable = signup(0, ip, "41", browser, "corp.example");
         disposable.disposable = true;
-        assert_eq!(names(&run(vec![], vec![disposable])), [("risky_signup", "high")], "the app's own verdict counts");
+        assert_eq!(names(&run(vec![], vec![disposable.clone()])), [("risky_signup", "high")], "the app's own verdict counts");
+        disposable.email_domain = None;
+        assert_eq!(names(&run(vec![], vec![disposable])), [("risky_signup", "high")], "even with no domain sent");
+        // A suspicious OAuth registration earlier in the same window flags the signup.
+        let mut reg = Event::new(T0 - 30 * S, "security.oauth_client.registered");
+        reg.ip = Some(ip.into());
+        reg.client_name = Some("pentest-tool".into());
+        let s = run(vec![], vec![reg.clone(), signup(0, ip, "41", browser, "example.com")]);
+        assert_eq!(names(&s), [("oauth_client_registered", "high"), ("risky_signup", "critical")]);
+        reg.at = T0 + 30 * S;
+        let s = run(vec![], vec![signup(0, ip, "41", browser, "example.com"), reg]);
+        assert_eq!(names(&s), [("risky_signup", "info"), ("oauth_client_registered", "high")], "a later registration does not");
+        // Evidence at the signup's own instant is not "before" it.
+        let same: Vec<Req> = (0..3).map(|i| req(-2 + i, ip, browser, "/.env", 404)).collect();
+        let s = run(same, vec![signup(0, ip, "41", browser, "example.com")]);
+        assert_eq!(names(&s), [("risky_signup", "info"), ("secrets_probe", "high")], "the third probe and the signup at one time");
         // An address already flagged high makes any signup critical.
         let probes: Vec<Req> = (0..3).map(|i| req(-60 + i, ip, browser, "/.env", 404)).collect();
         let s = run(probes, vec![signup(0, ip, "41", browser, "example.com")]);
