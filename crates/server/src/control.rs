@@ -433,6 +433,37 @@ impl Control {
         })
     }
 
+    /// A sign-in: User.authenticate_by, then the session row. The password
+    /// check is bcrypt at cost 12, a few hundred milliseconds by design,
+    /// and it runs with the control connection RELEASED. Every ingest
+    /// request and every page takes that one connection, so a check made
+    /// while holding it let a handful of anonymous sign-in attempts stall
+    /// telemetry for every account.
+    pub fn sign_in(&self, email: &str, password: &str, user_agent: Option<&str>, ip: Option<&str>) -> rusqlite::Result<Option<i64>> {
+        self.sign_in_with(email, user_agent, ip, |digest| verify_password(password, digest))
+    }
+
+    /// `verify` is the password check, given the digest to check against
+    /// (the dummy one when nobody has the address, so a miss costs what a
+    /// hit costs).
+    fn sign_in_with(&self, email: &str, user_agent: Option<&str>, ip: Option<&str>, verify: impl FnOnce(&str) -> bool) -> rusqlite::Result<Option<i64>> {
+        let found = self.with(|c| find_user_by_email(c, email))?;
+        if !verify(found.as_ref().map_or(dummy_digest(), |u| u.password_digest.as_str())) {
+            return Ok(None);
+        }
+        let Some(user) = found else { return Ok(None) };
+        self.with(|c| {
+            // The connection was free while the password was checked: a
+            // password change (or the user's deletion) in between ends
+            // this sign-in, as it ends every other session.
+            let current: Option<String> = c.query_row("SELECT password_digest FROM users WHERE id = ?", [user.id], |r| r.get(0)).optional()?;
+            if current.as_deref() != Some(user.password_digest.as_str()) {
+                return Ok(None);
+            }
+            create_session(c, user.id, user_agent, ip).map(Some)
+        })
+    }
+
     /// The one control connection, for every account. A panic while it was
     /// held (a handler bug) must not take the server down for everyone: the
     /// lock is recovered, not unwrapped. The connection itself is sound (a
@@ -1342,6 +1373,55 @@ mod tests {
         assert_eq!(open(&again.to_string()), Some((again, other)));
         assert_eq!(open(&theirs), None);
         assert_eq!(c.with(|x| session_cookie(x, again + 1)).unwrap(), None, "no such session, no cookie");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every ingest request and every page waits on the one control
+    /// connection. A sign-in must not hold it for the length of a bcrypt
+    /// check, or anonymous sign-in attempts stall telemetry for everyone.
+    #[test]
+    fn a_sign_in_checks_the_password_without_holding_the_control_connection() {
+        let dir = std::env::temp_dir().join(format!("rw-control-sign-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let password = test_password();
+        let user = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &password, true)).unwrap();
+        let sessions = || c.with(|x| x.query_row("SELECT count(*) FROM sessions", [], |r| r.get::<_, i64>(0))).unwrap();
+
+        // While the password is being checked, another request gets the connection.
+        let session = c
+            .sign_in_with(" Ada@Example.com ", Some("a browser"), Some("203.0.113.9"), |digest| {
+                assert!(c.conn.try_lock().is_ok(), "the control connection is held during the password check");
+                verify_password(&password, digest)
+            })
+            .unwrap()
+            .expect("the right password signs in");
+        assert_eq!(c.with(|x| find_session(x, session)).unwrap().unwrap().user_id, user);
+
+        // The public entry point is the same path.
+        assert!(c.sign_in("ada@example.com", &password, None, None).unwrap().is_some());
+        assert!(c.sign_in("ada@example.com", &format!("{password}x"), None, None).unwrap().is_none(), "a wrong password");
+        assert_eq!(sessions(), 2, "and it left no session behind");
+
+        // Nobody has the address: the dummy digest is still checked (a miss
+        // costs what a hit costs), and nothing signs in even if it "matched".
+        let mut checked = None;
+        let missing = c.sign_in_with("nobody@example.com", None, None, |digest| {
+            checked = Some(digest.to_string());
+            true
+        });
+        assert_eq!((missing.unwrap(), checked.as_deref()), (None, Some(dummy_digest())));
+
+        // The password changed while the old one was being checked: the
+        // change ends this sign-in, as it ends every other session.
+        let raced = c.sign_in_with("ada@example.com", None, None, |digest| {
+            let ok = verify_password(&password, digest);
+            c.tx(|tx| Ok(set_password(tx, user, &test_password(), None)?)).unwrap();
+            ok
+        });
+        assert_eq!(raced.unwrap(), None);
+        assert_eq!(sessions(), 0, "no session from the old password survives the change");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
