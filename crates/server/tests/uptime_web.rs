@@ -17,9 +17,10 @@ use railwatch_server::web::{self, WebState, cookies};
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-fn session_cookie(session_id: i64) -> String {
+fn session_cookie(control: &Control, session_id: i64) -> String {
     let keys = cookies::Keys::new(SECRET.as_bytes());
-    format!("{}={}", cookies::SESSION_TOKEN, keys.sign(cookies::SESSION_TOKEN, &session_id.to_string()))
+    let value = control.with(|x| control::session_cookie(x, session_id)).unwrap().expect("the session exists");
+    format!("{}={}", cookies::SESSION_TOKEN, keys.sign(cookies::SESSION_TOKEN, &value))
 }
 
 fn set_cookie(res: &reqwest::Response, name: &str) -> Option<String> {
@@ -123,7 +124,7 @@ async fn uptime_over_http() {
     let mut csrf = Vec::new();
     for user in [owner, member] {
         let sid = control.with(|x| control::create_session(x, user, Some("ua"), Some("127.0.0.1"))).unwrap();
-        let sess = session_cookie(sid);
+        let sess = session_cookie(&control, sid);
         let r = http.get(format!("{base}/apps/{app}/envs/{env}/uptime")).header("Cookie", &sess).send().await.unwrap();
         assert_eq!(r.status(), 200, "the Uptime page renders for every member");
         let xsrf = set_cookie(&r, "XSRF-TOKEN").unwrap();

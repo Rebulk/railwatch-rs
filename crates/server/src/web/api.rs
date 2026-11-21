@@ -927,6 +927,7 @@ impl Api<'_> {
         let mut props = props;
         if !self.token.allows(super::mcp::security::SECURITY_SCOPE) {
             super::mcp::security::strip_personal_fields(&mut props["execution"]["detail"]);
+            super::mcp::security::strip_personal_contexts(&mut props["exceptions"]);
             props["access"] = super::mcp::security::access_json(false);
         }
         ok(props)
@@ -1515,7 +1516,15 @@ impl Api<'_> {
         } else {
             (None, None)
         };
-        let detail = |r: Option<db::Rec>| r.as_ref().map_or(Value::Null, super::mcp::exception_occurrence);
+        let personal = self.token.allows(super::mcp::security::SECURITY_SCOPE);
+        let detail = |r: Option<db::Rec>| {
+            let mut occurrence = r.as_ref().map_or(Value::Null, super::mcp::exception_occurrence);
+            // A browser error's context names the browser: personal data.
+            if !personal && let Some(context) = occurrence.get_mut("context") {
+                super::mcp::security::strip_personal_context(context);
+            }
+            occurrence
+        };
         db::merge_into(&mut v, "sample_occurrence", detail(sample));
         db::merge_into(&mut v, "last_occurrence", detail(last));
         let comments: Vec<Value> = self.control(|c| {
@@ -2619,6 +2628,41 @@ mod tests {
         let (_, full) = get(&f, &path, "security");
         assert_eq!(full["execution"]["detail"], detail, "the security scope sees it all");
         assert!(full.get("access").is_none());
+    }
+
+    /// A browser error's stored context names the browser. On the API an
+    /// issue's occurrences and an execution's exceptions show that user agent
+    /// only to a token with the security scope, as a request's detail does.
+    #[test]
+    fn a_browser_errors_user_agent_on_the_api_needs_the_security_scope() {
+        let f = fixture("exception-context-personal");
+        let slug: String = f.c.with(|x| x.query_row("SELECT slug FROM environments WHERE id = ?", [f.env], |r| r.get(0))).unwrap();
+        let conn = crate::tenants::open_tenant(&f.dir.join("telemetry").join(format!("{slug}.sqlite3"))).unwrap();
+        let group: String = f.c.with(|x| x.query_row("SELECT group_hash FROM issues WHERE id = ?", [f.issue], |r| r.get(0))).unwrap();
+        let context = json!({"browser": {"user_agent": "Mozilla/5.0 (Probe)", "url": "/orders"}, "plan": "pro"});
+        conn.execute(
+            "INSERT INTO executions (execution_id, kind, name, method, group_hash, status, occurred_at, duration) VALUES ('ex-b', 'request', 'POST /railwatch/beacon', 'POST', 'g', 204, ?1, 1000)",
+            [qt(NOW - 60_000_000)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO exceptions (class_name, message, source, occurred_at, group_hash, execution_id, execution_source, context) VALUES ('TypeError', 'x is undefined', 'browser', ?1, ?2, 'ex-b', 'request', ?3)",
+            params![qt(NOW - 60_000_000), group, context.to_string()],
+        )
+        .unwrap();
+        let issue = format!("/api/v1/issues/{}", f.issue);
+        let execution = format!("/api/v1/applications/{}/environments/{}/executions/ex-b", f.app, f.env);
+        for path in [&issue, &execution] {
+            let (status, plain) = get(&f, path, "read_only");
+            assert_eq!(status, 200, "{plain}");
+            assert!(!plain.to_string().contains("Mozilla/5.0 (Probe)"), "{path}: {plain}");
+            assert!(plain.to_string().contains("/orders"), "the rest of the context stays: {plain}");
+            let (_, full) = get(&f, path, "security");
+            assert!(full.to_string().contains("Mozilla/5.0 (Probe)"), "{path}: the security scope sees it: {full}");
+        }
+        // The fixture's issue names no sample, so its one occurrence is the latest.
+        let (_, plain) = get(&f, &issue, "read_only");
+        assert_eq!(plain["last_occurrence"]["context"], json!({"browser": {"url": "/orders"}, "plan": "pro"}));
     }
 
     /// The API takes `a|b` and answers a key or value the resource does not

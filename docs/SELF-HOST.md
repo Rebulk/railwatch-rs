@@ -320,16 +320,25 @@ The security model:
   and acts with the claimed role only: an email that matches an existing
   user (one who signed up directly, or the owner) is that user *inside the
   proxy's account*, at the role the proxy signed, never in the user's other
-  accounts and never as an owner. Through the proxy nobody can switch
+  accounts and never as an owner. If that existing user never verified
+  their address (with open sign-up anyone can register an address they do
+  not own), the first proxied request for it replaces the password and
+  ends that user's sessions and tokens, as a password reset does: the
+  address's owner can still set a password with "Forgot password".
+  Through the proxy nobody can switch
   account, create or delete an account, transfer ownership, accept an
   invitation to another account, or create a token for anything but the
   proxy's account; a token created there never acts with more than the
   role the proxy signed. If that account is deleted, proxied requests are refused
   (403; MCP and the API 401) instead of joining the next account. Each
   proxied user has one session row, reused; Settings > Sessions shows it
-  as "railwatch trusted proxy". Proxy-created users have no usable
-  password, so the actions that ask for one (changing email or password,
-  deleting the user or an account) are not available to them.
+  as "railwatch trusted proxy", and through the proxy shows and ends only
+  that row, never the sessions of the user's own sign-ins. Deleting the
+  user is refused through the proxy (it would remove them from every
+  account), and the proxy's session never counts as a recent
+  authentication. Proxy-created users have no usable password, so the
+  actions that ask for one (changing email or password, deleting an
+  account) are not available to them.
 - **CSRF still applies**: a state-changing request needs the Origin check
   and the session's token, which the browser gets and sends through the
   proxy like any cookie.
@@ -530,7 +539,9 @@ systemctl stop railwatch railwatch.socket`, empty `/var/lib/railwatch`, run
 `railwatch restore` as the `railwatch` user with the same `BACKUP_S3_*`
 settings, then start again. `secret_key_base` is not in the bucket: copy
 `/var/lib/railwatch/secret_key_base` separately (or set `SECRET_KEY_BASE`),
-or integration secrets must be re-entered.
+or integration secrets must be re-entered. People who signed in after the
+backup was taken are signed out by the restore: their session is not in
+it, and their cookie does not open a session created afterwards.
 
 ## Upgrades
 

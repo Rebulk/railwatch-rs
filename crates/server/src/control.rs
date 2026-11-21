@@ -337,9 +337,32 @@ impl Control {
         let id = self
             .tx(|tx| {
                 let name = if retention_days == 30 { "default".to_string() } else { format!("default-{retention_days}d") };
-                let account = match tx.query_row("SELECT id FROM accounts WHERE slug = ?", [&name], |r| r.get(0)).optional()? {
+                // The operator's own account for this retention: the one
+                // under that slug that NO user is a member of. A server from
+                // before create_account refused these slugs may hold a
+                // user's account under one; that is never the operator's, and
+                // the operator's is then made under the next free name.
+                let account = match tx
+                    .query_row(
+                        "SELECT a.id FROM accounts a WHERE (a.slug = ?1 OR a.slug LIKE ?1 || '-cli%')
+                           AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.account_id = a.id) ORDER BY a.id LIMIT 1",
+                        [&name],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                {
                     Some(id) => id,
-                    None => insert_account(tx, &name, &name, retention_days)?,
+                    None => {
+                        let mut slug = name.clone();
+                        for n in 1.. {
+                            let taken: bool = tx.query_row("SELECT 1 FROM accounts WHERE slug = ?", [&slug], |_| Ok(true)).optional()?.unwrap_or(false);
+                            if !taken {
+                                break;
+                            }
+                            slug = if n == 1 { format!("{name}-cli") } else { format!("{name}-cli-{n}") };
+                        }
+                        insert_account(tx, &name, &slug, retention_days)?
+                    }
                 };
                 let app = match tx.query_row("SELECT id FROM applications WHERE account_id = ? AND slug = 'default'", [account], |r| r.get(0)).optional()? {
                     Some(id) => id,
@@ -410,6 +433,37 @@ impl Control {
         })
     }
 
+    /// A sign-in: User.authenticate_by, then the session row. The password
+    /// check is bcrypt at cost 12, a few hundred milliseconds by design,
+    /// and it runs with the control connection RELEASED. Every ingest
+    /// request and every page takes that one connection, so a check made
+    /// while holding it let a handful of anonymous sign-in attempts stall
+    /// telemetry for every account.
+    pub fn sign_in(&self, email: &str, password: &str, user_agent: Option<&str>, ip: Option<&str>) -> rusqlite::Result<Option<i64>> {
+        self.sign_in_with(email, user_agent, ip, |digest| verify_password(password, digest))
+    }
+
+    /// `verify` is the password check, given the digest to check against
+    /// (the dummy one when nobody has the address, so a miss costs what a
+    /// hit costs).
+    fn sign_in_with(&self, email: &str, user_agent: Option<&str>, ip: Option<&str>, verify: impl FnOnce(&str) -> bool) -> rusqlite::Result<Option<i64>> {
+        let found = self.with(|c| find_user_by_email(c, email))?;
+        if !verify(found.as_ref().map_or(dummy_digest(), |u| u.password_digest.as_str())) {
+            return Ok(None);
+        }
+        let Some(user) = found else { return Ok(None) };
+        self.with(|c| {
+            // The connection was free while the password was checked: a
+            // password change (or the user's deletion) in between ends
+            // this sign-in, as it ends every other session.
+            let current: Option<String> = c.query_row("SELECT password_digest FROM users WHERE id = ?", [user.id], |r| r.get(0)).optional()?;
+            if current.as_deref() != Some(user.password_digest.as_str()) {
+                return Ok(None);
+            }
+            create_session(c, user.id, user_agent, ip).map(Some)
+        })
+    }
+
     /// The one control connection, for every account. A panic while it was
     /// held (a handler bug) must not take the server down for everyone: the
     /// lock is recovered, not unwrapped. The connection itself is sound (a
@@ -455,6 +509,16 @@ pub fn insert_account(tx: &Connection, name: &str, slug: &str, retention_days: i
 /// taken slug fails validation in Rails ("Slug has already been taken").
 /// Here a numeric suffix is added instead, since every self-hosted user
 /// names their account and collisions are ordinary (DIFFERENCES.md).
+/// The slugs `railwatch env create` and `env import` look their account up
+/// by (`Control::create`): "default", or "default-<N>d" for a retention of N
+/// days. A dashboard user must never hold one. Whoever named an account
+/// "Default" became the owner of the next environment the operator created
+/// from the command line, and read everything sent to it.
+pub fn cli_account_slug(slug: &str) -> bool {
+    slug == "default"
+        || slug.strip_prefix("default-").and_then(|rest| rest.strip_suffix('d')).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 pub fn create_account(tx: &Connection, name: &str, owner_id: i64) -> ModelResult<i64> {
     let base = Some(parameterize(name)).filter(|s| !s.is_empty()).unwrap_or_else(|| {
         let mut b = [0u8; 4];
@@ -464,7 +528,7 @@ pub fn create_account(tx: &Connection, name: &str, owner_id: i64) -> ModelResult
     let mut slug = base.clone();
     for n in 2.. {
         let taken: bool = tx.query_row("SELECT 1 FROM accounts WHERE slug = ?", [&slug], |_| Ok(true)).optional()?.unwrap_or(false);
-        if !taken {
+        if !taken && !cli_account_slug(&slug) {
             break;
         }
         slug = format!("{base}-{n}");
@@ -817,6 +881,17 @@ pub fn find_user_by_email(c: &Connection, email: &str) -> rusqlite::Result<Optio
     c.prepare_cached(&format!("SELECT {USER_COLUMNS} FROM users WHERE email = ?"))?.query_row([normalize_email(email)], user_row).optional()
 }
 
+/// Marks user `id` verified, but only while their address is still `email`,
+/// the one a verification link proved. Whether it did.
+///
+/// The link is checked in one trip to the database and this runs in another,
+/// and the account's address can change between them. A write by id alone
+/// then verified an address nobody had proved: a link for an address you
+/// own, replayed while you change the account to someone else's.
+pub fn mark_email_verified(c: &Connection, id: i64, email: &str) -> rusqlite::Result<bool> {
+    Ok(c.execute("UPDATE users SET verified = 1, updated_at = ?1 WHERE id = ?2 AND email = ?3", params![now_db(), id, email])? == 1)
+}
+
 /// User.authenticate_by(email:, password:)
 pub fn authenticate_by(c: &Connection, email: &str, password: &str) -> rusqlite::Result<Option<User>> {
     match find_user_by_email(c, email)? {
@@ -868,10 +943,41 @@ pub struct Session {
 pub fn create_session(c: &Connection, user_id: i64, user_agent: Option<&str>, ip: Option<&str>) -> rusqlite::Result<i64> {
     let now = now_db();
     c.execute(
-        "INSERT INTO sessions (user_id, user_agent, ip_address, authenticated_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4, ?4)",
-        params![user_id, user_agent, ip, now],
+        "INSERT INTO sessions (user_id, user_agent, ip_address, authenticated_at, created_at, updated_at, token) VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5)",
+        params![user_id, user_agent, ip, now, base58(32)],
     )?;
     Ok(c.last_insert_rowid())
+}
+
+/// What the `session_token` cookie carries for a session (signed by the
+/// caller): "<id>.<token>". The id alone is not enough to name a session.
+/// Ids are a counter, a restore from backup puts the counter back, and
+/// `secret_key_base` is kept across a restore, so a cookie from before it
+/// would open whoever was given its id afterwards. The token is random per
+/// session, so a reused id never matches an outstanding cookie. None: no
+/// such session.
+pub fn session_cookie(c: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
+    let token: Option<Option<String>> = c.query_row("SELECT token FROM sessions WHERE id = ?", [id], |r| r.get(0)).optional()?;
+    Ok(token.map(|t| t.map_or_else(|| id.to_string(), |t| format!("{id}.{t}"))))
+}
+
+/// The session a (verified) `session_token` cookie value names. A session
+/// from before tokens (or an imported row) has none, and is opened by a bare
+/// id only; a session with a token is never opened without it.
+pub fn find_session_by_cookie(c: &Connection, value: &str) -> rusqlite::Result<Option<Session>> {
+    use subtle::ConstantTimeEq;
+    let (id, given) = match value.split_once('.') {
+        Some((id, token)) => (id, Some(token)),
+        None => (value, None),
+    };
+    let Ok(id) = id.parse::<i64>() else { return Ok(None) };
+    let stored: Option<Option<String>> = c.prepare_cached("SELECT token FROM sessions WHERE id = ?")?.query_row([id], |r| r.get(0)).optional()?;
+    let matches = match (stored, given) {
+        (Some(Some(stored)), Some(given)) => bool::from(stored.as_bytes().ct_eq(given.as_bytes())),
+        (Some(None), None) => true,
+        _ => false,
+    };
+    if matches { find_session(c, id) } else { Ok(None) }
 }
 
 pub fn find_session(c: &Connection, id: i64) -> rusqlite::Result<Option<Session>> {
@@ -1043,6 +1149,72 @@ pub(crate) fn test_password() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// `railwatch env create` picks its account by the slug "default". A
+    /// dashboard user who named an account "Default" owned the next
+    /// environment the operator made from the command line.
+    #[test]
+    fn the_cli_never_puts_an_environment_into_an_account_a_user_owns() {
+        let dir = std::env::temp_dir().join(format!("rw-control-cli-account-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let mallory = c.tx(|tx| insert_user(tx, "Mallory", "mallory@example.com", &test_password(), false)).unwrap();
+        let account_of = |c: &Control, env: i64| -> i64 {
+            c.with(|x| {
+                x.query_row("SELECT a.account_id FROM environments e JOIN applications a ON a.id = e.application_id WHERE e.id = ?", [env], |r| r.get(0))
+            })
+            .unwrap()
+        };
+        let members = |c: &Control, account: i64| -> i64 {
+            c.with(|x| x.query_row("SELECT COUNT(*) FROM memberships WHERE account_id = ?", [account], |r| r.get(0))).unwrap()
+        };
+
+        // Today: a user cannot take the names the CLI looks up.
+        for name in ["Default", "default", "Default 7d", "default-90d"] {
+            let theirs = c.tx(|tx| create_account(tx, name, mallory)).unwrap();
+            let slug: String = c.with(|x| x.query_row("SELECT slug FROM accounts WHERE id = ?", [theirs], |r| r.get(0))).unwrap();
+            assert!(!cli_account_slug(&slug), "{name:?} became {slug:?}");
+        }
+        assert!(!cli_account_slug("defaults") && !cli_account_slug("default-d") && !cli_account_slug("default-7days") && !cli_account_slug("my-default"));
+
+        // A server from before that rule: a user's account already holds the
+        // slug. The CLI must not use it.
+        let squatted = c.tx(|tx| insert_account(tx, "Default", "default", 30)).unwrap();
+        c.tx(|tx| insert_membership(tx, squatted, mallory, "owner")).unwrap();
+        let first = c.create("production", "digest-1", 30).unwrap();
+        let operators = account_of(&c, first.id);
+        assert_ne!(operators, squatted, "the operator's environment went into a user's account");
+        assert_eq!(members(&c, operators), 0, "nobody was made a member of the operator's account");
+        // And it finds its own account again, rather than making one per run.
+        let second = c.create("staging", "digest-2", 30).unwrap();
+        assert_eq!(account_of(&c, second.id), operators);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A verification link proves one address. If the account's address
+    /// changed after the link was checked, the row must not become verified.
+    #[test]
+    fn verifying_an_email_only_marks_the_address_the_link_proved() {
+        let dir = std::env::temp_dir().join(format!("rw-control-verify-bind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let id = c.tx(|tx| insert_user(tx, "Mallory", "mine@example.com", &test_password(), false)).unwrap();
+        let verified = |c: &Control| c.with(|x| x.query_row("SELECT verified FROM users WHERE id = ?", [id], |r| r.get::<_, bool>(0))).unwrap();
+
+        // The link was checked against mine@example.com; then the account's
+        // address changed before the write.
+        c.with(|x| x.execute("UPDATE users SET email = 'theirs@example.com', verified = 0 WHERE id = ?", [id])).unwrap();
+        assert!(!c.with(|x| mark_email_verified(x, id, "mine@example.com")).unwrap(), "the address the link proved is gone");
+        assert!(!verified(&c), "theirs@example.com was never proved");
+
+        // The same link while the address is still the one it proved.
+        c.with(|x| x.execute("UPDATE users SET email = 'mine@example.com' WHERE id = ?", [id])).unwrap();
+        assert!(c.with(|x| mark_email_verified(x, id, "mine@example.com")).unwrap());
+        assert!(verified(&c));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// GA hunt H1: a panic while a request holds the control connection
     /// (one handler's bug) must not fail every later request of every
     /// account; nor may a transaction it left open leak into the next.
@@ -1158,6 +1330,98 @@ mod tests {
         let rails = "$2a$12$1EzDBnePTwOGg6V1MTqICOaxRDkMD1vVk5RM0fB6JBBMam5iMRCly";
         assert!(verify_password("correct horse battery staple", rails));
         assert!(!verify_password("correct horse battery stapl", rails));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A session is named by its id AND its random token. An id alone (what
+    /// the cookie used to carry) names a session only if that session was
+    /// created before tokens existed, so nobody is signed out by the upgrade
+    /// and a reused id never opens a newer session.
+    #[test]
+    fn a_session_cookie_names_its_session_by_token_not_by_id_alone() {
+        let dir = std::env::temp_dir().join(format!("rw-control-session-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let user = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &test_password(), true)).unwrap();
+        let other = c.tx(|tx| insert_user(tx, "Bo", "bo@example.com", &test_password(), true)).unwrap();
+        let open = |value: &str| c.with(|x| find_session_by_cookie(x, value)).unwrap().map(|s| (s.id, s.user_id));
+
+        let id = c.with(|x| create_session(x, user, None, None)).unwrap();
+        let cookie = c.with(|x| session_cookie(x, id)).unwrap().unwrap();
+        let (cookie_id, token) = cookie.split_once('.').expect("id.token");
+        assert_eq!((cookie_id, token.len()), (id.to_string().as_str(), 32));
+        assert_eq!(open(&cookie), Some((id, user)));
+        assert_eq!(open(&id.to_string()), None, "the id alone does not open a session that has a token");
+        assert_eq!(open(&format!("{id}.{}", base58(32))), None, "nor does another token");
+        assert_eq!(open(&format!("{id}.")), None);
+        assert_eq!(open("not-a-number.x"), None);
+
+        // The id is handed out again (a restore puts the counter back): the
+        // old cookie names nobody, the new session has its own token.
+        c.with(|x| x.execute_batch("DELETE FROM sessions; DELETE FROM sqlite_sequence WHERE name = 'sessions';")).unwrap();
+        let again = c.with(|x| create_session(x, other, None, None)).unwrap();
+        assert_eq!(again, id, "premise: the id is reused");
+        assert_eq!(open(&cookie), None, "a cookie from before does not open whoever has the id now");
+        let theirs = c.with(|x| session_cookie(x, again)).unwrap().unwrap();
+        assert_eq!(open(&theirs), Some((again, other)));
+
+        // A session from before the upgrade has no token: its old cookie
+        // (the bare id) still opens it, and a token never does.
+        c.with(|x| x.execute("UPDATE sessions SET token = NULL WHERE id = ?", [again])).unwrap();
+        assert_eq!(c.with(|x| session_cookie(x, again)).unwrap().as_deref(), Some(again.to_string().as_str()));
+        assert_eq!(open(&again.to_string()), Some((again, other)));
+        assert_eq!(open(&theirs), None);
+        assert_eq!(c.with(|x| session_cookie(x, again + 1)).unwrap(), None, "no such session, no cookie");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every ingest request and every page waits on the one control
+    /// connection. A sign-in must not hold it for the length of a bcrypt
+    /// check, or anonymous sign-in attempts stall telemetry for everyone.
+    #[test]
+    fn a_sign_in_checks_the_password_without_holding_the_control_connection() {
+        let dir = std::env::temp_dir().join(format!("rw-control-sign-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let password = test_password();
+        let user = c.tx(|tx| insert_user(tx, "Ada", "ada@example.com", &password, true)).unwrap();
+        let sessions = || c.with(|x| x.query_row("SELECT count(*) FROM sessions", [], |r| r.get::<_, i64>(0))).unwrap();
+
+        // While the password is being checked, another request gets the connection.
+        let session = c
+            .sign_in_with(" Ada@Example.com ", Some("a browser"), Some("203.0.113.9"), |digest| {
+                assert!(c.conn.try_lock().is_ok(), "the control connection is held during the password check");
+                verify_password(&password, digest)
+            })
+            .unwrap()
+            .expect("the right password signs in");
+        assert_eq!(c.with(|x| find_session(x, session)).unwrap().unwrap().user_id, user);
+
+        // The public entry point is the same path.
+        assert!(c.sign_in("ada@example.com", &password, None, None).unwrap().is_some());
+        assert!(c.sign_in("ada@example.com", &format!("{password}x"), None, None).unwrap().is_none(), "a wrong password");
+        assert_eq!(sessions(), 2, "and it left no session behind");
+
+        // Nobody has the address: the dummy digest is still checked (a miss
+        // costs what a hit costs), and nothing signs in even if it "matched".
+        let mut checked = None;
+        let missing = c.sign_in_with("nobody@example.com", None, None, |digest| {
+            checked = Some(digest.to_string());
+            true
+        });
+        assert_eq!((missing.unwrap(), checked.as_deref()), (None, Some(dummy_digest())));
+
+        // The password changed while the old one was being checked: the
+        // change ends this sign-in, as it ends every other session.
+        let raced = c.sign_in_with("ada@example.com", None, None, |digest| {
+            let ok = verify_password(&password, digest);
+            c.tx(|tx| Ok(set_password(tx, user, &test_password(), None)?)).unwrap();
+            ok
+        });
+        assert_eq!(raced.unwrap(), None);
+        assert_eq!(sessions(), 0, "no session from the old password survives the change");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

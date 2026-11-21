@@ -520,6 +520,40 @@ pub(in crate::web) fn strip_personal_fields(detail: &mut Value) {
     }
 }
 
+/// An exception's stored `context` for a reader without the security scope.
+/// A browser error's context carries the browser's own user agent
+/// (`context.browser.user_agent`, written by the gem's beacon), which is the
+/// same personal data a request row's `user_agent` is. It is removed; the
+/// rest of the context stays as recorded. `context` is the parsed object, or
+/// the JSON text some readers pass through as a string.
+pub(in crate::web) fn strip_personal_context(context: &mut Value) {
+    fn strip(parsed: &mut Value) -> bool {
+        parsed.get_mut("browser").and_then(Value::as_object_mut).is_some_and(|b| b.remove("user_agent").is_some())
+    }
+    match context {
+        Value::Object(_) => {
+            strip(context);
+        }
+        Value::String(text) => {
+            if let Ok(mut parsed) = serde_json::from_str::<Value>(text)
+                && strip(&mut parsed)
+            {
+                *text = parsed.to_string();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `strip_personal_context` over each exception of a list (an execution's).
+pub(in crate::web) fn strip_personal_contexts(exceptions: &mut Value) {
+    for e in exceptions.as_array_mut().into_iter().flatten() {
+        if let Some(context) = e.get_mut("context") {
+            strip_personal_context(context);
+        }
+    }
+}
+
 /// Request fields from `detail` onto a request row. `full`: get_execution's
 /// detail, which adds the url, the halted callback and the unpermitted keys.
 pub(super) fn merge_request_fields(v: &mut Value, detail: &Value, access: bool, full: bool) {

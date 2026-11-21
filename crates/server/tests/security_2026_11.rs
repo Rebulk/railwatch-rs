@@ -197,6 +197,44 @@ fn user(s: &Server, name: &str, email: &str, password: &str, verified: bool) -> 
 }
 
 // ---------------------------------------------------------------------------
+// A session cookie after a restore
+
+/// Session ids are a counter, and a restore puts the counter back: the next
+/// sign-in is handed an id that a cookie from before the restore still
+/// names. `secret_key_base` is kept across a restore (docs/SELF-HOST.md), so
+/// that cookie still verifies. It must not open the other person's session.
+#[test]
+fn a_cookie_from_before_a_restore_does_not_open_whoever_was_given_its_session_id() {
+    let s = start("restore", "invite");
+    let (xavier_password, yolanda_password) = (control::base58(16), control::base58(16));
+    let xavier = user(&s, "Xavier", "xavier@example.com", &xavier_password, true);
+    let yolanda = user(&s, "Yolanda", "yolanda@example.com", &yolanda_password, true);
+    s.control.tx(|tx| control::create_account(tx, "Acme", xavier)).unwrap();
+    s.control.tx(|tx| control::create_account(tx, "Globex", yolanda)).unwrap();
+
+    let mut his = Browser::default();
+    his.sign_in(&s, "xavier@example.com", &xavier_password);
+    let profile = his.get(&s, "/settings/profile");
+    assert!(profile.status == 200 && profile.body.contains("xavier@example.com"), "premise: his cookie is his session");
+    let his_session: i64 = s.control.with(|c| c.query_row("SELECT id FROM sessions WHERE user_id = ?", [xavier], |r| r.get(0))).unwrap();
+
+    // What `railwatch restore` leaves behind for a backup taken before he
+    // signed in: no such session, and the counter where it was.
+    s.control.with(|c| c.execute_batch("DELETE FROM sessions; DELETE FROM sqlite_sequence WHERE name = 'sessions';")).unwrap();
+
+    let mut hers = Browser::default();
+    hers.sign_in(&s, "yolanda@example.com", &yolanda_password);
+    let her_session: i64 = s.control.with(|c| c.query_row("SELECT id FROM sessions WHERE user_id = ?", [yolanda], |r| r.get(0))).unwrap();
+    assert_eq!(her_session, his_session, "premise: the id was handed out again");
+
+    let after = his.get(&s, "/settings/profile");
+    assert!(!after.body.contains("yolanda@example.com"), "his old cookie opened her session");
+    assert_eq!((after.status, after.location()), (302, "/sign_in"), "an old cookie is signed out, not someone else");
+    let still_hers = hers.get(&s, "/settings/profile");
+    assert!(still_hers.status == 200 && still_hers.body.contains("yolanda@example.com"), "her own cookie still works");
+}
+
+// ---------------------------------------------------------------------------
 // Finding 9
 
 /// Adding someone to an account is an invitation they accept, whether or
@@ -233,10 +271,16 @@ fn adding_a_member_invites_them_instead_of_joining_them_without_consent() {
 fn reset_sid(s: &Server, user_id: i64) -> String {
     let (digest, email): (String, String) =
         s.control.with(|x| x.query_row("SELECT password_digest, email FROM users WHERE id = ?", [user_id], |r| Ok((r.get(0)?, r.get(1)?)))).unwrap();
-    let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 600;
-    let value = format!("{user_id}.{exp}");
-    let mac = s.state.keys.sign("password_reset", &format!("{value}.{}", railwatch_server::web::controllers::reset_bind(&digest, &email)));
-    format!("{value}.{}", mac.rsplit_once("--").unwrap().1)
+    let bind = railwatch_server::web::controllers::reset_bind(&digest, &email);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    // `-` is a base64url character, so about one link in a hundred has a MAC
+    // containing `--`, the separator signed values are split on. Those are
+    // the links this picks: each of them must work like any other.
+    (now + 300..now + 1200)
+        .map(|exp| format!("{user_id}.{exp}"))
+        .map(|value| format!("{value}.{}", s.state.keys.signature("password_reset", &format!("{value}.{bind}"))))
+        .find(|sid| sid.rsplit_once('.').unwrap().1.contains("--"))
+        .expect("a link whose MAC contains `--` within fifteen minutes of expiries")
 }
 
 /// With open sign-up anyone can register an address they do not own; the

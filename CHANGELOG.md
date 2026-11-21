@@ -7,6 +7,66 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- Security: the session cookie now carries a random per-session token
+  beside the session id (`sessions.token`, a new nullable column). The id
+  is a counter, and a restore from backup puts the counter back while
+  `secret_key_base` is kept, so a cookie from before a restore could open
+  the session of whoever was given its id afterwards. Sessions that exist
+  at upgrade keep working with the cookie they have; every new sign-in gets
+  a token, and a cookie without one never opens a session that has one.
+  Nothing to do on upgrade or on restore.
+- Fixed: about one sign-in and one emailed link in a hundred did not work.
+  A signed value is `<value>--<MAC>`, and it was split on the last `--`,
+  but `-` is a character of the MAC's own encoding. A MAC that contained
+  `--` was cut short and never verified: the session cookie signed nobody
+  in (the next attempt did), and a password reset or email verification
+  link was "invalid" from the moment it was sent. The format is unchanged;
+  existing cookies and links keep working.
+- Security: `railwatch env create` and `env import` no longer put an
+  environment into an account a user owns. They looked their account up by
+  the slug `default` (or `default-<N>d`), and a dashboard user could register
+  that slug by naming an account "Default". The next environment the
+  operator created from the command line then belonged to that user, who
+  read everything sent to it. Dashboard accounts can no longer take those
+  slugs, and the CLI only uses an account under that name that has no
+  members, creating its own (`default-cli`) when a user already holds it.
+  If you have used `env create` on a server where someone else could create
+  accounts, check which account your environments are in (Settings >
+  Applications in each account, or `railwatch env list`).
+- Security: an email verification link only verifies the address it was
+  sent to. The link was checked in one database call and `verified` was
+  written in another, by user id alone. Replaying a link for an address you
+  own while changing the account to an address you do not could, with the
+  right timing, mark that second address verified. That defeats the owner's
+  way of taking a squatted address back (a password reset only removes the
+  squatter's sessions and tokens from an unverified row) and lets the
+  owner's first Google sign-in link onto the squatter's account. The write
+  now names the address the link proved.
+- Security: a browser error's user agent needs the `security` scope
+  everywhere. `get_issue`, `investigate_issue`, `GET /api/v1/issues/:id` and
+  the exceptions of `GET /api/v1/.../executions/:id` returned an exception's
+  stored `context` whole, and for a JavaScript error that includes
+  `context.browser.user_agent`. A token without the scope got it there while
+  every request row withheld the same value. That one key is now left out
+  without the scope; the rest of the context is unchanged.
+- Security (trusted proxy, off by default): for a request the proxy signs
+  for an email that is already a user here, Settings > Sessions lists and
+  ends only the proxy's own session row (it listed every session of that
+  user with its user agent and IP address, and could end any of them), and
+  deleting the user is refused through the proxy. Before this, a user who signs in with Google could be
+  deleted through the proxy, from every account, because the proxy's
+  freshly created session row counted as a recent authentication.
+- Security (trusted proxy with open sign-up): when the proxy vouches for
+  an address that an unverified user already holds, that user's password,
+  sessions and tokens are replaced before the proxy's membership is
+  attached, as a password reset does. Before this, someone who had
+  registered a colleague's address kept their own sign-in and gained the
+  colleague's role in the proxy's account.
+- Security: a sign-in no longer holds the control database while it
+  checks the password. The check is bcrypt, a few hundred milliseconds by
+  design, and every ingest request and page waits on that one connection,
+  so a handful of sign-in attempts at once could stall telemetry for every
+  account. A password changed during the check ends that sign-in.
 - Dependencies: rusqlite 0.43, sha2, md-5 and chacha20poly1305 0.11, hmac
   0.13, bcrypt 0.19, jsonwebtoken 12, croner 4, toml 1,
   base64 0.23, getrandom 0.4 and sigstore 0.16 (#99); lucide-react 1.74 and

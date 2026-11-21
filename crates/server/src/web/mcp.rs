@@ -1437,10 +1437,20 @@ impl Mcp<'_> {
             return Ok((Value::Null, Value::Null));
         }
         let sample = issue.sample_json();
-        self.with_telemetry(&issue.env_row(), |conn| {
+        let (mut sample, mut last) = self.with_telemetry(&issue.env_row(), |conn| {
             let (sample, last) = issue_exception_occurrences(conn, &issue.group_hash, &sample)?;
             Ok((sample.as_ref().map_or(Value::Null, exception_detail), last.as_ref().map_or(Value::Null, exception_detail)))
-        })
+        })?;
+        // A browser error's context names the browser: personal data, as a
+        // request row's user agent is.
+        if !self.security_access() {
+            for o in [&mut sample, &mut last] {
+                if let Some(context) = o.get_mut("context") {
+                    security::strip_personal_context(context);
+                }
+            }
+        }
+        Ok((sample, last))
     }
 
     fn list_slow_routes(&self, a: &Args) -> R<String> {
@@ -3731,6 +3741,27 @@ mod tests {
             Ok(x.last_insert_rowid())
         })
         .unwrap()
+    }
+
+    /// A browser error's stored context names the browser. That user agent
+    /// is personal data wherever it is read: an issue's occurrence shows it
+    /// only to a token with the security scope, as a request row does.
+    #[test]
+    fn an_issue_occurrence_keeps_the_browser_user_agent_behind_the_security_scope() {
+        let f = seeded("issue-browser-ua");
+        seed_exception_issue(&f);
+        let context = json!({"browser": {"user_agent": "Mozilla/5.0 (Probe)", "url": "/orders", "session": "s1"}, "plan": "pro"});
+        f.tenant().execute("UPDATE exceptions SET source = 'browser', context = ?1 WHERE id = 55", [context.to_string()]).unwrap();
+        // The fixture's token: mcp, read, write.
+        for tool in ["get_issue", "investigate_issue"] {
+            let text = f.text(tool, json!({"key": "SHOP-79"}));
+            assert!(!text.contains("Mozilla/5.0 (Probe)"), "{tool}: {text}");
+        }
+        let o = f.tool("get_issue", json!({"key": "SHOP-79"}))["sample_occurrence"].clone();
+        assert_eq!(o["context"], json!({"browser": {"url": "/orders", "session": "s1"}, "plan": "pro"}), "the rest of the context stays");
+        f.grant_security();
+        let o = f.tool("get_issue", json!({"key": "SHOP-79"}))["sample_occurrence"].clone();
+        assert_eq!(o["context"], context, "the security scope sees it all");
     }
 
     #[test]
