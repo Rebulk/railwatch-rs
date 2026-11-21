@@ -7,6 +7,12 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- Dependencies: rusqlite 0.43, sha2, md-5 and chacha20poly1305 0.11, hmac
+  0.13, bcrypt 0.19, jsonwebtoken 12, croner 4, toml 1,
+  base64 0.23, getrandom 0.4 and sigstore 0.16 (#99); lucide-react 1.74 and
+  jsdom 31 (#82). Signed cookies, stored integration secrets and password
+  hashes from earlier versions still read.
+
 ## v0.3.6 (2026-11-20)
 
 Upgrading: no migrations and nothing on disk changes.
