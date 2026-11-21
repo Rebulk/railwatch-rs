@@ -464,16 +464,20 @@ async fn destructive_authentication(cx: &Ctx, password: &str) -> bool {
 async fn email_verification_show(cx: Ctx, p: Params) -> Response {
     guard!(rate_limited(&cx, &cx.state.verification_limit, "/settings/email", "Too many verification attempts. Try again later."));
     let sid = p.s("sid");
-    let user = match token_user(&cx, &sid, "email").await {
-        Some((uid, email)) => verify_token(&cx, "email_verification", &sid, |id| (id == uid).then(|| email.clone())),
+    let proven = match token_user(&cx, &sid, "email").await {
+        Some((uid, email)) => verify_token(&cx, "email_verification", &sid, |id| (id == uid).then(|| email.clone())).map(|id| (id, email)),
         None => None,
     };
-    match user {
-        Some(id) => {
-            let _ = cx.state.db(move |c| c.with(|x| x.execute("UPDATE users SET verified = 1, updated_at = ? WHERE id = ?", params![now_db(), id]))).await;
-            cx.redirect(Redirect::to("/").notice("Thank you for verifying your email address"))
-        }
-        None => cx.redirect(Redirect::to("/settings/email").alert("That email verification link is invalid")),
+    // The link proves ONE address; the write names it (mark_email_verified),
+    // because the account's address can change between the check and here.
+    let verified = match proven {
+        Some((id, email)) => cx.state.db(move |c| c.with(|x| control::mark_email_verified(x, id, &email))).await.unwrap_or(false),
+        None => false,
+    };
+    if verified {
+        cx.redirect(Redirect::to("/").notice("Thank you for verifying your email address"))
+    } else {
+        cx.redirect(Redirect::to("/settings/email").alert("That email verification link is invalid"))
     }
 }
 
