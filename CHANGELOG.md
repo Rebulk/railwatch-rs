@@ -7,6 +7,17 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- Security: `railwatch env create` and `env import` no longer put an
+  environment into an account a user owns. They looked their account up by
+  the slug `default` (or `default-<N>d`), and a dashboard user could register
+  that slug by naming an account "Default". The next environment the
+  operator created from the command line then belonged to that user, who
+  read everything sent to it. Dashboard accounts can no longer take those
+  slugs, and the CLI only uses an account under that name that has no
+  members, creating its own (`default-cli`) when a user already holds it.
+  If you have used `env create` on a server where someone else could create
+  accounts, check which account your environments are in (Settings >
+  Applications in each account, or `railwatch env list`).
 - Security: an email verification link only verifies the address it was
   sent to. The link was checked in one database call and `verified` was
   written in another, by user id alone. Replaying a link for an address you

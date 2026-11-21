@@ -337,9 +337,32 @@ impl Control {
         let id = self
             .tx(|tx| {
                 let name = if retention_days == 30 { "default".to_string() } else { format!("default-{retention_days}d") };
-                let account = match tx.query_row("SELECT id FROM accounts WHERE slug = ?", [&name], |r| r.get(0)).optional()? {
+                // The operator's own account for this retention: the one
+                // under that slug that NO user is a member of. A server from
+                // before create_account refused these slugs may hold a
+                // user's account under one; that is never the operator's, and
+                // the operator's is then made under the next free name.
+                let account = match tx
+                    .query_row(
+                        "SELECT a.id FROM accounts a WHERE (a.slug = ?1 OR a.slug LIKE ?1 || '-cli%')
+                           AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.account_id = a.id) ORDER BY a.id LIMIT 1",
+                        [&name],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                {
                     Some(id) => id,
-                    None => insert_account(tx, &name, &name, retention_days)?,
+                    None => {
+                        let mut slug = name.clone();
+                        for n in 1.. {
+                            let taken: bool = tx.query_row("SELECT 1 FROM accounts WHERE slug = ?", [&slug], |_| Ok(true)).optional()?.unwrap_or(false);
+                            if !taken {
+                                break;
+                            }
+                            slug = if n == 1 { format!("{name}-cli") } else { format!("{name}-cli-{n}") };
+                        }
+                        insert_account(tx, &name, &slug, retention_days)?
+                    }
                 };
                 let app = match tx.query_row("SELECT id FROM applications WHERE account_id = ? AND slug = 'default'", [account], |r| r.get(0)).optional()? {
                     Some(id) => id,
@@ -455,6 +478,16 @@ pub fn insert_account(tx: &Connection, name: &str, slug: &str, retention_days: i
 /// taken slug fails validation in Rails ("Slug has already been taken").
 /// Here a numeric suffix is added instead, since every self-hosted user
 /// names their account and collisions are ordinary (DIFFERENCES.md).
+/// The slugs `railwatch env create` and `env import` look their account up
+/// by (`Control::create`): "default", or "default-<N>d" for a retention of N
+/// days. A dashboard user must never hold one. Whoever named an account
+/// "Default" became the owner of the next environment the operator created
+/// from the command line, and read everything sent to it.
+pub fn cli_account_slug(slug: &str) -> bool {
+    slug == "default"
+        || slug.strip_prefix("default-").and_then(|rest| rest.strip_suffix('d')).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 pub fn create_account(tx: &Connection, name: &str, owner_id: i64) -> ModelResult<i64> {
     let base = Some(parameterize(name)).filter(|s| !s.is_empty()).unwrap_or_else(|| {
         let mut b = [0u8; 4];
@@ -464,7 +497,7 @@ pub fn create_account(tx: &Connection, name: &str, owner_id: i64) -> ModelResult
     let mut slug = base.clone();
     for n in 2.. {
         let taken: bool = tx.query_row("SELECT 1 FROM accounts WHERE slug = ?", [&slug], |_| Ok(true)).optional()?.unwrap_or(false);
-        if !taken {
+        if !taken && !cli_account_slug(&slug) {
             break;
         }
         slug = format!("{base}-{n}");
@@ -1054,6 +1087,48 @@ pub(crate) fn test_password() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// `railwatch env create` picks its account by the slug "default". A
+    /// dashboard user who named an account "Default" owned the next
+    /// environment the operator made from the command line.
+    #[test]
+    fn the_cli_never_puts_an_environment_into_an_account_a_user_owns() {
+        let dir = std::env::temp_dir().join(format!("rw-control-cli-account-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let mallory = c.tx(|tx| insert_user(tx, "Mallory", "mallory@example.com", &test_password(), false)).unwrap();
+        let account_of = |c: &Control, env: i64| -> i64 {
+            c.with(|x| {
+                x.query_row("SELECT a.account_id FROM environments e JOIN applications a ON a.id = e.application_id WHERE e.id = ?", [env], |r| r.get(0))
+            })
+            .unwrap()
+        };
+        let members = |c: &Control, account: i64| -> i64 {
+            c.with(|x| x.query_row("SELECT COUNT(*) FROM memberships WHERE account_id = ?", [account], |r| r.get(0))).unwrap()
+        };
+
+        // Today: a user cannot take the names the CLI looks up.
+        for name in ["Default", "default", "Default 7d", "default-90d"] {
+            let theirs = c.tx(|tx| create_account(tx, name, mallory)).unwrap();
+            let slug: String = c.with(|x| x.query_row("SELECT slug FROM accounts WHERE id = ?", [theirs], |r| r.get(0))).unwrap();
+            assert!(!cli_account_slug(&slug), "{name:?} became {slug:?}");
+        }
+        assert!(!cli_account_slug("defaults") && !cli_account_slug("default-d") && !cli_account_slug("default-7days") && !cli_account_slug("my-default"));
+
+        // A server from before that rule: a user's account already holds the
+        // slug. The CLI must not use it.
+        let squatted = c.tx(|tx| insert_account(tx, "Default", "default", 30)).unwrap();
+        c.tx(|tx| insert_membership(tx, squatted, mallory, "owner")).unwrap();
+        let first = c.create("production", "digest-1", 30).unwrap();
+        let operators = account_of(&c, first.id);
+        assert_ne!(operators, squatted, "the operator's environment went into a user's account");
+        assert_eq!(members(&c, operators), 0, "nobody was made a member of the operator's account");
+        // And it finds its own account again, rather than making one per run.
+        let second = c.create("staging", "digest-2", 30).unwrap();
+        assert_eq!(account_of(&c, second.id), operators);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A verification link proves one address. If the account's address
     /// changed after the link was checked, the row must not become verified.
     #[test]
