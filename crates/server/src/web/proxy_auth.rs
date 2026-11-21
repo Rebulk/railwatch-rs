@@ -74,7 +74,7 @@ pub struct Claims {
 pub struct Proxied(pub Claims);
 
 fn mac(secret: &[u8], signed: &[u8]) -> Hmac<sha2::Sha256> {
-    let mut m = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret).expect("hmac key");
+    let mut m = <Hmac<sha2::Sha256> as hmac::KeyInit>::new_from_slice(secret).expect("hmac key");
     m.update(signed);
     m
 }

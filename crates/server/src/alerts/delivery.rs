@@ -428,7 +428,7 @@ fn first_seen(micros: i64) -> String {
 }
 
 pub fn sign(secret: &str, body: &str) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("any key length");
+    let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(secret.as_bytes()).expect("any key length");
     mac.update(body.as_bytes());
     let hex: String = mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
     format!("sha256={hex}")

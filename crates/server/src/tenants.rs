@@ -850,7 +850,7 @@ mod tests {
         let all: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/wire_fixtures.json")).unwrap();
         let now = crate::time::now_micros() as f64 / 1e6;
         let sql = format!("SELECT {i} FROM widgets");
-        let group = format!("{:x}", <md5::Md5 as md5::Digest>::digest(format!("primary,{sql}").as_bytes()));
+        let group: String = <md5::Md5 as md5::Digest>::digest(format!("primary,{sql}").as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
         let mut q = all["query"].clone();
         q["timestamp"] = serde_json::json!(now);
         q["execution_id"] = serde_json::json!(format!("exec-{i}"));

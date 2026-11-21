@@ -34,7 +34,7 @@ pub struct Keys {
 }
 
 fn derive(secret: &[u8], purpose: &str) -> [u8; 32] {
-    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("any key length");
+    let mut m = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(secret).expect("any key length");
     m.update(purpose.as_bytes());
     m.finalize().into_bytes().into()
 }
@@ -45,7 +45,7 @@ impl Keys {
     }
 
     fn mac(&self, name: &str, value: &str) -> Vec<u8> {
-        let mut m = <Hmac<Sha256> as Mac>::new_from_slice(&self.sign).expect("any key length");
+        let mut m = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&self.sign).expect("any key length");
         // The cookie name is part of the MAC, so one cookie's value cannot be
         // replayed as another's.
         m.update(name.as_bytes());
@@ -62,7 +62,7 @@ impl Keys {
         let (v, mac) = cookie.rsplit_once("--")?;
         let value = String::from_utf8(URL_SAFE_NO_PAD.decode(v).ok()?).ok()?;
         let mac = URL_SAFE_NO_PAD.decode(mac).ok()?;
-        let mut m = <Hmac<Sha256> as Mac>::new_from_slice(&self.sign).expect("any key length");
+        let mut m = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&self.sign).expect("any key length");
         m.update(name.as_bytes());
         m.update(b"=");
         m.update(value.as_bytes());
@@ -74,7 +74,7 @@ impl Keys {
         let cipher = XChaCha20Poly1305::new((&self.encrypt).into());
         let mut nonce = [0u8; 24];
         getrandom::fill(&mut nonce).expect("random");
-        let ct = cipher.encrypt(XNonce::from_slice(&nonce), plain).expect("encrypt");
+        let ct = cipher.encrypt(&XNonce::from(nonce), plain).expect("encrypt");
         let mut out = nonce.to_vec();
         out.extend(ct);
         URL_SAFE_NO_PAD.encode(out)
@@ -86,7 +86,7 @@ impl Keys {
             return None;
         }
         let cipher = XChaCha20Poly1305::new((&self.encrypt).into());
-        cipher.decrypt(XNonce::from_slice(&raw[..24]), &raw[24..]).ok()
+        cipher.decrypt(&XNonce::try_from(&raw[..24]).expect("24-byte nonce, length checked above"), &raw[24..]).ok()
     }
 }
 

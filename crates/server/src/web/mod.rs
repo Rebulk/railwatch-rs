@@ -208,7 +208,7 @@ pub fn cursor_key_bytes(secret: &[u8]) -> Vec<u8> {
 /// key_generator.generate_key(purpose).
 fn hmac_derive(secret: &[u8], purpose: &[u8]) -> Vec<u8> {
     use hmac::{Hmac, Mac};
-    let mut m = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret).expect("hmac key");
+    let mut m = <Hmac<sha2::Sha256> as hmac::KeyInit>::new_from_slice(secret).expect("hmac key");
     m.update(purpose);
     m.finalize().into_bytes().to_vec()
 }
