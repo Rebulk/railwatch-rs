@@ -33,6 +33,24 @@ pub struct Keys {
     encrypt: [u8; 32],
 }
 
+/// base64url, unpadded, of a 32-byte MAC.
+const MAC_CHARS: usize = 43;
+
+/// "<base64url value>--<base64url MAC>" as (value, MAC). The MAC is the last
+/// MAC_CHARS characters, not "what follows the last `--`": `-` is in
+/// base64url's alphabet, so about one MAC in a hundred contains `--` itself.
+/// Splitting on the last `--` cut those MACs short, and that value never
+/// verified: a session cookie that signed nobody in, a reset link that was
+/// "invalid" the moment it was sent.
+pub fn split_signed(signed: &str) -> Option<(&str, &str)> {
+    let at = signed.len().checked_sub(MAC_CHARS)?;
+    if !signed.is_char_boundary(at) {
+        return None;
+    }
+    let (head, mac) = signed.split_at(at);
+    Some((head.strip_suffix("--")?, mac))
+}
+
 fn derive(secret: &[u8], purpose: &str) -> [u8; 32] {
     let mut m = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(secret).expect("any key length");
     m.update(purpose.as_bytes());
@@ -55,11 +73,17 @@ impl Keys {
     }
 
     pub fn sign(&self, name: &str, value: &str) -> String {
-        format!("{}--{}", URL_SAFE_NO_PAD.encode(value), URL_SAFE_NO_PAD.encode(self.mac(name, value)))
+        format!("{}--{}", URL_SAFE_NO_PAD.encode(value), self.signature(name, value))
+    }
+
+    /// The MAC half of `sign`, for a caller that carries the value itself
+    /// (the signed links in controllers.rs).
+    pub fn signature(&self, name: &str, value: &str) -> String {
+        URL_SAFE_NO_PAD.encode(self.mac(name, value))
     }
 
     pub fn verify(&self, name: &str, cookie: &str) -> Option<String> {
-        let (v, mac) = cookie.rsplit_once("--")?;
+        let (v, mac) = split_signed(cookie)?;
         let value = String::from_utf8(URL_SAFE_NO_PAD.decode(v).ok()?).ok()?;
         let mac = URL_SAFE_NO_PAD.decode(mac).ok()?;
         let mut m = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&self.sign).expect("any key length");
@@ -169,6 +193,31 @@ mod tests {
         let forged = format!("{}--{}", URL_SAFE_NO_PAD.encode("43"), c.rsplit_once("--").unwrap().1);
         assert_eq!(k.verify(SESSION_TOKEN, &forged), None);
         assert_eq!(Keys::new(b"another secret another secret 00").verify(SESSION_TOKEN, &c), None);
+    }
+
+    /// `-` is a base64url character, so some MACs contain the separator.
+    /// Every value this server signs must verify, whatever its MAC looks like.
+    #[test]
+    fn a_signed_value_verifies_when_its_mac_contains_the_separator() {
+        let k = Keys::new(b"0123456789abcdef0123456789abcdef");
+        let mut seen = 0;
+        for i in 0..5_000 {
+            let value = format!("{i}.token");
+            let signed = k.sign(SESSION_TOKEN, &value);
+            if k.signature(SESSION_TOKEN, &value).contains("--") {
+                seen += 1;
+            }
+            assert_eq!(k.verify(SESSION_TOKEN, &signed).as_deref(), Some(value.as_str()), "{signed}");
+        }
+        assert!(seen > 0, "premise: some of these MACs contain `--`");
+        // A value whose own encoding contains the separator, too.
+        let dashes = k.sign(SESSION_TOKEN, "\u{fb}\u{ef}\u{be}");
+        assert!(dashes.rsplit_once("--").unwrap().0.contains('-'));
+        assert_eq!(k.verify(SESSION_TOKEN, &dashes).as_deref(), Some("\u{fb}\u{ef}\u{be}"));
+        // Still exactly this shape: nothing shorter, no other separator.
+        for bad in ["", "--", "abc", &"a".repeat(MAC_CHARS), &format!("x-{}", "a".repeat(MAC_CHARS)), &format!("é{}", "a".repeat(MAC_CHARS - 1))] {
+            assert_eq!(k.verify(SESSION_TOKEN, bad), None, "{bad:?}");
+        }
     }
 
     #[test]

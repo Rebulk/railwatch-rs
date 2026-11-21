@@ -233,10 +233,16 @@ fn adding_a_member_invites_them_instead_of_joining_them_without_consent() {
 fn reset_sid(s: &Server, user_id: i64) -> String {
     let (digest, email): (String, String) =
         s.control.with(|x| x.query_row("SELECT password_digest, email FROM users WHERE id = ?", [user_id], |r| Ok((r.get(0)?, r.get(1)?)))).unwrap();
-    let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 600;
-    let value = format!("{user_id}.{exp}");
-    let mac = s.state.keys.sign("password_reset", &format!("{value}.{}", railwatch_server::web::controllers::reset_bind(&digest, &email)));
-    format!("{value}.{}", mac.rsplit_once("--").unwrap().1)
+    let bind = railwatch_server::web::controllers::reset_bind(&digest, &email);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    // `-` is a base64url character, so about one link in a hundred has a MAC
+    // containing `--`, the separator signed values are split on. Those are
+    // the links this picks: each of them must work like any other.
+    (now + 300..now + 1200)
+        .map(|exp| format!("{user_id}.{exp}"))
+        .map(|value| format!("{value}.{}", s.state.keys.signature("password_reset", &format!("{value}.{bind}"))))
+        .find(|sid| sid.rsplit_once('.').unwrap().1.contains("--"))
+        .expect("a link whose MAC contains `--` within fifteen minutes of expiries")
 }
 
 /// With open sign-up anyone can register an address they do not own; the
