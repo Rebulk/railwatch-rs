@@ -127,6 +127,15 @@ fn refuse_proxied(cx: &Ctx) -> Result<(), Response> {
     if cx.current.is_proxied() { Err((StatusCode::FORBIDDEN, "Not available through the trusted proxy").into_response()) } else { Ok(()) }
 }
 
+/// The one session a trusted proxy's request may see or end: its own row
+/// (proxy_auth::SESSION_AGENT). None for a normal sign-in, which sees all of
+/// the user's sessions. A matched email is an existing user, and their own
+/// sign-ins (with user agent and IP address) belong to them, not to whoever
+/// the fronting app vouched for.
+fn own_session_only(cx: &Ctx) -> Option<i64> {
+    cx.current.is_proxied().then(|| cx.current.session.as_ref().map(|s| s.id).unwrap_or(0))
+}
+
 fn rate_limited(cx: &Ctx, limit: &crate::rate_limit::FixedWindow<std::net::IpAddr>, to: &str, alert: &str) -> Result<(), Response> {
     let ip: std::net::IpAddr = cx.current.ip.parse().unwrap_or(std::net::IpAddr::from([127, 0, 0, 1]));
     if limit.exceeded(&ip) { Err(cx.redirect(Redirect::to(to).alert(alert))) } else { Ok(()) }
@@ -358,6 +367,11 @@ async fn send_verification(cx: &Ctx, user_id: i64) {
 
 async fn session_destroy(cx: Ctx, Path(id): Path<i64>) -> Response {
     guard!(authenticate(&cx));
+    // Through the trusted proxy the user's own sign-ins are not this
+    // request's to end: only the proxy's session row is.
+    if own_session_only(&cx).is_some_and(|own| own != id) {
+        return not_found();
+    }
     let user = cx.user_id();
     let deleted = cx.state.db(move |c| c.with(|x| x.execute("DELETE FROM sessions WHERE id = ? AND user_id = ?", params![id, user]))).await;
     match deleted {
@@ -375,6 +389,9 @@ async fn session_destroy(cx: Ctx, Path(id): Path<i64>) -> Response {
 /// UsersController#destroy
 async fn user_destroy(cx: Ctx, p: Params) -> Response {
     guard!(authenticate(&cx));
+    // Deleting the user removes them from every account, and a proxied
+    // request acts in the proxy's account only.
+    guard!(refuse_proxied(&cx));
     let user = cx.current.user.clone().expect("authenticated");
     let uid = user.id;
     let blocking = match cx.state.db(move |c| c.with(|x| sole_owned_accounts(x, uid))).await {
@@ -439,6 +456,12 @@ fn to_sentence(items: &[String]) -> String {
 /// (Google) confirms through it, so only a recent Google round-trip counts
 /// (sessions_oauth's reauthentication), never the password.
 async fn destructive_authentication(cx: &Ctx, password: &str) -> bool {
+    // The proxy's session row is new whenever proxy_auth::resolve had to
+    // create it, which says nothing about the person: it is never a recent
+    // authentication.
+    if cx.current.is_proxied() {
+        return false;
+    }
     let Some(user) = cx.current.user.clone() else { return false };
     if user.provider.as_deref().is_some_and(|p| !p.is_empty()) {
         return cx.current.session.as_ref().is_some_and(control::recently_authenticated);
@@ -1686,16 +1709,19 @@ async fn email_update(cx: Ctx, p: Params) -> Response {
 async fn sessions_index(cx: Ctx) -> Response {
     guard!(authenticate(&cx));
     let uid = cx.user_id();
+    let only = own_session_only(&cx);
     let sessions = cx
         .state
         .db(move |c| {
             c.with(|x| {
-                x.prepare("SELECT id, user_agent, ip_address, created_at FROM sessions WHERE user_id = ? ORDER BY created_at DESC")?
-                    .query_map([uid], |r| {
-                        Ok(json!({"id": r.get::<_, i64>(0)?, "user_agent": r.get::<_, Option<String>>(1)?,
+                x.prepare(
+                    "SELECT id, user_agent, ip_address, created_at FROM sessions WHERE user_id = ?1 AND (?2 IS NULL OR id = ?2) ORDER BY created_at DESC",
+                )?
+                .query_map(params![uid, only], |r| {
+                    Ok(json!({"id": r.get::<_, i64>(0)?, "user_agent": r.get::<_, Option<String>>(1)?,
                                   "ip_address": r.get::<_, Option<String>>(2)?, "created_at": t_json(&r.get::<_, String>(3)?)}))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
             })
         })
         .await;

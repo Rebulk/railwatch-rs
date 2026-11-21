@@ -49,6 +49,19 @@ tag is a release candidate (marked pre-release, not "latest", so
   `context.browser.user_agent`. A token without the scope got it there while
   every request row withheld the same value. That one key is now left out
   without the scope; the rest of the context is unchanged.
+- Security (trusted proxy, off by default): for a request the proxy signs
+  for an email that is already a user here, Settings > Sessions lists and
+  ends only the proxy's own session row (it listed every session of that
+  user with its user agent and IP address, and could end any of them), and
+  deleting the user is refused through the proxy. Before this, a user who signs in with Google could be
+  deleted through the proxy, from every account, because the proxy's
+  freshly created session row counted as a recent authentication.
+- Security (trusted proxy with open sign-up): when the proxy vouches for
+  an address that an unverified user already holds, that user's password,
+  sessions and tokens are replaced before the proxy's membership is
+  attached, as a password reset does. Before this, someone who had
+  registered a colleague's address kept their own sign-in and gained the
+  colleague's role in the proxy's account.
 - Dependencies: rusqlite 0.43, sha2, md-5 and chacha20poly1305 0.11, hmac
   0.13, bcrypt 0.19, jsonwebtoken 12, croner 4, toml 1,
   base64 0.23, getrandom 0.4 and sigstore 0.16 (#99); lucide-react 1.74 and
