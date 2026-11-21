@@ -7,6 +7,13 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- Fixed: about one sign-in and one emailed link in a hundred did not work.
+  A signed value is `<value>--<MAC>`, and it was split on the last `--`,
+  but `-` is a character of the MAC's own encoding. A MAC that contained
+  `--` was cut short and never verified: the session cookie signed nobody
+  in (the next attempt did), and a password reset or email verification
+  link was "invalid" from the moment it was sent. The format is unchanged;
+  existing cookies and links keep working.
 - Dependencies: rusqlite 0.43, sha2, md-5 and chacha20poly1305 0.11, hmac
   0.13, bcrypt 0.19, jsonwebtoken 12, croner 4, toml 1,
   base64 0.23, getrandom 0.4 and sigstore 0.16 (#99); lucide-react 1.74 and

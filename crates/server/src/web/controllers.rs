@@ -175,8 +175,7 @@ pub(crate) fn model_errors(e: ModelError) -> Result<Vec<(String, String)>, Respo
 fn signed_token(cx: &Ctx, purpose: &str, user_id: i64, bind: &str, ttl_secs: i64) -> String {
     let exp = crate::time::now_micros() / 1_000_000 + ttl_secs;
     let value = format!("{user_id}.{exp}");
-    let mac = cx.state.keys.sign(purpose, &format!("{value}.{bind}"));
-    format!("{value}.{}", mac.rsplit_once("--").map_or("", |(_, m)| m))
+    format!("{value}.{}", cx.state.keys.signature(purpose, &format!("{value}.{bind}")))
 }
 
 fn verify_token(cx: &Ctx, purpose: &str, token: &str, bind_for: impl Fn(i64) -> Option<String>) -> Option<i64> {
