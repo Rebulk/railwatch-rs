@@ -7,6 +7,15 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- Security: a password change, an email change and a new API token
+  re-check, in the write itself, that the request's session still exists
+  and (for the two changes) that the password its challenge was checked
+  against is still the user's. Each request loaded the user at its start
+  and wrote later, so a request already in flight when a password reset or
+  a trusted proxy's takeover of an unverified address committed could set
+  a password its sender knew, move the address, or mint a token after the
+  old ones were deleted. Such a request is now refused as an invalid
+  challenge (a token request is sent to sign in).
 - Security: the session cookie now carries a random per-session token
   beside the session id (`sessions.token`, a new nullable column). The id
   is a counter, and a restore from backup puts the counter back while
