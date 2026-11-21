@@ -7,6 +7,13 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- Security: a browser error's user agent needs the `security` scope
+  everywhere. `get_issue`, `investigate_issue`, `GET /api/v1/issues/:id` and
+  the exceptions of `GET /api/v1/.../executions/:id` returned an exception's
+  stored `context` whole, and for a JavaScript error that includes
+  `context.browser.user_agent`. A token without the scope got it there while
+  every request row withheld the same value. That one key is now left out
+  without the scope; the rest of the context is unchanged.
 - Dependencies: rusqlite 0.43, sha2, md-5 and chacha20poly1305 0.11, hmac
   0.13, bcrypt 0.19, jsonwebtoken 12, croner 4, toml 1,
   base64 0.23, getrandom 0.4 and sigstore 0.16 (#99); lucide-react 1.74 and
