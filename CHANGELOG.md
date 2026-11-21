@@ -7,12 +7,11 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
-- Security (trusted proxy, off by default): a request the proxy signs for
-  an email that is already a user here no longer reaches that user's own
-  sign-ins or the user itself. Settings > Sessions lists and ends only the
-  proxy's session row (it listed every session with its user agent and IP
-  address, and could end any of them), and deleting the user is refused
-  through the proxy. Before this, a user who signs in with Google could be
+- Security (trusted proxy, off by default): for a request the proxy signs
+  for an email that is already a user here, Settings > Sessions lists and
+  ends only the proxy's own session row (it listed every session of that
+  user with its user agent and IP address, and could end any of them), and
+  deleting the user is refused through the proxy. Before this, a user who signs in with Google could be
   deleted through the proxy, from every account, because the proxy's
   freshly created session row counted as a recent authentication.
 - Security (trusted proxy with open sign-up): when the proxy vouches for
