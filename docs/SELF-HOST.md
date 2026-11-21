@@ -327,9 +327,13 @@ The security model:
   role the proxy signed. If that account is deleted, proxied requests are refused
   (403; MCP and the API 401) instead of joining the next account. Each
   proxied user has one session row, reused; Settings > Sessions shows it
-  as "railwatch trusted proxy". Proxy-created users have no usable
-  password, so the actions that ask for one (changing email or password,
-  deleting the user or an account) are not available to them.
+  as "railwatch trusted proxy", and through the proxy shows and ends only
+  that row, never the sessions of the user's own sign-ins. Deleting the
+  user is refused through the proxy (it would remove them from every
+  account), and the proxy's session never counts as a recent
+  authentication. Proxy-created users have no usable password, so the
+  actions that ask for one (changing email or password, deleting an
+  account) are not available to them.
 - **CSRF still applies**: a state-changing request needs the Origin check
   and the session's token, which the browser gets and sends through the
   proxy like any cookie.
