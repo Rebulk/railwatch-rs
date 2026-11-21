@@ -10,4 +10,4 @@
 # no patched release). Pulled in by croner, oauth2 and rustls-acme as well as
 # used directly, so it cannot be dropped alone. Moving to jiff/time is
 # tracked in #97; remove this then.
-ignore = ["RUSTSEC-2026-0381", "RUSTSEC-2026-0543"]
+ignore = ["RUSTSEC-2026-0543"]
