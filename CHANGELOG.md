@@ -7,6 +7,11 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- Security: a sign-in no longer holds the control database while it
+  checks the password. The check is bcrypt, a few hundred milliseconds by
+  design, and every ingest request and page waits on that one connection,
+  so a handful of sign-in attempts at once could stall telemetry for every
+  account. A password changed during the check ends that sign-in.
 - Dependencies: rusqlite 0.43, sha2, md-5 and chacha20poly1305 0.11, hmac
   0.13, bcrypt 0.19, jsonwebtoken 12, croner 4, toml 1,
   base64 0.23, getrandom 0.4 and sigstore 0.16 (#99); lucide-react 1.74 and
