@@ -30,6 +30,8 @@ struct Fx {
     tenant: Connection,
     target: Target,
     integration: i64,
+    /// The key the fixture's integration settings are encrypted with.
+    key: String,
     n: i64,
 }
 
@@ -45,7 +47,8 @@ impl Fx {
         let (env, _token) = c.tx(|tx| create_environment(tx, app, "production")).unwrap();
         let slug: String = c.with(|x| x.query_row("SELECT slug FROM environments WHERE id = ?", [env], |r| r.get(0))).unwrap();
         let tenant = crate::tenants::open_tenant(&dir.join("telemetry").join(format!("{slug}.sqlite3"))).unwrap();
-        let cipher = crate::alerts::integration::SettingsCipher::new(b"k");
+        let key = crate::control::base58(32);
+        let cipher = crate::alerts::integration::SettingsCipher::new(key.as_bytes());
         let mut settings = serde_json::Map::new();
         settings.insert("url".into(), json!("https://hooks.example.com/railwatch"));
         settings.insert("secret".into(), json!("s3cret"));
@@ -53,7 +56,7 @@ impl Fx {
         let p = Policy::parse("[apps.shop]\nenabled = true\n").unwrap();
         let (target, _) = c.with(|x| targets(x, &p)).unwrap().pop().unwrap();
         assert_eq!(target.environment_id, env);
-        Fx { dir, c, tenant, target, integration, n: 0 }
+        Fx { dir, c, tenant, target, integration, key, n: 0 }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -363,7 +366,14 @@ fn shadow_alerts_go_only_to_the_shadow_integration_and_live_through_rules() {
         f.c.with(|x| {
             x.execute("INSERT INTO accounts (name, slug, created_at, updated_at) VALUES ('Other', 'other', 't', 't')", [])?;
             let acc = x.last_insert_rowid();
-            crate::alerts::integration::insert(x, &crate::alerts::integration::SettingsCipher::new(b"k"), acc, "webhook", "theirs", &serde_json::Map::new())
+            crate::alerts::integration::insert(
+                x,
+                &crate::alerts::integration::SettingsCipher::new(crate::control::base58(32).as_bytes()),
+                acc,
+                "webhook",
+                "theirs",
+                &serde_json::Map::new(),
+            )
         })
         .unwrap();
     f.req(T0 + 2 * MIN, "198.51.100.9", "curl/8", "GET", "/.env", 404, None, None);
@@ -390,7 +400,7 @@ fn the_webhook_carries_the_incident_and_is_signed() {
     }
     f.tick(&policy(&f), T0 + MIN);
     f.c.configure_alerting(crate::alerts::integration::Alerting {
-        cipher: crate::alerts::integration::SettingsCipher::new(b"k"),
+        cipher: crate::alerts::integration::SettingsCipher::new(f.key.as_bytes()),
         smtp: None,
         url: "https://rw.example.com".into(),
         deliver: true,
@@ -399,6 +409,7 @@ fn the_webhook_carries_the_incident_and_is_signed() {
     let claimed = crate::alerts::outbox::claim_due(&conn, 10).unwrap().pop().unwrap();
     let ctx = crate::alerts::delivery::Context::load(&conn, f.c.alerting(), claimed).unwrap();
     drop(conn);
+    assert!(ctx.settings_error.is_none(), "the webhook's secret decrypts: {:?}", ctx.settings_error);
     let body: serde_json::Value = serde_json::from_str(&crate::rjson::generate(&ctx.webhook_body()).unwrap()).unwrap();
     assert_eq!(body["event"], "security_incident");
     let p = &body["payload"];
