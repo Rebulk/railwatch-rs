@@ -9,11 +9,14 @@
 //! both. Each account has two applications with two environments each, all
 //! with real telemetry ingested over /ingest (every wire type, the
 //! exceptions grouped into issues by the real worker), a deploy, a source
-//! map, a webhook integration with an alert rule (and the alert it fired), a
-//! comment, an uptime monitor, a (disabled) status page, a private saved view
-//! and a pending invitation. B's telemetry and rows carry marker strings
-//! (`B_MARKERS` plus B's environment token prefixes and Bob's API token);
-//! no response to A may contain one.
+//! map, a webhook integration with an alert rule and an alert, a comment, an
+//! uptime monitor, a (disabled) status page, a private saved view and a
+//! pending invitation. B's telemetry and rows carry marker strings
+//! (`Tag::markers`, plus B's slugs, environment token prefixes and Bob's API
+//! token); no response to A may contain one. Every probe is aimed at one of
+//! B's real objects (`Selectors`), and
+//! `account_bs_own_principals_see_bs_data_through_the_same_probes` checks
+//! that the same probes, sent by B, do show B's markers.
 //!
 //! Principals of A: three browser sessions (owner, admin, member), eight API
 //! tokens (all-access, read-only, account-restricted, app-restricted,
@@ -328,7 +331,12 @@ impl Tag {
         let (u, c, l) = (self.upper, self.camel, self.lower);
         vec![
             format!("{c}Widget"),
-            format!("/{l}widgets"),
+            format!("{l}widgets"),
+            format!("{l}-tenant"),
+            format!("{l}-model"),
+            format!("{l}-session-1"),
+            format!("{l}-span"),
+            format!("{l}-user-1"),
             format!("{u}-LOG-MARKER"),
             format!("{u}-EXC-MARKER"),
             format!("{l}-customer.example"),
@@ -360,6 +368,41 @@ struct Env {
     group: String,
     execution: String,
     trace: String,
+    /// What each detail page and tool selects by, read back from the
+    /// tenant (`selectors`): {id} on /queries, /spans, /profiles, /users,
+    /// /tenants, /sessions, /releases, /deploys, and get_job/explain_query's
+    /// group hashes.
+    sel: Selectors,
+}
+
+#[derive(Default)]
+struct Selectors {
+    query_group: String,
+    span_group: String,
+    job_group: String,
+    profile_id: i64,
+    person: String,
+    tenant: String,
+    session: String,
+    release: String,
+    deploy_id: i64,
+}
+
+/// The ids B's own rows have, from its telemetry and control rows.
+fn selectors(s: &Server, slug: &str, env: i64) -> Selectors {
+    let t = open_tenant_reader(&s.tenants_dir, slug).unwrap();
+    let text = |sql: &str| t.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap_or_else(|e| panic!("{slug}: {sql}: {e}"));
+    Selectors {
+        query_group: text("SELECT group_hash FROM queries LIMIT 1"),
+        span_group: text("SELECT group_hash FROM spans LIMIT 1"),
+        job_group: text("SELECT group_hash FROM executions WHERE kind = 'job_attempt' LIMIT 1"),
+        profile_id: t.query_row("SELECT id FROM profiles LIMIT 1", [], |r| r.get(0)).unwrap(),
+        person: text("SELECT ref FROM people LIMIT 1"),
+        tenant: text("SELECT app_tenant FROM executions WHERE app_tenant IS NOT NULL LIMIT 1"),
+        session: text("SELECT session_id FROM sessions LIMIT 1"),
+        release: text("SELECT deploy FROM executions LIMIT 1"),
+        deploy_id: one(s, "SELECT id FROM deploys WHERE environment_id = ? ORDER BY id LIMIT 1", [env]),
+    }
 }
 
 struct App {
@@ -451,14 +494,36 @@ fn telemetry(t: &Tag, execution: &str, trace: &str) -> (Vec<u8>, String) {
         ("127.0.0.1", t.ip.to_string()),
         ("Write article", format!("{}-WORKFLOW-MARKER", t.upper)),
         ("Ada", format!("{}ada", t.camel)),
+        ("claude-opus-5", format!("{}-model", t.lower)),
+        ("3f9c2a1", format!("{}deploy-r1", t.lower)),
+        ("pdf.render", format!("{}-span.render", t.lower)),
+        (r#""user":"1""#, format!(r#""user":"{}-user-1""#, t.lower)),
+        // serde_json writes "tenant":null; give every record the account's tenant.
+        (r#""tenant":null"#, format!(r#""tenant":"{}-tenant""#, t.lower)),
         (FIXTURE_EXECUTION, execution.to_string()),
         (FIXTURE_TRACE, trace.to_string()),
     ];
     for (from, to) in renames {
         text = text.replace(from, &to);
     }
-    let fixtures: Map<String, Value> = serde_json::from_str(&text).unwrap();
+    let mut fixtures: Map<String, Value> = serde_json::from_str(&text).unwrap();
+    // The execution fixtures share one execution_id (one row is kept); the
+    // job attempt gets its own so the account has a job to find.
+    fixtures["job_attempt"]["execution_id"] = json!(uuid::Uuid::new_v4().to_string());
+    // One browser session, linked from the request and the visit, so the
+    // session pages and tools have a journey to show.
+    let session = format!("{}-session-1", t.lower);
+    fixtures["session"]["id"] = json!(session);
+    fixtures["session"]["started_at"] = json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 120);
+    fixtures["request"]["session_id"] = json!(session);
+    fixtures["visit"]["session_id"] = json!(session);
+    fixtures["user"]["id"] = json!(format!("{}-user-1", t.lower));
     let group = fixtures["request"]["_group"].as_str().unwrap().to_string();
+    // A second release of the same route, so compare has two sides.
+    let mut later = fixtures["request"].clone();
+    later["execution_id"] = json!(uuid::Uuid::new_v4().to_string());
+    later["deploy"] = json!(format!("{}deploy-r2", t.lower));
+    fixtures.insert("request_r2".into(), later);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64() - 60.0;
     let mut out = Vec::new();
     for (_, mut r) in fixtures {
@@ -506,7 +571,7 @@ fn account(s: &Server, t: &Tag, owner: i64) -> Account {
             let (records, group) = telemetry(t, &execution, &trace);
             let r = ingest_records(s, &token, "/ingest", &records, &[]);
             assert_eq!((r.status, r.json()["rejected"].clone()), (200, json!(0)), "fixture ingest into {env_slug}: {}", r.body);
-            envs.push(Env { id: env, name: env_name.into(), slug: env_slug, token, group, execution, trace });
+            envs.push(Env { id: env, name: env_name.into(), slug: env_slug, token, group, execution, trace, sel: Selectors::default() });
         }
         apps.push(App { id: app, slug: app_slug.into(), name: name.into(), envs });
     }
@@ -545,8 +610,13 @@ fn account(s: &Server, t: &Tag, owner: i64) -> Account {
 
     let deploy = format!("{}deploy1", t.lower);
     let body = json!({"deploy": deploy, "url": format!("https://git.{}.example/c/1", t.lower)}).to_string();
-    let r = ingest_post(s, &apps[0].envs[0].token, "/ingest/deploys", "application/json", body.as_bytes(), &[]);
-    assert!(r.status < 300, "deploy: {} {}", r.status, r.body);
+    for e in apps.iter().flat_map(|a| a.envs.iter()) {
+        let r = ingest_post(s, &e.token, "/ingest/deploys", "application/json", body.as_bytes(), &[]);
+        assert!(r.status < 300, "deploy: {} {}", r.status, r.body);
+    }
+    for e in apps.iter_mut().flat_map(|a| a.envs.iter_mut()) {
+        e.sel = selectors(s, &e.slug, e.id);
+    }
     let map = format!(r#"{{"version":3,"sources":["{}-sourcemap.js"],"names":[],"mappings":"AAAA"}}"#, t.lower);
     let r = ingest_post(
         s,
@@ -653,6 +723,8 @@ fn build() -> Fx {
     let bob_session: i64 = one(&s, "SELECT max(id) FROM sessions WHERE user_id = ?", [bob]);
 
     let mut b_markers = B_TAG.markers();
+    b_markers.push(b.slug.clone());
+    b_markers.extend(b.apps.iter().map(|a| a.slug.clone()));
     b_markers.extend(b.envs().map(|e| e.token[..12].to_string()));
     b_markers.push(bob_token.clone());
     Fx { s, a, b, password, bob_token, bob_token_id, bob_session, dan_b_membership, sessions, bob_browser, tokens, b_markers }
@@ -661,12 +733,26 @@ fn build() -> Fx {
 // ---------------------------------------------------------------------------
 // Checks
 
+/// What a request sent, as the strings a response may quote back: the
+/// path, each of its segments and query values, and the body.
+fn sent_parts(path: &str, body: &str) -> Vec<String> {
+    let (p, q) = path.split_once('?').unwrap_or((path, ""));
+    let mut out = vec![path.to_string(), body.to_string()];
+    out.extend(p.split('/').map(str::to_string));
+    out.extend(form_urlencoded::parse(q.as_bytes()).map(|(_, v)| v.into_owned()));
+    out.extend(form_urlencoded::parse(body.as_bytes()).map(|(_, v)| v.into_owned()));
+    out
+}
+
 /// The B markers in `body`, after removing what the request itself sent
-/// (an error that quotes the caller's input back is not a leak: tenancy
-/// review I1).
+/// (a page or error that quotes the caller's input back is not a leak:
+/// tenancy review I1).
 fn leaks(fx: &Fx, sent: &[String], body: &str) -> Vec<String> {
     let mut body = body.replace("\\/", "/");
-    for s in sent.iter().filter(|s| s.len() >= 3) {
+    let mut sent: Vec<&String> = sent.iter().filter(|s| s.len() >= 3).collect();
+    // Longest first: an environment slug contains the account and app slugs.
+    sent.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    for s in sent {
         body = body.replace(s.as_str(), "");
     }
     fx.b_markers.iter().filter(|m| body.contains(m.as_str())).cloned().collect()
@@ -805,6 +891,26 @@ fn probe(method: &'static str, route: &str, path: String, form: &str, refused: b
     Probe { method, route: route.to_string(), path, form: form.to_string(), refused }
 }
 
+/// The `{id}` an environment page under `sub` selects one of the
+/// environment's own rows by: the selector its page function reads. A new
+/// detail page fails here until it is given one.
+fn detail_id(e: &Env, sub: &str) -> String {
+    let s = &e.sel;
+    match sub.strip_suffix("/{id}") {
+        None => String::new(),
+        Some("/requests" | "/jobs" | "/scheduled_tasks" | "/commands" | "/executions") => e.execution.clone(),
+        Some("/queries") => s.query_group.clone(),
+        Some("/spans") => s.span_group.clone(),
+        Some("/profiles") => s.profile_id.to_string(),
+        Some("/users") => s.person.clone(),
+        Some("/deploys") => s.deploy_id.to_string(),
+        Some("/releases") => s.release.clone(),
+        Some("/sessions") => s.session.clone(),
+        Some("/tenants") => s.tenant.clone(),
+        Some(other) => panic!("env page {other}/{{id}}: tell detail_id() which of B's ids it selects by"),
+    }
+}
+
 /// Every GET a browser of A can send that names B, or that could list B.
 fn dashboard_reads(fx: &Fx) -> Vec<Probe> {
     let (a, b) = (&fx.a, &fx.b);
@@ -812,12 +918,13 @@ fn dashboard_reads(fx: &Fx) -> Vec<Probe> {
     let mut v = Vec::new();
     for (sub, _) in PAGES {
         let route = if *sub == "/" { "/apps/{app}/envs/{env}".to_string() } else { format!("/apps/{{app}}/envs/{{env}}{sub}") };
+        let id = detail_id(b.env(), sub);
         let fill = |app: i64, env: i64| {
             route
                 .replace("{app}", &app.to_string())
                 .replace("{env}", &env.to_string())
                 .replace("{group_hash}", &b.env().group)
-                .replace("{id}", &b.env().execution)
+                .replace("{id}", &id)
                 .replace("{trace_id}", &b.env().trace)
         };
         for (app, env) in [(ba, be), (aa, be), (ba, ae)] {
@@ -970,7 +1077,7 @@ fn account_a_browsers_see_nothing_of_account_b_on_any_dashboard_page() {
                 assert!(r.status == 200 && r.body.contains("ACQ-LOG-MARKER"), "{who} reads A's own logs (the session works): {}", r.status);
                 for p in probes {
                     let r = br.get(&fx.s, &p.path);
-                    let sent = vec![p.path.clone()];
+                    let sent = sent_parts(&p.path, "");
                     let leaked = leaks(fx, &sent, &r.body);
                     let mut f = failures.lock().unwrap();
                     if p.refused && !matches!(r.status, 403 | 404) {
@@ -1004,7 +1111,7 @@ fn account_a_browsers_cannot_change_anything_of_account_b() {
             if !matches!(r.status, 302 | 403 | 404 | 422) {
                 failures.push(format!("{who}: {} {} [{}] -> {}", p.method, p.path, p.form, r.status));
             }
-            let sent = vec![p.path.clone(), p.form.clone()];
+            let sent = sent_parts(&p.path, &p.form);
             let leaked = leaks(fx, &sent, &r.body);
             if !leaked.is_empty() {
                 failures.push(format!("{who}: {} {} answered with B's {leaked:?}", p.method, p.path));
@@ -1069,7 +1176,7 @@ fn api_probes(fx: &Fx) -> Vec<ApiProbe> {
     for (action, method, template) in API_ROUTES {
         let body = match *action {
             "CreateDeploy" => Some(json!({"deploy": "acq-api-probe"})),
-            "UpdateIssue" => Some(json!({"status": "resolved", "priority": "critical", "assignee_id": b.owner, "title": "evil"})),
+            "UpdateIssue" => Some(json!({"status": "resolved", "priority": "urgent", "assignee_id": b.owner, "title": "evil"})),
             "CreateComment" => Some(json!({"body": "ACQ attacker comment"})),
             _ => None,
         };
@@ -1129,7 +1236,10 @@ fn account_a_api_tokens_get_nothing_of_account_b_over_the_rest_api() {
                 assert!(r.status == 200 && r.body.contains(&fx.a.apps[0].name), "{who} lists A's applications (the token works): {} {}", r.status, r.body);
                 for p in probes {
                     let r = api(&fx.s, token, p.method, &p.path, p.body.as_ref());
-                    let sent = vec![p.path.clone(), p.body.as_ref().map(Value::to_string).unwrap_or_default()];
+                    let mut sent = sent_parts(&p.path, "");
+                    if let Some(b) = &p.body {
+                        strings(b, &mut sent);
+                    }
                     let leaked = leaks(fx, &sent, &r.body);
                     let mut f = failures.lock().unwrap();
                     if p.refused && !matches!(r.status, 403 | 404) {
@@ -1152,6 +1262,8 @@ fn account_a_api_tokens_get_nothing_of_account_b_over_the_rest_api() {
 
 /// Arguments that name the environment; each shape fills them its own way.
 const IDENTITY_ARGS: [&str; 4] = ["application_slug", "account_slug", "application_id", "environment"];
+/// Selectors a tool takes exactly one of (session_journey).
+const EXCLUSIVE: [&str; 3] = ["session_id", "execution_id", "user"];
 /// Arguments that narrow or page a result: left out so the widest result
 /// comes back (a filter could hide a leak). Required ones get a value from
 /// the schema's enum.
@@ -1216,14 +1328,18 @@ fn aim(fx: &Fx, tool: &Value) -> Vec<Map<String, Value>> {
     let target = |p: &str| -> Option<Value> {
         Some(match p {
             "route" => json!(format!("GET /{}widgets(.:format)", B_TAG.lower)),
-            "group_hash" => json!(b.env().group),
+            "group_hash" => json!(match name {
+                "explain_query" => &b.env().sel.query_group,
+                "get_job" => &b.env().sel.job_group,
+                _ => &b.env().group,
+            }),
             "execution_id" => json!(b.env().execution),
-            "session_id" => json!("x"),
-            "user" => json!("1"),
+            "session_id" => json!(b.env().sel.session),
+            "user" => json!(b.env().sel.person),
             "ip" => json!(B_TAG.ip),
             "path" => json!(format!("/{}widgets", B_TAG.lower)),
             "job" => json!(format!("{}WidgetJob", B_TAG.camel)),
-            "profile_id" => json!(1),
+            "profile_id" => json!(b.env().sel.profile_id),
             "monitor" => json!(b.monitor_name),
             "component" => json!(format!("{}Widgets/Index", B_TAG.camel)),
             "q" => json!("zqb"),
@@ -1233,7 +1349,7 @@ fn aim(fx: &Fx, tool: &Value) -> Vec<Map<String, Value>> {
     let write = |p: &str| -> Option<Value> {
         Some(match p {
             "status" => json!("resolved"),
-            "priority" => json!("critical"),
+            "priority" => json!("urgent"),
             "assignee_email" => json!(B_TAG.owner.1),
             "agent" => json!("probe"),
             "body" => json!("ACQ attacker comment"),
@@ -1268,6 +1384,16 @@ fn aim(fx: &Fx, tool: &Value) -> Vec<Map<String, Value>> {
             }
         }
         let mut sets = vec![args];
+        // Selectors a tool takes exactly one of: one call per selector.
+        let given: Vec<&str> = EXCLUSIVE.iter().copied().filter(|k| sets[0].contains_key(*k)).collect();
+        if given.len() > 1 {
+            let all = sets.remove(0);
+            for keep in &given {
+                let mut one = all.clone();
+                one.retain(|k, _| k == keep || !given.contains(&k.as_str()));
+                sets.push(one);
+            }
+        }
         for (p, values) in expand {
             sets = sets
                 .into_iter()
@@ -1595,33 +1721,61 @@ fn account_a_ingest_key_only_ever_writes_to_its_own_environment() {
 // ---------------------------------------------------------------------------
 // The scans are not vacuous
 
-/// B's own principals see B's markers on the same surfaces A is scanned on
-/// (API, MCP, dashboard page and issue), so "no marker in A's responses"
-/// means the data was withheld, not that it was never there.
+/// The probes reach B's data when B itself sends them: Bob's session gets
+/// every environment page with the same ids A's probes use, and Bob's token
+/// calls every read-only MCP tool with the same arguments (`aim`, B's own
+/// shape), and each shows B's markers. So "no marker in A's responses"
+/// means the data was withheld, not that a probe aimed at nothing.
 #[test]
-fn account_bs_markers_reach_account_b_itself_so_the_scans_mean_something() {
+fn account_bs_own_principals_see_bs_data_through_the_same_probes() {
     let fx = fx();
     let (b, t) = (&fx.b, &fx.bob_token);
     let (ba, be) = (b.apps[0].id, b.env().id);
     let mut failures = Vec::new();
-    let mut expect = |what: &str, body: &str, markers: &[&str]| {
-        for m in markers {
-            if !body.contains(m) {
-                failures.push(format!("{what} does not show {m:?} to B"));
-            }
-        }
-    };
-    let base = format!("/api/v1/applications/{ba}/environments/{be}");
-    expect("API logs", &api(&fx.s, t, "GET", &format!("{base}/logs"), None).body, &["ZQB-LOG-MARKER"]);
-    expect("API requests", &api(&fx.s, t, "GET", &format!("{base}/requests"), None).body, &["/zqbwidgets"]);
-    expect("API accounts", &api(&fx.s, t, "GET", "/api/v1/accounts", None).body, &["Bravo Holdings ZQ"]);
-    expect("API issue", &api(&fx.s, t, "GET", &format!("/api/v1/issues/{}", b.issue), None).body, &["ZQB-EXC-MARKER"]);
-    let r =
-        mcp(&fx.s, t, "tools/call", json!({"name": "search_logs", "arguments": {"application_slug": b.apps[0].slug, "environment": b.env().name, "q": "zqb"}}));
-    expect("MCP search_logs", &r.body, &["ZQB-LOG-MARKER"]);
     let mut br = fx.bob_browser.clone();
-    expect("dashboard logs page", &br.get(&fx.s, &format!("/apps/{ba}/envs/{be}/logs")).body, &["ZQB-LOG-MARKER"]);
-    expect("dashboard issue page", &br.get(&fx.s, &format!("/issues/{}", b.issue)).body, &["ZQB-EXC-MARKER", "ZQB-COMMENT-MARKER"]);
+    for p in dashboard_reads(fx).iter().filter(|p| p.path.starts_with(&format!("/apps/{ba}/envs/{be}"))) {
+        let r = br.get(&fx.s, &p.path);
+        if r.status != 200 || leaks(fx, &[], &r.body).is_empty() {
+            failures.push(format!("Bob: GET {} -> {} with no B marker", p.path, r.status));
+        }
+    }
+    for path in [format!("/issues/{}", b.issue), format!("/apps/{ba}/envs/{be}/uptime"), "/settings/integrations".into(), "/alerts".into()] {
+        let r = br.get(&fx.s, &path);
+        if r.status != 200 || leaks(fx, &[], &r.body).is_empty() {
+            failures.push(format!("Bob: GET {path} -> {} with no B marker", r.status));
+        }
+    }
+    let r = mcp(&fx.s, t, "tools/list", json!({}));
+    for tool in r.json()["result"]["tools"].as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        // Writes would change B (the snapshot tests compare against it);
+        // their lookups are the read tools' (get_issue covers the key forms).
+        if matches!(name, "update_issue" | "add_comment") {
+            continue;
+        }
+        // aim()'s first shape is B's own identity, with B's object ids.
+        let args = aim(fx, tool).remove(0);
+        let r = mcp(&fx.s, t, "tools/call", json!({"name": name, "arguments": args}));
+        if leaks(fx, &[], &r.body).is_empty() {
+            failures.push(format!("Bob: MCP {name} {} shows no B marker: {}", Value::Object(args), &r.body[..r.body.len().min(200)]));
+        }
+    }
+    let base = format!("/api/v1/applications/{ba}/environments/{be}");
+    // Counts and time series only: no string of B's to find. A's probes of
+    // these are asserted refused (403/404), which needs no marker.
+    const NUMBERS_ONLY: [&str; 2] = ["Summary", "Series"];
+    for (action, _, template) in API_ROUTES.iter().filter(|(a, m, _)| *m == "GET" && !NUMBERS_ONLY.contains(a)) {
+        let path = template
+            .replace("/api/v1/applications/{app}/environments/{env}", &base)
+            .replace("{app}", &ba.to_string())
+            .replace("{group}", &b.env().group)
+            .replace("{execution}", &b.env().execution)
+            .replace("{issue}", &b.issue.to_string());
+        let r = api(&fx.s, t, "GET", &path, None);
+        if r.status != 200 || leaks(fx, &[], &r.body).is_empty() {
+            failures.push(format!("Bob: API {action} GET {path} -> {} with no B marker", r.status));
+        }
+    }
     report("positive control", failures);
 }
 
@@ -1688,6 +1842,12 @@ fn source_routes() -> BTreeSet<(String, String)> {
     for f in files.iter().filter(|f| f.extension().is_some_and(|e| e == "rs")) {
         let text = std::fs::read_to_string(f).unwrap();
         let src = text.split("#[cfg(test)]\nmod tests").next().unwrap();
+        // Every `.route(` call must be one the scanner reads: a path it
+        // cannot resolve fails here instead of being skipped. (`.route(` in
+        // a comment or doc line is not a call.)
+        let calls = src.lines().filter(|l| !l.trim_start().starts_with("//")).map(|l| l.matches(".route(").count()).sum::<usize>();
+        let parsed = route_re.find_iter(src).count();
+        assert_eq!(calls, parsed, "{}: a .route( whose path the isolation guard cannot read; teach source_routes() its form", f.display());
         for m in route_re.captures_iter(src) {
             let open = m.get(0).unwrap().start() + ".route".len();
             let methods: Vec<String> = method_re.captures_iter(call_span(src, open)).map(|c| c[1].to_uppercase()).collect();
