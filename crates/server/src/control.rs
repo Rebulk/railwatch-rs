@@ -817,6 +817,17 @@ pub fn find_user_by_email(c: &Connection, email: &str) -> rusqlite::Result<Optio
     c.prepare_cached(&format!("SELECT {USER_COLUMNS} FROM users WHERE email = ?"))?.query_row([normalize_email(email)], user_row).optional()
 }
 
+/// Marks user `id` verified, but only while their address is still `email`,
+/// the one a verification link proved. Whether it did.
+///
+/// The link is checked in one trip to the database and this runs in another,
+/// and the account's address can change between them. A write by id alone
+/// then verified an address nobody had proved: a link for an address you
+/// own, replayed while you change the account to someone else's.
+pub fn mark_email_verified(c: &Connection, id: i64, email: &str) -> rusqlite::Result<bool> {
+    Ok(c.execute("UPDATE users SET verified = 1, updated_at = ?1 WHERE id = ?2 AND email = ?3", params![now_db(), id, email])? == 1)
+}
+
 /// User.authenticate_by(email:, password:)
 pub fn authenticate_by(c: &Connection, email: &str, password: &str) -> rusqlite::Result<Option<User>> {
     match find_user_by_email(c, email)? {
@@ -1043,6 +1054,30 @@ pub(crate) fn test_password() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A verification link proves one address. If the account's address
+    /// changed after the link was checked, the row must not become verified.
+    #[test]
+    fn verifying_an_email_only_marks_the_address_the_link_proved() {
+        let dir = std::env::temp_dir().join(format!("rw-control-verify-bind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Control::open(&dir.join("control.sqlite3")).unwrap();
+        let id = c.tx(|tx| insert_user(tx, "Mallory", "mine@example.com", &test_password(), false)).unwrap();
+        let verified = |c: &Control| c.with(|x| x.query_row("SELECT verified FROM users WHERE id = ?", [id], |r| r.get::<_, bool>(0))).unwrap();
+
+        // The link was checked against mine@example.com; then the account's
+        // address changed before the write.
+        c.with(|x| x.execute("UPDATE users SET email = 'theirs@example.com', verified = 0 WHERE id = ?", [id])).unwrap();
+        assert!(!c.with(|x| mark_email_verified(x, id, "mine@example.com")).unwrap(), "the address the link proved is gone");
+        assert!(!verified(&c), "theirs@example.com was never proved");
+
+        // The same link while the address is still the one it proved.
+        c.with(|x| x.execute("UPDATE users SET email = 'mine@example.com' WHERE id = ?", [id])).unwrap();
+        assert!(c.with(|x| mark_email_verified(x, id, "mine@example.com")).unwrap());
+        assert!(verified(&c));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// GA hunt H1: a panic while a request holds the control connection
     /// (one handler's bug) must not fail every later request of every
     /// account; nor may a transaction it left open leak into the next.

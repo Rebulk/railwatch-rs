@@ -7,6 +7,15 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- Security: an email verification link only verifies the address it was
+  sent to. The link was checked in one database call and `verified` was
+  written in another, by user id alone. Replaying a link for an address you
+  own while changing the account to an address you do not could, with the
+  right timing, mark that second address verified. That defeats the owner's
+  way of taking a squatted address back (a password reset only removes the
+  squatter's sessions and tokens from an unverified row) and lets the
+  owner's first Google sign-in link onto the squatter's account. The write
+  now names the address the link proved.
 - Security: a browser error's user agent needs the `security` scope
   everywhere. `get_issue`, `investigate_issue`, `GET /api/v1/issues/:id` and
   the exceptions of `GET /api/v1/.../executions/:id` returned an exception's
