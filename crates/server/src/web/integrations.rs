@@ -334,6 +334,17 @@ fn rule_errors(event: &str, filters: &Map<String, Value>) -> Vec<(String, String
     errors
 }
 
+/// Whether the application already has this exact rule (event, filters and
+/// integration). Each copy of a rule makes its own alert for one event, so
+/// copies only multiply what the shared outbox has to deliver.
+pub fn identical_rule_exists(x: &Connection, application_id: i64, integration_id: i64, event: &str, filters: &Map<String, Value>) -> rusqlite::Result<bool> {
+    x.query_row(
+        "SELECT EXISTS (SELECT 1 FROM alert_rules WHERE application_id = ? AND integration_id = ? AND event = ? AND filters = ?)",
+        params![application_id, integration_id, event, Value::Object(filters.clone()).to_string()],
+        |r| r.get(0),
+    )
+}
+
 /// Inserts an alert rule (the setup CLI uses it too).
 pub fn insert_rule(x: &Connection, application_id: i64, integration_id: i64, event: &str, filters: &Map<String, Value>) -> rusqlite::Result<i64> {
     let now = crate::control::now_db();
@@ -368,6 +379,9 @@ async fn rule_create(cx: Ctx, p: Params) -> Response {
                 let errors = rule_errors(&event, &filters);
                 if !errors.is_empty() {
                     return Ok(Out::Invalid(errors));
+                }
+                if identical_rule_exists(x, app, integ, &event, &filters)? {
+                    return Ok(Out::Invalid(vec![("event".into(), "already has an identical rule for this application and integration".into())]));
                 }
                 insert_rule(x, app, integ, &event, &filters)?;
                 Ok(Out::Created)

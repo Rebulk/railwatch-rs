@@ -20,6 +20,28 @@ tag is a release candidate (marked pre-release, not "latest", so
   least recently first. The 8-slot limit and the timeouts are unchanged, so
   a busy server still delays checks, but no account's monitors wait behind
   another's indefinitely. Nothing to do.
+- Security: one account's alerts can no longer delay or silently drop
+  another account's. All accounts share one alert outbox, and each delivery
+  pass took the 200 oldest due alerts from all of them; alert rules could be
+  added any number of times, and each identical copy made its own alert for
+  one event. So one account with many duplicate rules on a busy event could
+  fill every pass ahead of the others. An alert that had no delivery attempt
+  within an hour of being raised was then never claimed, and stayed
+  `pending` forever with no error. Three changes:
+  - Each pass now takes alerts from every account in turn (every account's
+    oldest, then every account's second oldest, and so on), still at most 200.
+  - Adding an alert rule that already exists (same application, event,
+    filters and integration) is refused with "Event already has an identical
+    rule for this application and integration". Existing duplicates are kept
+    and still fire; delete them in Settings > Integrations.
+  - The one-hour window is unchanged (it is Rails' reconcile window and keeps
+    a restored or long-stopped server from sending a flood of stale alerts).
+    An alert that ages out without an attempt is now marked `failed` with the
+    error "Not delivered: the outbox did not reach it within an hour of being
+    raised", and the number is logged as a warning. It shows on the Alerts
+    page, where Retry sends it. On the first start after upgrading, alerts
+    already stranded that way are marked failed the same way. Nothing to do,
+    unless you want to retry them.
 
 ## v0.3.8 (2026-11-22)
 
