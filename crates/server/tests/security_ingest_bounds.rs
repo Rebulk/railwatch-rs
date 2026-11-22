@@ -5,6 +5,8 @@
 //!    in the control database every account shares, never deleted (not even
 //!    with its environment) and scanned each tick with the one control
 //!    connection held.
+//! 2. `/ingest/deploys` and `/ingest/kamal` wrote while the environment was
+//!    paused or over quota, and deploy rows had no per-environment limit.
 //!
 //! Dummy data only, loopback only.
 
@@ -261,4 +263,76 @@ fn rows_past_the_watch_window_are_deleted_unless_still_silent() {
 
 fn count_on(c: &rusqlite::Connection, sql: &str) -> i64 {
     c.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+/// A paused environment's deploy posts store nothing, refused with the
+/// source-map action's 409; over quota, its 402.
+#[test]
+fn a_paused_or_over_quota_environment_stores_no_deploy_marker() {
+    let s = start("paused-deploy");
+    let (env, token) = tenant(&s.control, "paused-co");
+    let auth = ("Authorization", format!("Bearer {token}"));
+    let ct = ("Content-Type", "application/json".to_string());
+    s.control.with(|c| c.execute("UPDATE environments SET paused_at = '2026-01-01 00:00:00' WHERE id = ?", [env])).unwrap();
+    let deploy = request(s.addr, "/ingest/deploys", &[auth.clone(), ct.clone()], br#"{"deploy":"release-1"}"#);
+    let map = request(s.addr, "/ingest/sourcemaps", &[auth.clone(), ("X-Railwatch-Deploy", "d".into()), ("X-Railwatch-Filename", "a.js".into())], b"{}");
+    assert_eq!(map, (409, r#"{"error":"environment is paused"}"#.to_string()));
+    assert_eq!(deploy, map, "the same refusal as the source-map action");
+    assert_eq!(count(&s.control, "SELECT COUNT(*) FROM deploys WHERE environment_id = ?", env), 0);
+
+    s.control.with(|c| c.execute("UPDATE environments SET paused_at = NULL WHERE id = ?", [env])).unwrap();
+    s.control.with(|c| c.execute("UPDATE accounts SET monthly_event_quota = 0, additional_events_cap = 0", [])).unwrap();
+    let deploy = request(s.addr, "/ingest/deploys", &[auth.clone(), ct.clone()], br#"{"deploy":"release-1"}"#);
+    assert_eq!(deploy, (402, r#"{"error":"quota"}"#.to_string()));
+    assert_eq!(count(&s.control, "SELECT COUNT(*) FROM deploys WHERE environment_id = ?", env), 0);
+}
+
+/// The same for Kamal markers: nothing about the hosts is stored.
+#[test]
+fn a_paused_or_over_quota_environment_stores_no_kamal_marker() {
+    let s = start("paused-kamal");
+    let (env, token) = tenant(&s.control, "paused-co");
+    let auth = ("Authorization", format!("Bearer {token}"));
+    let ct = ("Content-Type", "application/json".to_string());
+    let stored = || -> (String, String) {
+        s.control.with(|c| c.query_row("SELECT expected_servers, kamal_config FROM environments WHERE id = ?", [env], |r| Ok((r.get(0)?, r.get(1)?)))).unwrap()
+    };
+    s.control.with(|c| c.execute("UPDATE environments SET paused_at = '2026-01-01 00:00:00' WHERE id = ?", [env])).unwrap();
+    let kamal = request(s.addr, "/ingest/kamal", &[auth.clone(), ct.clone()], br#"{"hosts":["web-9"],"version":"v1"}"#);
+    assert_eq!(kamal, (409, r#"{"error":"environment is paused"}"#.to_string()));
+    assert_eq!(stored(), ("[]".to_string(), "{}".to_string()), "Kamal hosts are not stored");
+
+    s.control.with(|c| c.execute("UPDATE environments SET paused_at = NULL WHERE id = ?", [env])).unwrap();
+    s.control.with(|c| c.execute("UPDATE accounts SET monthly_event_quota = 0, additional_events_cap = 0", [])).unwrap();
+    let kamal = request(s.addr, "/ingest/kamal", &[auth.clone(), ct.clone()], br#"{"hosts":["web-9"]}"#);
+    assert_eq!(kamal, (402, r#"{"error":"quota"}"#.to_string()));
+    assert_eq!(stored(), ("[]".to_string(), "{}".to_string()));
+}
+
+/// After N+1 distinct deploys the environment holds the newest N, and an
+/// ordinary deploy is still recorded and answered as before.
+#[test]
+fn an_environment_keeps_only_its_newest_deploys() {
+    let s = start("deploy-cap");
+    let (env, token) = tenant(&s.control, "busy-co");
+    let (other, other_token) = tenant(&s.control, "quiet-co");
+    let n = http::MAX_DEPLOYS_PER_ENVIRONMENT;
+    let ct = ("Content-Type", "application/json".to_string());
+    let post = |token: &str, body: String| request(s.addr, "/ingest/deploys", &[("Authorization", format!("Bearer {token}")), ct.clone()], body.as_bytes());
+    let first = post(&other_token, json!({"deploy": "v1", "ref": "abc", "timestamp": "2026-10-13T10:00:00Z"}).to_string());
+    assert_eq!(first, (201, r#"{"ok":true,"deploy":"v1"}"#.to_string()), "an ordinary deploy is recorded as before");
+    // Distinct, increasing timestamps: release-0 is the oldest.
+    for i in 0..=n {
+        let at = format!("2026-10-{:02}T{:02}:{:02}:00Z", 1 + i / 1440, (i / 60) % 24, i % 60);
+        let (st, body) = post(&token, json!({"deploy": format!("release-{i}"), "timestamp": at}).to_string());
+        assert_eq!(st, 201, "release-{i}: {body}");
+    }
+    assert_eq!(count(&s.control, "SELECT COUNT(*) FROM deploys WHERE environment_id = ?", env), n);
+    let oldest: i64 = count(&s.control, "SELECT COUNT(*) FROM deploys WHERE environment_id = ? AND deploy = 'release-0'", env);
+    assert_eq!(oldest, 0, "the oldest went");
+    assert_eq!(count(&s.control, &format!("SELECT COUNT(*) FROM deploys WHERE environment_id = ? AND deploy = 'release-{n}'"), env), 1, "the newest stays");
+    assert_eq!(count(&s.control, "SELECT COUNT(*) FROM deploys WHERE environment_id = ?", other), 1, "another environment's deploys are untouched");
+    let r: Option<String> =
+        s.control.with(|c| c.query_row("SELECT ref FROM deploys WHERE environment_id = ? AND deploy = 'v1'", [other], |r| r.get(0))).unwrap();
+    assert_eq!(r.as_deref(), Some("abc"));
 }

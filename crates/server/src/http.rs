@@ -589,6 +589,9 @@ fn presence(s: String) -> Option<String> {
 }
 
 async fn deploys(state: &Arc<AppState>, env: Environment, headers: &HeaderMap, raw: &[u8]) -> Response {
+    if let Some(refused) = not_ingesting(&env) {
+        return refused;
+    }
     let params = match json_params(headers, raw) {
         Ok(p) => p,
         Err(r) => return *r,
@@ -675,11 +678,18 @@ struct DeployRecord {
     detail: Value,
 }
 
+/// Deploys an environment keeps in the control database every account
+/// shares. Readers take the newest 10 to 100 (the deploys page 100, the API
+/// and MCP 50); older ones are deleted when a new one is saved.
+pub const MAX_DEPLOYS_PER_ENVIRONMENT: i64 = 500;
+
 /// Deploy find_or_initialize_by + save!, with its before_validation hooks
-/// (assign_previous_ref, trim_commits).
+/// (assign_previous_ref, trim_commits), keeping only the environment's
+/// MAX_DEPLOYS_PER_ENVIRONMENT newest.
 fn save_deploy(control: &Control, env_id: i64, mut d: DeployRecord) -> rusqlite::Result<()> {
     use rusqlite::OptionalExtension;
-    let conn = control.conn();
+    let mut guard = control.conn();
+    let conn = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let deployed_at = match d.deployed_at {
         Some(t) => crate::time::quoted_date_micros(t),
         None => conn
@@ -713,8 +723,13 @@ fn save_deploy(control: &Control, env_id: i64, mut d: DeployRecord) -> rusqlite:
            commits = excluded.commits, detail = excluded.detail, updated_at = excluded.updated_at",
         rusqlite::params![env_id, d.deploy, d.r#ref, d.name, d.url, d.server, d.previous_ref, deployed_at, commits, detail, now],
     )?;
+    conn.execute(
+        "DELETE FROM deploys WHERE environment_id = ?1 AND id NOT IN
+           (SELECT id FROM deploys WHERE environment_id = ?1 ORDER BY deployed_at DESC, id DESC LIMIT ?2)",
+        rusqlite::params![env_id, MAX_DEPLOYS_PER_ENVIRONMENT],
+    )?;
     conn.execute("UPDATE environments SET last_seen_at = ? WHERE id = ?", rusqlite::params![now, env_id])?;
-    Ok(())
+    conn.commit()
 }
 
 /// Time.zone.parse for the shapes deploy hooks send (ISO 8601 with or
@@ -799,6 +814,9 @@ pub(crate) fn web_url(u: &str) -> bool {
 }
 
 async fn kamal(state: &Arc<AppState>, env: Environment, headers: &HeaderMap, raw: &[u8]) -> Response {
+    if let Some(refused) = not_ingesting(&env) {
+        return refused;
+    }
     let params = match json_params(headers, raw) {
         Ok(p) => p,
         Err(r) => return *r,
@@ -847,6 +865,19 @@ async fn kamal(state: &Arc<AppState>, env: Environment, headers: &HeaderMap, raw
     }
 }
 
+/// The refusal for an environment that is paused or over its quota, for
+/// the actions that write outside the telemetry batch path (deploy and
+/// Kamal markers, source maps): nothing is stored in either state.
+fn not_ingesting(env: &Environment) -> Option<Response> {
+    if env.paused {
+        return Some(json(StatusCode::CONFLICT, rhash! {"error" => "environment is paused"}));
+    }
+    if env.quota_exhausted(&current_month()) {
+        return Some(json(StatusCode::PAYMENT_REQUIRED, rhash! {"error" => "quota"}));
+    }
+    None
+}
+
 /// Not in railwatch-cloud. The gem (Railwatch::SourceMaps#upload_file) posts
 /// one map per request with X-Railwatch-Deploy and X-Railwatch-Filename, and
 /// requires `{ok: true, filename:, bytes:}` back.
@@ -872,11 +903,8 @@ async fn sourcemaps(state: &Arc<AppState>, env: Environment, headers: &HeaderMap
     // As /ingest: nothing is stored for a paused environment or one over
     // its quota, and uploads have their own, lower, rate (GA review
     // 2026-11-19, security #2).
-    if env.paused {
-        return json(StatusCode::CONFLICT, rhash! {"error" => "environment is paused"});
-    }
-    if env.quota_exhausted(&current_month()) {
-        return json(StatusCode::PAYMENT_REQUIRED, rhash! {"error" => "quota"});
+    if let Some(refused) = not_ingesting(&env) {
+        return refused;
     }
     if crate::storage::sourcemaps::rate_limit().exceeded(&env.id) {
         return rate_limited();

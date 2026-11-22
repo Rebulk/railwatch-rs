@@ -36,6 +36,18 @@ tag is a release candidate (marked pre-release, not "latest", so
   deletes its rows. On the first start after upgrading, rows of deleted
   environments and named servers past the cap (the least recently seen go)
   are deleted, and rows older than a day go on the first tick. Nothing to do.
+- Security: `POST /ingest/deploys` and `POST /ingest/kamal` refuse a paused
+  environment (409 `{"error":"environment is paused"}`) and one over its
+  event quota (402 `{"error":"quota"}`), the same answers the source-map
+  upload gives. They used to write to the control database in both states.
+  An environment now keeps its 500 newest deploys (by `deployed_at`); saving
+  a new one deletes the older ones in the same transaction. Before, every
+  new deploy name was a new row of up to about 50 KB in the control
+  database, kept forever and outside the disk budget. The pages, API and
+  MCP tools read at most the newest 100. An environment with more than 500
+  deploys is trimmed the next time it records one, not at start. A deploy
+  hook posting to a paused environment now gets a 409; the generated Kamal
+  hook ignores it, as it ignores every failed call.
 
 ## v0.3.7 (2026-11-21)
 
