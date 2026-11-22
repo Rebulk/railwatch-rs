@@ -21,6 +21,21 @@ tag is a release candidate (marked pre-release, not "latest", so
   new MCP tools `list_security_incidents` and `get_security_incident` and
   under `/api/v1/.../security_incidents`, all with the `security` scope.
   New control tables; an older binary ignores them.
+- Security: the watchdog keeps at most 500 named servers per environment.
+  Every distinct `server` on an ingested row became a row in the control
+  database that every account shares, and nothing ever deleted those rows,
+  not even deleting the environment. Each watchdog tick (every 10 s) read
+  the whole table and ran one more query per row while holding the one
+  control connection, so one ingest token that sent a few batches naming
+  200,000 servers made every other account's ingest and dashboard wait
+  seconds per tick. Servers past the cap now count for the environment as a
+  whole (one warning in the log per environment); the records themselves
+  are stored as before. Rows not seen for a day are deleted, except up to
+  500 per environment that are still marked silent (so a server back after
+  a long outage still sends its recovery alert). Deleting an environment
+  deletes its rows. On the first start after upgrading, rows of deleted
+  environments and named servers past the cap (the least recently seen go)
+  are deleted, and rows older than a day go on the first tick. Nothing to do.
 
 ## v0.3.7 (2026-11-21)
 

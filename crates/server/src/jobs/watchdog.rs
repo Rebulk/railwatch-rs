@@ -13,6 +13,13 @@
 //!   ~6x the worst seen; keyed per host, not per process, so restarts do not
 //!   look like gaps. Only pairs seen within the last WATCH_WINDOW are watched,
 //!   so a retired server stops being watched after a day;
+//! - at most MAX_SERVERS_PER_ENVIRONMENT named servers are watched per
+//!   environment: `server` is client data, and every pair is a row in the
+//!   control database every account shares, scanned each tick with its one
+//!   connection held. Further names count for the environment as a whole
+//!   (server ""). Rows past WATCH_WINDOW are deleted, except a bounded
+//!   number still marked silent (so a server back after a long outage still
+//!   gets its recovery alert), and a deleted environment's rows go with it;
 //! - state (last seen, silent since) is persisted to environment_heartbeats
 //!   every tick so a restart neither forgets a silence nor re-alerts it;
 //! - a dead-man switch (RAILWATCH_DEADMAN_URL): pinged every 30 s only while
@@ -33,33 +40,64 @@ use crate::time;
 
 pub const WATCH_WINDOW_SECS: i64 = 24 * 3600;
 
+/// Named servers watched per environment. Kamal reports at most 100 hosts
+/// and the servers page lists 200 processes; 500 leaves room for a pod per
+/// deploy over the day the window covers. Past it, a batch's other servers
+/// count for the environment as a whole (server "").
+pub const MAX_SERVERS_PER_ENVIRONMENT: usize = 500;
+
 pub fn silence_secs() -> i64 {
     std::env::var("RAILWATCH_SILENCE_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60).max(30)
 }
 
 #[derive(Default)]
 pub struct Heartbeats {
-    /// (env, server) -> last committed micros
-    seen: Mutex<HashMap<(i64, String), i64>>,
+    /// env -> server -> last committed micros
+    seen: Mutex<HashMap<i64, HashMap<String, i64>>>,
+    /// Environments already logged as over MAX_SERVERS_PER_ENVIRONMENT.
+    capped: Mutex<std::collections::HashSet<i64>>,
     pub last_commit_micros: AtomicI64,
+}
+
+/// Records `at` for (env, server) unless that would be a named server past
+/// the cap; "" (the environment as a whole) is always taken.
+fn note(m: &mut HashMap<i64, HashMap<String, i64>>, env: i64, server: &str, at: i64) -> bool {
+    let servers = m.entry(env).or_default();
+    if let Some(e) = servers.get_mut(server) {
+        *e = (*e).max(at);
+        return true;
+    }
+    let named = servers.len() - usize::from(servers.contains_key(""));
+    if !server.is_empty() && named >= MAX_SERVERS_PER_ENVIRONMENT {
+        return false;
+    }
+    servers.insert(server.to_string(), at);
+    true
 }
 
 impl Heartbeats {
     pub fn beat(&self, env: i64, servers: &[String], at: i64) {
         let mut m = self.seen.lock().unwrap();
+        let mut over = false;
         for s in servers {
-            let e = m.entry((env, s.clone())).or_insert(at);
-            *e = (*e).max(at);
+            over |= !note(&mut m, env, s, at);
         }
-        if servers.is_empty() {
-            let e = m.entry((env, String::new())).or_insert(at);
-            *e = (*e).max(at);
+        if servers.is_empty() || over {
+            note(&mut m, env, "", at);
+        }
+        drop(m);
+        if over && self.capped.lock().unwrap().insert(env) {
+            tracing::warn!(
+                environment = env,
+                max = MAX_SERVERS_PER_ENVIRONMENT,
+                "watchdog: environment reports more servers than are watched; the rest count for the environment as a whole"
+            );
         }
         self.last_commit_micros.fetch_max(at, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> Vec<((i64, String), i64)> {
-        self.seen.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)).collect()
+        self.seen.lock().unwrap().iter().flat_map(|(env, servers)| servers.iter().map(|(s, at)| ((*env, s.clone()), *at))).collect()
     }
 
     /// Forgets pairs last seen before `before` (micros): they are past
@@ -69,24 +107,37 @@ impl Heartbeats {
     /// tick. Returns how many went.
     pub fn forget_before(&self, before: i64) -> usize {
         let mut m = self.seen.lock().unwrap();
-        let n = m.len();
-        m.retain(|_, at| *at >= before);
+        let mut gone = 0;
+        m.retain(|_, servers| {
+            let n = servers.len();
+            servers.retain(|_, at| *at >= before);
+            gone += n - servers.len();
+            !servers.is_empty()
+        });
         // retain keeps the peak's allocation; give it back after a big expiry.
         if m.capacity() > 2 * m.len() + 64 {
             m.shrink_to_fit();
         }
-        n - m.len()
+        gone
     }
 
-    /// Reloads persisted last-seen times at boot.
+    /// Reloads persisted last-seen times at boot, newest first and within
+    /// the cap. Rows written before there was a cap are trimmed here, once:
+    /// those of deleted environments, and named servers past the cap.
     pub fn restore(&self, c: &Connection) -> rusqlite::Result<()> {
-        let mut s = c.prepare("SELECT environment_id, server, last_seen_micros FROM environment_heartbeats")?;
-        let rows = s.query_map([], |r| Ok(((r.get::<_, i64>(0)?, r.get::<_, String>(1)?), r.get::<_, i64>(2)?)))?;
+        c.execute("DELETE FROM environment_heartbeats WHERE environment_id NOT IN (SELECT id FROM environments)", [])?;
+        c.execute(
+            "DELETE FROM environment_heartbeats WHERE rowid IN (
+               SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY environment_id ORDER BY last_seen_micros DESC, server) AS n
+                                  FROM environment_heartbeats WHERE server != '') WHERE n > ?)",
+            [MAX_SERVERS_PER_ENVIRONMENT as i64],
+        )?;
+        let mut s = c.prepare("SELECT environment_id, server, last_seen_micros FROM environment_heartbeats ORDER BY last_seen_micros DESC, server")?;
+        let rows = s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
         let mut m = self.seen.lock().unwrap();
         for r in rows {
-            let (k, v) = r?;
-            let e = m.entry(k).or_insert(v);
-            *e = (*e).max(v);
+            let (env, server, at) = r?;
+            note(&mut m, env, &server, at);
         }
         Ok(())
     }
@@ -104,21 +155,36 @@ pub fn check(c: &Connection, hb: &Heartbeats, now_micros: i64, threshold_secs: i
     let snapshot = hb.snapshot();
     let mut out = Vec::new();
     c.execute_batch("BEGIN IMMEDIATE")?;
+    let window_start = now_micros - WATCH_WINDOW_SECS * 1_000_000;
     let r = (|| {
         for ((env, server), last) in &snapshot {
+            // A deleted environment's pairs stay in memory until they age
+            // out; they must not put its rows back.
             c.prepare_cached(
-                "INSERT INTO environment_heartbeats (environment_id, server, last_seen_micros) VALUES (?1, ?2, ?3)
+                "INSERT INTO environment_heartbeats (environment_id, server, last_seen_micros)
+                 SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM environments WHERE id = ?1)
                  ON CONFLICT (environment_id, server) DO UPDATE SET last_seen_micros = MAX(last_seen_micros, excluded.last_seen_micros)",
             )?
             .execute(params![env, server, last])?;
         }
-        let rows: Vec<(i64, String, i64, Option<i64>)> = {
-            let mut s = c.prepare_cached("SELECT environment_id, server, last_seen_micros, silent_since_micros FROM environment_heartbeats")?;
-            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?
+        // Past the window nothing is watched: those rows go, except the
+        // newest MAX_SERVERS_PER_ENVIRONMENT per environment still marked
+        // silent, which a server's return turns into a recovery alert.
+        c.prepare_cached(
+            "DELETE FROM environment_heartbeats WHERE last_seen_micros < ?1 AND (silent_since_micros IS NULL OR rowid IN (
+               SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY environment_id ORDER BY last_seen_micros DESC, server) AS n
+                                  FROM environment_heartbeats WHERE last_seen_micros < ?1 AND silent_since_micros IS NOT NULL) WHERE n > ?2))",
+        )?
+        .execute(params![window_start, MAX_SERVERS_PER_ENVIRONMENT as i64])?;
+        let rows: Vec<(i64, String, i64, Option<i64>, bool)> = {
+            let mut s = c.prepare_cached(
+                "SELECT h.environment_id, h.server, h.last_seen_micros, h.silent_since_micros, e.id IS NULL OR e.paused_at IS NOT NULL
+                 FROM environment_heartbeats h LEFT JOIN environments e ON e.id = h.environment_id WHERE h.last_seen_micros >= ?",
+            )?;
+            s.query_map([window_start], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<rusqlite::Result<_>>()?
         };
-        for (env, server, last, silent_since) in rows {
+        for (env, server, last, silent_since, paused) in rows {
             let quiet = now_micros - last;
-            let paused: bool = c.query_row("SELECT paused_at IS NOT NULL FROM environments WHERE id = ?", [env], |r| r.get::<_, bool>(0)).unwrap_or(true);
             match silent_since {
                 None if !paused && quiet > threshold_secs * 1_000_000 && quiet < WATCH_WINDOW_SECS * 1_000_000 => {
                     c.execute(
