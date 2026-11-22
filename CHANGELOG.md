@@ -7,7 +7,21 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
-**Fixes from the 2026-11-22 security audit**
+**Security**
+- Security: the "Logs" and "Users" links on a tenant page and the "View
+  distributed trace" link on a request or job page can no longer be set
+  from the URL. The environment pages passed every query parameter to the
+  page, including the three the server meant to fill in itself
+  (`_logs_path`, `_people_path`, `_environment_path`), so a link such as
+  `.../tenants/x?_logs_path=https://evil.example/login` made a signed-in
+  member's "Logs" button go to another site (in the Inertia JSON and the
+  first-visit HTML alike). Query parameters starting with `_` are now
+  dropped, and the server sets the three paths itself.
+- Fixed: those links work again. The tenant page's "Logs" link opens this
+  environment's logs filtered to the tenant (`tenant:<id>`) and "Users"
+  opens its users page, both in the current time window; they were empty.
+  The trace link is under the environment (`/apps/<a>/envs/<e>/traces/<id>`)
+  instead of `/traces/<id>`, which did not exist.
 - Security: uptime checks share their 8 slots between accounts in turn.
   The probe loop gave free slots to due monitors in ascending id and
   stopped at the first one it could not seat, and a check holds its slot

@@ -130,7 +130,7 @@ class, text, FTS, store, host, model, tenant...), and second cursor pages.
 |---|---|
 | Shared props `auth`, `account`, `accounts`, `flash`, `google_oauth`, `applications`, `environment`, `saved_views` | Control-DB/session props p3-control owns; this module returns page props plus `shared_props(ctx)` (window, range, step, steps), which ARE compared. |
 | `pagination.next_cursor` (presence compared) | Cursors are signed by each server with its own key. Rust: base64url(JSON {v, model, order, context, value, id}) + "--" + hex HMAC-SHA256; same payload shape as Rails' MessageVerifier, but only round-trips within this server. A Rails cursor gets 422 here. |
-| `trace_url` (executions#show), `links` (tenants#show) | URL helpers. Rust takes the paths as params (`_environment_path`, `_logs_path`, `_people_path`) from the router. |
+| `trace_url` (executions#show), `links` (tenants#show) | URL helpers. Rust takes the paths as params (`_environment_path`, `_logs_path`, `_people_path`) from the router; the router drops every `_`-prefixed query parameter first, so a URL cannot set them. |
 
 ## Not in this module
 
