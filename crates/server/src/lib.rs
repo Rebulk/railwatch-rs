@@ -44,6 +44,7 @@ pub mod release_signature;
 pub mod rjson;
 pub mod rollup;
 pub mod schema;
+pub mod security;
 pub mod serve;
 pub mod standby;
 pub mod storage;

@@ -549,6 +549,23 @@ signatures verified); `bench/restart/run.sh`; `deploy/install.sh` in a
 systemd container; `bench/diff/run.sh` and `bench/diff/props/run.sh` after
 all of it (identical; 130/130).
 
+## Deliberate addition: the security watcher
+
+No Rails counterpart ([security-watcher.md](security-watcher.md)). Off
+unless `security_watcher_file` names a policy. Fixed detectors run over
+each enabled application's recent requests and `security.*` events, and
+keep incidents in new control tables (`security_incidents`,
+`security_incident_signals`, `security_incident_events`,
+`security_accounts`, `security_digests`; control migration
+`20261121000010_security_watcher`). Two new rule events fire,
+**`security_incident`** and **`security_digest`**. New surfaces: the MCP
+tools `list_security_incidents` and `get_security_incident`, and `GET
+/api/v1/.../environments/<env>/security_incidents[/<id>]`, all behind the
+`security` scope.
+
+Rollback: an older binary ignores the new tables and never fires the new
+events.
+
 ## Alerts and integrations
 
 1. **Integration secrets are encrypted with XChaCha20-Poly1305**, not Active

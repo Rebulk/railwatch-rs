@@ -40,6 +40,9 @@
 //!    counter back, so an id alone could name another person's session
 //!    after one. NULL (a session from before this, or an imported row):
 //!    only a cookie that carries no token opens it.
+//! 9. `security_watcher`: Rust-only security incidents (security/), each
+//!    cascading from its environment: incidents, their signals and
+//!    transitions, the accounts seen signing up (7 days), daily digests.
 
 pub mod issues;
 
@@ -65,6 +68,7 @@ pub const MIGRATIONS: &[(&str, Step)] = &[
     ("20261119000002_api_token_role_ceiling", api_token_role_ceiling),
     ("20261119000010_retired_environment_slugs", retired_environment_slugs),
     ("20261121000001_session_token", session_token),
+    ("20261121000010_security_watcher", security_watcher),
 ];
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<&'static str>> {
@@ -307,6 +311,12 @@ CREATE TABLE status_pages (
 );
 ";
 
+/// The security watcher's incidents, their signals and transitions, the
+/// accounts it saw sign up, and the daily digests (security/incidents.rs).
+fn security_watcher(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(crate::security::incidents::MIGRATION)
+}
+
 fn uptime(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(UPTIME)
 }
@@ -441,11 +451,14 @@ mod tests {
                     "20261119000001_trusted_proxy",
                     "20261119000002_api_token_role_ceiling",
                     "20261119000010_retired_environment_slugs",
-                    "20261121000001_session_token"
+                    "20261121000001_session_token",
+                    "20261121000010_security_watcher"
                 ]
             );
             let ceiling: Option<String> = c.query_row("SELECT role_ceiling FROM api_tokens LIMIT 1", [], |r| r.get(0)).optional().unwrap().flatten();
             assert_eq!(ceiling, None, "existing tokens keep no ceiling");
+            let incidents: i64 = c.query_row("SELECT count(*) FROM security_incidents", [], |r| r.get(0)).unwrap();
+            assert_eq!(incidents, 0, "the watcher's tables exist, empty");
             c.query_row("SELECT account_id FROM trusted_proxy", [], |r| r.get::<_, i64>(0)).optional().unwrap()
         };
         assert_eq!(upgrade(&[7, 3, 9]), Some(3));

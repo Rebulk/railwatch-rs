@@ -134,6 +134,8 @@ enum Action {
     Series,
     Visits,
     Uptime,
+    SecurityIncidents,
+    SecurityIncident,
     Issues,
     Issue,
     UpdateIssue,
@@ -164,6 +166,7 @@ impl Action {
             Series => "api/v1/environments/series",
             Visits => "api/v1/environments/visits",
             Uptime => "api/v1/environments/uptime",
+            SecurityIncidents | SecurityIncident => "api/v1/environments/security_incidents",
             Issues | Issue | UpdateIssue => "api/v1/issues",
             CreateComment => "api/v1/issue_comments",
         }
@@ -190,6 +193,8 @@ impl Action {
                 | Series
                 | Visits
                 | Uptime
+                | SecurityIncidents
+                | SecurityIncident
         )
     }
 }
@@ -256,6 +261,8 @@ fn route(method: &Method, path: &str) -> Option<Routed> {
                 (["series"], true, _) => (Series, p(&base)),
                 (["visits"], true, _) => (Visits, p(&base)),
                 (["uptime"], true, _) => (Uptime, p(&base)),
+                (["security_incidents"], true, _) => (SecurityIncidents, p(&base)),
+                (["security_incidents", id], true, _) => (SecurityIncident, p(&[base[0], base[1], ("id", id)])),
                 _ => return None,
             }
         }
@@ -518,6 +525,8 @@ fn run(
         Series => api.series(e()),
         Visits => api.visits(e()),
         Uptime => api.uptime(e()),
+        SecurityIncidents => api.security_incidents(e()),
+        SecurityIncident => api.security_incident(e()),
         Issues => api.issues(),
         Issue => api.issue(),
         UpdateIssue => api.update_issue(),
@@ -1347,6 +1356,45 @@ impl Api<'_> {
 
     /// The environment's uptime monitors (docs/uptime.md): state, uptime
     /// windows, the last 90 days and recent incidents. Rust-only.
+    /// The security watcher's incidents (docs/security-watcher.md): keyed
+    /// by client address, so the security scope is required (403 without).
+    fn security_incidents(&self, e: &Scoped) -> R<Rendered> {
+        self.require_security()?;
+        let status = match self.params.s("status").as_str() {
+            "" => None,
+            s @ ("open" | "closed") => Some(s.to_string()),
+            _ => return Err(unprocessable("status", "is open or closed")),
+        };
+        let min = match self.params.s("min_severity").as_str() {
+            "" => crate::security::Severity::Low,
+            s => crate::security::Severity::parse(s)
+                .filter(|v| *v >= crate::security::Severity::Low)
+                .ok_or_else(|| unprocessable("min_severity", "is low, medium, high or critical"))?,
+        };
+        let limit = self.params.s("limit").parse::<i64>().unwrap_or(50).clamp(1, 200);
+        let (from, _) = self.window().range();
+        let rows = self.control(|c| crate::security::incidents::list(c, e.id, status.as_deref(), min, from, limit))?;
+        ok(json!({"data": rows}))
+    }
+
+    fn security_incident(&self, e: &Scoped) -> R<Rendered> {
+        self.require_security()?;
+        let id = self.params.s("id").parse::<i64>().map_err(|_| not_found())?;
+        let found = self.control(|c| crate::security::incidents::incident_json(c, id, 200))?;
+        match found.filter(|v| v["environment_id"] == json!(e.id)) {
+            Some(v) => ok(json!({"data": v})),
+            None => Err(not_found()),
+        }
+    }
+
+    fn require_security(&self) -> R<()> {
+        if self.token.allows(super::mcp::security::SECURITY_SCOPE) {
+            Ok(())
+        } else {
+            Err(Halt::Json(StatusCode::FORBIDDEN, json!({"error": "insufficient_scope", "detail": "security incidents need a token with the security scope"})))
+        }
+    }
+
     fn uptime(&self, e: &Scoped) -> R<Rendered> {
         let now = self.now;
         let account: i64 = self.control(|c| c.query_row("SELECT account_id FROM applications WHERE id = ?", [e.application_id], |r| r.get(0)))?;

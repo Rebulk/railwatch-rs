@@ -425,6 +425,9 @@ struct Account {
     alert: i64,
     monitor: i64,
     monitor_name: String,
+    /// A security incident on the account's first environment, its actor
+    /// the account's marker address (B_TAG.ip, a leak marker).
+    incident: i64,
     view: i64,
     invitation: i64,
     status_slug: String,
@@ -652,6 +655,23 @@ fn account(s: &Server, t: &Tag, owner: i64) -> Account {
             )
         })
         .unwrap();
+    let incident = s
+        .control
+        .with(|x| {
+            x.execute(
+                "INSERT INTO security_incidents (environment_id, actor, status, severity, identity, opened_at, last_signal_at, created_at, updated_at)
+                 VALUES (?1, ?2, 'open', 'high', 0, ?3, ?3, ?3, ?3)",
+                rusqlite::params![env, t.ip, railwatch_server::time::now_micros()],
+            )?;
+            let incident = x.last_insert_rowid();
+            x.execute(
+                "INSERT INTO security_incident_signals (incident_id, detector, subject, severity, first_at, last_at, count, summary, identity)
+                 VALUES (?1, 'secrets_probe', '', 'high', ?2, ?2, 3, ?3, 0)",
+                rusqlite::params![incident, railwatch_server::time::now_micros(), format!("3 probes of /{}widgets/.env", t.lower)],
+            )?;
+            Ok(incident)
+        })
+        .unwrap();
     let invitation = s.control.tx(|tx| control::create_invitation(tx, id, owner, &format!("carol@{}.test", t.lower), "member")).unwrap().id;
     let owner_membership: i64 = one(s, "SELECT id FROM memberships WHERE account_id = ? AND user_id = ?", [id, owner]);
     Account {
@@ -667,6 +687,7 @@ fn account(s: &Server, t: &Tag, owner: i64) -> Account {
         alert,
         monitor,
         monitor_name,
+        incident,
         view,
         invitation,
         status_slug,
@@ -808,6 +829,7 @@ fn snapshot(fx: &Fx) -> Vec<String> {
         format!("SELECT * FROM deploys WHERE environment_id IN ({envs}) ORDER BY id"),
         format!("SELECT * FROM saved_views WHERE environment_id IN ({envs}) ORDER BY id"),
         format!("SELECT * FROM uptime_monitors WHERE environment_id IN ({envs}) ORDER BY id"),
+        format!("SELECT * FROM security_incidents WHERE environment_id IN ({envs}) ORDER BY id"),
         format!("SELECT * FROM status_pages WHERE environment_id IN ({envs}) OR slug = '{}'", b.status_slug),
         format!("SELECT * FROM ingest_usage_months WHERE environment_id IN ({envs}) ORDER BY id"),
     ];
@@ -1156,6 +1178,8 @@ const API_ROUTES: &[(&str, &str, &str)] = &[
     ("Series", "GET", "/api/v1/applications/{app}/environments/{env}/series?type=request"),
     ("Visits", "GET", "/api/v1/applications/{app}/environments/{env}/visits"),
     ("Uptime", "GET", "/api/v1/applications/{app}/environments/{env}/uptime"),
+    ("SecurityIncidents", "GET", "/api/v1/applications/{app}/environments/{env}/security_incidents"),
+    ("SecurityIncident", "GET", "/api/v1/applications/{app}/environments/{env}/security_incidents/{incident}"),
     ("Issues", "GET", "/api/v1/issues"),
     ("Issue", "GET", "/api/v1/issues/{issue}"),
     ("UpdateIssue", "PATCH", "/api/v1/issues/{issue}"),
@@ -1188,6 +1212,7 @@ fn api_probes(fx: &Fx) -> Vec<ApiProbe> {
                 .replace("{group}", &b.env().group)
                 .replace("{execution}", &b.env().execution)
                 .replace("{issue}", &b.issue.to_string())
+                .replace("{incident}", &b.incident.to_string())
         };
         let p = |path: String, body: Option<Value>, refused: bool| ApiProbe { method, path, body, refused };
         if template.contains("{issue}") {
@@ -1295,6 +1320,7 @@ const FILTER_ARGS: &[&str] = &[
     "cursor",
     "group_by",
     "resource",
+    "min_severity",
 ];
 
 /// The argument sets a tool is called with: B's identity in every shape an
@@ -1342,6 +1368,7 @@ fn aim(fx: &Fx, tool: &Value) -> Vec<Map<String, Value>> {
             "job" => json!(format!("{}WidgetJob", B_TAG.camel)),
             "profile_id" => json!(b.env().sel.profile_id),
             "monitor" => json!(b.monitor_name),
+            "incident_id" => json!(b.incident),
             "component" => json!(format!("{}Widgets/Index", B_TAG.camel)),
             "q" => json!("zqb"),
             _ => return None,
@@ -1771,7 +1798,8 @@ fn account_bs_own_principals_see_bs_data_through_the_same_probes() {
             .replace("{app}", &ba.to_string())
             .replace("{group}", &b.env().group)
             .replace("{execution}", &b.env().execution)
-            .replace("{issue}", &b.issue.to_string());
+            .replace("{issue}", &b.issue.to_string())
+            .replace("{incident}", &b.incident.to_string());
         let r = api(&fx.s, t, "GET", &path, None);
         if r.status != 200 || leaks(fx, &[], &r.body).is_empty() {
             failures.push(format!("Bob: API {action} GET {path} -> {} with no B marker", r.status));

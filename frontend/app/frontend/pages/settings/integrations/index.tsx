@@ -110,6 +110,9 @@ const eventLabel: Record<string, string> = {
   // railwatch-rs: uptime monitors.
   monitor_down: "Monitor down",
   monitor_recovered: "Monitor up again",
+  // railwatch-rs: the security watcher.
+  security_incident: "Security incident opened, escalated or closed",
+  security_digest: "Daily security digest",
 }
 
 // "production · anomaly · >= high · /timeout/", or nothing when the rule

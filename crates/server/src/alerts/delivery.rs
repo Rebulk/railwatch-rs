@@ -36,6 +36,8 @@ fn heading(event: &str) -> String {
         "environment_recovered" => "Environment reporting again",
         "monitor_down" => "Monitor down",
         "monitor_recovered" => "Monitor up",
+        "security_incident" => "Security incident",
+        "security_digest" => "Security digest",
         other => return humanize(other),
     }
     .to_string()
@@ -197,6 +199,18 @@ impl Context {
     }
 
     pub fn severity(&self) -> Option<String> {
+        if self.alert.event == "security_incident" {
+            // The incident's own severity, as the priority words Slack's icons read.
+            return Some(
+                match pstr(self.payload(), "severity").as_deref() {
+                    Some("critical") => "urgent",
+                    Some("high") => "high",
+                    Some("medium") => "normal",
+                    _ => "low",
+                }
+                .into(),
+            );
+        }
         self.issue.as_ref().map(|i| i.priority.clone()).filter(|p| !p.is_empty()).or_else(|| severity_default(&self.alert.event).map(String::from))
     }
 

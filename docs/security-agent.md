@@ -8,6 +8,10 @@ each one made. Over MCP an agent can query that freely, looking for attacks,
 probing, auth abuse and gaps in the app's defences. It does not have to
 settle for a fixed list of findings.
 
+For incidents raised without anyone asking (detectors on a schedule,
+alerts when an incident opens or escalates), see
+[security-watcher.md](security-watcher.md).
+
 This page covers what the data can answer, the tools, a set of
 investigations with their exact calls, and a read-only agent prompt.
 
