@@ -77,6 +77,12 @@ environment's next write. Nothing to do.
   are not trimmed at start; an environment over the limit is trimmed by its
   next upload.
 
+**Dependencies**
+- url 2.5.9 and form_urlencoded 1.2.3, for RUSTSEC-2026-0592
+  (a stack overflow in `Url::origin()` on nested `blob:` URLs). Railwatch
+  calls `origin()` only on the configured Google OAuth endpoint, never on a
+  caller's URL; the upgrade keeps `cargo audit` clean.
+
 ## v0.3.7 (2026-11-21)
 
 Upgrading: the first start runs one control-database migration in place
