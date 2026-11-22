@@ -7,11 +7,17 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
-- Dependencies: url 2.5.9 and form_urlencoded 1.2.3, for RUSTSEC-2026-0592
-  (a stack overflow in `Url::origin()` on nested `blob:` URLs). Railwatch
-  calls `origin()` only on the configured Google OAuth endpoint, never on a
-  caller's URL; the upgrade keeps `cargo audit` clean.
-- New, off by default: the security watcher (docs/security-watcher.md).
+## v0.3.8 (2026-11-22)
+
+Upgrading: the first start runs one control-database migration in place
+(`security_watcher`), which only adds the security watcher's tables; an
+older binary ignores them. The same start deletes watchdog rows of deleted
+environments and named servers past the new cap of 500 per environment.
+Deploys and source maps over their new limits are trimmed on that
+environment's next write. Nothing to do.
+
+**New, off by default**
+- The security watcher (docs/security-watcher.md).
   With `security_watcher_file` set, it evaluates each application its
   policy enables every 15 s over the last 15 min, and also as soon as a
   `security.*` event arrives. Fixed detectors cover secret-file probes,
@@ -25,6 +31,8 @@ tag is a release candidate (marked pre-release, not "latest", so
   new MCP tools `list_security_incidents` and `get_security_incident` and
   under `/api/v1/.../security_incidents`, all with the `security` scope.
   New control tables; an older binary ignores them.
+
+**Fixes from the 2026-11-22 security audit**
 - Security: the watchdog keeps at most 500 named servers per environment.
   Every distinct `server` on an ingested row became a row in the control
   database that every account shares, and nothing ever deleted those rows,
@@ -68,6 +76,12 @@ tag is a release candidate (marked pre-release, not "latest", so
   fail with a 500 after pruning them. Existing maps
   are not trimmed at start; an environment over the limit is trimmed by its
   next upload.
+
+**Dependencies**
+- url 2.5.9 and form_urlencoded 1.2.3, for RUSTSEC-2026-0592
+  (a stack overflow in `Url::origin()` on nested `blob:` URLs). Railwatch
+  calls `origin()` only on the configured Google OAuth endpoint, never on a
+  caller's URL; the upgrade keeps `cargo audit` clean.
 
 ## v0.3.7 (2026-11-21)
 
