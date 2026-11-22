@@ -2,7 +2,8 @@
 //!
 //! The address policy is the alert webhooks' (alerts::outbound_http): every
 //! address the host resolves to must be public (not private, loopback,
-//! link-local, CGNAT, metadata or reserved), and the connection is pinned
+//! link-local, CGNAT, metadata or reserved) and not one of this server's
+//! own addresses, and the connection is pinned
 //! to the checked address while TLS still verifies the hostname, so DNS
 //! rebinding between the check and the connect cannot reach an internal
 //! address. Two differences: plain http is allowed (an app's health URL
@@ -17,7 +18,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use crate::alerts::outbound_http::ensure_public;
+use crate::alerts::outbound_http::{allowed, own_addresses};
 
 /// The most of a body read to look for the keyword.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -106,10 +107,8 @@ pub fn validate_url(url: &str, policy: Policy) -> Result<reqwest::Url, String> {
         return Err("must not contain credentials".into());
     }
     let host = u.host_str().filter(|h| !h.is_empty()).ok_or("must name a host")?;
-    if let Ok(ip) = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>()
-        && !policy.allow_private
-    {
-        ensure_public(ip).map_err(|_| private_message())?;
+    if let Ok(ip) = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        allowed(ip, policy.allow_private, &own_addresses()).map_err(|_| private_message())?;
     }
     Ok(u)
 }
@@ -142,10 +141,9 @@ async fn run(req: &Request, policy: Policy) -> Result<(i64, Option<Failed>), Fai
     if addrs.is_empty() {
         return Err((Failure::Dns, format!("{host} did not resolve")));
     }
-    if !policy.allow_private {
-        for a in &addrs {
-            ensure_public(a.ip()).map_err(|_| (Failure::Blocked, format!("{host} resolved to a private or internal address")))?;
-        }
+    let own = own_addresses();
+    for a in &addrs {
+        allowed(a.ip(), policy.allow_private, &own).map_err(|_| (Failure::Blocked, format!("{host} resolved to a private or internal address")))?;
     }
     let client = reqwest::Client::builder()
         .resolve_to_addrs(&host, &addrs)

@@ -1,7 +1,8 @@
 //! Port of Alerts::OutboundHttp (railwatch-cloud app/models/alerts/
 //! outbound_http.rb): the only path from customer-configured destinations to
 //! the network. HTTPS only, no credentials or fragment; every resolved
-//! address must be public; the connection is pinned to the checked address
+//! address must be public and not this server's own (`allowed`); the
+//! connection is pinned to the checked address
 //! (reqwest `resolve`) while TLS still verifies the hostname, so DNS
 //! rebinding between check and connect is impossible. Responses are capped
 //! at 1 MiB and the whole exchange at 15 s.
@@ -82,10 +83,8 @@ pub fn validate_with(url: &str, kind: Kind, policy: Policy) -> Result<Target, Un
             return Err(Unsafe("Slack destination must be a hooks.slack.com/services/... webhook URL".into()));
         }
     }
-    if let Ok(ip) = host.parse::<IpAddr>()
-        && !policy.allow_private
-    {
-        ensure_public(ip)?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        allowed(ip, policy.allow_private, &own_addresses())?;
     }
     Ok(Target { url: u, host, port })
 }
@@ -148,6 +147,78 @@ pub fn ensure_public(ip: IpAddr) -> Result<(), Unsafe> {
     if blocked { Err(Unsafe("destination resolved to a non-public address".into())) } else { Ok(()) }
 }
 
+/// The address rule for alert webhooks and uptime probes: anything when the
+/// operator allows private targets; otherwise a public address that is not
+/// one of `own`, this server's own addresses. A public address configured on
+/// one of this machine's interfaces is delivered locally, so a request to
+/// it reaches services that a firewall outside the machine hides, and the
+/// fixed ranges cannot know it.
+pub fn allowed(ip: IpAddr, allow_private: bool, own: &[IpAddr]) -> Result<(), Unsafe> {
+    if allow_private {
+        return Ok(());
+    }
+    ensure_public(ip)?;
+    let canonical = |ip: IpAddr| match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    if own.iter().any(|o| canonical(*o) == canonical(ip)) {
+        return Err(Unsafe("destination resolved to this server's own address".into()));
+    }
+    Ok(())
+}
+
+/// This server's own addresses: every address on this machine's network
+/// interfaces, read when asked (DHCP, VPNs and containers change them),
+/// plus the host of `RAILWATCH_URL` when it is an IP address. A host name
+/// there is not resolved; the address it names is covered when it is on an
+/// interface. If the interfaces cannot be read, only the URL's address and
+/// the fixed ranges apply.
+pub fn own_addresses() -> Vec<IpAddr> {
+    let mut out = interface_addresses();
+    if let Some(ip) = std::env::var("RAILWATCH_URL")
+        .ok()
+        .and_then(|u| reqwest::Url::parse(u.trim()).ok())
+        .and_then(|u| u.host_str().and_then(|h| h.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().ok()))
+    {
+        out.push(ip);
+    }
+    out
+}
+
+fn interface_addresses() -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list that is only read here and
+    // freed once with freeifaddrs; each ifa_addr is null or points to a
+    // sockaddr whose family says which sockaddr_* it is.
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return out;
+        }
+        let mut p = head;
+        while !p.is_null() {
+            let a = (*p).ifa_addr;
+            if !a.is_null() {
+                match i32::from((*a).sa_family) {
+                    libc::AF_INET => {
+                        let sin = &*(a as *const libc::sockaddr_in);
+                        out.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
+                    }
+                    libc::AF_INET6 => {
+                        let sin6 = &*(a as *const libc::sockaddr_in6);
+                        out.push(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            p = (*p).ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    out
+}
+
 /// RAILWATCH_ALERT_CA_FILE's certificates; an unreadable file fails the
 /// delivery (with the path), never silently falls back.
 fn extra_roots() -> Result<Vec<reqwest::Certificate>, String> {
@@ -179,10 +250,9 @@ async fn post_inner(url: &str, body: String, headers: &[(&str, String)], kind: K
     if addrs.is_empty() {
         return Err("destination hostname did not resolve".into());
     }
-    if !policy.allow_private {
-        for a in &addrs {
-            ensure_public(a.ip()).map_err(|e| e.0)?;
-        }
+    let own = own_addresses();
+    for a in &addrs {
+        allowed(a.ip(), policy.allow_private, &own).map_err(|e| e.0)?;
     }
     let mut builder = reqwest::Client::builder()
         // The address was checked and is pinned here: a proxy from the
@@ -265,6 +335,29 @@ mod tests {
         let url = format!("https://127.0.0.1:{port}/hook?token=t0ps3cret");
         let err = post_inner(&url, "{}".into(), &[], Kind::Webhook, Policy { allow_private: true }).await.err().expect("nothing listens there");
         assert!(!err.contains("t0ps3cret") && !err.contains("/hook"), "{err}");
+    }
+
+    /// A public address on one of this host's interfaces is delivered
+    /// locally, past any firewall outside the machine. The host's addresses
+    /// are given as data: the sandbox and CI have no public interface.
+    #[test]
+    fn this_hosts_own_public_addresses_are_refused_unless_private_targets_are_allowed() {
+        let v4: IpAddr = "100.128.0.9".parse().unwrap();
+        let v6: IpAddr = "2a01:4f8:1:2::5".parse().unwrap();
+        let own = [IpAddr::V4(Ipv4Addr::LOCALHOST), v4, v6];
+        for ip in [v4, v6, "::ffff:100.128.0.9".parse().unwrap()] {
+            assert!(allowed(ip, false, &own).is_err(), "{ip} is this host's own address");
+            assert!(allowed(ip, true, &own).is_ok(), "{ip}: the allow-private setting still allows it");
+        }
+        assert!(allowed("100.128.0.10".parse().unwrap(), false, &own).is_ok(), "control: another public address is allowed");
+        assert!(allowed(v4, false, &[]).is_ok(), "control: the same address is allowed when it is not this host's");
+        assert!(allowed("10.0.0.1".parse().unwrap(), false, &[]).is_err(), "control: the fixed ranges still apply");
+    }
+
+    #[test]
+    fn this_hosts_interface_addresses_are_read() {
+        let own = interface_addresses();
+        assert!(own.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)), "{own:?}");
     }
 
     #[test]

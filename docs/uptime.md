@@ -39,7 +39,9 @@ The first check runs within a few seconds of saving.
 - **Redirects are not followed.** A 3xx is an answer, and it passes unless
   you set an exact expected status. Point the monitor at the final URL.
 - **Address rules.** As with alert webhooks, every address the host resolves
-  to must be public. Private, loopback, link-local, carrier-grade NAT and
+  to must be public and must not be one of this server's own addresses (any
+  address on its network interfaces, and the host of `RAILWATCH_URL` when it
+  is an IP). Private, loopback, link-local, carrier-grade NAT and
   cloud metadata addresses (such as `169.254.169.254`) are refused when the
   monitor is saved (for an IP in the URL) and again at every check (for a
   name). The connection is pinned to the address that was checked, so DNS

@@ -42,6 +42,23 @@ tag is a release candidate (marked pre-release, not "latest", so
     page, where Retry sends it. On the first start after upgrading, alerts
     already stranded that way are marked failed the same way. Nothing to do,
     unless you want to retry them.
+- Security: alert webhooks and uptime monitors refuse this server's own
+  addresses. The address rule checked fixed reserved ranges only, so a
+  public address configured on the server's own network interface passed.
+  A request to it is delivered on the machine itself, so an account admin
+  could point a monitor at it and learn which ports answer, and whether a
+  response contains a given word, for services that a firewall outside the
+  machine hides. Every address on the server's interfaces, and the host of
+  `RAILWATCH_URL` when it is an IP address, is now refused for both, when a
+  monitor or integration is saved and again at every check or delivery
+  (refused checks are recorded with cause `blocked`).
+  `RAILWATCH_ALLOW_PRIVATE_MONITOR_TARGETS` and
+  `RAILWATCH_ALLOW_PRIVATE_ALERT_TARGETS` still allow them. Whether this was
+  reachable depends on the host: it applies where the public address is on
+  a local interface (common on VPS hosts and with host networking), not
+  where the provider translates it outside the machine. A monitor already
+  pointing at the server's own address now fails with `blocked`; to keep
+  watching the server itself, set the monitor flag. Nothing else to do.
 
 ## v0.3.8 (2026-11-22)
 
