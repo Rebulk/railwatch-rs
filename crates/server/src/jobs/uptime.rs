@@ -90,12 +90,17 @@ impl Turns {
         }
         accounts.sort_by_key(|(a, _)| (self.account.get(a).copied().unwrap_or(0), *a));
         let mut out = Vec::with_capacity(due.len());
-        for round in 0.. {
-            let before = out.len();
-            out.extend(accounts.iter().filter_map(|(_, ids)| ids.get(round).copied()));
-            if out.len() == before {
-                break;
-            }
+        let mut live: Vec<std::vec::IntoIter<i64>> = accounts.into_iter().map(|(_, ids)| ids.into_iter()).collect();
+        // One monitor per account per round; an account leaves once it has
+        // none left, so the work is linear in the due monitors.
+        while !live.is_empty() {
+            live.retain_mut(|ids| match ids.next() {
+                Some(id) => {
+                    out.push(id);
+                    true
+                }
+                None => false,
+            });
         }
         out
     }

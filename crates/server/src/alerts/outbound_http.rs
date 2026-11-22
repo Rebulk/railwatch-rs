@@ -84,7 +84,7 @@ pub fn validate_with(url: &str, kind: Kind, policy: Policy) -> Result<Target, Un
         }
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        allowed(ip, policy.allow_private, &own_addresses())?;
+        allowed(ip, policy.allow_private, own_addresses().as_deref())?;
     }
     Ok(Target { url: u, host, port })
 }
@@ -153,11 +153,14 @@ pub fn ensure_public(ip: IpAddr) -> Result<(), Unsafe> {
 /// one of this machine's interfaces is delivered locally, so a request to
 /// it reaches services that a firewall outside the machine hides, and the
 /// fixed ranges cannot know it.
-pub fn allowed(ip: IpAddr, allow_private: bool, own: &[IpAddr]) -> Result<(), Unsafe> {
+pub fn allowed(ip: IpAddr, allow_private: bool, own: Option<&[IpAddr]>) -> Result<(), Unsafe> {
     if allow_private {
         return Ok(());
     }
     ensure_public(ip)?;
+    let Some(own) = own else {
+        return Err(Unsafe("this server's own addresses could not be read, so no destination can be checked against them".into()));
+    };
     let canonical = |ip: IpAddr| match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
         v4 => v4,
@@ -172,10 +175,13 @@ pub fn allowed(ip: IpAddr, allow_private: bool, own: &[IpAddr]) -> Result<(), Un
 /// interfaces, read when asked (DHCP, VPNs and containers change them),
 /// plus the host of `RAILWATCH_URL` when it is an IP address. A host name
 /// there is not resolved; the address it names is covered when it is on an
-/// interface. If the interfaces cannot be read, only the URL's address and
-/// the fixed ranges apply.
-pub fn own_addresses() -> Vec<IpAddr> {
-    let mut out = interface_addresses();
+/// interface.
+///
+/// None when the interfaces cannot be read (musl's getifaddrs needs a
+/// netlink socket, which the installed unit's RestrictAddressFamilies must
+/// allow): `allowed` then refuses every target rather than guessing.
+pub fn own_addresses() -> Option<Vec<IpAddr>> {
+    let mut out = interface_addresses()?;
     if let Some(ip) = std::env::var("RAILWATCH_URL")
         .ok()
         .and_then(|u| reqwest::Url::parse(u.trim()).ok())
@@ -183,10 +189,12 @@ pub fn own_addresses() -> Vec<IpAddr> {
     {
         out.push(ip);
     }
-    out
+    Some(out)
 }
 
-fn interface_addresses() -> Vec<IpAddr> {
+/// None when getifaddrs fails, or returns no address at all (a host always
+/// has loopback, so an empty list means the read did not happen).
+fn interface_addresses() -> Option<Vec<IpAddr>> {
     let mut out = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs fills `head` with a list that is only read here and
@@ -194,7 +202,7 @@ fn interface_addresses() -> Vec<IpAddr> {
     // sockaddr whose family says which sockaddr_* it is.
     unsafe {
         if libc::getifaddrs(&mut head) != 0 {
-            return out;
+            return None;
         }
         let mut p = head;
         while !p.is_null() {
@@ -216,7 +224,7 @@ fn interface_addresses() -> Vec<IpAddr> {
         }
         libc::freeifaddrs(head);
     }
-    out
+    (!out.is_empty()).then_some(out)
 }
 
 /// RAILWATCH_ALERT_CA_FILE's certificates; an unreadable file fails the
@@ -252,7 +260,7 @@ async fn post_inner(url: &str, body: String, headers: &[(&str, String)], kind: K
     }
     let own = own_addresses();
     for a in &addrs {
-        allowed(a.ip(), policy.allow_private, &own).map_err(|e| e.0)?;
+        allowed(a.ip(), policy.allow_private, own.as_deref()).map_err(|e| e.0)?;
     }
     let mut builder = reqwest::Client::builder()
         // The address was checked and is pinned here: a proxy from the
@@ -346,17 +354,19 @@ mod tests {
         let v6: IpAddr = "2a01:4f8:1:2::5".parse().unwrap();
         let own = [IpAddr::V4(Ipv4Addr::LOCALHOST), v4, v6];
         for ip in [v4, v6, "::ffff:100.128.0.9".parse().unwrap()] {
-            assert!(allowed(ip, false, &own).is_err(), "{ip} is this host's own address");
-            assert!(allowed(ip, true, &own).is_ok(), "{ip}: the allow-private setting still allows it");
+            assert!(allowed(ip, false, Some(&own)).is_err(), "{ip} is this host's own address");
+            assert!(allowed(ip, true, Some(&own)).is_ok(), "{ip}: the allow-private setting still allows it");
         }
-        assert!(allowed("100.128.0.10".parse().unwrap(), false, &own).is_ok(), "control: another public address is allowed");
-        assert!(allowed(v4, false, &[]).is_ok(), "control: the same address is allowed when it is not this host's");
-        assert!(allowed("10.0.0.1".parse().unwrap(), false, &[]).is_err(), "control: the fixed ranges still apply");
+        assert!(allowed("100.128.0.10".parse().unwrap(), false, Some(&own)).is_ok(), "control: another public address is allowed");
+        assert!(allowed(v4, false, Some(&[])).is_ok(), "control: the same address is allowed when it is not this host's");
+        assert!(allowed("10.0.0.1".parse().unwrap(), false, Some(&[])).is_err(), "control: the fixed ranges still apply");
+        assert!(allowed("100.128.0.10".parse().unwrap(), false, None).is_err(), "unreadable interfaces refuse every target (fail closed)");
+        assert!(allowed("100.128.0.10".parse().unwrap(), true, None).is_ok(), "...unless private targets are allowed");
     }
 
     #[test]
     fn this_hosts_interface_addresses_are_read() {
-        let own = interface_addresses();
+        let own = interface_addresses().expect("getifaddrs works here");
         assert!(own.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)), "{own:?}");
     }
 

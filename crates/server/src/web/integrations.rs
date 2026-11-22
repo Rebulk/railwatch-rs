@@ -337,12 +337,18 @@ fn rule_errors(event: &str, filters: &Map<String, Value>) -> Vec<(String, String
 /// Whether the application already has this exact rule (event, filters and
 /// integration). Each copy of a rule makes its own alert for one event, so
 /// copies only multiply what the shared outbox has to deliver.
+/// Filters compare as parsed JSON objects: an imported rule's stored text can
+/// be formatted differently ("{ }") from what this form writes ("{}").
 pub fn identical_rule_exists(x: &Connection, application_id: i64, integration_id: i64, event: &str, filters: &Map<String, Value>) -> rusqlite::Result<bool> {
-    x.query_row(
-        "SELECT EXISTS (SELECT 1 FROM alert_rules WHERE application_id = ? AND integration_id = ? AND event = ? AND filters = ?)",
-        params![application_id, integration_id, event, Value::Object(filters.clone()).to_string()],
-        |r| r.get(0),
-    )
+    let mut s = x.prepare_cached("SELECT filters FROM alert_rules WHERE application_id = ? AND integration_id = ? AND event = ?")?;
+    let stored = s.query_map(params![application_id, integration_id, event], |r| r.get::<_, String>(0))?;
+    let wanted = Value::Object(filters.clone());
+    for text in stored {
+        if serde_json::from_str::<Value>(&text?).unwrap_or_else(|_| json!({})) == wanted {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Inserts an alert rule (the setup CLI uses it too).

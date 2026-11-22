@@ -89,6 +89,10 @@ fn one_accounts_slow_monitors_do_not_keep_another_accounts_monitor_from_being_ch
         std::thread::sleep(Duration::from_millis(100));
     }
     let (other_checked, slow_checked) = (checked(other).is_some(), slow_checked());
+    let status =
+        |id: i64| -> Option<i64> { control.with(|x| x.query_row("SELECT last_status_code FROM uptime_monitors WHERE id = ?", [id], |r| r.get(0))).unwrap() };
+    let slow_status: Vec<Option<i64>> = slow_ids.iter().filter(|id| checked(**id).is_some()).map(|id| status(*id)).collect();
+    let other_status = status(other);
     let _ = stop.send(true);
     rt.block_on(looping).unwrap();
     drop(rt);
@@ -96,4 +100,9 @@ fn one_accounts_slow_monitors_do_not_keep_another_accounts_monitor_from_being_ch
 
     assert!(slow_checked > 0, "control: the loop ran and recorded account A's timed-out checks");
     assert!(other_checked, "account B's monitor was never checked in 12 s (4 of its intervals) while account A's slow monitors held the slots");
+    assert!(
+        !slow_status.is_empty() && slow_status.iter().all(Option::is_none),
+        "control: account A's checks held their slots to the timeout (no HTTP status), {slow_status:?}"
+    );
+    assert_eq!(other_status, Some(200), "account B's check reached its server and got 200");
 }

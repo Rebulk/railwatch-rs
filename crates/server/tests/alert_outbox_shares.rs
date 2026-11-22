@@ -137,6 +137,18 @@ async fn an_identical_alert_rule_is_refused_so_one_event_makes_one_alert() {
     let base = format!("http://{addr}");
     let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
 
+    // An imported rule keeps the Rails text as it was stored, formatted
+    // differently from what the form writes ("{}"): still the same rule.
+    control
+        .with(|x| {
+            let now = control::now_db();
+            x.execute(
+                "INSERT INTO alert_rules (application_id, created_at, event, filters, integration_id, updated_at) VALUES (?, ?, 'quota', '{ }', ?, ?)",
+                params![app, now, integ, now],
+            )
+        })
+        .unwrap();
+
     let sid = control.with(|x| control::create_session(x, owner, Some("ua"), Some("127.0.0.1"))).unwrap();
     let sess = session_cookie(&control, sid);
     let r = http.get(format!("{base}/settings/integrations")).header("Cookie", &sess).send().await.unwrap();
@@ -156,7 +168,7 @@ async fn an_identical_alert_rule_is_refused_so_one_event_makes_one_alert() {
         assert_eq!(r.status(), 302);
     }
     let rules_n: i64 = control.with(|x| x.query_row("SELECT COUNT(*) FROM alert_rules WHERE application_id = ?", [app], |r| r.get(0))).unwrap();
-    assert!(rules_n >= 1, "control: the first rule was added");
+    assert!(rules_n >= 1, "control: the imported rule is there");
 
     let fired = {
         let c = control.conn();
@@ -164,6 +176,10 @@ async fn an_identical_alert_rule_is_refused_so_one_event_makes_one_alert() {
     };
     let alerts_n: i64 = control.with(|x| x.query_row("SELECT COUNT(*) FROM alerts WHERE integration_id = ?", params![integ], |r| r.get(0))).unwrap();
     assert!(!fired.is_empty(), "control: the event fired the rule");
-    assert_eq!((rules_n, alerts_n), (1, 1), "five identical rules: one event made {alerts_n} alerts to the same destination");
+    assert_eq!(
+        (rules_n, alerts_n),
+        (1, 1),
+        "an imported rule plus five identical submissions: {rules_n} rules, one event made {alerts_n} alerts to the same destination"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }

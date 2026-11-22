@@ -72,7 +72,12 @@ tag is a release candidate (marked pre-release, not "latest", so
   a local interface (common on VPS hosts and with host networking), not
   where the provider translates it outside the machine. A monitor already
   pointing at the server's own address now fails with `blocked`; to keep
-  watching the server itself, set the monitor flag. Nothing else to do.
+  watching the server itself, set the monitor flag.   The server reads its own addresses over a netlink socket, so install.sh
+  now adds `AF_NETLINK` to the unit's `RestrictAddressFamilies`; if they
+  cannot be read, every target is refused rather than let through.
+  `railwatch upgrade` re-runs the installer and rewrites the unit; a server
+  whose unit is not rewritten refuses all monitor checks and alert
+  deliveries until it is (or until the allow-private flags are set).
 
 ## v0.3.8 (2026-11-22)
 

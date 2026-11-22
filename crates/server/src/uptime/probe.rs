@@ -108,7 +108,7 @@ pub fn validate_url(url: &str, policy: Policy) -> Result<reqwest::Url, String> {
     }
     let host = u.host_str().filter(|h| !h.is_empty()).ok_or("must name a host")?;
     if let Ok(ip) = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
-        allowed(ip, policy.allow_private, &own_addresses()).map_err(|_| private_message())?;
+        allowed(ip, policy.allow_private, own_addresses().as_deref()).map_err(|_| private_message())?;
     }
     Ok(u)
 }
@@ -143,7 +143,7 @@ async fn run(req: &Request, policy: Policy) -> Result<(i64, Option<Failed>), Fai
     }
     let own = own_addresses();
     for a in &addrs {
-        allowed(a.ip(), policy.allow_private, &own).map_err(|_| (Failure::Blocked, format!("{host} resolved to a private or internal address")))?;
+        allowed(a.ip(), policy.allow_private, own.as_deref()).map_err(|_| (Failure::Blocked, format!("{host} resolved to a private or internal address")))?;
     }
     let client = reqwest::Client::builder()
         .resolve_to_addrs(&host, &addrs)
