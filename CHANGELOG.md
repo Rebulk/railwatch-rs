@@ -7,6 +7,10 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+- Dependencies: url 2.5.9 and form_urlencoded 1.2.3, for RUSTSEC-2026-0592
+  (a stack overflow in `Url::origin()` on nested `blob:` URLs). Railwatch
+  calls `origin()` only on the configured Google OAuth endpoint, never on a
+  caller's URL; the upgrade keeps `cargo audit` clean.
 - New, off by default: the security watcher (docs/security-watcher.md).
   With `security_watcher_file` set, it evaluates each application its
   policy enables every 15 s over the last 15 min, and also as soon as a
