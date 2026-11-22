@@ -53,8 +53,11 @@ The first check runs within a few seconds of saving.
   `RAILWATCH_ALLOW_PRIVATE_ALERT_TARGETS`.
 - **Scheduling.** A monitor is checked one interval after its last check,
   plus up to a tenth of the interval of random jitter, so monitors added
-  together drift apart. At most 8 checks run at once; any others wait for a
-  free slot. After a restart, a monitor that is overdue is checked within a
+  together drift apart. At most 8 checks run at once for the whole server;
+  any others wait for a free slot. Free slots go to accounts in turn (one
+  monitor per account per round, the monitor checked least recently first),
+  so one account's slow monitors can delay another account's checks but not
+  stop them. After a restart, a monitor that is overdue is checked within a
   few seconds.
 - Each check records its status code, latency and, when it fails, a cause:
 

@@ -7,6 +7,20 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+**Fixes from the 2026-11-22 security audit**
+- Security: uptime checks share their 8 slots between accounts in turn.
+  The probe loop gave free slots to due monitors in ascending id and
+  stopped at the first one it could not seat, and a check holds its slot
+  for its whole timeout (up to 30 s) when the target never answers. So one
+  account with more slow monitors than slots kept every monitor with a
+  higher id, in any account, from ever being checked: a new monitor stayed
+  `pending`, never opened an incident and never sent `monitor_down`. Free
+  slots now go one monitor per account per round, the account that started
+  a check least recently first, and within an account the monitor checked
+  least recently first. The 8-slot limit and the timeouts are unchanged, so
+  a busy server still delays checks, but no account's monitors wait behind
+  another's indefinitely. Nothing to do.
+
 ## v0.3.8 (2026-11-22)
 
 Upgrading: the first start runs one control-database migration in place
