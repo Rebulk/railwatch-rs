@@ -456,3 +456,21 @@ fn walk(p: &std::path::Path) -> u64 {
     }
     n
 }
+
+/// Audit 2026-11-22 (rw-h-parse): a deploy dated year 0001 made its release
+/// page chart one point per 6 hours across two thousand years. The ingest
+/// refuses such a timestamp and stores nothing.
+#[test]
+fn a_deploy_dated_year_one_is_refused() {
+    let s = start("deploy-year-one");
+    let (env, token) = tenant(&s.control, "ancient-co");
+    let ct = ("Content-Type", "application/json".to_string());
+    let post = |body: Value| request(s.addr, "/ingest/deploys", &[("Authorization", format!("Bearer {token}")), ct.clone()], body.to_string().as_bytes());
+    let (st, _) = post(json!({"deploy": "ancient", "timestamp": "0001-01-01T00:00:00Z"}));
+    assert_eq!(st, 422);
+    let (st, _) = post(json!({"deploy": "future", "timestamp": "9999-01-01T00:00:00Z"}));
+    assert_eq!(st, 422);
+    assert_eq!(count(&s.control, "SELECT COUNT(*) FROM deploys WHERE environment_id = ?", env), 0);
+    let (st, body) = post(json!({"deploy": "backfilled", "timestamp": "2019-06-01T12:00:00Z"}));
+    assert_eq!((st, body.as_str()), (201, r#"{"ok":true,"deploy":"backfilled"}"#), "an old but plausible deploy is still recorded");
+}

@@ -80,7 +80,9 @@ here that differs is a bug.
 9. **Deploy `timestamp` parsing** handles what the gem and its Kamal hook send
    (ISO 8601 with Z or +hh:mm, "YYYY-MM-DD HH:MM[:SS]"). Rails'
    `Time.zone.parse` accepts many more shapes ("Oct 13 2026"); those answer 422
-   here.
+   here. A timestamp before 2000-01-01 UTC or more than a day past the
+   server's clock also answers 422 (Rails stores any year): a release page
+   reads the window from its deploy to the next one.
 10. **`String#inspect` for unassigned code points.** Ruby escapes unassigned
     Unicode code points (e.g. U+0378) when a Hash or Array is stored in a
     string column (its `to_s` is `inspect`). Rust has no Unicode
@@ -170,6 +172,11 @@ class, text, FTS, store, host, model, tenant...), and second cursor pages.
 6. **An unknown t-digest encoding** is skipped (its centroids are left out)
    instead of raising; Rails 500s the page. Rows written by RollupJob never
    have one.
+7. **A release page charts at most 90 days.** `ReleaseHealth.series` over a
+   deploy's window (deploy to next deploy, or now) charts only its last
+   `MAX_CUSTOM_RANGE`; Rails charts all of it at 6 h, so a deploy dated
+   years back emitted thousands of points per view. The page's summary and
+   `range` still cover the whole window.
 
 ## Ruby semantics ported on purpose (and checked)
 
