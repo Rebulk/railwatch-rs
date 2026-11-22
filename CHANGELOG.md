@@ -7,6 +7,18 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+**Security**
+- Security: a release page no longer builds a chart of unbounded length. It
+  charts its deploy's window (from the deploy to the next one, or now), and
+  nothing capped that span, so an app's ingest key could post a deploy dated
+  year 0001 and every account member who opened that release page made the
+  server build one chart point per 6 hours across two thousand years (about
+  3 million JSON objects) on a shared worker. The chart now covers at most
+  the window's last 90 days (at most 361 points); the summary still covers
+  the whole window. Deploy `timestamp`s before 2000-01-01 UTC or more than a
+  day in the future are refused with the same 422 as an unparseable one.
+  Deploys already stored with such a date stay, and their pages are bounded.
+
 ## v0.3.9 (2026-11-22)
 
 Upgrading: run `railwatch upgrade` (or re-run install.sh) so the systemd

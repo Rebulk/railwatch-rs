@@ -609,7 +609,7 @@ async fn deploys(state: &Arc<AppState>, env: Environment, headers: &HeaderMap, r
     // An explicit timestamp sets deployed_at; without one save_deploy keeps
     // an existing deploy's and stamps a new one now.
     let deployed_at = if params.get("timestamp").present() {
-        match parse_time(&bounded_string(params.get("timestamp"), 64)) {
+        match deploy_time(&bounded_string(params.get("timestamp"), 64), crate::time::now_micros()) {
             Some(t) => Some(t),
             None => return json(StatusCode::UNPROCESSABLE_ENTITY, rhash! {"error" => "Deployed at can't be blank"}),
         }
@@ -769,6 +769,17 @@ fn parse_time(s: &str) -> Option<i64> {
     let days = crate::time::days_from_civil(y, m, day);
     let secs = days.checked_mul(86_400)?.checked_add(h * 3600 + mi * 60 + se)?.checked_sub(offset_secs)?;
     secs.checked_mul(1_000_000)?.checked_add(usec)
+}
+
+/// Earliest deploy `timestamp` accepted: 2000-01-01 00:00 UTC, in micros.
+const EARLIEST_DEPLOY: i64 = 946_684_800_000_000;
+
+/// A deploy `timestamp`: parseable and between 2000 and a day past `now`.
+/// Deploys may be backfilled, so the floor is generous, but the release page
+/// reads (and charts) the window from a deploy to the next one, so a year
+/// 0001 or 9999 deploy is refused like an unparseable one.
+fn deploy_time(s: &str, now: i64) -> Option<i64> {
+    parse_time(s).filter(|t| (EARLIEST_DEPLOY..=now.saturating_add(86_400_000_000)).contains(t))
 }
 
 /// Splits a trailing "Z", " UTC" or "+hh:mm"/"-hh:mm" off. Byte-safe: the
@@ -1049,5 +1060,22 @@ mod tests {
         assert_eq!(parse_time("-9223372036854775808-01-01"), None);
         assert_eq!(parse_time("300000-01-01"), None);
         assert_eq!(parse_time("2026-10-13T10:00:00.5-01:30"), Some(1_791_885_600_000_000 + 5_400_000_000 + 500_000));
+    }
+
+    // A deploy may be backfilled, but not to year 0001 or past tomorrow: its
+    // window (deployed_at .. next deploy or now) is what the release page
+    // reads and charts.
+    #[test]
+    fn deploy_timestamps_outside_2000_to_tomorrow_are_refused() {
+        let now = 1_791_885_600_000_000; // 2026-10-13 10:00 UTC
+        let at = |s: &str| deploy_time(s, now);
+        assert_eq!(at("2026-10-13T10:00:00Z"), Some(now));
+        assert_eq!(at("2000-01-01T00:00:00Z"), Some(EARLIEST_DEPLOY));
+        assert_eq!(at("2026-10-14T10:00:00Z"), Some(now + 86_400_000_000), "a day of clock skew");
+        assert_eq!(at("1999-12-31T23:59:59Z"), None);
+        assert_eq!(at("0001-01-01T00:00:00Z"), None);
+        assert_eq!(at("2026-10-14T10:00:01Z"), None);
+        assert_eq!(at("9999-12-31T00:00:00Z"), None);
+        assert_eq!(at("garbage"), None);
     }
 }

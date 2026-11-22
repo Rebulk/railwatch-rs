@@ -15,7 +15,7 @@ use crate::dashboard::execution_presenter::viewable;
 use crate::dashboard::models;
 use crate::dashboard::rb;
 use crate::dashboard::rollup;
-use crate::dashboard::window::{DAY, HOUR, MINUTE, STEPS, default_step, step_seconds};
+use crate::dashboard::window::{DAY, HOUR, MAX_CUSTOM_RANGE, MINUTE, STEPS, default_step, step_seconds};
 
 fn i(v: &Sql) -> i64 {
     match v {
@@ -164,7 +164,12 @@ pub fn release_health_for(conn: &Connection, deploy: Option<&str>, from: i64, to
 }
 
 /// `ReleaseHealth.series(deploy, from, to, step:)`.
+///
+/// Charts at most the window's last `MAX_CUSTOM_RANGE`: a release page's
+/// window runs from its deploy to the next one, with no other bound, and
+/// at the 6 h default step that keeps the chart within `MAX_POINTS`.
 pub fn release_health_series(conn: &Connection, deploy: Option<&str>, from: i64, to: i64, step: Option<&str>) -> rusqlite::Result<Value> {
+    let from = from.max(to.saturating_sub(MAX_CUSTOM_RANGE));
     let key = step.unwrap_or_else(|| default_step(from, to));
     let step_us = STEPS.iter().find(|(k, _)| *k == key).unwrap().1.max(HOUR);
     let secs = step_us / 1_000_000;
@@ -701,4 +706,55 @@ pub fn issue_telemetry(conn: &Connection, ctx: &PageContext, issue: &control::Is
             "execution_id" => js(a.s("execution_id")), "execution_preview" => js(a.s("execution_preview")),
         }).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dashboard::window::MAX_POINTS;
+
+    fn release_health_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE \"release_health\" (\"id\" integer PRIMARY KEY AUTOINCREMENT NOT NULL, \"bucket\" datetime(6) NOT NULL, \
+             \"deploy\" varchar(128) NOT NULL, \"duration_count\" integer DEFAULT 0, \"duration_sum\" bigint DEFAULT 0, \"sessions\" integer DEFAULT 0, \
+             \"sessions_crashed\" integer DEFAULT 0, \"sessions_errored\" integer DEFAULT 0, \"users\" integer DEFAULT 0, \"users_crashed\" integer DEFAULT 0)",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn points(v: &Value) -> usize {
+        v.as_array().unwrap().len()
+    }
+
+    // A release page charts its deploy's whole window (deployed_at .. next
+    // deploy or now), and a deploy can be stored with any timestamp. A deploy
+    // dated years back used to chart one point per 6 hours across all of it.
+    #[test]
+    fn an_old_deploys_release_chart_stays_within_max_points() {
+        let conn = release_health_db();
+        let to = 1_791_885_600_000_000; // 2026-10-13 10:00 UTC
+        let decade_ago = to - 3650 * DAY;
+        let series = release_health_series(&conn, Some("v1"), decade_ago, to, None).unwrap();
+        assert!(points(&series) as f64 <= MAX_POINTS, "a decade-old deploy charted {} points", points(&series));
+        let year_one = crate::time::days_from_civil(1, 1, 1) * DAY;
+        let series = release_health_series(&conn, Some("v1"), year_one, to, None).unwrap();
+        assert!(points(&series) as f64 <= MAX_POINTS, "a year-0001 deploy charted {} points", points(&series));
+        // It charts the window's most recent MAX_CUSTOM_RANGE, as a custom
+        // window of that length would.
+        assert_eq!(series, release_health_series(&conn, Some("v1"), to - MAX_CUSTOM_RANGE, to, None).unwrap());
+        // A deploy dated far in the future (the page's `to` is the next
+        // deploy) is bounded too.
+        let far = crate::time::days_from_civil(200_000, 1, 1) * DAY;
+        assert!(points(&release_health_series(&conn, Some("v1"), to, far, None).unwrap()) as f64 <= MAX_POINTS);
+    }
+
+    #[test]
+    fn an_ordinary_release_window_charts_as_before() {
+        let conn = release_health_db();
+        let to = 1_791_885_600_000_000;
+        assert_eq!(points(&release_health_series(&conn, Some("v1"), to - DAY, to, None).unwrap()), 25, "24 h at 1 h");
+        assert_eq!(points(&release_health_series(&conn, None, to - 30 * DAY, to, Some("6h")).unwrap()), 121, "30 d at 6 h");
+    }
 }
