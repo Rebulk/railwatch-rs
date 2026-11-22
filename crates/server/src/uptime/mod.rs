@@ -260,6 +260,17 @@ pub fn active_monitors(c: &Connection) -> rusqlite::Result<Vec<Monitor>> {
     .collect()
 }
 
+/// The account of every enabled monitor (the probe loop's slots are shared
+/// between accounts in turn).
+pub fn monitor_accounts(c: &Connection) -> rusqlite::Result<std::collections::HashMap<i64, i64>> {
+    c.prepare_cached(
+        "SELECT m.id, ap.account_id FROM uptime_monitors m JOIN environments e ON e.id = m.environment_id
+           JOIN applications ap ON ap.id = e.application_id WHERE m.enabled = 1",
+    )?
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+    .collect()
+}
+
 pub fn find(c: &Connection, environment_id: i64, id: i64) -> rusqlite::Result<Option<Monitor>> {
     c.prepare_cached(&format!("SELECT {MONITOR_COLUMNS} FROM uptime_monitors WHERE environment_id = ? AND id = ?"))?
         .query_row(params![environment_id, id], monitor_row)

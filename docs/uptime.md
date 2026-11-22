@@ -39,7 +39,9 @@ The first check runs within a few seconds of saving.
 - **Redirects are not followed.** A 3xx is an answer, and it passes unless
   you set an exact expected status. Point the monitor at the final URL.
 - **Address rules.** As with alert webhooks, every address the host resolves
-  to must be public. Private, loopback, link-local, carrier-grade NAT and
+  to must be public and must not be one of this server's own addresses (any
+  address on its network interfaces, and the host of `RAILWATCH_URL` when it
+  is an IP). Private, loopback, link-local, carrier-grade NAT and
   cloud metadata addresses (such as `169.254.169.254`) are refused when the
   monitor is saved (for an IP in the URL) and again at every check (for a
   name). The connection is pinned to the address that was checked, so DNS
@@ -53,8 +55,11 @@ The first check runs within a few seconds of saving.
   `RAILWATCH_ALLOW_PRIVATE_ALERT_TARGETS`.
 - **Scheduling.** A monitor is checked one interval after its last check,
   plus up to a tenth of the interval of random jitter, so monitors added
-  together drift apart. At most 8 checks run at once; any others wait for a
-  free slot. After a restart, a monitor that is overdue is checked within a
+  together drift apart. At most 8 checks run at once for the whole server;
+  any others wait for a free slot. Free slots go to accounts in turn (one
+  monitor per account per round, the monitor checked least recently first),
+  so one account's slow monitors can delay another account's checks but not
+  stop them. After a restart, a monitor that is overdue is checked within a
   few seconds.
 - Each check records its status code, latency and, when it fails, a cause:
 

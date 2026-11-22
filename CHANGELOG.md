@@ -22,6 +22,62 @@ tag is a release candidate (marked pre-release, not "latest", so
   opens its users page, both in the current time window; they were empty.
   The trace link is under the environment (`/apps/<a>/envs/<e>/traces/<id>`)
   instead of `/traces/<id>`, which did not exist.
+- Security: uptime checks share their 8 slots between accounts in turn.
+  The probe loop gave free slots to due monitors in ascending id and
+  stopped at the first one it could not seat, and a check holds its slot
+  for its whole timeout (up to 30 s) when the target never answers. So one
+  account with more slow monitors than slots kept every monitor with a
+  higher id, in any account, from ever being checked: a new monitor stayed
+  `pending`, never opened an incident and never sent `monitor_down`. Free
+  slots now go one monitor per account per round, the account that started
+  a check least recently first, and within an account the monitor checked
+  least recently first. The 8-slot limit and the timeouts are unchanged, so
+  a busy server still delays checks, but no account's monitors wait behind
+  another's indefinitely. Nothing to do.
+- Security: one account's alerts can no longer delay or silently drop
+  another account's. All accounts share one alert outbox, and each delivery
+  pass took the 200 oldest due alerts from all of them; alert rules could be
+  added any number of times, and each identical copy made its own alert for
+  one event. So one account with many duplicate rules on a busy event could
+  fill every pass ahead of the others. An alert that had no delivery attempt
+  within an hour of being raised was then never claimed, and stayed
+  `pending` forever with no error. Three changes:
+  - Each pass now takes alerts from every account in turn (every account's
+    oldest, then every account's second oldest, and so on), still at most 200.
+  - Adding an alert rule that already exists (same application, event,
+    filters and integration) is refused with "Event already has an identical
+    rule for this application and integration". Existing duplicates are kept
+    and still fire; delete them in Settings > Integrations.
+  - The one-hour window is unchanged (it is Rails' reconcile window and keeps
+    a restored or long-stopped server from sending a flood of stale alerts).
+    An alert that ages out without an attempt is now marked `failed` with the
+    error "Not delivered: the outbox did not reach it within an hour of being
+    raised", and the number is logged as a warning. It shows on the Alerts
+    page, where Retry sends it. On the first start after upgrading, alerts
+    already stranded that way are marked failed the same way. Nothing to do,
+    unless you want to retry them.
+- Security: alert webhooks and uptime monitors refuse this server's own
+  addresses. The address rule checked fixed reserved ranges only, so a
+  public address configured on the server's own network interface passed.
+  A request to it is delivered on the machine itself, so an account admin
+  could point a monitor at it and learn which ports answer, and whether a
+  response contains a given word, for services that a firewall outside the
+  machine hides. Every address on the server's interfaces, and the host of
+  `RAILWATCH_URL` when it is an IP address, is now refused for both, when a
+  monitor or integration is saved and again at every check or delivery
+  (refused checks are recorded with cause `blocked`).
+  `RAILWATCH_ALLOW_PRIVATE_MONITOR_TARGETS` and
+  `RAILWATCH_ALLOW_PRIVATE_ALERT_TARGETS` still allow them. Whether this was
+  reachable depends on the host: it applies where the public address is on
+  a local interface (common on VPS hosts and with host networking), not
+  where the provider translates it outside the machine. A monitor already
+  pointing at the server's own address now fails with `blocked`; to keep
+  watching the server itself, set the monitor flag.   The server reads its own addresses over a netlink socket, so install.sh
+  now adds `AF_NETLINK` to the unit's `RestrictAddressFamilies`; if they
+  cannot be read, every target is refused rather than let through.
+  `railwatch upgrade` re-runs the installer and rewrites the unit; a server
+  whose unit is not rewritten refuses all monitor checks and alert
+  deliveries until it is (or until the allow-private flags are set).
 
 ## v0.3.8 (2026-11-22)
 

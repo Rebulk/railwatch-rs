@@ -67,7 +67,7 @@ test" proves a destination works. Webhooks are signed:
 `X-Railwatch-Signature: sha256=<hex HMAC-SHA256(secret, body)>`.
 
 Alert destinations must be public HTTPS by default (no SSRF into the box's
-network). `RAILWATCH_ALLOW_PRIVATE_ALERT_TARGETS=1` allows private and loopback
+network), and not one of the server's own addresses. `RAILWATCH_ALLOW_PRIVATE_ALERT_TARGETS=1` allows private and loopback
 addresses (ntfy on the same box, a LAN relay); that lets anyone who can edit an
 integration make the server POST to anything it can reach (cloud metadata,
 localhost admin ports), so only set it when every account admin is trusted with

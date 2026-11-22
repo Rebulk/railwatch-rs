@@ -1,7 +1,8 @@
 //! The uptime probe loop (uptime/mod.rs has the model, docs/uptime.md the
 //! behaviour). Every TICK it reads the enabled monitors from the control DB
 //! and starts a check for each one that is due and not already running,
-//! at most MAX_CONCURRENT at a time; a monitor is due `interval` after its
+//! at most MAX_CONCURRENT at a time, free slots going to accounts in turn
+//! (`Turns`); a monitor is due `interval` after its
 //! last check, plus up to a tenth of the interval of jitter, so monitors
 //! added together do not stay in lockstep. After a restart the persisted
 //! last check decides what is due: nothing is checked twice in a burst and
@@ -60,12 +61,72 @@ impl Schedule {
     }
 }
 
+/// Who gets a free slot first. One pool of MAX_CONCURRENT slots serves
+/// every account, and a check may hold its slot for its whole timeout, so
+/// the order decides who waits. Ascending id let one account's slow
+/// monitors keep every monitor with a higher id (any account's) from ever
+/// being checked. Due monitors take turns by account instead: one monitor
+/// per account per round, the account that started a check least recently
+/// first, and within an account the monitor started least recently first.
+#[derive(Default)]
+pub struct Turns {
+    /// Increases with every start; 0 is never.
+    seq: u64,
+    monitor: HashMap<i64, u64>,
+    account: HashMap<i64, u64>,
+}
+
+impl Turns {
+    /// `due` in the order free slots go to; `account_of` maps a monitor to
+    /// its account.
+    pub fn order(&self, due: &[i64], account_of: &HashMap<i64, i64>) -> Vec<i64> {
+        let mut groups: HashMap<i64, Vec<i64>> = HashMap::new();
+        for &id in due {
+            groups.entry(account_of.get(&id).copied().unwrap_or(0)).or_default().push(id);
+        }
+        let mut accounts: Vec<(i64, Vec<i64>)> = groups.into_iter().collect();
+        for (_, ids) in &mut accounts {
+            ids.sort_by_key(|id| (self.monitor.get(id).copied().unwrap_or(0), *id));
+        }
+        accounts.sort_by_key(|(a, _)| (self.account.get(a).copied().unwrap_or(0), *a));
+        let mut out = Vec::with_capacity(due.len());
+        let mut live: Vec<std::vec::IntoIter<i64>> = accounts.into_iter().map(|(_, ids)| ids.into_iter()).collect();
+        // One monitor per account per round; an account leaves once it has
+        // none left, so the work is linear in the due monitors.
+        while !live.is_empty() {
+            live.retain_mut(|ids| match ids.next() {
+                Some(id) => {
+                    out.push(id);
+                    true
+                }
+                None => false,
+            });
+        }
+        out
+    }
+
+    /// A check of `id` (of `account`) started.
+    pub fn started(&mut self, id: i64, account: i64) {
+        self.seq += 1;
+        self.monitor.insert(id, self.seq);
+        self.account.insert(account, self.seq);
+    }
+
+    /// Forgets monitors and accounts no longer listed.
+    pub fn retain(&mut self, account_of: &HashMap<i64, i64>) {
+        self.monitor.retain(|id, _| account_of.contains_key(id));
+        let accounts: HashSet<i64> = account_of.values().copied().collect();
+        self.account.retain(|a, _| accounts.contains(a));
+    }
+}
+
 /// Runs until `shutdown` changes.
 pub async fn run_forever(control: Arc<Control>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let policy = probe::Policy::from_env();
     let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
     let running: Arc<Mutex<HashSet<i64>>> = Default::default();
     let mut schedule = Schedule::default();
+    let mut turns = Turns::default();
     let mut last_maintain = 0i64;
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -88,13 +149,13 @@ pub async fn run_forever(control: Arc<Control>, mut shutdown: tokio::sync::watch
                     Err(e) => tracing::error!(error = %e, "uptime: rollup/retention failed"),
                 }
             }
-            uptime::active_monitors(&conn)
+            Ok::<_, rusqlite::Error>((uptime::active_monitors(&conn)?, uptime::monitor_accounts(&conn)?))
         })
         .await;
         if maintain {
             last_maintain = now / 1_000_000;
         }
-        let monitors = match listed {
+        let (monitors, accounts) = match listed {
             Ok(Ok(m)) => m,
             Ok(Err(e)) => {
                 tracing::error!(error = %e, "uptime: could not list monitors");
@@ -106,7 +167,9 @@ pub async fn run_forever(control: Arc<Control>, mut shutdown: tokio::sync::watch
             }
         };
         let by_id: HashMap<i64, &uptime::Monitor> = monitors.iter().map(|m| (m.id, m)).collect();
-        for id in schedule.due(&monitors, now) {
+        turns.retain(&accounts);
+        let due = schedule.due(&monitors, now);
+        for id in turns.order(&due, &accounts) {
             if running.lock().unwrap().contains(&id) {
                 continue;
             }
@@ -114,6 +177,7 @@ pub async fn run_forever(control: Arc<Control>, mut shutdown: tokio::sync::watch
             let Ok(permit) = limit.clone().try_acquire_owned() else { break };
             let m = by_id[&id];
             schedule.started(id, m.interval_seconds, now);
+            turns.started(id, accounts.get(&id).copied().unwrap_or(0));
             running.lock().unwrap().insert(id);
             let (c, req, run) = (control.clone(), m.request(), running.clone());
             tokio::spawn(async move {
@@ -174,6 +238,23 @@ mod tests {
         assert!(s.due(&ms, now + 56_000_000).is_empty(), "started: the next one is an interval away");
         assert!(s.due(&ms, now + 115_000_000).is_empty());
         assert_eq!(s.due(&ms, now + 122_000_000), vec![1]);
+    }
+
+    #[test]
+    fn free_slots_go_to_accounts_in_turn_and_to_the_monitor_started_least_recently() {
+        let mut t = Turns::default();
+        let account_of: HashMap<i64, i64> = (1..=10).map(|id| (id, 1)).chain([(11, 2), (12, 2)]).collect();
+        let due: Vec<i64> = (1..=12).collect();
+        assert_eq!(t.order(&due, &account_of)[..4], [1, 11, 2, 12]);
+        for id in [1, 11, 2, 12, 3, 4] {
+            t.started(id, account_of[&id]);
+        }
+        // Account 1 started a check last (4), so account 2 goes first. Account
+        // 1's never-started monitors (5..10) come before 1, 2, 3, 4, which
+        // follow in the order they started.
+        assert_eq!(t.order(&due, &account_of), [11, 5, 12, 6, 7, 8, 9, 10, 1, 2, 3, 4]);
+        t.retain(&HashMap::from([(5, 1)]));
+        assert!(t.monitor.keys().all(|id| *id == 5) && !t.account.contains_key(&2), "removed monitors and accounts are forgotten");
     }
 
     #[test]

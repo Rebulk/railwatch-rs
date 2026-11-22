@@ -259,13 +259,18 @@ fn an_alert_in_its_retry_schedule_is_delivered_past_the_reconcile_window_and_ret
     )
     .unwrap();
     assert_eq!(outbox::claim_due(&c, 10).unwrap().len(), 1, "attempt 5 is still claimed");
-    // A never-attempted alert that old is not (it predates the outbox).
+    // A never-attempted alert that old is not claimed; it is marked failed
+    // with the reason instead of staying pending with nothing said.
     let stale = rules::fire_issueless(&c, app, "quota", &payload).unwrap()[0];
     c.execute("UPDATE alerts SET created_at = datetime('now', '-2 hours') WHERE id = ?", [stale]).unwrap();
     assert!(outbox::claim_due(&c, 10).unwrap().is_empty());
+    let (status, error): (String, String) = c.query_row("SELECT status, error FROM alerts WHERE id = ?", [stale], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((status.as_str(), error.as_str()), ("failed", outbox::NEVER_ATTEMPTED));
     // Retry: only failed alerts, fresh budget, due now even though it is old.
+    let fresh = rules::fire_issueless(&c, app, "quota", &payload).unwrap()[0];
     c.execute("UPDATE alerts SET status = 'failed', delivery_attempts = 5, delivery_lease_id = NULL WHERE id = ?", [id]).unwrap();
-    assert!(!outbox::retry(&c, stale).unwrap(), "a pending alert is not 'retried'");
+    assert!(!outbox::retry(&c, fresh).unwrap(), "a pending alert is not 'retried'");
+    c.execute("DELETE FROM alerts WHERE id IN (?, ?)", [stale, fresh]).unwrap();
     assert!(outbox::retry(&c, id).unwrap());
     let claimed = outbox::claim_due(&c, 10).unwrap();
     assert_eq!((claimed.len(), claimed[0].id, claimed[0].attempts), (1, id, 1));

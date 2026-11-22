@@ -16,6 +16,8 @@ pub const RETRY_DELAYS_SECS: [i64; 4] = [60, 5 * 60, 15 * 60, 3600];
 /// Alert::RECONCILE_WINDOW
 pub const RECONCILE_WINDOW_SECS: i64 = 3600;
 pub const BATCH_SIZE: i64 = 200;
+/// The error an alert gets when no pass reached it within the window.
+pub const NEVER_ATTEMPTED: &str = "Not delivered: the outbox did not reach it within an hour of being raised";
 pub const MAX_COLLAPSED_PER_SUMMARY: i64 = 5_000;
 
 fn at(offset_secs: i64) -> String {
@@ -111,6 +113,17 @@ pub struct Claimed {
 /// then claims up to `limit` due alerts (due_for_delivery + claim_delivery!),
 /// in one transaction.
 ///
+/// Every account shares the outbox, so the batch is shared in turn: each
+/// account's due alerts are ranked oldest first and the batch takes every
+/// account's first, then every account's second, and so on. Oldest first
+/// across all accounts let one account's backlog fill every batch ahead of
+/// the others.
+///
+/// A pending alert that never had an attempt and is past the window is not
+/// claimed (as in Rails); it is marked failed here with NEVER_ATTEMPTED and
+/// counted in the log, so it shows on the Alerts page and can be retried,
+/// instead of staying pending with nothing said.
+///
 /// Rails' RECONCILE_WINDOW only bounds the reconciler; an alert already in
 /// its retry schedule (attempts > 0) or explicitly retried was enqueued as a
 /// job and is delivered whatever its age. With no job queue here, those two
@@ -133,14 +146,28 @@ pub fn claim_due(c: &Connection, limit: i64) -> rusqlite::Result<Vec<Claimed>> {
              WHERE status = 'delivering' AND delivery_lease_expires_at <= ?1",
             [&now],
         )?;
+        let window = at(-RECONCILE_WINDOW_SECS);
+        let aged = c.execute(
+            "UPDATE alerts SET status = 'failed', error = ?1, next_delivery_at = NULL, updated_at = ?2
+             WHERE status = 'pending' AND created_at < ?3 AND delivery_attempts = 0 AND delivery_enqueued_until IS NULL",
+            params![NEVER_ATTEMPTED, now, window],
+        )?;
+        if aged > 0 {
+            tracing::warn!(alerts = aged, "alert outbox: alerts never attempted within an hour marked failed (retry them from the Alerts page)");
+        }
         let ids: Vec<i64> = {
             let mut s = c.prepare_cached(
-                "SELECT id FROM alerts WHERE status = 'pending'
-                 AND (created_at >= ? OR delivery_attempts > 0 OR delivery_enqueued_until IS NOT NULL)
-                 AND (next_delivery_at IS NULL OR next_delivery_at <= ?)
-                 AND (delivery_enqueued_until IS NULL OR delivery_enqueued_until <= ?) ORDER BY next_delivery_at, id LIMIT ?",
+                "SELECT id FROM (
+                   SELECT a.id, a.next_delivery_at,
+                     ROW_NUMBER() OVER (PARTITION BY COALESCE(i.account_id, 0) ORDER BY a.next_delivery_at, a.id) AS turn
+                   FROM alerts a LEFT JOIN integrations i ON i.id = a.integration_id
+                   WHERE a.status = 'pending'
+                   AND (a.created_at >= ? OR a.delivery_attempts > 0 OR a.delivery_enqueued_until IS NOT NULL)
+                   AND (a.next_delivery_at IS NULL OR a.next_delivery_at <= ?)
+                   AND (a.delivery_enqueued_until IS NULL OR a.delivery_enqueued_until <= ?))
+                 ORDER BY turn, next_delivery_at, id LIMIT ?",
             )?;
-            s.query_map(params![at(-RECONCILE_WINDOW_SECS), now, now, limit], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+            s.query_map(params![window, now, now, limit], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
         };
         let mut out = Vec::new();
         for id in ids {
