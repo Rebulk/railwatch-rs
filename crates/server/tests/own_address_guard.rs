@@ -26,5 +26,8 @@ fn a_monitor_or_webhook_aimed_at_this_servers_own_address_is_refused_unless_priv
     assert!(outbound_http::validate_with(&hook, Kind::Webhook, lan.1).is_ok(), "the alert flag still allows it");
 
     assert!(probe::validate_url(&monitor, probe::Policy::default()).is_err(), "a monitor aimed at this server's own address was accepted");
-    assert!(outbound_http::validate_with(&hook, Kind::Webhook, outbound_http::Policy::default()).is_err(), "a webhook aimed at this server's own address was accepted");
+    assert!(
+        outbound_http::validate_with(&hook, Kind::Webhook, outbound_http::Policy::default()).is_err(),
+        "a webhook aimed at this server's own address was accepted"
+    );
 }

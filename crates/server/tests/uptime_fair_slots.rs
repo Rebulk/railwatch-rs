@@ -80,9 +80,8 @@ fn one_accounts_slow_monitors_do_not_keep_another_accounts_monitor_from_being_ch
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let looping = rt.spawn(railwatch_server::jobs::uptime::run_forever(control.clone(), stopped));
-    let checked = |id: i64| -> Option<i64> {
-        control.with(|x| x.query_row("SELECT last_checked_at FROM uptime_monitors WHERE id = ?", [id], |r| r.get(0))).unwrap()
-    };
+    let checked =
+        |id: i64| -> Option<i64> { control.with(|x| x.query_row("SELECT last_checked_at FROM uptime_monitors WHERE id = ?", [id], |r| r.get(0))).unwrap() };
     let slow_checked = || slow_ids.iter().filter(|id| checked(**id).is_some()).count();
     // Four of B's intervals.
     let deadline = Instant::now() + Duration::from_secs(12);
