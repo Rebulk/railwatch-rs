@@ -255,13 +255,18 @@ async fn props_for(cx: &Ctx, component: &str, scoped: &Scoped, params: &Params, 
         }
     };
     // params[:x] for the query string and the route's own segments, as Rails merges them.
-    let mut p: crate::dashboard::Params = params.0.iter().map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect();
+    // A `_`-prefixed key is the router's (`_environment_path`, `_logs_path`,
+    // `_people_path`: paths the page functions render as links), never the
+    // client's, so the query string cannot set one.
+    let mut p: crate::dashboard::Params =
+        params.0.iter().filter(|(k, _)| !k.starts_with('_')).map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect();
     for (k, v) in segments {
         if k != "app" && k != "env" {
             p.insert(k.clone(), v.clone());
         }
     }
-    let ctx = crate::dashboard::PageContext::new(env, crate::time::now_micros(), p, cx.state.cursor_key.clone());
+    let mut ctx = crate::dashboard::PageContext::new(env, crate::time::now_micros(), p, cx.state.cursor_key.clone());
+    router_paths(&mut ctx, &cx.state.config.base_path, scoped.application_id, env, component);
     let state = cx.state.clone();
     let slug = scoped.slug.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -281,6 +286,32 @@ async fn props_for(cx: &Ctx, component: &str, scoped: &Scoped, params: &Params, 
             Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response())
         }
     }
+}
+
+/// The paths the page functions take from the router (docs/DIFFERENCES.md,
+/// "URL helpers"): `_environment_path` for executions#show's trace link, and
+/// tenants#show's `_logs_path` (logs filtered to the tenant) and
+/// `_people_path`, both in the current window like TenantsController#links.
+fn router_paths(ctx: &mut crate::dashboard::PageContext, base_path: &str, app: i64, env: i64, component: &str) {
+    let env_path = format!("{base_path}/apps/{app}/envs/{env}");
+    if component == "tenants/show" {
+        let window = |q: &mut form_urlencoded::Serializer<String>| {
+            if ctx.window.is_custom() {
+                q.append_pair("from", &crate::time::iso8601_6(ctx.window.from)).append_pair("to", &crate::time::iso8601_6(ctx.window.to));
+            } else {
+                q.append_pair("window", &ctx.window.key);
+            }
+        };
+        let mut logs = form_urlencoded::Serializer::new(String::new());
+        window(&mut logs);
+        logs.append_pair("q", &crate::dashboard::filter_query::token("tenant", &ctx.param_s("id")));
+        let mut people = form_urlencoded::Serializer::new(String::new());
+        window(&mut people);
+        let (logs, people) = (format!("{env_path}/logs?{}", logs.finish()), format!("{env_path}/users?{}", people.finish()));
+        ctx.params.insert("_logs_path".into(), logs);
+        ctx.params.insert("_people_path".into(), people);
+    }
+    ctx.params.insert("_environment_path".into(), env_path);
 }
 
 /// The overview's uptime stat (Rust-only): how many enabled monitors are
