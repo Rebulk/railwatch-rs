@@ -21,6 +21,49 @@ tag is a release candidate (marked pre-release, not "latest", so
   new MCP tools `list_security_incidents` and `get_security_incident` and
   under `/api/v1/.../security_incidents`, all with the `security` scope.
   New control tables; an older binary ignores them.
+- Security: the watchdog keeps at most 500 named servers per environment.
+  Every distinct `server` on an ingested row became a row in the control
+  database that every account shares, and nothing ever deleted those rows,
+  not even deleting the environment. Each watchdog tick (every 10 s) read
+  the whole table and ran one more query per row while holding the one
+  control connection, so one ingest token that sent a few batches naming
+  200,000 servers made every other account's ingest and dashboard wait
+  seconds per tick. Servers past the cap now count for the environment as a
+  whole (one warning in the log per environment), and that environment-wide
+  entry keeps advancing with every later batch, so the environment is not
+  reported silent while its watched servers report; the records themselves
+  are stored as before. Rows not seen for a day are deleted, except up to
+  500 per environment that are still marked silent (so a server back after
+  a long outage still sends its recovery alert). Deleting an environment
+  deletes its rows. On the first start after upgrading, rows of deleted
+  environments and named servers past the cap (the least recently seen go)
+  are deleted, and rows older than a day go on the first tick. Nothing to do.
+- Security: `POST /ingest/deploys` and `POST /ingest/kamal` refuse a paused
+  environment (409 `{"error":"environment is paused"}`) and one over its
+  event quota (402 `{"error":"quota"}`), the same answers the source-map
+  upload gives. They used to write to the control database in both states.
+  An environment now keeps its 500 newest deploys (by `deployed_at`); saving
+  a new one deletes the older ones in the same transaction. Before, every
+  new deploy name was a new row of up to about 50 KB in the control
+  database, kept forever and outside the disk budget. Deploy history is now
+  limited to those 500: the pages and MCP tools read at most the newest
+  100, and the API's deploy listing pages back no further than the 500th.
+  An environment with more than 500
+  deploys is trimmed the next time it records one, not at start. A deploy
+  hook posting to a paused environment now gets a 409; the generated Kamal
+  hook ignores it, as it ignores every failed call.
+- Security: source-map uploads refuse an empty map (422), and an
+  environment keeps at most 50,000 files and directories of source maps
+  (the 200 MiB byte cap is unchanged). The byte cap did not see directories,
+  so empty maps under deep filenames could create any number of them: 200
+  uploads left 25,201 directories while every counter read 0. An upload
+  that would pass the limit first deletes older deploys' maps, like the
+  byte cap, and is refused (507) if it still would not fit. A filename too
+  long to write once the map's temporary suffix is added (over 247 bytes)
+  is refused (422) before any older deploy's maps are deleted; it used to
+  fail with a 500 after pruning them. Existing maps
+  are not trimmed at start; an environment over the limit is trimmed by its
+  next upload.
 
 ## v0.3.7 (2026-11-21)
 

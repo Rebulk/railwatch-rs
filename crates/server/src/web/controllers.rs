@@ -899,7 +899,7 @@ fn delete_issue_rows(tx: &rusqlite::Connection, filter: &str, id: i64) -> rusqli
 
 fn delete_environment_rows(tx: &rusqlite::Connection, env: i64) -> rusqlite::Result<()> {
     delete_issue_rows(tx, "environment_id = ?", env)?;
-    for table in ["deploys", "saved_views", "ingest_usage_months", "ingest_followup_receipts", "anomaly_rules", "thresholds"] {
+    for table in ["deploys", "saved_views", "ingest_usage_months", "ingest_followup_receipts", "anomaly_rules", "thresholds", "environment_heartbeats"] {
         tx.execute(&format!("DELETE FROM {table} WHERE environment_id = ?"), [env])?;
     }
     tx.execute("DELETE FROM environments WHERE id = ?", [env])?;
@@ -2050,6 +2050,7 @@ mod tests {
                     "INSERT INTO thresholds (environment_id, \"limit\", target_kind, created_at, updated_at) VALUES (?, 1.0, 'route', '2026-01-01', '2026-01-01')",
                     [env],
                 )?;
+                x.execute("INSERT INTO environment_heartbeats (environment_id, server, last_seen_micros) VALUES (?, 'web-1', 1)", [env])?;
                 Ok(())
             })
             .unwrap();
@@ -2060,6 +2061,8 @@ mod tests {
         let (_, env) = populate("Env", "env");
         c.tx(|tx| Ok(delete_environment_rows(tx, env)?)).expect("an environment with issues deletes");
         assert_eq!(count("SELECT COUNT(*) FROM issues WHERE environment_id = ?", env), 0);
+        // No foreign key ties the watchdog's rows to it (audit 2026-11-22).
+        assert_eq!(count("SELECT COUNT(*) FROM environment_heartbeats WHERE environment_id = ?", env), 0, "its watchdog rows go too");
 
         let (app, _) = populate("Shop", "shop");
         let scopes: Vec<String> = ["api", "read"].iter().map(|s| s.to_string()).collect();
@@ -2084,6 +2087,7 @@ mod tests {
             "integrations",
             "anomaly_rules",
             "thresholds",
+            "environment_heartbeats",
         ] {
             assert_eq!(count(&format!("SELECT COUNT(*) FROM {table} WHERE ? = ?1"), 1), 0, "{table} is empty");
         }
