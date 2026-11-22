@@ -236,6 +236,31 @@ fn the_watchdog_still_alerts_for_a_real_silent_server() {
     assert_eq!(count_on(&c, "SELECT COUNT(*) FROM alerts WHERE event = 'environment_recovered'"), 1);
 }
 
+/// An environment that once named more servers than the cap gets an
+/// environment-wide entry (server ""). It must keep advancing while the
+/// watched servers report, or the watchdog calls the whole environment
+/// silent although every watched server is sending.
+#[test]
+fn a_capped_environment_is_not_reported_silent_while_its_servers_report() {
+    let s = start("hb-capped");
+    let (env, _) = tenant(&s.control, "capped-co");
+    let c = s.control.conn();
+    let hb = watchdog::Heartbeats::default();
+    let t0 = 1_791_900_000_000_000i64;
+    let names = |n: usize| (0..n).map(|i| format!("web-{i}")).collect::<Vec<String>>();
+    // One batch past the cap: the extra name counts for the environment.
+    hb.beat(env, &names(watchdog::MAX_SERVERS_PER_ENVIRONMENT + 1), t0);
+    assert!(watchdog::check(&c, &hb, t0 + 1_000_000, 60).unwrap().is_empty());
+    // Then only the watched servers report, every 20 s, well past the
+    // 60 s silence threshold.
+    for step in 1..=6 {
+        let at = t0 + step * 20_000_000;
+        hb.beat(env, &names(watchdog::MAX_SERVERS_PER_ENVIRONMENT), at);
+        let t = watchdog::check(&c, &hb, at + 1_000_000, 60).unwrap();
+        assert!(t.is_empty(), "no server, and not the environment, is silent at step {step}: {t:?}");
+    }
+}
+
 /// Rows past the watch window are deleted; one still marked silent stays,
 /// so a server back after a long outage still gets its recovery alert.
 #[test]
@@ -394,6 +419,31 @@ fn source_map_uploads_past_the_entry_limit_are_refused() {
     assert_eq!(statuses, [201, 201, 507, 507, 507]);
     assert_eq!(walk(&env_dir), limit - 300 + 2 * 127, "refused uploads create nothing");
     assert_eq!(std::fs::read(env_dir.join("v1/vite/assets/app-123.js.map")).unwrap(), MAP, "the ordinary map is still there");
+}
+
+/// A filename the upload accepts must also be writable: the map is written
+/// to a temporary name first, and an upload that cannot be written must not
+/// have pruned any older deploy's maps on the way.
+#[test]
+fn an_upload_that_cannot_be_written_prunes_nothing() {
+    let (s, slug, token) = maps_env("maps-tmpname");
+    let env_dir = s.dir.join(format!("sourcemaps/{slug}"));
+    // The deploy-count cap: every older deploy past it is pruned before the
+    // new map is written.
+    let max = railwatch_server::storage::sourcemaps::MAX_DEPLOYS;
+    for d in 0..max {
+        assert_eq!(upload(&s, &token, &format!("v{d:03}"), "app.js", MAP).0, 201);
+    }
+    let before = std::fs::read_dir(&env_dir).unwrap().count();
+    // 248 bytes is a valid filename; with ".map" it is 252, and its
+    // temporary name (".map.tmp") would be 256, past the filesystem's 255.
+    let long = "a".repeat(248);
+    let (st, body) = upload(&s, &token, "vnew", &long, MAP);
+    assert_eq!((st, body.as_str()), (422, r#"{"error":"invalid deploy or filename"}"#), "refused cleanly, not a 500");
+    assert_eq!(std::fs::read_dir(&env_dir).unwrap().count(), before, "a refused upload pruned no older deploy");
+    assert!(env_dir.join("v000/app.js.map").exists(), "the oldest deploy's map is still there");
+    // One byte shorter is written as before (and prunes the oldest deploy).
+    assert_eq!(upload(&s, &token, "vnew", &"a".repeat(247), MAP).0, 201);
 }
 
 fn walk(p: &std::path::Path) -> u64 {

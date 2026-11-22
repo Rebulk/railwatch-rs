@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 pub const MAX_ENV_BYTES: u64 = 200 * 1024 * 1024;
 /// Deploys per environment whose maps are kept.
 pub const MAX_DEPLOYS: usize = 10;
+
+/// The longest file name (one path segment) ext4, xfs and btrfs allow.
+const MAX_NAME_BYTES: usize = 255;
 /// Uploads per environment per minute. A large Vite or Next release uploads
 /// hundreds of maps, and the uploader does not fail the deploy on a 429, so
 /// a lower limit dropped maps silently (PR #107 review L7). The byte caps
@@ -117,6 +120,9 @@ pub enum Refused {
     /// The environment's maps would pass MAX_ENV_BYTES (or MAX_ENV_ENTRIES)
     /// even with every other deploy's pruned.
     TooMuch,
+    /// The map's file name (with the temporary suffix it is written under)
+    /// is longer than a file name may be.
+    NameTooLong,
     /// The environment was deleted while the upload was in flight.
     Deleted,
 }
@@ -145,6 +151,12 @@ pub fn store(
     }
     let this = env_dir.join(deploy);
     let path = this.join(format!("{filename}.map"));
+    // The map is written to a temporary name beside it before the rename;
+    // refuse one whose temporary name the filesystem cannot hold before
+    // anything (an older deploy's maps included) is deleted.
+    if path.with_extension("map.tmp").file_name().is_some_and(|n| n.len() > MAX_NAME_BYTES) {
+        return Ok(Err(Refused::NameTooLong));
+    }
     let replaced = std::fs::metadata(&path).map_or(0, |m| m.len());
     let new = body.len() as u64;
     // The entries this upload adds: the directories of its path that do

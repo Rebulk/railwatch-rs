@@ -82,7 +82,12 @@ impl Heartbeats {
         for s in servers {
             over |= !note(&mut m, env, s, at);
         }
-        if servers.is_empty() || over {
+        // The environment-wide entry ("") is created for a batch that names no
+        // server or names one past the cap, and then refreshed by every
+        // batch: otherwise an environment that once went past the cap would
+        // be reported silent while its watched servers keep reporting.
+        let tracks_environment = m.get(&env).is_some_and(|servers| servers.contains_key(""));
+        if servers.is_empty() || over || tracks_environment {
             note(&mut m, env, "", at);
         }
         drop(m);

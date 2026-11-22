@@ -29,7 +29,9 @@ tag is a release candidate (marked pre-release, not "latest", so
   control connection, so one ingest token that sent a few batches naming
   200,000 servers made every other account's ingest and dashboard wait
   seconds per tick. Servers past the cap now count for the environment as a
-  whole (one warning in the log per environment); the records themselves
+  whole (one warning in the log per environment), and that environment-wide
+  entry keeps advancing with every later batch, so the environment is not
+  reported silent while its watched servers report; the records themselves
   are stored as before. Rows not seen for a day are deleted, except up to
   500 per environment that are still marked silent (so a server back after
   a long outage still sends its recovery alert). Deleting an environment
@@ -43,8 +45,10 @@ tag is a release candidate (marked pre-release, not "latest", so
   An environment now keeps its 500 newest deploys (by `deployed_at`); saving
   a new one deletes the older ones in the same transaction. Before, every
   new deploy name was a new row of up to about 50 KB in the control
-  database, kept forever and outside the disk budget. The pages, API and
-  MCP tools read at most the newest 100. An environment with more than 500
+  database, kept forever and outside the disk budget. Deploy history is now
+  limited to those 500: the pages and MCP tools read at most the newest
+  100, and the API's deploy listing pages back no further than the 500th.
+  An environment with more than 500
   deploys is trimmed the next time it records one, not at start. A deploy
   hook posting to a paused environment now gets a 409; the generated Kamal
   hook ignores it, as it ignores every failed call.
@@ -54,7 +58,10 @@ tag is a release candidate (marked pre-release, not "latest", so
   so empty maps under deep filenames could create any number of them: 200
   uploads left 25,201 directories while every counter read 0. An upload
   that would pass the limit first deletes older deploys' maps, like the
-  byte cap, and is refused (507) if it still would not fit. Existing maps
+  byte cap, and is refused (507) if it still would not fit. A filename too
+  long to write once the map's temporary suffix is added (over 247 bytes)
+  is refused (422) before any older deploy's maps are deleted; it used to
+  fail with a 500 after pruning them. Existing maps
   are not trimmed at start; an environment over the limit is trimmed by its
   next upload.
 

@@ -928,6 +928,9 @@ async fn sourcemaps(state: &Arc<AppState>, env: Environment, headers: &HeaderMap
         Ok(Ok(Err(crate::storage::sourcemaps::Refused::Deleted))) => {
             return json(StatusCode::GONE, rhash! {"error" => "this environment was deleted"});
         }
+        Ok(Ok(Err(crate::storage::sourcemaps::Refused::NameTooLong))) => {
+            return json(StatusCode::UNPROCESSABLE_ENTITY, rhash! {"error" => "invalid deploy or filename"});
+        }
         _ => {}
     }
     let written = written.map(|r| r.map(|_| ()));
