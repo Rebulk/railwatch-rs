@@ -1,5 +1,5 @@
-//! Audit 2026-11-22 (rw-h-ingest): ways one ingest token grew shared state
-//! that nothing bounded, over the real ingest router and real HTTP.
+//! Audit 2026-11-22 (rw-h-ingest): three ways one ingest token grew shared
+//! state that nothing bounded, over the real ingest router and real HTTP.
 //!
 //! 1. Every distinct `server` named on a batch's rows became a watchdog row
 //!    in the control database every account shares, never deleted (not even
@@ -7,6 +7,8 @@
 //!    connection held.
 //! 2. `/ingest/deploys` and `/ingest/kamal` wrote while the environment was
 //!    paused or over quota, and deploy rows had no per-environment limit.
+//! 3. `/ingest/sourcemaps` counted file bytes only, so empty maps under deep
+//!    filenames made directories the per-environment cap never saw.
 //!
 //! Dummy data only, loopback only.
 
@@ -335,4 +337,72 @@ fn an_environment_keeps_only_its_newest_deploys() {
     let r: Option<String> =
         s.control.with(|c| c.query_row("SELECT ref FROM deploys WHERE environment_id = ? AND deploy = 'v1'", [other], |r| r.get(0))).unwrap();
     assert_eq!(r.as_deref(), Some("abc"));
+}
+
+/// Control: an ordinary nested map stores and reads back byte for byte.
+const MAP: &[u8] = br#"{"version":3,"sources":["app.ts"],"names":[],"mappings":"AAAA"}"#;
+
+fn maps_env(name: &str) -> (Srv, String, String) {
+    let s = start(name);
+    let (env, token) = tenant(&s.control, "maps-co");
+    let slug: String = s.control.with(|c| c.query_row("SELECT slug FROM environments WHERE id = ?", [env], |r| r.get(0))).unwrap();
+    (s, slug, token)
+}
+
+fn upload(s: &Srv, token: &str, deploy: &str, file: &str, body: &[u8]) -> (u16, String) {
+    request(
+        s.addr,
+        "/ingest/sourcemaps",
+        &[("Authorization", format!("Bearer {token}")), ("X-Railwatch-Deploy", deploy.into()), ("X-Railwatch-Filename", file.into())],
+        body,
+    )
+}
+
+/// An empty map is refused and creates nothing; an ordinary nested map
+/// still stores intact.
+#[test]
+fn an_empty_source_map_is_refused() {
+    let (s, slug, token) = maps_env("maps-empty");
+    assert_eq!(upload(&s, &token, "v1", "vite/assets/app-123.js", MAP).0, 201);
+    assert_eq!(std::fs::read(s.dir.join(format!("sourcemaps/{slug}/v1/vite/assets/app-123.js.map"))).unwrap(), MAP);
+    let (st, body) = upload(&s, &token, "v1", "000/a/a/a.js", b"");
+    assert_eq!((st, body.as_str()), (422, r#"{"error":"the source map is empty"}"#));
+    assert!(!s.dir.join(format!("sourcemaps/{slug}/v1/000")).exists(), "nothing is created for an empty map");
+}
+
+/// Uploads past the environment's file and directory limit are refused and
+/// create nothing; what was stored before is still served.
+#[test]
+fn source_map_uploads_past_the_entry_limit_are_refused() {
+    let (s, slug, token) = maps_env("maps-entries");
+    assert_eq!(upload(&s, &token, "v1", "vite/assets/app-123.js", MAP).0, 201);
+    // The environment 300 entries short of its limit (filled on disk: the
+    // walk over tens of thousands of entries per upload is otherwise what
+    // the test would spend its time on).
+    let limit = railwatch_server::storage::sourcemaps::MAX_ENV_ENTRIES;
+    let env_dir = s.dir.join(format!("sourcemaps/{slug}"));
+    let fill = env_dir.join("v1/fill");
+    std::fs::create_dir_all(&fill).unwrap();
+    let have = walk(&env_dir);
+    for i in 0..(limit - 300 - have) {
+        std::fs::write(fill.join(i.to_string()), b"x").unwrap();
+    }
+    assert_eq!(walk(&env_dir), limit - 300);
+    // Deep filenames: 126 directories and a map each (127 entries). Two
+    // fit, then every one is refused (507) and nothing more is created.
+    let statuses: Vec<u16> = (0..5).map(|i| upload(&s, &token, "v1", &format!("{i:03}{}", "/a".repeat(126)), b"{}").0).collect();
+    assert_eq!(statuses, [201, 201, 507, 507, 507]);
+    assert_eq!(walk(&env_dir), limit - 300 + 2 * 127, "refused uploads create nothing");
+    assert_eq!(std::fs::read(env_dir.join("v1/vite/assets/app-123.js.map")).unwrap(), MAP, "the ordinary map is still there");
+}
+
+fn walk(p: &std::path::Path) -> u64 {
+    let mut n = 0;
+    for e in std::fs::read_dir(p).into_iter().flatten().flatten() {
+        n += 1;
+        if e.file_type().unwrap().is_dir() {
+            n += walk(&e.path());
+        }
+    }
+    n
 }

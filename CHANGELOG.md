@@ -48,6 +48,15 @@ tag is a release candidate (marked pre-release, not "latest", so
   deploys is trimmed the next time it records one, not at start. A deploy
   hook posting to a paused environment now gets a 409; the generated Kamal
   hook ignores it, as it ignores every failed call.
+- Security: source-map uploads refuse an empty map (422), and an
+  environment keeps at most 50,000 files and directories of source maps
+  (the 200 MiB byte cap is unchanged). The byte cap did not see directories,
+  so empty maps under deep filenames could create any number of them: 200
+  uploads left 25,201 directories while every counter read 0. An upload
+  that would pass the limit first deletes older deploys' maps, like the
+  byte cap, and is refused (507) if it still would not fit. Existing maps
+  are not trimmed at start; an environment over the limit is trimmed by its
+  next upload.
 
 ## v0.3.7 (2026-11-21)
 

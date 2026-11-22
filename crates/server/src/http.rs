@@ -900,6 +900,11 @@ async fn sourcemaps(state: &Arc<AppState>, env: Environment, headers: &HeaderMap
     if !safe(&deploy) || deploy.contains('/') || !safe(&filename) {
         return json(StatusCode::UNPROCESSABLE_ENTITY, rhash! {"error" => "invalid deploy or filename"});
     }
+    // An empty map maps nothing, and would let a deep filename make
+    // directories the byte cap does not see.
+    if raw.is_empty() {
+        return json(StatusCode::UNPROCESSABLE_ENTITY, rhash! {"error" => "the source map is empty"});
+    }
     // As /ingest: nothing is stored for a paused environment or one over
     // its quota, and uploads have their own, lower, rate (GA review
     // 2026-11-19, security #2).
@@ -912,8 +917,8 @@ async fn sourcemaps(state: &Arc<AppState>, env: Environment, headers: &HeaderMap
     let (dir, slug, name) = (state.sourcemaps_dir.clone(), env.slug.clone(), filename.clone());
     let bytes = raw.len();
     let written = tokio::task::spawn_blocking(move || {
-        use crate::storage::sourcemaps::{MAX_DEPLOYS, MAX_ENV_BYTES, store};
-        store(&dir, &slug, &deploy, &name, &raw, MAX_ENV_BYTES, MAX_DEPLOYS)
+        use crate::storage::sourcemaps::{MAX_DEPLOYS, MAX_ENV_BYTES, MAX_ENV_ENTRIES, store};
+        store(&dir, &slug, &deploy, &name, &raw, MAX_ENV_BYTES, MAX_DEPLOYS, MAX_ENV_ENTRIES)
     })
     .await;
     match written {
