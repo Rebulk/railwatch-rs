@@ -7,6 +7,16 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+## v0.3.7 (2026-11-21)
+
+Upgrading: the first start runs one control-database migration in place
+(`session_token`). It adds a nullable column and nothing on disk moves.
+Sessions that exist at upgrade keep working with the cookie they have. If
+you have used `railwatch env create` or `env import` on a server where
+someone else could create accounts, check which account your environments
+are in (see the `env create` entry below).
+
+**Fixes from the 2026-11-21 security audit**
 - Security: a password change, an email change and a new API token
   re-check, in the write itself, that the request's session still exists
   and (for the two changes) that the password its challenge was checked
@@ -76,7 +86,9 @@ tag is a release candidate (marked pre-release, not "latest", so
   design, and every ingest request and page waits on that one connection,
   so a handful of sign-in attempts at once could stall telemetry for every
   account. A password changed during the check ends that sign-in.
-- Dependencies: rusqlite 0.43, sha2, md-5 and chacha20poly1305 0.11, hmac
+
+**Dependencies**
+- rusqlite 0.43, sha2, md-5 and chacha20poly1305 0.11, hmac
   0.13, bcrypt 0.19, jsonwebtoken 12, croner 4, toml 1,
   base64 0.23, getrandom 0.4 and sigstore 0.16 (#99); lucide-react 1.74 and
   jsdom 31 (#82). Signed cookies, stored integration secrets and password
