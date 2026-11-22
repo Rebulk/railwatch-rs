@@ -7,6 +7,21 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+## v0.3.9 (2026-11-22)
+
+Upgrading: run `railwatch upgrade` (or re-run install.sh) so the systemd
+unit is rewritten. The server now reads its own network addresses over a
+netlink socket, and the new unit allows `AF_NETLINK`; under an old unit it
+cannot read them and refuses every uptime check and alert delivery until
+the unit is rewritten (or the allow-private flags are set). After the
+upgrade, a monitor pointed at the server's own public address reports
+`blocked`, alerts that were stranded as `pending` are marked `failed` and
+can be retried, and an identical alert rule is refused. Not verified
+before release: the musl binary under the installed unit, and an
+end-to-end check on a real host (an external monitor stays up; one on the
+host's own public address reports `blocked`). Check both on the first
+upgraded host.
+
 **Security**
 - Security: the "Logs" and "Users" links on a tenant page and the "View
   distributed trace" link on a request or job page can no longer be set
