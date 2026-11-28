@@ -7,6 +7,16 @@ tag is a release candidate (marked pre-release, not "latest", so
 
 ## Unreleased
 
+## v0.3.10 (2026-11-27)
+
+No upgrade steps: `railwatch upgrade` (or re-running install.sh) is
+enough. Deploy markers dated before 2000-01-01 UTC or more than a day in
+the future are now refused with a 422, so a client posting such a date
+starts seeing that refusal. `railwatch open` prints, and no longer opens,
+a link that is not on the server it is connected to (for example, when
+connected through an SSH tunnel to localhost while the server's public URL
+is configured). The `cookie` crate is 0.18.3 (RUSTSEC-2026-0594).
+
 **Security**
 - Security: the `railwatch` client commands no longer pass terminal control
   sequences from a server to your terminal. Their text output carries
