@@ -22,6 +22,11 @@ use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_railwatch");
 
+/// `s` as one POSIX shell word.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Clear screen + cursor home + a fake "all clear", conceal; OSC 52
 /// (clipboard), OSC 0 (window title), OSC 8 (a link whose text is not its
 /// target); C1 CSI/OSC/ST; bidi override and isolate; CR; DEL.
@@ -218,7 +223,8 @@ fn open_gives_the_desktop_opener_only_the_servers_own_links() {
         let _ = std::fs::remove_file(&log);
         // The terminal stays open briefly after the client exits, as a
         // shell's does (script(1) would otherwise hang up the opener).
-        let cmd = format!("{BIN} open SHOP-1 --url {url}; sleep 0.5");
+        // Quoted, so a checkout path with spaces stays one word.
+        let cmd = format!("{} open SHOP-1 --url {}; sleep 0.5", sh_quote(BIN), sh_quote(&url));
         let o = Command::new("/usr/bin/script")
             .args(["-qec", &cmd, "/dev/null"])
             .env_clear()
