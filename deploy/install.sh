@@ -229,14 +229,23 @@ else
   if [ -n "$pinned" ] && [ "$listed" != "$pinned" ]; then
     die "$RELEASE_URL/SHA256SUMS says $listed for $TARBALL, this installer pins $pinned; not installing"
   fi
-  if command -v cosign > /dev/null && fetch "$RELEASE_URL/SHA256SUMS.sigstore.json" "$TMP/SHA256SUMS.sigstore.json" 2> /dev/null; then
+  # Whether a signature is required is decided by cosign being installed,
+  # never by whether the release host serves the bundle: a host that drops
+  # the bundle must not turn the check off.
+  if command -v cosign > /dev/null; then
     tag=${TARBALL#railwatch-}; tag=${tag%-"$ARCH"-linux-musl.tar.gz}
-    cosign verify-blob "$TMP/SHA256SUMS" --bundle "$TMP/SHA256SUMS.sigstore.json" \
-      --certificate-identity "https://github.com/$RAILWATCH_REPO_DEFAULT/.github/workflows/release.yml@refs/tags/$tag" \
-      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-      --certificate-github-workflow-trigger push --certificate-github-workflow-repository "$RAILWATCH_REPO_DEFAULT" > /dev/null 2>&1 \
-      || die "SHA256SUMS signature does not verify for $RAILWATCH_REPO_DEFAULT $tag; not installing"
-    echo "SHA256SUMS: signature verified ($tag)"
+    if fetch "$RELEASE_URL/SHA256SUMS.sigstore.json" "$TMP/SHA256SUMS.sigstore.json"; then
+      cosign verify-blob "$TMP/SHA256SUMS" --bundle "$TMP/SHA256SUMS.sigstore.json" \
+        --certificate-identity "https://github.com/$RAILWATCH_REPO_DEFAULT/.github/workflows/release.yml@refs/tags/$tag" \
+        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        --certificate-github-workflow-trigger push --certificate-github-workflow-repository "$RAILWATCH_REPO_DEFAULT" > /dev/null 2>&1 \
+        || die "SHA256SUMS signature does not verify for $RAILWATCH_REPO_DEFAULT $tag; not installing"
+      echo "SHA256SUMS: signature verified ($tag)"
+    elif [ -z "$pinned" ]; then
+      die "cosign is installed but $RELEASE_URL/SHA256SUMS.sigstore.json could not be downloaded, so SHA256SUMS cannot be verified; not installing"
+    else
+      echo "warning: no signature at $RELEASE_URL/SHA256SUMS.sigstore.json: relying on the checksums pinned in this installer"
+    fi
   elif [ -z "$pinned" ]; then
     echo "warning: this install.sh has no pinned checksums and cosign is not installed: trusting $RELEASE_URL/SHA256SUMS as served"
   fi

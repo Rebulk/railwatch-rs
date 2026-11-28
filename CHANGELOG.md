@@ -8,6 +8,31 @@ tag is a release candidate (marked pre-release, not "latest", so
 ## Unreleased
 
 **Security**
+- Security: the `railwatch` client commands no longer pass terminal control
+  sequences from a server to your terminal. Their text output carries
+  strings that lower-trust parties wrote (an app's ingest token writes
+  exception titles and profile frames; any account member writes issue
+  comments), and those strings could hold escape sequences that redraw the
+  screen, set the window title, disguise a link or, on terminals that allow
+  it, write the clipboard. Text output, failure messages, `railwatch
+  upgrade`'s refusals (which can quote a release that has not been verified
+  yet) and `railwatch digest send --dry-run` now show every control
+  character other than line feed and tab, every C1 control and the bidi
+  override and isolate characters as U+FFFD. `--json` output is unchanged.
+- Security: `railwatch open` only hands the desktop opener (`xdg-open`,
+  macOS `open`) an http or https link on the scheme, host and port of the
+  server it is connected to. It used to open whatever `url` the server
+  answered, so a hostile server, or a process answering on the default
+  localhost port, could make the desktop open a `file:` path or any
+  registered URI scheme. Anything else is printed and not opened.
+- Security: `install.sh` (the repository copy, which has no baked
+  checksums) no longer skips the cosign check when the release host does
+  not serve `SHA256SUMS.sigstore.json`. With cosign installed, a bundle that
+  cannot be downloaded now stops the install and shows the download error,
+  where it used to say "cosign is not installed" and trust SHA256SUMS as
+  served. SHA256SUMS alone is trusted only when cosign is not installed. A
+  release's own copy of the script, with its pinned checksums, still
+  installs when no bundle is served, and now says so.
 - Security: a release page no longer builds a chart of unbounded length. It
   charts its deploy's window (from the deploy to the next one, or now), and
   nothing capped that span, so an app's ingest key could post a deploy dated
