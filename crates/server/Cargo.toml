@@ -46,7 +46,7 @@ hmac = "0.13"
 regex = { version = "1", default-features = false, features = ["std", "unicode"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 # Solid Queue schedules (fugit's cron and "every ..." forms) for CheckScheduledTasksJob.
-croner = "4"
+croner = "5"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
 # Phase 3: the web app (control DB, auth, Inertia shell, assets, cable).
@@ -75,10 +75,10 @@ oauth2 = { version = "5", default-features = false, features = ["reqwest", "rust
 # (release_signature.rs) against the embedded public-good trust root.
 # Without aws-lc-rs: signatures are checked with ring (already here) through
 # sigstore-crypto's CryptoProvider, prehashed ECDSA with p256/p384.
-sigstore-verify = { version = "0.16", default-features = false }
-sigstore-trust-root = { version = "0.16", default-features = false }
-sigstore-crypto = { version = "0.16", default-features = false }
-sigstore-types = "0.16"
+sigstore-verify = { version = "0.17", default-features = false }
+sigstore-trust-root = { version = "0.17", default-features = false }
+sigstore-crypto = { version = "0.17", default-features = false }
+sigstore-types = "0.17"
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 p384 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 
