@@ -4,6 +4,7 @@
 //! (bench/install/*.sh); this runs its `semver_lt` with sh against
 //! Semantic Versioning 2.0's precedence examples.
 
+use std::path::Path;
 use std::process::Command;
 
 fn semver_lt(a: &str, b: &str) -> bool {
@@ -200,4 +201,138 @@ fn setup_reads_alert_secrets_from_its_environment() {
     let text = String::from_utf8_lossy(&shown.stdout);
     assert!(text.contains("hook-SECRET") && text.contains("slack-SECRET"), "{text}{}", String::from_utf8_lossy(&shown.stderr));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The binary step of install.sh (from `step "binary"` through running the
+/// downloaded binary) with the script's own defaults and helpers, against a
+/// release served by a stub `curl` from `release`, on a PATH holding only
+/// the tools it needs, the stubs, and `cosign` when given. `pinned` stands
+/// in for the checksum bin/release bakes into a released copy.
+/// (exit ok, stdout, stderr, whether the downloaded binary ran)
+fn binary_step(release: &[(&str, Vec<u8>)], cosign: Option<&str>, pinned: Option<&str>) -> (bool, String, String, bool) {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!("rw-install-cosign-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (bin, rel) = (root.join("bin"), root.join("release"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&rel).unwrap();
+    for name in ["sh", "uname", "mktemp", "grep", "head", "cut", "sha256sum", "tar", "gzip", "mv", "chmod", "rm", "cp", "cat"] {
+        let real = ["/usr/bin", "/bin"].iter().map(|d| Path::new(d).join(name)).find(|p| p.exists()).unwrap_or_else(|| panic!("this test needs {name}"));
+        symlink(real, bin.join(name)).unwrap();
+    }
+    let exe = |name: &str, body: &str| {
+        let p = bin.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // curl -fsSL ... -o OUT URL: the file named by the URL's last segment,
+    // or curl's own 404 failure.
+    exe(
+        "curl",
+        "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 1 ]; do [ \"$1\" = -o ] && out=$2; shift; done\nf=\"$RW_RELEASE/${1##*/}\"\n[ -f \"$f\" ] || { echo \"curl: (22) The requested URL returned error: 404\" >&2; exit 22; }\ncp \"$f\" \"$out\"\n",
+    );
+    if let Some(body) = cosign {
+        exe("cosign", body);
+    }
+    for (name, bytes) in release {
+        std::fs::write(rel.join(name), bytes).unwrap();
+    }
+    let script = install_sh();
+    let header = &script[..script.find("die() {").unwrap()];
+    let header = match pinned {
+        Some(p) => header
+            .replace("\nRAILWATCH_SHA256_X86_64=\n", &format!("\nRAILWATCH_SHA256_X86_64={p}\n"))
+            .replace("\nRAILWATCH_SHA256_AARCH64=\n", &format!("\nRAILWATCH_SHA256_AARCH64={p}\n")),
+        None => {
+            assert!(header.contains("\nRAILWATCH_SHA256_X86_64=\n") && header.contains("\nRAILWATCH_SHA256_AARCH64=\n"), "the repository copy is unbaked");
+            header.to_string()
+        }
+    };
+    let helpers = &script[script.find("die() {").unwrap()..script.find("started=$(date").unwrap()];
+    let fetch = &script[script.find("fetch() {").unwrap()..script.find("step \"binary\"").unwrap()];
+    let start = script.find("step \"binary\"").unwrap();
+    let run_line = "\"$TMP/railwatch\" version > /dev/null 2>&1 || die";
+    let end = start + script[start..].find(run_line).expect("the step runs the downloaded binary");
+    let end = end + script[end..].find('\n').unwrap();
+    let body = format!("{header}\nRELEASE_URL=https://release.invalid/rel\n{helpers}\n{fetch}\n{}\necho STEP-DONE\n", &script[start..end]);
+    let marker = root.join("ran");
+    let o = Command::new(bin.join("sh"))
+        .arg("-c")
+        .arg(body)
+        .env_clear()
+        .env("PATH", &bin)
+        .env("TMPDIR", &root)
+        .env("RW_RELEASE", &rel)
+        .env("RW_MARKER", &marker)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let ran = marker.exists();
+    let (out, err) = (String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned());
+    assert!(!o.status.success() || out.contains("STEP-DONE"), "{out}{err}");
+    std::fs::remove_dir_all(&root).unwrap();
+    (o.status.success(), out, err, ran)
+}
+
+/// A release: SHA256SUMS and the tarball for this machine, whose
+/// `railwatch` records that it ran. (files, the tarball's sha256)
+fn release() -> (Vec<(&'static str, Vec<u8>)>, String) {
+    use sha2::Digest;
+    use std::os::unix::fs::PermissionsExt;
+    let arch = std::env::consts::ARCH;
+    let name = format!("railwatch-v9.9.9-{arch}-linux-musl");
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let stage = std::env::temp_dir().join(format!("rw-install-cosign-stage-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(stage.join(&name)).unwrap();
+    let fake = stage.join(&name).join("railwatch");
+    std::fs::write(&fake, "#!/bin/sh\necho ran >> \"$RW_MARKER\"\necho 'railwatch v9.9.9'\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = Command::new("tar").arg("-czf").arg("-").arg("-C").arg(&stage).arg(&name).output().unwrap();
+    assert!(out.status.success());
+    std::fs::remove_dir_all(&stage).unwrap();
+    let sum: String = sha2::Sha256::digest(&out.stdout).iter().map(|b| format!("{b:02x}")).collect();
+    let tarball: &'static str = Box::leak(format!("{name}.tar.gz").into_boxed_str());
+    (vec![("SHA256SUMS", format!("{sum}  {tarball}\n").into_bytes()), (tarball, out.stdout)], sum)
+}
+
+const COSIGN_OK: &str = "#!/bin/sh\n[ \"$1\" = verify-blob ] || exit 2\nexit 0\n";
+const COSIGN_FAILS: &str = "#!/bin/sh\nexit 1\n";
+
+/// Security (audit: missing bundle skips the signature check): with cosign
+/// installed and no checksum baked into the script, the release host could
+/// switch the cosign check off by not serving SHA256SUMS.sigstore.json; the
+/// script then said "cosign is not installed", trusted SHA256SUMS as
+/// served and ran the downloaded binary as root. Whether a signature is
+/// required now follows from cosign being installed, and a bundle that
+/// cannot be downloaded stops the install, with the download's error shown.
+#[test]
+fn install_sh_with_cosign_requires_the_signature_bundle() {
+    let (files, _) = release();
+    let (ok, out, err, ran) = binary_step(&files, Some(COSIGN_OK), None);
+    assert!(!ok && !ran, "no bundle served: refused, the downloaded binary never runs\n{out}{err}");
+    assert!(err.contains("cosign is installed but") && err.contains("SHA256SUMS.sigstore.json could not be downloaded"), "{err}");
+    assert!(err.contains("returned error: 404"), "the download's own error is not discarded: {err}");
+    assert!(!out.contains("cosign is not installed"), "{out}");
+}
+
+/// The other branches keep their behaviour: a served bundle is verified
+/// (refused when cosign refuses it); with no cosign an unbaked script
+/// trusts SHA256SUMS and says so; a baked checksum still carries a release
+/// whose host serves no bundle.
+#[test]
+fn install_sh_signature_branches() {
+    let (mut files, sum) = release();
+    let (ok, out, err, ran) = binary_step(&files, None, None);
+    assert!(ok && ran && out.contains("has no pinned checksums and cosign is not installed: trusting"), "no cosign: {out}{err}");
+    let (ok, out, err, ran) = binary_step(&files, Some(COSIGN_OK), Some(&sum));
+    assert!(ok && ran && out.contains("relying on the checksums pinned in this installer"), "baked, no bundle: {out}{err}");
+    files.push(("SHA256SUMS.sigstore.json", b"{}".to_vec()));
+    let (ok, out, err, ran) = binary_step(&files, Some(COSIGN_OK), None);
+    assert!(ok && ran && out.contains("SHA256SUMS: signature verified (v9.9.9)"), "bundle verifies: {out}{err}");
+    let (ok, out, err, ran) = binary_step(&files, Some(COSIGN_FAILS), None);
+    assert!(!ok && !ran && err.contains("signature does not verify"), "bundle does not verify: {out}{err}");
 }

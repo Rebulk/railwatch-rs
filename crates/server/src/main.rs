@@ -79,8 +79,11 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
+/// Messages can carry text the operator did not write (an unverified
+/// release's tag or bundle, a server's error), so they go through
+/// client::terminal_safe.
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
-    eprintln!("railwatch: {msg}");
+    eprintln!("railwatch: {}", client::terminal_safe(&msg.to_string()));
     ExitCode::FAILURE
 }
 
@@ -748,7 +751,8 @@ fn digest_dry_run(account: Option<i64>) -> ExitCode {
     let now = railwatch_server::time::now_micros();
     match railwatch_server::jobs::weekly_digest::dry_run(&control, &cfg.tenants_dir(), &cfg.pages_url(), now, account, delivery) {
         Ok(out) => {
-            print!("{out}");
+            // Application names are set by account admins, unchecked.
+            print!("{}", client::terminal_safe(&out));
             ExitCode::SUCCESS
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => fail(format!("no account {}", account.unwrap_or_default())),

@@ -93,11 +93,26 @@ pub fn run(args: &[&str]) -> Option<ExitCode> {
     let code = match main(command, &args[1..]) {
         Ok(code) => code,
         Err(f) => {
-            eprintln!("railwatch: {}", f.message);
+            eprintln!("railwatch: {}", terminal_safe(&f.message));
             f.code
         }
     };
     Some(ExitCode::from(code))
+}
+
+/// `s` with every character a terminal acts on made visible: C0 controls
+/// other than line feed and tab, DEL, the C1 controls (U+0080-U+009F, which
+/// include CSI and OSC) and the bidi override and isolate characters each
+/// become U+FFFD, as the server's request_scan::untrusted does. Applied
+/// where text that came from a server (telemetry, comments, error bodies,
+/// a release host) is written to a terminal; --json output is left as the
+/// server sent it.
+pub(crate) fn terminal_safe(s: &str) -> std::borrow::Cow<'_, str> {
+    let unsafe_char = |c: char| (c.is_control() && c != '\n' && c != '\t') || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    if !s.chars().any(unsafe_char) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(s.chars().map(|c| if unsafe_char(c) { '\u{FFFD}' } else { c }).collect())
 }
 
 pub fn help() {
@@ -490,7 +505,7 @@ fn print(o: &Opts, r: &ToolResult, text: impl FnOnce(&Value) -> String) -> Outco
         let hint = t.get("hint").and_then(Value::as_str).unwrap_or("narrow the request");
         out.push_str(&format!("\n(result truncated by the server: {hint})"));
     }
-    println!("{out}");
+    println!("{}", terminal_safe(&out));
     Ok(OK)
 }
 
@@ -682,7 +697,7 @@ fn tail(o: &Opts) -> Outcome {
                     seen.0.remove(&old);
                 }
             }
-            let line = if o.json() { row.to_string() } else { render::request_line(row) };
+            let line = if o.json() { row.to_string() } else { terminal_safe(&render::request_line(row)).into_owned() };
             if writeln!(out, "{line}").and_then(|_| out.flush()).is_err() {
                 return Ok(OK); // the reader went away (| head)
             }
@@ -737,13 +752,38 @@ fn open(o: &Opts) -> Outcome {
     if o.json() {
         println!("{}", json!({"url": url}));
     } else {
-        println!("{url}");
+        println!("{}", terminal_safe(&url));
     }
     if std::io::stdout().is_terminal() {
-        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-        let _ = std::process::Command::new(opener).arg(&url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+        match dashboard_link(&url, &c.endpoint) {
+            // The parsed link, not the server's string (the parser trims
+            // spaces and controls around it). No `--` before it: xdg-open
+            // refuses `--` as an unknown option, and a serialized http(s)
+            // URL starts with its scheme, never with `-`.
+            Ok(link) => {
+                let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                let _ = std::process::Command::new(opener).arg(link.as_str()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+            }
+            Err(why) => eprintln!("railwatch: not opening that link: {why}"),
+        }
     }
     Ok(OK)
+}
+
+/// `url` parsed, when it is an http(s) link on the origin (scheme, host and
+/// port) of `endpoint`, the server this client talks to. The desktop opener
+/// dispatches on scheme and file type, so the server's answer goes to it
+/// only when it is a link to that server's own dashboard.
+fn dashboard_link(url: &str, endpoint: &str) -> Result<reqwest::Url, String> {
+    let server = reqwest::Url::parse(endpoint).map_err(|e| format!("{endpoint}: {e}"))?;
+    let link = reqwest::Url::parse(url).map_err(|_| "it is not an absolute URL".to_string())?;
+    if !matches!(link.scheme(), "http" | "https") {
+        return Err("it is not an http or https link".into());
+    }
+    if link.origin() != server.origin() {
+        return Err(format!("it is not on {}, the server this client is connected to", server.origin().ascii_serialization()));
+    }
+    Ok(link)
 }
 
 fn tools(o: &Opts) -> Outcome {
@@ -758,7 +798,7 @@ fn tools(o: &Opts) -> Outcome {
     if o.json() {
         println!("{list}");
     } else {
-        println!("{}", render::tools(&list).trim_end());
+        println!("{}", terminal_safe(render::tools(&list).trim_end()));
     }
     Ok(OK)
 }
@@ -806,6 +846,55 @@ mod tests {
         assert_eq!(Opts::parse(&["--nope"], &[]).err().map(|f| f.code), Some(NOT_FOUND));
         assert_eq!(Opts::parse(&["--app"], &[]).err().map(|f| f.code), Some(NOT_FOUND));
         assert!(Opts::parse(&["--json=1"], &[]).is_err());
+    }
+
+    /// Server-written text reaches the terminal with nothing a terminal
+    /// would act on: the audit's clear-screen, OSC 52/0/8, C1 CSI/OSC/ST,
+    /// bidi override/isolate and CR all become U+FFFD; line feeds and tabs
+    /// (the renderers' layout) and ordinary non-ASCII text stay.
+    #[test]
+    fn terminal_safe_neutralises_control_and_bidi_characters() {
+        let hostile = "a\u{1b}[2J\u{1b}]52;c;eA==\u{7}\u{1b}]8;;https://x.invalid/\u{1b}\\b\u{9b}2J\u{9d}0;t\u{9c}c\u{202e}d\u{2066}e\rf\u{7f}g\u{0}h";
+        let safe = terminal_safe(hostile);
+        assert!(
+            safe.chars().all(|c| c == '\n' || c == '\t' || !(c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))),
+            "{safe:?}"
+        );
+        assert_eq!(safe.matches('\u{FFFD}').count(), 13, "each one is replaced, not dropped: {safe:?}");
+        assert!(safe.starts_with("a\u{FFFD}[2J") && safe.ends_with("f\u{FFFD}g\u{FFFD}h"), "{safe:?}");
+        for c in ['\u{80}', '\u{9f}', '\u{202a}', '\u{202d}', '\u{2069}', '\u{8}', '\u{1f}'] {
+            assert_eq!(terminal_safe(&format!("x{c}y")), "x\u{FFFD}y", "{c:?}");
+        }
+        let plain = "SHOP-12  4×  exception\n\tcafé · 東京 → ok";
+        assert!(matches!(terminal_safe(plain), std::borrow::Cow::Borrowed(p) if p == plain), "layout and text are untouched");
+    }
+
+    /// `railwatch open` hands only links on the connected server's origin
+    /// to the desktop opener.
+    #[test]
+    fn open_only_hands_the_servers_own_links_to_the_opener() {
+        let ep = "http://127.0.0.1:3000/monitoring/mcp";
+        assert!(dashboard_link("http://127.0.0.1:3000/monitoring/issues/1", ep).is_ok());
+        assert!(dashboard_link("http://127.0.0.1:3000/elsewhere", ep).is_ok(), "the origin, not the base path");
+        assert!(dashboard_link("http://127.0.0.1:3000//evil.example/x", ep).is_ok(), "a joined path stays on the host");
+        for bad in [
+            "file:///tmp/x.command",
+            "x-scheme://handler/run?arg=1",
+            "--version",
+            "javascript:alert(1)",
+            "http://127.0.0.1:3001/monitoring",
+            "https://127.0.0.1:3000/monitoring",
+            "http://localhost:3000/monitoring",
+            "http://evil.example/",
+            "http://127.0.0.1:3000@evil.example/",
+            "/relative",
+            "",
+        ] {
+            assert!(dashboard_link(bad, ep).is_err(), "{bad:?}");
+        }
+        assert!(dashboard_link("https://rw.example.com/issues/1", "https://rw.example.com:443/mcp").is_ok(), "the default port is the same port");
+        let trimmed = dashboard_link(" \u{1}http://127.0.0.1:3000/x\t", ep).unwrap();
+        assert_eq!(trimmed.as_str(), "http://127.0.0.1:3000/x", "the opener gets the parsed link, not the server's string");
     }
 
     #[test]
